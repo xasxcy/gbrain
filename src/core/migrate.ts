@@ -3766,6 +3766,24 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 81,
+    name: 'pgroonga_fts_chinese',
+    // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
+    // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
+    idempotent: true,
+    sql: '',
+    sqlFor: {
+      postgres: `
+        CREATE EXTENSION IF NOT EXISTS pgroonga;
+        CREATE INDEX IF NOT EXISTS idx_content_chunks_pgroonga
+          ON content_chunks
+          USING pgroonga (chunk_text)
+          WITH (tokenizer='TokenBigram("unify_alphabet", true)');
+      `,
+      pglite: '',
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
