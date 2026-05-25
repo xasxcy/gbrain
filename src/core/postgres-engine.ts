@@ -99,6 +99,7 @@ export class PostgresEngine implements BrainEngine {
    * db.disconnect() and clobber the unrelated module-level connection.
    */
   private _connectionStyle: 'instance' | 'module' | null = null;
+  private _usePgroonga = false;
 
   /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
@@ -181,6 +182,7 @@ export class PostgresEngine implements BrainEngine {
         this.connectionManager.setReadPool(db.getConnection());
       }
     }
+    await this.detectPgroonga();
   }
 
   async disconnect(): Promise<void> {
@@ -272,6 +274,8 @@ export class PostgresEngine implements BrainEngine {
         console.log(`  Schema verify: self-healed ${verify.healed.length} missing column(s)`);
       }
 
+      await this.detectPgroonga(conn);
+
       // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
       // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
       // to stderr but never block engine.connect.
@@ -289,6 +293,19 @@ export class PostgresEngine implements BrainEngine {
         caller: 'PostgresEngine.initSchema',
         duration_ms: Date.now() - t0,
       });
+    }
+  }
+
+  private async detectPgroonga(conn: ReturnType<typeof postgres> = this.sql): Promise<void> {
+    if (process.env.GBRAIN_USE_PGROONGA === '1') {
+      this._usePgroonga = true;
+      return;
+    }
+    try {
+      const rows = await conn`SELECT 1 FROM pg_extension WHERE extname = 'pgroonga' LIMIT 1`;
+      this._usePgroonga = rows.length > 0;
+    } catch {
+      this._usePgroonga = false;
     }
   }
 
@@ -1214,6 +1231,12 @@ export class PostgresEngine implements BrainEngine {
     // column lookup. NOT bypassed by detail=high — soft-delete is a contract,
     // not a temporal preference.
     const visibilityClause = buildVisibilityClause('p', 's');
+    const scoreExpr = this._usePgroonga
+      ? `pgroonga_score(cc.tableoid, cc.ctid) * ${sourceFactorCase}`
+      : `ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase}`;
+    const keywordWhere = this._usePgroonga
+      ? `cc.chunk_text &@~ $1`
+      : `cc.search_vector @@ websearch_to_tsquery('english', $1)`;
 
     const rawQuery = `
       WITH ranked_chunks AS (
@@ -1221,11 +1244,11 @@ export class PostgresEngine implements BrainEngine {
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
           p.effective_date, p.effective_date_source,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score
+          ${scoreExpr} AS score
         FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
         JOIN sources s ON s.id = p.source_id
-        WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
+        WHERE ${keywordWhere}
           ${typeClause}
           ${typesClause}
           ${excludeSlugsClause}
@@ -1357,18 +1380,24 @@ export class PostgresEngine implements BrainEngine {
 
     // v0.26.5: visibility filter for searchKeywordChunks (anchor primitive).
     const visibilityClause = buildVisibilityClause('p', 's');
+    const scoreExpr = this._usePgroonga
+      ? `pgroonga_score(cc.tableoid, cc.ctid) * ${sourceFactorCase}`
+      : `ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase}`;
+    const keywordWhere = this._usePgroonga
+      ? `cc.chunk_text &@~ $1`
+      : `cc.search_vector @@ websearch_to_tsquery('english', $1)`;
 
     const rawQuery = `
       SELECT
         p.slug, p.id as page_id, p.title, p.type, p.source_id,
         p.effective_date, p.effective_date_source,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-        ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+        ${scoreExpr} AS score,
         false AS stale
       FROM content_chunks cc
       JOIN pages p ON p.id = cc.page_id
       JOIN sources s ON s.id = p.source_id
-      WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
+      WHERE ${keywordWhere}
         ${typeClause}
         ${typesClause}
         ${excludeSlugsClause}
