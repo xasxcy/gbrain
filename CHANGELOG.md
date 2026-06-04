@@ -2,6 +2,35 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.25.0] - 2026-06-03
+
+**Cost caps and budget gates now fire on Opus 4.8 — and every model price lives in one place, so they can't silently drift again.** If you pointed a gbrain tier at Opus 4.8 (`models.aliases.opus`), the cost guardrails were quietly not working: there was no price on file for 4.8, so the `gbrain dream` budget meter let runs proceed unbounded (it warns `BUDGET_METER_NO_PRICING` and skips the gate for unpriced models), and `gbrain skillopt --max-cost-usd` fell back to a cheaper tier's rate and refused too late. This release adds Opus 4.8 pricing ($5 in / $25 out per 1M tokens, same as 4.7) and the caps enforce again.
+
+While fixing that, the deeper problem surfaced: model prices were hand-copied across five separate tables and had already drifted apart. One eval's budget gate priced Opus 4.7 at a stale $15/$75 (3x too high), and Gemini 2.0 Flash disagreed with itself between two tables. All chat-model prices now live in one canonical table (`src/core/model-pricing.ts`) and every other table derives from it — so cross-table price drift is structurally impossible, not just discouraged.
+
+Nothing to configure. `gbrain upgrade` and your caps start enforcing on 4.8.
+
+### Added
+- Opus 4.8 pricing ($5 in / $25 out per 1M tokens) so `--max-cost-usd` and the dream-cycle budget meter enforce on 4.8 runs.
+
+### Changed
+- All chat-model pricing unified into one canonical source. The Anthropic bare-key table, the takes-quality eval allowlist, the contradictions cost-tracker, the cross-modal eval panel, and the skillopt preflight estimate all derive their numbers from it instead of carrying their own copies.
+- skillopt preflight now resolves bare, colon, and slash model ids through the shared parser (previously bare-only), so provider-prefixed 4.8 ids price correctly.
+
+### Fixed
+- Stale Opus 4.7 price in the takes-quality eval budget gate ($15/$75 → $5/$25), which over-estimated cost ~3x.
+- Gemini 2.0 Flash price reconciled to $0.10/$0.40 across the budget-gating tables (the coarse per-provider baselines shown by `gbrain providers` are a separate display layer, unchanged here).
+- Brainstorm and brain-score cost estimates now price provider-prefixed model ids (e.g. `anthropic:claude-opus-4-8`) instead of silently falling back to a default rate.
+
+### To take advantage of v0.42.25.0
+
+`gbrain upgrade` applies this automatically — no migrations, no config. To confirm:
+
+1. With Opus 4.8 as your deep tier, run a capped skillopt dry-run and watch the estimate refuse above the cap:
+   ```bash
+   gbrain skillopt <skill> --bootstrap-from-skill --dry-run --max-cost-usd 1
+   ```
+2. The dream-cycle budget meter no longer prints `BUDGET_METER_NO_PRICING` for Opus 4.8.
 ## [0.42.24.0] - 2026-06-03
 
 **Minion workers no longer silently wedge mid-job on a Supabase brain.** The background worker that runs your cron jobs, enrich fan-out, and autopilot cycle holds a lock on each job and heartbeats it every couple of seconds to say "still working." On a Supabase brain that heartbeat was running on the transaction-mode pooler (the high-traffic 6543 port), which recycles its connections per transaction. A lock is held open for minutes, so the pooler would periodically drop the socket mid-heartbeat. The worker read that dropped socket as "the lock expired," force-evicted its own in-flight job, and then sat in a claim loop holding nothing — process alive, no errors in the log, just quietly doing no work. It showed up most under heavy `enrich` load.
