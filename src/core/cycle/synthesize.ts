@@ -28,10 +28,10 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
-import { chat as gatewayChat, type ChatResult } from '../ai/gateway.ts';
-import { resolveRecipe } from '../ai/model-resolver.ts';
+import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
-import { loadConfig } from '../config.ts';
+import { normalizeModelId } from '../model-id.ts';
+import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { join, dirname, isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
@@ -732,25 +732,23 @@ export interface JudgeClient {
  * time is caught by the verdict loop and surfaced per-transcript.
  */
 export function makeJudgeClient(verdictModel: string): JudgeClient | null {
-  // Normalize: ensure provider:model shape. resolveModel returns bare
-  // anthropic ids (e.g. `claude-haiku-4-5-20251001`); gateway.chat needs
-  // `anthropic:...`.
-  const modelStr = verdictModel.includes(':') ? verdictModel : `anthropic:${verdictModel}`;
+  // Normalize: ensure provider:model shape (and slash→colon — #1698). resolveModel
+  // returns bare anthropic ids (e.g. `claude-haiku-4-5`); gateway.chat needs `anthropic:...`.
+  const modelStr = normalizeModelId(verdictModel);
 
-  // Availability probe: resolveRecipe throws AIConfigError on unknown provider.
-  let providerId: string;
-  try {
-    const { parsed } = resolveRecipe(modelStr);
-    providerId = parsed.providerId;
-  } catch (e) {
-    if (e instanceof AIConfigError) return null;
-    throw e;
-  }
+  // #1698 (C1): id-validity via the shared `validateModelId` core (resolveRecipe +
+  // assertTouchpoint) — catches unknown provider AND typo'd native model. We do NOT
+  // use the full `probeChatModel` here: its `isAvailable` layer would reject
+  // non-Anthropic-no-key providers and an unconfigured gateway, breaking the
+  // deliberate per-transcript-degrade contract (and test A9). validateModelId reads
+  // the recipe registry, not gateway _config, so it works pre-configureGateway().
+  const v = validateModelId(modelStr);
+  if (!v.ok) return null;
 
-  // Anthropic key probe (legacy behavior preserved). Other providers'
-  // key checks happen lazily at chat call time and surface as
-  // AIConfigError, which the verdict loop catches per-transcript.
-  if (providerId === 'anthropic' && !hasAnthropicKey()) return null;
+  // Anthropic key probe (legacy behavior preserved verbatim). Other providers' key
+  // checks happen lazily at chat call time and surface as AIConfigError, which the
+  // verdict loop catches per-transcript.
+  if (v.parsed.providerId === 'anthropic' && !hasAnthropicKey()) return null;
 
   return {
     create: async (params): Promise<Anthropic.Message> => {
@@ -802,23 +800,6 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
   };
 }
 
-/**
- * Anthropic key availability probe. Reads BOTH env (`ANTHROPIC_API_KEY`)
- * AND the gbrain config file (`anthropic_api_key` set via
- * `gbrain config set`) so stdio MCP launches that don't inherit shell env
- * keep working (mirrors `hasAnthropicKey()` in src/core/think/index.ts).
- */
-function hasAnthropicKey(): boolean {
-  if (process.env.ANTHROPIC_API_KEY) return true;
-  try {
-    const cfg = loadConfig();
-    if (cfg?.anthropic_api_key) return true;
-  } catch {
-    // loadConfig may throw on first-run installs; treat as no key.
-  }
-  return false;
-}
-
 interface VerdictResult {
   worth_processing: boolean;
   reasons: string[];
@@ -832,9 +813,26 @@ export async function judgeSignificance(
   // Truncate the transcript at 8K chars for cost control. Haiku's verdict
   // doesn't need the full body; the opening + closing sections are usually
   // representative of significance.
-  const trimmed = t.content.length > 8000
-    ? t.content.slice(0, 4000) + '\n[...truncated...]\n' + t.content.slice(-4000)
-    : t.content;
+  //
+  // v0.41.13 surrogate-safety (supersedes PRs #1559+#1561's safeSliceEnd
+  // helper; see text-safe.ts:18-21 module docstring for why that helper
+  // re-introduces the case-3 bug the canonical safeSplitIndex was written
+  // to fix). Routes head + tail slicing through safeSplitIndex so an emoji
+  // at offset 4000 (or length-4000) never produces a lone surrogate that
+  // Anthropic's JSON parser rejects ("no low surrogate in string", caught
+  // 2026-05-24 on telegram).
+  //
+  // Contract: this branch only runs when content.length > 8000, so
+  // length - 4000 > 4000 > 0 — safeSplitIndex never sees an out-of-range
+  // maxChars here. (Codex C-10 documented contract.)
+  let trimmed: string;
+  if (t.content.length > 8000) {
+    const headEnd = safeSplitIndex(t.content, 4000);
+    const tailStart = safeSplitIndex(t.content, t.content.length - 4000);
+    trimmed = t.content.slice(0, headEnd) + '\n[...truncated...]\n' + t.content.slice(tailStart);
+  } else {
+    trimmed = t.content;
+  }
 
   const sys = `You judge whether a conversation transcript is worth synthesizing into a personal knowledge brain.
 

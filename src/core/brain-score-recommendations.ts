@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import type { BrainHealth } from './types.ts';
-import { ANTHROPIC_PRICING } from './anthropic-pricing.ts';
+import { canonicalLookup } from './model-pricing.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing.ts';
 import { getRecipe } from './ai/recipes/index.ts';
 import { parseModelId } from './ai/model-resolver.ts';
@@ -167,9 +167,26 @@ export interface CheckClassification {
  * Returns ONLY `remediable` items. `blocked` items surface via
  * `classifyChecks()` and are rendered alongside the plan as informational.
  */
+/**
+ * Generalized (v0.41.18.0, A2 + codex finding #3): an optional third arg
+ * lets callers inject RemediationStep entries discovered by doctor checks
+ * outside this module's hardcoded planner. Without this, adding a
+ * `Check.remediation` field to a new doctor check wouldn't auto-wire into
+ * `gbrain doctor --remediation-plan` — the planner would just ignore it.
+ *
+ * Onboard's runRemediationPlan calls the 4 new check helpers (embed_staleness,
+ * entity_link_coverage, timeline_coverage, takes_count) and threads their
+ * RemediationStep[] outputs through this slot. Each helper produces its own
+ * cheap query (D7 cheap-path preserved); aggregation happens in the caller.
+ *
+ * Sort + dedup applies across BOTH the hardcoded + extra entries: stable id
+ * collisions resolve in favor of the hardcoded entry (legacy behavior wins),
+ * which means extras only add coverage they're not duplicating.
+ */
 export function computeRecommendations(
   health: BrainHealth,
   ctx: RecommendationContext,
+  extraRemediations: Remediation[] = [],
 ): Remediation[] {
   const out: Remediation[] = [];
   const source = ctx.sourceId ?? 'default';
@@ -264,6 +281,16 @@ export function computeRecommendations(
       rationale: 'Materialize link + timeline edges from fresh pages',
       status: 'remediable',
     });
+  }
+
+  // v0.41.18.0 (A2 + codex #3): merge caller-supplied extras. Hardcoded
+  // entries win on id collision so legacy behavior is preserved when an
+  // extra accidentally duplicates a hardcoded id.
+  if (extraRemediations.length > 0) {
+    const hardcodedIds = new Set(out.map((r) => r.id));
+    for (const extra of extraRemediations) {
+      if (!hardcodedIds.has(extra.id)) out.push(extra);
+    }
   }
 
   // Sort: severity (critical first), then est_seconds ascending so quick
@@ -406,7 +433,7 @@ export function estimateAnthropicCost(
   estInputTokensPerCall = 5_000,
   estOutputTokensPerCall = 1_000,
 ): number {
-  const pricing = ANTHROPIC_PRICING[modelId];
+  const pricing = canonicalLookup(modelId);
   if (!pricing) return 0;
   const inputCost = (estInputTokensPerCall * estCallsPerInvocation / 1_000_000) * pricing.input;
   const outputCost = (estOutputTokensPerCall * estCallsPerInvocation / 1_000_000) * pricing.output;

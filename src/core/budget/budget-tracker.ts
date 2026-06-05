@@ -33,6 +33,7 @@ import { dirname } from 'node:path';
 import { gbrainPath } from '../config.ts';
 import { ANTHROPIC_PRICING, type ModelPricing } from '../anthropic-pricing.ts';
 import { EMBEDDING_PRICING, lookupEmbeddingPrice } from '../embedding-pricing.ts';
+import { splitProviderModelId } from '../model-id.ts';
 import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
 
 export type BudgetKind = 'chat' | 'embed' | 'rerank';
@@ -181,10 +182,14 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
     }
     return null;
   }
-  // chat or rerank: try bare key first, then provider:model
+  // chat or rerank: try bare key first, then provider:model or provider/model.
+  // v0.41.21.0: route through splitProviderModelId so slash-prefixed ids
+  // (the form `--judge-model` and OpenRouter recipes emit) hit the pricing
+  // table. Pre-fix, slash-form silently no_pricing-failed `--max-cost` on
+  // brainstorm/lsd.
   const bare = ANTHROPIC_PRICING[modelId];
   if (bare) return bare;
-  const [providerId, modelTail] = modelId.includes(':') ? modelId.split(':', 2) : [null, modelId];
+  const { provider: providerId, model: modelTail } = splitProviderModelId(modelId);
   if (modelTail) {
     const tailHit = ANTHROPIC_PRICING[modelTail];
     if (tailHit) return tailHit;
@@ -221,6 +226,16 @@ export class BudgetTracker {
   /** Public read access. */
   get totalSpent(): number {
     return this.cumulativeUsd;
+  }
+
+  /**
+   * The configured cost ceiling (USD), or undefined when uncapped. Read-only.
+   * Lets callers detect a post-hoc overage when a final-call BudgetExhausted is
+   * swallowed by the gateway ("surfaced via next reserve") and there is no next
+   * reserve — `totalSpent > cap` with no throw. See enrich's runEnrichCore.
+   */
+  get cap(): number | undefined {
+    return this.opts.maxCostUsd;
   }
 
   /**

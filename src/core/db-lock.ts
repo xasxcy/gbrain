@@ -34,6 +34,81 @@ export interface DbLockHandle {
 const DEFAULT_TTL_MINUTES = 30;
 
 /**
+ * v0.42 (#1780 Gap 3): grace window before a same-host dead-pid lock is
+ * eligible for automatic takeover. Matches `runBreakLock`'s `age >= 60_000`
+ * gate so the two paths agree. Defends against PID reuse: the OS can recycle
+ * a crashed holder's PID, so we refuse takeover until the lock is older than
+ * this window.
+ */
+export const HOLDER_TAKEOVER_GRACE_MS = 60_000;
+
+/**
+ * Liveness classification of a lock holder, from the perspective of the
+ * current host. Shared by `isHolderDeadLocally` (auto-takeover in
+ * `tryAcquireDbLock`) and `gbrain sync --break-lock`'s safe path so the two
+ * never drift.
+ *
+ *   - `cross_host`     — holder is on a different host; `process.kill` is
+ *                        meaningless remotely, never take over.
+ *   - `alive`          — the PID exists (probe succeeded) OR the probe got
+ *                        EPERM (the PID exists but isn't ours). EPERM-as-ALIVE
+ *                        is load-bearing: stealing a live lock is the worst case.
+ *   - `too_young`      — PID is provably dead (ESRCH) but the lock is younger
+ *                        than the grace window (possible PID reuse).
+ *   - `dead_eligible`  — PID is provably dead AND the lock is old enough.
+ *   - `unknown`        — the probe threw something other than ESRCH/EPERM;
+ *                        conservative, treat as NOT eligible.
+ */
+export type HolderLiveness = 'cross_host' | 'alive' | 'too_young' | 'dead_eligible' | 'unknown';
+
+export interface HolderLivenessOpts {
+  /** Grace window in ms (default HOLDER_TAKEOVER_GRACE_MS). */
+  graceMs?: number;
+  /** Override the local hostname (test seam; default `os.hostname()`). */
+  localHost?: string;
+  /** Override the liveness probe (test seam; default `process.kill`). */
+  processKill?: (pid: number, signal: number) => void;
+}
+
+export function classifyHolderLiveness(
+  holderPid: number,
+  holderHost: string,
+  ageMs: number,
+  opts: HolderLivenessOpts = {},
+): HolderLiveness {
+  const localHost = opts.localHost ?? hostname();
+  if (holderHost !== localHost) return 'cross_host';
+
+  const probe = opts.processKill ?? ((p: number, s: number) => process.kill(p, s));
+  let probeResult: 'alive' | 'dead' | 'eperm' | 'unknown';
+  try {
+    probe(holderPid, 0);
+    probeResult = 'alive';
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    probeResult = code === 'ESRCH' ? 'dead' : code === 'EPERM' ? 'eperm' : 'unknown';
+  }
+
+  // EPERM → the PID exists but isn't ours: treat as ALIVE, never steal.
+  if (probeResult === 'alive' || probeResult === 'eperm') return 'alive';
+  if (probeResult === 'unknown') return 'unknown';
+
+  // Provably dead (ESRCH). Gate on the grace window to defend against PID reuse.
+  const grace = opts.graceMs ?? HOLDER_TAKEOVER_GRACE_MS;
+  return ageMs < grace ? 'too_young' : 'dead_eligible';
+}
+
+/** Convenience boolean: is the holder provably dead, same-host, and past the grace window? */
+export function isHolderDeadLocally(
+  holderPid: number,
+  holderHost: string,
+  ageMs: number,
+  opts: HolderLivenessOpts = {},
+): boolean {
+  return classifyHolderLiveness(holderPid, holderHost, ageMs, opts) === 'dead_eligible';
+}
+
+/**
  * Try to acquire a named DB lock.
  *
  * Returns a handle on success. Returns `null` if another live holder has
@@ -71,17 +146,25 @@ export async function tryAcquireDbLock(
   // registration for free (single ownership site per outside-voice F11).
   const { registerCleanup } = await import('./process-cleanup.ts');
 
+  const acquireOnce = async (): Promise<DbLockHandle | null> => {
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
     const ttl = `${ttlMinutes} minutes`;
+    // v0.41.13.0 (D-V3-4 / migration v98): write last_refreshed_at on INSERT
+    // AND on takeover. last_refreshed_at = acquired_at on initial INSERT;
+    // every refresh() tick bumps both ttl_expires_at AND last_refreshed_at.
+    // `gbrain sync --break-lock --max-age <s>` uses last_refreshed_at (not
+    // acquired_at) to identify wedged-but-alive holders without stealing
+    // healthy long-running holders that are actively refreshing.
     const rows: Array<{ id: string }> = await sql`
-      INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at)
-      VALUES (${lockId}, ${pid}, ${host}, NOW(), NOW() + ${ttl}::interval)
+      INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at)
+      VALUES (${lockId}, ${pid}, ${host}, NOW(), NOW() + ${ttl}::interval, NOW())
       ON CONFLICT (id) DO UPDATE
         SET holder_pid = ${pid},
             holder_host = ${host},
             acquired_at = NOW(),
-            ttl_expires_at = NOW() + ${ttl}::interval
+            ttl_expires_at = NOW() + ${ttl}::interval,
+            last_refreshed_at = NOW()
         WHERE gbrain_cycle_locks.ttl_expires_at < NOW()
       RETURNING id
     `;
@@ -95,9 +178,13 @@ export async function tryAcquireDbLock(
     return {
       id: lockId,
       refresh: async () => {
+        // v0.41.13.0: bump BOTH ttl_expires_at AND last_refreshed_at.
+        // Without last_refreshed_at, --max-age would steal healthy locks
+        // whose acquired_at is old but whose holder is alive and refreshing.
         await sql`
           UPDATE gbrain_cycle_locks
-            SET ttl_expires_at = NOW() + ${ttl}::interval
+            SET ttl_expires_at = NOW() + ${ttl}::interval,
+                last_refreshed_at = NOW()
           WHERE id = ${lockId} AND holder_pid = ${pid}
         `;
       },
@@ -115,13 +202,14 @@ export async function tryAcquireDbLock(
     const db = maybePGLite.db;
     const ttl = `${ttlMinutes} minutes`;
     const { rows } = await db.query(
-      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at)
-       VALUES ($1, $2, $3, NOW(), NOW() + $4::interval)
+      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at)
+       VALUES ($1, $2, $3, NOW(), NOW() + $4::interval, NOW())
        ON CONFLICT (id) DO UPDATE
          SET holder_pid = $2,
              holder_host = $3,
              acquired_at = NOW(),
-             ttl_expires_at = NOW() + $4::interval
+             ttl_expires_at = NOW() + $4::interval,
+             last_refreshed_at = NOW()
          WHERE gbrain_cycle_locks.ttl_expires_at < NOW()
        RETURNING id`,
       [lockId, pid, host, ttl],
@@ -138,7 +226,8 @@ export async function tryAcquireDbLock(
       refresh: async () => {
         await db.query(
           `UPDATE gbrain_cycle_locks
-              SET ttl_expires_at = NOW() + $1::interval
+              SET ttl_expires_at = NOW() + $1::interval,
+                  last_refreshed_at = NOW()
             WHERE id = $2 AND holder_pid = $3`,
           [ttl, lockId, pid],
         );
@@ -154,6 +243,32 @@ export async function tryAcquireDbLock(
   }
 
   throw new Error(`Unknown engine kind for db-lock: ${engine.kind}`);
+  };
+
+  const first = await acquireOnce();
+  if (first) return first;
+
+  // v0.42 (#1780 Gap 3): the lock is held and its TTL hasn't expired (the
+  // upsert's ON CONFLICT ... WHERE ttl_expires_at < NOW() returned no row).
+  // If the holder is on THIS host, provably dead, and past the grace window,
+  // reclaim it: guarded DELETE then retry the normal upsert ONCE. The retry
+  // returns the normal DbLockHandle (refresh/release intact) — no hand-rolled
+  // handle. TTL-expired holders are NOT handled here (the upsert already takes
+  // them); cross-host holders stay TTL-only. Best-effort: any error falls
+  // through to `return null` (busy), exactly as the pre-takeover behavior.
+  try {
+    const snap = await inspectLock(engine, lockId);
+    if (snap && !snap.ttl_expired && isHolderDeadLocally(snap.holder_pid, snap.holder_host, snap.age_ms)) {
+      const { deleted } = await deleteLockRow(engine, lockId, snap.holder_pid);
+      if (deleted) {
+        const second = await acquireOnce();
+        if (second) return second;
+      }
+    }
+  } catch {
+    // Auto-takeover is best-effort; never throw from the acquire path.
+  }
+  return null;
 }
 
 /**
@@ -178,6 +293,18 @@ export interface LockSnapshot {
   age_ms: number;
   /** TTL has already expired — lock is structurally available for next acquire. */
   ttl_expired: boolean;
+  /**
+   * v0.41.13.0 (D-V3-4 / migration v98): timestamp of the most recent
+   * refresh() tick (or NULL on pre-v98 brains where the column was just
+   * added but no acquire has happened since). For lock holders using
+   * withRefreshingLock, this is the heartbeat signal: a healthy holder
+   * has last_refreshed_at within the refresh interval (~5 min for default
+   * 30-min TTL). A wedged-but-alive holder (JS interval stopped firing)
+   * has stale last_refreshed_at.
+   */
+  last_refreshed_at: Date | null;
+  /** ms since the most recent refresh, or null when last_refreshed_at is null. */
+  ms_since_last_refresh: number | null;
 }
 
 export async function inspectLock(engine: BrainEngine, lockId: string): Promise<LockSnapshot | null> {
@@ -186,19 +313,26 @@ export async function inspectLock(engine: BrainEngine, lockId: string): Promise<
     db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
   };
 
-  let row: { id?: string; holder_pid?: number; holder_host?: string; acquired_at?: Date | string; ttl_expires_at?: Date | string } | undefined;
+  let row: {
+    id?: string;
+    holder_pid?: number;
+    holder_host?: string;
+    acquired_at?: Date | string;
+    ttl_expires_at?: Date | string;
+    last_refreshed_at?: Date | string | null;
+  } | undefined;
 
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
     const rows = await sql`
-      SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at
+      SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at
         FROM gbrain_cycle_locks
        WHERE id = ${lockId}
     `;
     row = rows[0];
   } else if (engine.kind === 'pglite' && maybePGLite.db) {
     const { rows } = await maybePGLite.db.query(
-      `SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at
+      `SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at
          FROM gbrain_cycle_locks
         WHERE id = $1`,
       [lockId],
@@ -213,6 +347,15 @@ export async function inspectLock(engine: BrainEngine, lockId: string): Promise<
   const acquired = row.acquired_at instanceof Date ? row.acquired_at : new Date(row.acquired_at);
   const ttlExpires = row.ttl_expires_at instanceof Date ? row.ttl_expires_at : new Date(row.ttl_expires_at);
   const now = Date.now();
+  // v0.41.13.0: last_refreshed_at may be NULL on pre-v98 brains that have
+  // the column but no acquire has happened since the migration ran. Render
+  // both `last_refreshed_at` and the computed delta as null so callers can
+  // distinguish "never observed a refresh" from "refresh fired N ms ago".
+  const lastRefreshed = row.last_refreshed_at == null
+    ? null
+    : (row.last_refreshed_at instanceof Date
+        ? row.last_refreshed_at
+        : new Date(row.last_refreshed_at));
 
   return {
     id: lockId,
@@ -222,6 +365,8 @@ export async function inspectLock(engine: BrainEngine, lockId: string): Promise<
     ttl_expires_at: ttlExpires,
     age_ms: now - acquired.getTime(),
     ttl_expired: ttlExpires.getTime() < now,
+    last_refreshed_at: lastRefreshed,
+    ms_since_last_refresh: lastRefreshed ? now - lastRefreshed.getTime() : null,
   };
 }
 
@@ -237,19 +382,19 @@ export async function listStaleLocks(engine: BrainEngine): Promise<LockSnapshot[
     db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
   };
 
-  let rows: Array<{ id?: string; holder_pid?: number; holder_host?: string; acquired_at?: Date | string; ttl_expires_at?: Date | string }>;
+  let rows: Array<{ id?: string; holder_pid?: number; holder_host?: string; acquired_at?: Date | string; ttl_expires_at?: Date | string; last_refreshed_at?: Date | string | null }>;
 
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
     rows = await sql`
-      SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at
+      SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at
         FROM gbrain_cycle_locks
        WHERE ttl_expires_at < NOW()
        ORDER BY acquired_at
     `;
   } else if (engine.kind === 'pglite' && maybePGLite.db) {
     const result = await maybePGLite.db.query(
-      `SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at
+      `SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at
          FROM gbrain_cycle_locks
         WHERE ttl_expires_at < NOW()
         ORDER BY acquired_at`,
@@ -265,6 +410,10 @@ export async function listStaleLocks(engine: BrainEngine): Promise<LockSnapshot[
     .map(r => {
       const acquired = r.acquired_at instanceof Date ? r.acquired_at : new Date(r.acquired_at!);
       const ttl = r.ttl_expires_at instanceof Date ? r.ttl_expires_at : new Date(r.ttl_expires_at!);
+      // v0.41.13.0: last_refreshed_at may be NULL on pre-v98 brains.
+      const lastRefreshed = r.last_refreshed_at == null
+        ? null
+        : (r.last_refreshed_at instanceof Date ? r.last_refreshed_at : new Date(r.last_refreshed_at));
       return {
         id: String(r.id ?? ''),
         holder_pid: Number(r.holder_pid),
@@ -273,6 +422,8 @@ export async function listStaleLocks(engine: BrainEngine): Promise<LockSnapshot[
         ttl_expires_at: ttl,
         age_ms: now - acquired.getTime(),
         ttl_expired: true,
+        last_refreshed_at: lastRefreshed,
+        ms_since_last_refresh: lastRefreshed ? now - lastRefreshed.getTime() : null,
       };
     });
 }
@@ -319,6 +470,89 @@ export async function deleteLockRow(
     return { deleted: rows.length > 0 };
   }
   throw new Error(`Unknown engine kind for deleteLockRow: ${engine.kind}`);
+}
+
+/**
+ * v0.41.13.0 (D-V3-4 + D-V4-mech-4 + D-V4-mech-5) — atomic age-gated
+ * verify-and-delete for `gbrain sync --break-lock --max-age <seconds>`.
+ *
+ * Runs:
+ *   DELETE FROM gbrain_cycle_locks
+ *    WHERE id = $1
+ *      AND holder_pid = $2
+ *      AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+ *   RETURNING id, last_refreshed_at
+ *
+ * Three matching conditions in one SQL statement (no TOCTOU window):
+ *   - id matches the per-source lock key
+ *   - holder_pid matches the inspected snapshot (defeats PID-reuse races)
+ *   - last_refreshed_at is older than maxAgeSeconds ago — the "wedged but
+ *     alive" signal. A healthy holder using withRefreshingLock refreshes
+ *     every (ttl/6) ms (~5 min for default 30-min TTL), so
+ *     last_refreshed_at is always recent. Only holders whose JS interval
+ *     stopped firing (Postgres query timeout, event-loop wedge, etc.)
+ *     show a stale value.
+ *
+ * Why $3 * INTERVAL '1 second' instead of $3::interval: Postgres does NOT
+ * cast a bare integer to interval via ::interval (that's a string-only
+ * cast). The multiplicative form is the canonical idiom and works on both
+ * Postgres + PGLite.
+ *
+ * Why RETURNING last_refreshed_at: callers print the actual stale age in
+ * the per-source verdict so the operator can see "broke lock for source-X
+ * (last refresh was 47 min ago)." If we only RETURN id, the caller can't
+ * distinguish "broke" from "no-op" without a follow-up query, and we lose
+ * the auditable stale-age signal that motivated the break.
+ *
+ * Returns:
+ *   { deleted: true,  lastRefreshedAt: Date } — broke the lock; reports the actual age.
+ *   { deleted: false, lastRefreshedAt: null } — refused (lock not stale enough,
+ *                                                or holder_pid mismatched,
+ *                                                or row absent).
+ */
+export async function deleteLockRowIfStale(
+  engine: BrainEngine,
+  lockId: string,
+  holderPid: number,
+  maxAgeSeconds: number,
+): Promise<{ deleted: boolean; lastRefreshedAt: Date | null }> {
+  const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
+  const maybePGLite = engine as unknown as {
+    db?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> };
+  };
+
+  if (engine.kind === 'postgres' && maybePG.sql) {
+    const sql = maybePG.sql as any;
+    const rows: Array<{ id: string; last_refreshed_at: Date | string | null }> = await sql`
+      DELETE FROM gbrain_cycle_locks
+       WHERE id = ${lockId}
+         AND holder_pid = ${holderPid}
+         AND last_refreshed_at IS NOT NULL
+         AND last_refreshed_at < NOW() - ${maxAgeSeconds} * INTERVAL '1 second'
+      RETURNING id, last_refreshed_at
+    `;
+    if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
+    const lr = rows[0].last_refreshed_at;
+    const lastRefreshed = lr == null ? null : (lr instanceof Date ? lr : new Date(lr));
+    return { deleted: true, lastRefreshedAt: lastRefreshed };
+  }
+  if (engine.kind === 'pglite' && maybePGLite.db) {
+    const { rows } = await maybePGLite.db.query(
+      `DELETE FROM gbrain_cycle_locks
+        WHERE id = $1
+          AND holder_pid = $2
+          AND last_refreshed_at IS NOT NULL
+          AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+       RETURNING id, last_refreshed_at`,
+      [lockId, holderPid, maxAgeSeconds],
+    );
+    if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
+    const r = rows[0] as { id: string; last_refreshed_at: Date | string | null };
+    const lr = r.last_refreshed_at;
+    const lastRefreshed = lr == null ? null : (lr instanceof Date ? lr : new Date(lr));
+    return { deleted: true, lastRefreshedAt: lastRefreshed };
+  }
+  throw new Error(`Unknown engine kind for deleteLockRowIfStale: ${engine.kind}`);
 }
 
 /**
@@ -438,6 +672,10 @@ export async function withRefreshingLock<T>(
       }
     })();
   }, refreshIntervalMs);
+  // #1633: don't let the refresh timer keep the process alive on its own. The
+  // finally clearInterval is the primary cleanup; unref is belt-and-suspenders
+  // so a missed clear can't pin the event loop open past real work completion.
+  (interval as unknown as { unref?: () => void }).unref?.();
 
   try {
     return await work();
