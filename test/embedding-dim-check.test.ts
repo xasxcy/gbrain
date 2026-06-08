@@ -237,6 +237,20 @@ describe('resolveSchemaEmbeddingDim', () => {
     if (got.ok) expect(got.dim).toBe(768);
   });
 
+  test('Ollama qwen3 embedding accepts explicit 1536d schema target', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'ollama:qwen3-embedding:4b',
+      embedding_dimensions: 1536,
+    });
+    expect(got).toEqual({
+      ok: true,
+      dim: 1536,
+      model: 'ollama:qwen3-embedding:4b',
+      provider: 'ollama',
+      recipeDefault: 768,
+    });
+  });
+
   test('unknown provider rejected with provider list hint', () => {
     const got = resolveSchemaEmbeddingDim({ embedding_model: 'notarealprovider:foo' });
     expect(got.ok).toBe(false);

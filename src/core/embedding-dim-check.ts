@@ -350,6 +350,9 @@ export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts)
  *   - `ZEROENTROPY_VALID_DIMS` (2560/1280/640/320/160/80/40) for ZE zembed-1
  *   - OpenAI text-embedding-3-* accepts ANY positive integer up to the
  *     model's native size (1536 small / 3072 large)
+ *   - Ollama's OpenAI-compatible endpoint accepts a `dimensions` parameter
+ *     for Matryoshka-capable local models; runtime still verifies the returned
+ *     vector width before writing.
  *
  * Validation order:
  *   1. recipe-declared `dims_options` (highest precedence — recipe author
@@ -447,6 +450,9 @@ function isCustomDimValidForProvider(
       error:
         `OpenAI ${modelId} accepts dimensions 1..${maxDim}, got ${requestedDims}.`,
     };
+  }
+  if (recipe.id === 'ollama') {
+    return { valid: true, error: '' };
   }
 
   // Tier 3: provider not known to support custom dims at all.
