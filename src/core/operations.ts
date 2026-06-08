@@ -498,6 +498,12 @@ export interface Operation {
   localOnly?: boolean;
   cliHints?: {
     name?: string;
+    /**
+     * Alternate CLI command names that dispatch to this same op (v114 / #1941).
+     * e.g. `link-add` aliasing `link`. Registered in `cli.ts`'s `cliAliases`
+     * map; collisions with primary names or CLI_ONLY commands throw at startup.
+     */
+    aliases?: string[];
     positional?: string[];
     stdin?: string;
     hidden?: boolean;
@@ -1425,6 +1431,11 @@ const query: Operation = {
         "  TRUE is redundant in default mode (it's already on); it only matters to override a brain whose config turned autocut off.\n" +
         "Safe by construction: never returns empty when there are matches, only applies to the first page (omit when paginating), and is a no-op when no reranker scored the results (so it can't cut on an untrustworthy signal). Distinct from `adaptive_return`: autocut cuts on the score cliff; adaptive_return caps by question intent. Leave both unset for the smart default.",
     },
+    relational: {
+      type: 'boolean',
+      description:
+        "v0.43 — relational recall arm. SMART DEFAULT (on in balanced/tokenmax). When the question is about a RELATIONSHIP ('who invested in widget-co', 'who introduced me to alice', 'what connects fund-a and fund-b'), the brain resolves the named entity and walks its typed-edge graph (invested_in, works_at, founded, …), surfacing the answer even when no passage mentions both sides. Pure no-op for non-relational questions. Pass FALSE to force lexical/vector-only retrieval (e.g. debugging why a graph answer appeared). You almost never set this.",
+    },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -1522,6 +1533,8 @@ const query: Operation = {
       // v0.42.3.0 — autocut ceiling override. Omitted = smart default (ON in
       // reranked modes). `false` forces the full top-K.
       autocut: typeof p.autocut === 'boolean' ? (p.autocut as boolean) : undefined,
+      // v0.43 — relational recall override. Omitted = smart default (mode bundle).
+      relationalRetrieval: typeof p.relational === 'boolean' ? (p.relational as boolean) : undefined,
     });
     const latency_ms = Date.now() - startedAt;
 
@@ -1793,6 +1806,18 @@ const get_tags: Operation = {
 
 // --- Links ---
 
+/**
+ * v114 (#1941): reconciliation-managed provenances a CALLER must not forge via
+ * the add_link op. Internal writers (import-file frontmatter reconciliation,
+ * extract --by-mention, wikilink resolution) write these straight through the
+ * engine — they're excluded here, not at the DB CHECK. A hand-created edge
+ * tagged 'frontmatter' with no origin_page_id would be a phantom that put_page
+ * reconciliation (link_source='frontmatter' AND origin_page_id=written_page)
+ * never cleans (see src/schema.sql). `manual` is intentionally absent — it IS
+ * the user-facing provenance and the default for omitted link_source.
+ */
+export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wikilink-resolved'];
+
 const add_link: Operation = {
   name: 'add_link',
   description: 'Create link between pages',
@@ -1801,11 +1826,22 @@ const add_link: Operation = {
     to: { type: 'string', required: true },
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at)' },
     context: { type: 'string', description: 'Context for the link' },
+    link_source: { type: 'string', description: "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected." },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to };
+    // v114 (#1941): default omitted provenance to 'manual' (NOT the engine's
+    // 'markdown' default) so hand/tool-created CLI edges are honestly manual,
+    // and forbid forging the reconciliation-managed built-ins.
+    const linkSource = ((p.link_source as string) || 'manual').trim();
+    if (MANAGED_LINK_SOURCES.includes(linkSource)) {
+      throw new Error(
+        `link_source '${linkSource}' is reconciliation-managed and cannot be set manually; ` +
+        `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
+      );
+    }
     // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
     // source link creation is out of scope for this wave; use the engine API
     // directly for that edge case.
@@ -1815,12 +1851,12 @@ const add_link: Operation = {
     await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
       p.from as string, p.to as string,
       (p.context as string) || '', (p.link_type as string) || '',
-      undefined, undefined, undefined,
+      linkSource, undefined, undefined,
       linkOpts,
     );
     return { status: 'ok' };
   },
-  cliHints: { name: 'link', positional: ['from', 'to'] },
+  cliHints: { name: 'link', aliases: ['link-add'], positional: ['from', 'to'] },
 };
 
 const remove_link: Operation = {
@@ -1829,6 +1865,8 @@ const remove_link: Operation = {
   params: {
     from: { type: 'string', required: true },
     to: { type: 'string', required: true },
+    link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
+    link_source: { type: 'string', description: 'Only remove edges of this provenance (e.g. citation-graph); omit = any provenance' },
   },
   mutating: true,
   scope: 'write',
@@ -1837,10 +1875,15 @@ const remove_link: Operation = {
     const linkOpts = ctx.sourceId
       ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
       : undefined;
-    await ctx.engine.removeLink(p.from as string, p.to as string, undefined, undefined, linkOpts);
+    await ctx.engine.removeLink(
+      p.from as string, p.to as string,
+      (p.link_type as string) || undefined,
+      (p.link_source as string) || undefined,
+      linkOpts,
+    );
     return { status: 'ok' };
   },
-  cliHints: { name: 'unlink', positional: ['from', 'to'] },
+  cliHints: { name: 'unlink', aliases: ['link-rm'], positional: ['from', 'to'] },
 };
 
 const get_links: Operation = {
@@ -1870,6 +1913,22 @@ const get_backlinks: Operation = {
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
+};
+
+const list_link_sources: Operation = {
+  name: 'list_link_sources',
+  // v114 (#1941): the read-side counterpart to link-add/link-rm. Since
+  // link_source is now an open kebab provenance (no allowlist), this is how an
+  // agent discovers which provenances a brain actually carries.
+  description: 'List distinct link_source provenances in the brain with edge counts (e.g. citation-graph, manual, markdown)',
+  params: {},
+  handler: async (ctx) => {
+    // Route through sourceScopeOpts so the read honors both scalar ctx.sourceId
+    // and federated ctx.auth.allowedSources (no cross-source provenance leak).
+    return ctx.engine.listLinkSources(sourceScopeOpts(ctx));
+  },
+  scope: 'read',
+  cliHints: { name: 'link-sources' },
 };
 
 /**
@@ -4677,7 +4736,7 @@ export const operations: Operation[] = [
   // Tags
   add_tag, remove_tag, get_tags,
   // Links
-  add_link, remove_link, get_links, get_backlinks, traverse_graph,
+  add_link, remove_link, get_links, get_backlinks, list_link_sources, traverse_graph,
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin

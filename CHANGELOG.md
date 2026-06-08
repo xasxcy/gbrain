@@ -2,6 +2,106 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.36.0] - 2026-06-08
+
+**A huge `gbrain sync` that keeps getting killed now converges instead of restarting from zero.** On a high-write source — hundreds of thousands of files, a generator committing faster than each sync can drain — a full sync that ran past its launching session's timeout (SIGTERM) would lose 100% of its progress and re-import the entire backlog on the next run, forever. The bookmark never advanced, the source went quietly stale for hours while the importer burned CPU the whole time, and competing hourly launches stole each other's lock and raced. This release makes a large sync **resumable, durable, and single-flight** so it banks what it imports and picks up where it left off.
+
+Progress is now banked into an append-only checkpoint as files drain, written through a direct session connection so it survives connection-pool exhaustion (the exact condition that used to silently drop every checkpoint write). The write is a delta — one row per drained file — instead of rewriting the whole completed-set each flush, so banking stays cheap even at hundreds of thousands of files. The bookmark still only advances on true completion, so a killed run resumes from the checkpoint rather than re-walking from zero. And the per-source lock now heartbeats through the direct pool and refuses to steal a holder that's alive and actively refreshing — so a long sync that overruns into the next scheduled run is skipped, not break-locked into a thrashing race.
+
+### Fixed
+- **Resumable sync survives pool exhaustion (gbrain#1794).** Checkpoint reads/writes route through the direct session pool with bounded retry; `EMAXCONNSESSION` / `too_many_connections` are now classified retryable. A killed run banks its progress and the next run skips already-drained files.
+- **Guaranteed final flush on every exit path.** A cooperative timeout, an external SIGTERM (one-shot no-retry flush via the cleanup registry, ordered before lock release), and a clean finish all bank the in-flight delta. The bookmark is never advanced on a partial.
+- **Fail-loud instead of burning CPU.** If checkpoint persistence fails repeatedly (pool genuinely dead), the run aborts with a `checkpoint_unavailable` partial rather than importing work it can never bank. Every partial/blocked exit now logs how many files were banked, so a killed run is never misread as total loss.
+- **Lock thrash eliminated.** The import loop yields the event loop so the lock-refresh heartbeat fires mid-import; takeover refuses to steal a recently-refreshed (alive-but-starved) holder; a bare `gbrain sync` (no `--source`) now uses the refreshing lock too; and a cron sync that collides with a running one is reported as a skip, not a phase failure.
+
+### Added
+- **Append-only checkpoint storage** (`op_checkpoint_paths`, migration v115): one row per drained path; O(delta) writes instead of O(N²) full-set rewrites over a large sync.
+
+### To take advantage of v0.42.36.0
+- Nothing to do. `gbrain sync` is resumable by default — a killed sync now banks its progress and the next run converges. Five env knobs tune cadence, fail-loud threshold, event-loop yield, and lock-steal grace if you need them at incident time; see the "Sync resumability + lock tuning" section in CLAUDE.md.
+
+## [0.42.35.0] - 2026-06-07
+
+**A bookmark left pointing at a rewritten-away commit no longer freezes your brain in an endless full re-walk.** When a source's history is rewritten — a force-push, a `master`→`main` consolidation, a squash — the commit gbrain recorded as "last synced" can fall outside the branch's current history. The old guard treated that the same as a missing commit and fell back to re-importing the entire repository on every run. On a large brain with a cross-region database that full walk never finishes inside the sync timeout, so the bookmark never advanced and the source went quietly stale with no error surfaced.
+
+The fix is a smaller, exact diff. `git diff A..B` compares two trees and does not require A to be an ancestor of B, so when the recorded commit's object is still on disk (the common case right after a rewrite) gbrain now diffs directly against it and imports only the real delta — the changed files, not the whole tree. A clear `[sync] last_commit … history rewritten` line marks the recovery. Only when the commit object is genuinely gone does sync fall back to a full reconcile, and that reconcile now also purges pages whose source files were removed — so a full sync is finally authoritative for deletes, not just imports (manually authored `put_page` pages and metafiles are never swept). Sibling of the v0.42.32.0 silent-staleness fix (gbrain#1939); closes gbrain#1970.
+
+### Fixed
+- **Sync recovers from an unreachable `last_commit` instead of full-walking forever (gbrain#1970).** A bookmark orphaned by a history rewrite is now diffed tree-to-tree directly when its object is still present, importing only the changed files; an oversized or failed diff degrades to a full reconcile instead of throwing. Only a truly-absent (gc'd) object forces a full reconcile.
+- **A full sync now purges deleted files.** `performFullSync` reconciles deletions — pages whose backing file is gone are removed (gated to file-backed pages via `source_path`; manual `put_page` pages and metafiles are spared). This makes both the object-absent recovery path and every `--full` sync authoritative for deletes, not just imports.
+- **Rename to an unsyncable path deletes the stale page.** A syncable file renamed to a non-syncable destination (which git reports as a rename, not a delete) now removes the old page instead of leaving it orphaned.
+
+### To take advantage of v0.42.35.0
+- Nothing to do. The next `gbrain sync` after upgrading self-heals a stuck bookmark automatically; watch for the one-line `[sync] last_commit … history rewritten` recovery message. If a source has been stale since a force-push or branch consolidation, this is the release that unsticks it.
+## [0.42.34.0] - 2026-06-07
+
+**Relationship questions now get relationship answers.** Ask "who invested in widget-co", "who introduced me to alice-example", or "what connects fund-a and fund-b" and gbrain resolves the named entity and walks its typed-edge graph (`invested_in`, `works_at`, `founded`, `attended`, `advises`, …) to surface the answer — even when no single page mentions both sides. Until now the graph only re-ranked results that keyword/vector search had already found; a relationship that lived purely in the edges (an investor whose page never names the company) was invisible. It now enters retrieval as a first-class candidate.
+
+This is on by default in the `balanced` and `tokenmax` search modes, a pure no-op for non-relational questions and for brains with no typed edges, and off in `conservative`. On a benchmark of relationship queries whose answers are unreachable by content similarity, recall@10 goes from near-zero to over 75%. The traversal is deterministic (same query + brain → same answer), stays within a single source (it never crosses a mounted-brain boundary), excludes noisy body-text "mentions" edges by default, and is depth- and fan-out-bounded so a popular hub entity can't blow up a query.
+
+### Added
+- **Typed-edge relational retrieval** (`search.relational_retrieval`, on for balanced/tokenmax). Relational questions resolve their seed entity and traverse the typed-edge graph, injecting edge-derived answers as a fourth fusion arm alongside keyword + vector. Relation vocabulary is schema-pack-extensible: a pack that defines its own link types can declare the query phrases that retrieve them. The `query` operation gains a `relational` flag (omit for the smart default; pass `false` to force lexical/vector-only). Results carry `--explain` attribution ("surfaced via invested_in from widget-co") and, for "what connects A and B", the connecting path.
+- **`relationalFanout` engine method** (PGLite + Postgres, in lockstep). Seed-array typed-edge fan-out aggregating to ranked nodes (shortest hop, edge richness, connecting path, canonical chunk), source-scoped and deterministic.
+- **`gbrain eval retrieval-quality --ab-relational`**: A/Bs the arm off vs on over a question set and reports the recall@10 lift + latency. The retrieval-quality harness gains recall@k / recall@10 metrics.
+
+### Fixed
+- **Cross-source result collapse.** The search fusion/dedup key now carries `source_id`, so two pages that share a slug across mounted brains no longer merge into one result. The semantic query cache is likewise scoped per source-set, so a federated search can't be served a single-source cached result.
+
+### To take advantage of v0.42.34.0
+- Just ask relationship questions in natural language — the arm is on by default in balanced/tokenmax. To turn it off: `gbrain config set search.relational_retrieval false`.
+- One-time cache note: this release advances the search-cache key version (a relational-on result must not be served to a relational-off lookup), so the first query after upgrade re-runs instead of hitting a stale cache row. No action needed; it self-heals on first use.
+## [0.42.33.0] - 2026-06-07
+
+**`gbrain sync` will never delete a repo it didn't create.** If a source was registered with a `remote_url` but its `local_path` pointed at a working tree you manage yourself (not a gbrain-managed clone), a failed or degraded code sync could remove that directory and re-clone over it. Sync now re-clones **only** clones gbrain actually created — identified by an ownership marker, or by gbrain's own clone location for clones made before this release. Anything else, including your live working tree, is treated as read-only: indexed, never deleted. On an unowned path, sync aborts loudly **before touching the filesystem** and tells you how to fix the source registration. Thanks to @zaqwery for the report.
+
+The re-clone path is also crash-safer now: it clones into a sibling temp on the same filesystem and swaps atomically (old aside → new in → drop old), so a cross-device rename can't leave a source deleted-but-not-restored. If the swap ever fails, the error names exactly where your original clone is preserved.
+
+### Fixed
+- **`gbrain sync` never deletes an unowned working tree (gbrain#1881).** Re-clone is confined to clones gbrain created (`config.managed_clone` marker, or the default clone location for pre-marker clones). A `remote_url` source whose `local_path` is your own working tree is synced read-only and refused — loudly, before any filesystem op — never removed. `gbrain sources restore` on such a source warns and keeps the tree instead of deleting it. Reported by @zaqwery.
+- **Safer re-clone swap.** Re-clone uses a same-filesystem sibling temp plus an atomic swap (no cross-device "deleted but not re-cloned" window); a symlinked clone path is refused; a failed swap reports where the original is preserved.
+
+### To take advantage of v0.42.33.0
+
+Upgrade. Nothing to configure. New `--url` sources are marked gbrain-owned automatically, and existing managed clones at the default location keep auto-recovering. If you registered a source whose `local_path` is a working tree you maintain yourself, `gbrain sync` now syncs it read-only and prints how to re-register it if you want gbrain to manage the clone.
+## [0.42.32.0] - 2026-06-07
+
+**A single un-parseable note can no longer silently stop your brain from indexing anything new.** A page whose YAML frontmatter `title:` was a bare date (`title: 2024-06-01`) or number (`title: 1458`) parsed as a Date/number, not text — and the importer threw when it tried to lowercase it. That throw blocked the sync bookmark from advancing, so every later `gbrain sync` re-walked the whole repo, never reached HEAD, and quietly stopped indexing new commits. The page was committed and on GitHub, but `gbrain get` returned `page_not_found` with no surfaced error.
+
+Two fixes. First, a non-string title/slug/type now coerces deterministically at parse time — a YAML date becomes its UTC ISO string (`2024-06-01`), so the same page reads the same on every machine and the import never throws. Second, the importer gained a **bounded auto-skip safety valve**: a file that fails to import N consecutive syncs (default 3, `GBRAIN_SYNC_AUTOSKIP_AFTER`) is recorded and skipped so it can't wedge all indexing forever — while a *fresh* failure still fails closed (the bookmark holds and you're told what broke), and a repository history rewrite still hard-blocks even with `--skip-failed`. Skipped pages stay visible: `gbrain doctor` keeps warning until you fix them, and escalates to a hard failure when a real failure has blocked the bookmark past the staleness window.
+
+`gbrain doctor` now decides sync-failure severity through one shared rule on both the local and remote surfaces, so a stuck bookmark surfaces identically whether you run doctor on your own machine or against a remote brain.
+
+### Added
+- **Bounded auto-skip sync ledger.** A file that fails N consecutive syncs (`GBRAIN_SYNC_AUTOSKIP_AFTER`, default 3; set `0` to disable) is auto-skipped so one poison file can't freeze indexing for the whole brain. Skips are per-source, survive crashes (the bookmark advances before anything is marked skipped), and self-heal — fix or delete the file and the next sync clears it. `gbrain doctor` lists what was skipped and why.
+
+### Fixed
+- **Non-string frontmatter titles no longer wedge indexing (#1939).** `title: 2024-06-01` / `title: 1458` (and date/number `slug`/`type`) coerce to deterministic strings at parse time instead of throwing, so a handful of date-named notes can't silently stop your brain from indexing new commits.
+- **`gbrain doctor` sync-failure severity is now consistent across surfaces (#1939).** Local and remote doctor share one decision: a stuck bookmark escalates to FAIL once it has blocked past the staleness window (or many files are blocking), while already-skipped pages stay a visible warning.
+
+### To take advantage of v0.42.32.0
+Upgrade and run `gbrain sync` once. Any pages that previously wedged the importer (bare date/number titles) now import on their own. If a file still genuinely can't parse, sync tells you which one; fix it, or let the auto-skip valve move past it after a few runs and watch for it in `gbrain doctor`. Tune the threshold with `GBRAIN_SYNC_AUTOSKIP_AFTER` (set `0` to keep the strict fail-closed behavior).
+
+## [0.42.31.0] - 2026-06-07
+
+**You can now write typed graph edges with your own provenance straight from the CLI — `gbrain link-add a b --link-type relies-on --link-source citation-graph` — and an external edge-writer (a citation-graph ingester, an importer, a classifier) no longer needs a gbrain schema migration to register a new provenance.** Two ergonomics gaps for tools that compute edges out-of-band, filed by a downstream agent building a citation-graph ingester (#1941).
+
+Before this, `link_source` was a closed allowlist: anything outside `markdown`/`frontmatter`/`manual`/`mentions`/`wikilink-resolved` was rejected by a CHECK constraint, so a deriver had to either patch gbrain's schema or stamp its machine-derived edges `manual` — which made them indistinguishable from hand-entered ones. `link_source` is now an open, format-validated provenance: any lowercase kebab-case tag up to 64 chars (`citation-graph`, `relies-on-graph`, your-tag) is valid, no migration needed. The format gate still rejects garbage (uppercase, spaces, underscores, leading/trailing/double dashes).
+
+The CLI gap is closed too. `gbrain link` / `gbrain unlink` now take `--link-source` and `--link-type`, with `link-add` / `link-rm` aliases for discoverability. A new `gbrain link-sources` lists the distinct provenances a brain carries (with counts) — the read-side replacement for the discoverability the old allowlist gave you for free. CLI-created edges now record `manual` provenance by default instead of masquerading as parsed-from-`markdown`, and the reconciliation-managed provenances stay reserved for the writers that own their semantics.
+
+### Added
+- **`gbrain link-add` / `link-rm` / `link-sources`** plus `--link-source` and `--link-type` on the link ops. Write typed, provenance-tagged, source-scoped edges from the CLI and list which provenances a brain holds. Provenance is any kebab-case tag; removals can filter by provenance so machine-derived edges delete cleanly without touching hand-entered ones. (#1941)
+
+### Changed
+- **`link_source` is an open kebab-case provenance, not a closed allowlist (migration v114).** External edge-writers register a new provenance with no gbrain migration. Existing provenances are unaffected; the migration is lock-friendly on Postgres (validates without blocking writes) and applies automatically on upgrade. CLI-created links now default to `manual` provenance.
+
+### Fixed
+- **Supervisor queue-singleton hardening (follow-up to #1849).** Two supervisors pointed at the same database via different-but-equivalent connection strings could each acquire the "one per queue" lock; the lock is now keyed on the queue alone (its row already lives in the target database), so same-database + same-queue collides correctly. A supervisor that loses the lock race on startup also no longer leaves its pidfile behind to block the next start.
+
+### To take advantage of v0.42.31.0
+
+`gbrain upgrade`. The constraint migration runs automatically. To write edges from a tool or the CLI: `gbrain link-add <from> <to> --link-type <verb> --link-source <your-tag>`; `gbrain link-sources` shows what's in the graph; `gbrain link-rm <from> <to> --link-source <your-tag>` removes only that provenance's edges.
+
 ## [0.42.29.0] - 2026-06-07
 
 **The background-job queue stops thrashing on long jobs, the cycle stops wedging itself, and you can no longer run two supervisors against one queue by accident.** Three fixes plus a voice-agent feature.

@@ -255,12 +255,11 @@ CREATE TABLE IF NOT EXISTS links (
   to_page_id     INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   link_type      TEXT    NOT NULL DEFAULT '',
   context        TEXT    NOT NULL DEFAULT '',
-  -- v0.41.18.0: 'mentions' added for auto-linked body-text mentions
-  -- (gbrain extract links --by-mention). Filtered OUT of backlink-count
-  -- for search ranking; only counts toward orphan-ratio + graph traversal.
-  -- v0.40.8.2 (#972): 'wikilink-resolved' added for opt-in global-basename
-  -- wikilink resolution. See src/schema.sql for full rationale.
-  link_source    TEXT    CHECK (link_source IS NULL OR link_source IN ('markdown', 'frontmatter', 'manual', 'mentions', 'wikilink-resolved')),
+  -- v114 (#1941): open kebab-case provenance (not a closed allowlist) so
+  -- external derivers stamp their own tag. Format gate only: lowercase kebab,
+  -- <=64 chars. Managed built-ins still satisfy this; see src/schema.sql for
+  -- full rationale + the add_link op-layer guard against forging them.
+  link_source    TEXT    CHECK (link_source IS NULL OR (link_source ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*$' AND char_length(link_source) <= 64)),
   -- v0.41.18.0 (codex finding #12): nullable link_kind distinguishes
   -- "plain body mention" from "verb-pattern-derived typed link" within
   -- link_source='mentions'. See src/schema.sql for full rationale.
@@ -931,6 +930,20 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
+
+-- #1794: append-only delta storage (one row per completed path). FK cascade
+-- drops children with the parent. PK prefix (op,fingerprint) serves all reads.
+-- Mirrors migration v115 + src/schema.sql. Placed after op_checkpoints so the
+-- FK target exists in the top-to-bottom replay.
+CREATE TABLE IF NOT EXISTS op_checkpoint_paths (
+  op          TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (op, fingerprint, path),
+  CONSTRAINT op_checkpoint_paths_parent_fk
+    FOREIGN KEY (op, fingerprint) REFERENCES op_checkpoints (op, fingerprint) ON DELETE CASCADE
+);
 
 -- ============================================================
 -- migration_impact_log (v0.41.18.0 — gbrain onboard wave)
