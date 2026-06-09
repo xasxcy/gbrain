@@ -150,7 +150,10 @@ export async function embedStaleForSource(
       let embedded = false;
       let lastError: unknown;
       // Try original length first (single chunk avoids batch-size pressure), then truncate.
-      for (const maxLen of [text.length, ...FALLBACK_LEVELS]) {
+      // Only include fallback levels that are strictly shorter than the text — retrying the
+      // same length after an OOM crash wastes time and never recovers.
+      const effectiveLevels = [text.length, ...FALLBACK_LEVELS.filter(l => l < text.length)];
+      for (const maxLen of effectiveLevels) {
         if (fnOpts.abortSignal?.aborted) throw new Error('embed budget aborted');
         const t = text.length > maxLen ? text.slice(0, maxLen) : text;
         try {

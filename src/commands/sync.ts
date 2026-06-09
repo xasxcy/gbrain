@@ -1459,7 +1459,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const syncOpts = (opts.strategy || sourceExcludePaths.length > 0)
     ? {
         ...(opts.strategy ? { strategy: opts.strategy } : {}),
-        ...(sourceExcludePaths.length > 0 ? { exclude: sourceExcludePaths.map(p => `${p}/**`) } : {}),
+        // Normalize trailing slash before appending /** so "path/" doesn't produce "path//**".
+        ...(sourceExcludePaths.length > 0 ? { exclude: sourceExcludePaths.map(p => `${p.replace(/\/$/, '')}/**`) } : {}),
       }
     : undefined;
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
