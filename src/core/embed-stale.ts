@@ -119,6 +119,62 @@ export async function embedStaleForSource(
   };
   const signature = opts.embeddingSignature;
 
+  // ---- helpers ----
+
+  /** True for Ollama llama-server OOM/crash errors that truncation can work around. */
+  function isOllamaOomLikeError(e: unknown): boolean {
+    const msg = e instanceof Error ? e.message : String(e);
+    return /EOF|timed out|llama-server process no longer running/i.test(msg);
+  }
+
+  /**
+   * Try embedding `texts` via `embedFn`. On OOM-like failure, fall back to embedding
+   * each chunk individually with progressive truncation: 5500 → 5000 → 4500 chars.
+   * This handles the case where one overlong chunk in a batch crashes llama-server.
+   */
+  async function embedWithTruncationFallback(
+    texts: string[],
+    fn: (ts: string[], o: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>,
+    fnOpts: { abortSignal?: AbortSignal },
+  ): Promise<Float32Array[]> {
+    try {
+      return await fn(texts, fnOpts);
+    } catch (e) {
+      if (!isOllamaOomLikeError(e)) throw e;
+    }
+    // Batch crashed — retry each chunk individually with progressive truncation.
+    const FALLBACK_LEVELS = [5500, 5000, 4500] as const;
+    const results: Float32Array[] = [];
+    for (const text of texts) {
+      if (fnOpts.abortSignal?.aborted) throw new Error('embed budget aborted');
+      let embedded = false;
+      let lastError: unknown;
+      // Try original length first (single chunk avoids batch-size pressure), then truncate.
+      for (const maxLen of [text.length, ...FALLBACK_LEVELS]) {
+        if (fnOpts.abortSignal?.aborted) throw new Error('embed budget aborted');
+        const t = text.length > maxLen ? text.slice(0, maxLen) : text;
+        try {
+          const [vec] = await fn([t], fnOpts);
+          if (t.length < text.length) {
+            process.stderr.write(
+              `  [embed-fallback] chunk truncated ${text.length}→${t.length} chars for embedding\n`,
+            );
+          }
+          results.push(vec);
+          embedded = true;
+          break;
+        } catch (e2) {
+          if (!isOllamaOomLikeError(e2)) throw e2;
+          lastError = e2;
+        }
+      }
+      if (!embedded) throw lastError;
+    }
+    return results;
+  }
+
+  // ---- main loop ----
+
   // v0.41.31: invalidate embeddings stamped under a prior model signature so
   // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
   // untouched. Best-effort — a failure here must not abort the backfill.
@@ -173,8 +229,9 @@ export async function embedStaleForSource(
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
-        const embeddings = await embedFn(
+        const embeddings = await embedWithTruncationFallback(
           stale.map((c) => c.chunk_text),
+          embedFn,
           { abortSignal: signal },
         );
         const existing = await engine.getChunks(slug, { sourceId: keySourceId });

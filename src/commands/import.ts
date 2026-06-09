@@ -44,7 +44,7 @@ export interface RunImportResult {
 export async function runImport(
   engine: BrainEngine,
   args: string[],
-  opts: { commit?: string; strategy?: SyncStrategy; sourceId?: string; managedBookmark?: boolean } = {},
+  opts: { commit?: string; strategy?: SyncStrategy; sourceId?: string; managedBookmark?: boolean; excludePaths?: string[] } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
@@ -175,7 +175,7 @@ export async function runImport(
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
-  const allFiles = collectSyncableFiles(dir, { strategy });
+  const allFiles = collectSyncableFiles(dir, { strategy, excludePaths: opts.excludePaths });
   console.error(
     `[gbrain phase] import.collect_files done ${Date.now() - _walkT0}ms files=${allFiles.length}`,
   );
@@ -484,6 +484,8 @@ function resolveMaxWalkDepth(): number {
 
 interface CollectOpts {
   strategy?: SyncStrategy;
+  /** Relative path prefixes (from root of scan dir) to skip, e.g. ["01-raw/canvas"]. */
+  excludePaths?: string[];
 }
 
 /**
@@ -535,6 +537,14 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   const maxDepth = resolveMaxWalkDepth();
   const visitedInodes = new Map<string, true>();
   const files: string[] = [];
+  // Normalize excludePaths once: ensure no trailing slash, use forward slashes.
+  const excludePaths = (opts.excludePaths ?? []).map(p => p.replace(/\\/g, '/').replace(/\/$/, ''));
+
+  function isExcluded(relPath: string): boolean {
+    if (excludePaths.length === 0) return false;
+    const normalized = relPath.replace(/\\/g, '/');
+    return excludePaths.some(ep => normalized === ep || normalized.startsWith(ep + '/'));
+  }
 
   function walk(d: string, depth: number): void {
     if (depth >= maxDepth) {
@@ -555,6 +565,9 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
       if (entry === 'node_modules' || entry === 'ops') continue;
 
       const full = join(d, entry);
+      const rel = full.slice(dir.length + 1).replace(/\\/g, '/');
+      if (isExcluded(rel)) continue;
+
       let stat;
       try {
         stat = lstatSync(full);

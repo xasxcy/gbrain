@@ -1122,6 +1122,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // clone is auto-managed. validateRepoState classifies the on-disk state;
   // we recover from missing/no-git/not-a-dir by re-cloning, refuse on
   // url-drift or corruption with structured hints.
+  // sourceCfg is hoisted here so exclude_paths is accessible at the filter
+  // section below (cfg would be block-scoped inside the if).
+  let sourceCfg: Record<string, unknown> = {};
   if (opts.sourceId) {
     serr(`[gbrain phase] sync.validate_repo_state`);
     const { validateRepoState } = await import('../core/git-remote.ts');
@@ -1136,6 +1139,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       typeof cfgRows[0]?.config === 'string'
         ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
         : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+    sourceCfg = cfg;
     const remoteUrl = typeof cfg.remote_url === 'string' ? cfg.remote_url : null;
     if (remoteUrl) {
       const ownSrc = {
@@ -1450,8 +1454,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     manifest.renamed = [...manifest.renamed, ...detachedWorkingTreeManifest.renamed];
   }
 
-  // Filter to syncable files (strategy-aware)
-  const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+  // Filter to syncable files (strategy-aware, plus source-config exclude_paths as globs)
+  const sourceExcludePaths: string[] = Array.isArray(sourceCfg.exclude_paths) ? (sourceCfg.exclude_paths as string[]) : [];
+  const syncOpts = (opts.strategy || sourceExcludePaths.length > 0)
+    ? {
+        ...(opts.strategy ? { strategy: opts.strategy } : {}),
+        ...(sourceExcludePaths.length > 0 ? { exclude: sourceExcludePaths.map(p => `${p}/**`) } : {}),
+      }
+    : undefined;
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
   // `renamed` (only `r.to` is kept below) AND `deleted` (git emits it as `R`,
   // not `D`), leaving the OLD page stale. Fold the source side into the delete
@@ -2516,6 +2526,23 @@ async function performFullSync(
   const importArgs = [repoPath];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
+  // Resolve source config exclude_paths so full sync honours the same exclusions
+  // as incremental sync. Done here (not passed through opts) to keep SyncOpts
+  // interface stable and self-contained.
+  let fullSyncExcludePaths: string[] = [];
+  if (opts.sourceId) {
+    const fullCfgRows = await engine.executeRaw<{ config: unknown }>(
+      `SELECT config FROM sources WHERE id = $1`,
+      [opts.sourceId],
+    );
+    const fullCfg =
+      typeof fullCfgRows[0]?.config === 'string'
+        ? (JSON.parse(fullCfgRows[0].config as string) as Record<string, unknown>)
+        : ((fullCfgRows[0]?.config ?? {}) as Record<string, unknown>);
+    fullSyncExcludePaths = Array.isArray(fullCfg.exclude_paths)
+      ? (fullCfg.exclude_paths as string[])
+      : [];
+  }
   // v0.31.2: thread strategy through so code-strategy first sync
   // actually enumerates code files (closes bug 1).
   // v0.30.x: thread sourceId so performFullSync routes pages to the named
@@ -2526,6 +2553,7 @@ async function performFullSync(
     commit: headCommit,
     strategy: opts.strategy,
     sourceId: opts.sourceId,
+    excludePaths: fullSyncExcludePaths.length > 0 ? fullSyncExcludePaths : undefined,
     // issue #1939: performFullSync owns the failure ledger + bookmark via the
     // shared gate below; don't let runImport double-record or write its own.
     managedBookmark: true,

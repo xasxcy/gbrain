@@ -2,6 +2,22 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.36.1] - 2026-06-09
+
+**Embedding OOM fallback + exclude_paths support.** `gbrain embed --stale` now automatically recovers from llama-server OOM errors (EOF / timeout) by retrying individual chunks at progressively shorter lengths: 5500 → 5000 → 4500 chars. This handles the case where one overlong chunk in a batch crashes the model server without poisoning the entire run. Sources can also declare path prefixes to exclude from sync/import via `config.exclude_paths` — useful for directories with binary/non-text content (e.g. Excalidraw canvas files).
+
+### Fixed
+- **OOM-resilient embedding** (`src/core/embed-stale.ts`): batch-level llama-server crash (EOF, timeout, "process no longer running") no longer stalls the stale-embed loop. Affected batch is re-tried chunk-by-chunk; each chunk is progressively truncated (5500 → 5000 → 4500 chars) until it embeds or all fallback levels are exhausted. Non-OOM errors still propagate immediately.
+
+### Added
+- **`exclude_paths` source config** (`src/commands/sync.ts`, `src/commands/import.ts`): sources can set `config.exclude_paths: string[]` to skip path prefixes in both full sync (walker) and incremental sync (git-diff filter). Paths are relative to the repo root; prefix matching is used (e.g. `"01-raw/canvas"` excludes `01-raw/canvas/**`).
+
+### To take advantage of v0.42.36.1
+- No migration required. The OOM fallback is active automatically.
+- To exclude a directory: `UPDATE sources SET config = jsonb_set(config, '{exclude_paths}', '["path/to/exclude"]') WHERE id = '<source-id>';`
+
+---
+
 ## [0.42.36.0] - 2026-06-08
 
 **A huge `gbrain sync` that keeps getting killed now converges instead of restarting from zero.** On a high-write source — hundreds of thousands of files, a generator committing faster than each sync can drain — a full sync that ran past its launching session's timeout (SIGTERM) would lose 100% of its progress and re-import the entire backlog on the next run, forever. The bookmark never advanced, the source went quietly stale for hours while the importer burned CPU the whole time, and competing hourly launches stole each other's lock and raced. This release makes a large sync **resumable, durable, and single-flight** so it banks what it imports and picks up where it left off.
