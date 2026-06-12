@@ -2,6 +2,41 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.40.0] - 2026-06-09
+
+**`gbrain extract --stale` no longer aborts partway through a brain that contains emoji or other non-BMP characters.** On a large brain, link/timeline extraction could die with `invalid input syntax for type json` and commit nothing — and because the staleness bookmark only advances on a clean finish, every retry re-hit the same point and extraction stayed wedged. The cause: the link-context excerpt was sliced by raw UTF-16 index, so a window boundary landing inside an emoji's surrogate pair left an unpaired surrogate half in the text, which Postgres rejects when the batch is serialized to JSONB — taking down the whole batch, not just the one row. (PGLite is more permissive here, so this primarily bit the managed-Postgres engine.)
+
+The fix well-forms free text before it is serialized: any unpaired surrogate half is replaced with the Unicode replacement character before it reaches the database. It is applied at the slicer and, as defense in depth, centrally at the batch-insert boundary for every free-text field — link context, timeline summary/detail/source, take claim/source — across both the batch and single-row write paths and both engines. Identity fields (slugs, source ids, holders) are deliberately left untouched, so a malformed identifier still fails loudly instead of being silently rewritten. The same well-forming helper now also backs the brainstorm prompt path, replacing a hand-rolled version that left back-to-back malformed characters half-cleaned.
+
+### Fixed
+- **`extract --stale` runs to completion on brains with emoji / non-BMP text (gbrain#2011).** The link-context slicer no longer leaves an unpaired UTF-16 surrogate that Postgres rejects at the JSONB cast and aborts the whole batch. A 192K-page brain that died at ~1,550 pages now sweeps clean.
+- **Defense in depth at the batch-insert boundary.** Every free-text field written to JSONB (link context; timeline summary/detail/source; take claim/source) is now NUL- and surrogate-sanitized centrally, in both the batch and single-row paths and on both engines, so no future slicer can re-trigger this class of crash. Identity/security fields stay un-sanitized and fail closed.
+
+### Changed
+- **One shared well-forming primitive.** The brainstorm cross-prompt path now uses the same surrogate-cleaning helper, which also fixes a case where consecutive malformed characters were only half-cleaned.
+
+### To take advantage of v0.42.40.0
+`gbrain upgrade`. No configuration needed. If a `gbrain extract` run had been stalling at the same page count every time, this is the release that unsticks it — the next run resumes and completes.
+## [0.42.39.0] - 2026-06-09
+
+**Your agent now learns a brain page exists the moment you name someone — instead of talking about a close contact for four messages without ever opening their page.** gbrain was great at *storing* knowledge and at injecting deterministic per-turn context, but it never taught the agent the *policy* of retrieval: when to look something up, and what to pull. That lived in each user's hand-rolled instructions and failed silently. The Retrieval Reflex makes it a property of having a brain.
+
+Two layers, on by default. A **deterministic pointer layer** in the context engine scans each turn's message for salient, resolvable entities (capitalized names, `@handles`) and injects a compact pointer — name → slug → one-line summary → "open the page before relying on details." Zero-LLM, fail-open, capped, and judgment-gated: it points, it never auto-dumps the page body, and it stays silent on trivial mentions or entities already in context. A **policy skill** (installed into your agent's resolver via `gbrain integrations install retrieval-reflex`) encodes the trigger policy and the pointer → full-page → graph-neighbors escalation ladder so the agent knows what to do with the pointer.
+
+It works on every engine without leaking a second database connection. PGLite holds a single connection (your `gbrain serve` owns it), so the context engine resolves *through* the live holder over a local socket rather than opening its own — and on Postgres it uses a cached direct connection. Synopses run through the same privacy boundary `get_page` applies, so private facts never reach the prompt. `gbrain doctor` reports whether the reflex is actually firing.
+
+### Added
+- **Retrieval Reflex deterministic pointer layer (gbrain#1981).** The context engine injects compact, privacy-safe entity pointers per turn — on by default, zero-LLM, fail-open, capped. Disable with `GBRAIN_RETRIEVAL_REFLEX=false` or `retrieval_reflex: false` in `~/.gbrain/config.json` (file/env plane).
+- **`retrieval-reflex` recipe + policy skill.** Installs the when/what-to-retrieve policy into your agent's resolver: `gbrain integrations install retrieval-reflex --target <host-repo>`.
+- **`retrieval_reflex_health` doctor check.** Reports the deterministic layer's real runtime status (observed firing, resolve path, policy-skill install state).
+
+### Fixed
+- **Resolver-row install fence is now keyed by recipe id.** Installing a second `copy-into-host-repo` recipe previously wrote a block mislabeled with the first recipe's name; `--refresh`/uninstall now find their own rows.
+
+### To take advantage of v0.42.39.0
+
+`gbrain upgrade`. The deterministic pointer layer is on automatically — no config needed. To give the agent the matching policy skill, run `gbrain integrations install retrieval-reflex --target <your-agent-repo>`, then `gbrain doctor` to confirm `retrieval_reflex_health` is green.
+
 ## [0.42.38.0] - 2026-06-09
 
 **Three independent job-layer bugs that left autopilot wedged or swallowed a command's output are fixed, each traced to source.** A triage of the job/lock/teardown layer (gbrain#1972) pulled them into one wave.

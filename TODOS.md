@@ -1,5 +1,21 @@
 # TODOS
 
+## gbrain#1981 Retrieval Reflex follow-ups (v0.43+)
+
+Filed from the #1981 ship (v0.42.39.0). Deliberately scoped OUT — the v1 extractor
+is deterministic + precision-biased. See plan + GSTACK REVIEW REPORT at
+`~/.claude/plans/system-instruction-you-are-working-wild-yeti.md`.
+
+- [ ] **P3 — broaden entity detection beyond proper-case ASCII.** The v1 extractor
+  (`src/core/context/entity-salience.ts`) misses lowercase names, many non-Latin
+  scripts, pronoun follow-ups ("what about her?"), and assistant-introduced entities.
+  These need conversation state or an LLM pass. **Why:** higher recall on the read
+  side. **Where:** `entity-salience.ts` + the orchestrator's `priorContextText`.
+- [ ] **P3 — recall knob: optional fuzzy/prefix-expansion resolution.** The resolver
+  (`src/core/context/retrieval-reflex.ts`) is exact-only (alias + title + slug-suffix)
+  for precision. Revisit adding `resolveEntitySlug`'s trgm-fuzzy / prefix-expansion
+  arm, gated on an unambiguous single hit, if recall telemetry comes back weak.
+
 ## gbrain#1972 job-layer follow-up (v0.43+)
 
 Filed from the #1972 fix (stale-lock reaper + bounded disconnect + complete
@@ -108,8 +124,9 @@ context). Deliberately scoped OUT of that PR. See plan + GSTACK REVIEW REPORT at
   batch error, retry the batch element-by-element so one bad row can't abort a
   353K-page `extract --stale` sweep, logging the offending `(from_slug, context)`
   instead of dying. The durable JSONB fix removed the known crash class (malformed
-  array literal) and NUL-stripping removed the other known jsonb-parse failure, so
-  there is no remaining data-dependent crash for this to catch *today* — it's
+  array literal), NUL-stripping removed a second jsonb-parse failure, and
+  v0.42.40.0 lone-surrogate well-forming (#2011) removed a third, so there is no
+  remaining *known* data-dependent crash for this to catch *today* — it's
   belt-and-suspenders against unknown future per-row failures. Wire it in
   `addLinksBatch`/`addTimelineEntriesBatch`/`addTakesBatch` (or in `batchRetry` as
   a post-classification fallback). Issue #1861 option 2.
