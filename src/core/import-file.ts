@@ -1193,7 +1193,15 @@ export async function importCodeFile(
   // chunk IDs are stable.
   if (extractedEdges.length > 0 && chunks.length > 0) {
     try {
-      const persistedChunks = await engine.getChunks(slug, sourceId ? { sourceId } : undefined);
+      // Normalize ONCE: '' and undefined both mean the schema-default source
+      // (pages.source_id DEFAULT 'default'). Using the normalized value for
+      // BOTH the chunk lookup and the edge stamp keeps them in lockstep —
+      // an unscoped getChunks here could fan out to same-slug chunks from
+      // another source, and a '' stamp would FK-violate against sources(id)
+      // and silently drop the file's whole call graph in the best-effort
+      // catch below (adversarial review findings).
+      const edgeSourceId = sourceId || 'default';
+      const persistedChunks = await engine.getChunks(slug, { sourceId: edgeSourceId });
       const byIndex = new Map<number, { id?: number; symbol_name_qualified?: string | null; start_line?: number | null; end_line?: number | null }>();
       for (const pc of persistedChunks) {
         byIndex.set(pc.chunk_index, pc);
@@ -1231,6 +1239,17 @@ export async function importCodeFile(
           from_symbol_qualified: from.symbol_name_qualified,
           to_symbol_qualified: e.toSymbol,
           edge_type: e.edgeType,
+          // Stamp the source: getCallersOf/getCalleesOf add
+          // `AND source_id = <scoped>` whenever a worktree pin / --source is
+          // in play, and a NULL here never matches that filter — so every
+          // scoped call-graph query silently returned 0 rows on
+          // multi-source brains even though the edges existed. The fallback
+          // is 'default', NOT null: an unscoped import lands its pages under
+          // the schema default (pages.source_id DEFAULT 'default'), so a
+          // NULL-stamped edge would be invisible to the matching scoped
+          // query getCallersOf(sym, { sourceId: 'default' }) — the same bug
+          // through the other door.
+          source_id: edgeSourceId,
         });
       }
 
@@ -1506,6 +1525,12 @@ export interface ImportImageOptions {
    * with sourceId would TS-error on the importImageFile branch.
    */
   sourceId?: string;
+  /**
+   * Skip the content_hash short-circuit even if the file is unchanged.
+   * Use during provider migration after clearing embedding_image in SQL so
+   * unchanged images get re-embedded with the new provider.
+   */
+  forceReembed?: boolean;
 }
 
 /** Module-level limiter so concurrent imports across files share the budget. */
@@ -1548,7 +1573,7 @@ export async function importImageFile(
   const hash = createHash('sha256').update(buf).digest('hex');
 
   const existing = await engine.getPage(imageSlug);
-  if (existing?.content_hash === hash) {
+  if (existing?.content_hash === hash && !opts.forceReembed) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
 
