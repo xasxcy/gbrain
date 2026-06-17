@@ -13,7 +13,6 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import {
   runBrainstorm,
   formatBrainstormMarkdown,
@@ -323,7 +322,7 @@ async function runBrainstormCli(
     const msg = formatSaveOutcome(outcome, { profileLabel: profile.label, slug });
     if (msg.stdout) console.log(msg.stdout);
     for (const line of msg.stderr) console.error(line);
-    if (msg.exitCode) setCliExitVerdict(msg.exitCode);
+    if (msg.exitCode) process.exitCode = msg.exitCode;
   }
 }
 

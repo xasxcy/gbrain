@@ -317,10 +317,8 @@ describe('Eng-review D3 — executeRaw has no per-call retry wrapper', () => {
   it('Supervisor still has the 3-strikes-then-reconnect path', () => {
     const src = readFileSync(resolve('src/core/minions/supervisor.ts'), 'utf-8');
     expect(src).toContain('consecutiveHealthFailures');
-    // #2034: reconnect() is now a first-class BrainEngine method, so the
-    // supervisor calls it directly after 3 consecutive failures (the prior
-    // `(engine as unknown as { reconnect(): Promise<void> })` cast was removed).
-    expect(src).toContain('this.engine.reconnect(');
+    // Supervisor invokes reconnect via a typed cast after 3 consecutive failures.
+    expect(src).toMatch(/reconnect\(\): Promise<void>/);
     expect(src).toContain('this.consecutiveHealthFailures >= 3');
   });
 });

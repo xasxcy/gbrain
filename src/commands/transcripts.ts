@@ -14,7 +14,6 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 
 interface RunOpts {
   days?: number;
@@ -64,7 +63,7 @@ export async function runTranscripts(engine: BrainEngine, args: string[]): Promi
   const sub = args[0];
   if (sub !== 'recent') {
     console.log(HELP);
-    if (sub && sub !== '--help' && sub !== '-h') setCliExitVerdict(2);
+    if (sub && sub !== '--help' && sub !== '-h') process.exitCode = 2;
     return;
   }
 

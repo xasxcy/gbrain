@@ -195,39 +195,10 @@ export function buildPgliteInitErrorMessage(
   return `${header}\n${hint}\n  Original error: ${original}`;
 }
 
-/**
- * #2084 — PGLite's Emscripten runtime hijacks `process.exitCode` as ITS status
- * channel: instantiation REPLACES the property with an accessor whose getter
- * falls back to the WASM runtime status (99 while alive, the exit status after
- * close) whenever no explicit value was assigned — and assigning `undefined`
- * resets to that fallback, so "unset" cannot be restored. Pre-fix, every clean
- * PGLite run carried a bogus 99 until close zeroed it, and an errored op's
- * exit 1 survived only by accident of write ordering.
- *
- * Containment: around PGlite.create(), snapshot the pre-call value and restore
- * it — pinning an explicit 0 when nothing was set, because restoring
- * `undefined` would surface the WASM fallback instead. This keeps the GLOBAL
- * tidy for external readers; the CLI's own verdict never reads it (it lives in
- * the owned channel: setCliExitVerdict/currentExitCode, cli-force-exit.ts —
- * in-memory brains run initdb whose status lands on a later tick, past any
- * snapshot). db.close() stays unwrapped (see the comment at the close site).
- */
-async function preservingProcessExitCode<T>(fn: () => Promise<T>): Promise<T> {
-  const pre = process.exitCode;
-  try {
-    return await fn();
-  } finally {
-    process.exitCode = typeof pre === 'number' || typeof pre === 'string' ? pre : 0;
-  }
-}
-
 export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
   private _lock: LockHandle | null = null;
-  // #2034: captured at connect() so reconnect() can restore the same data dir
-  // after a drop, matching PostgresEngine's _savedConfig contract.
-  private _savedConfig: EngineConfig | null = null;
   // Tier 3: when GBRAIN_PGLITE_SNAPSHOT loaded a post-initSchema state into
   // PGlite.create(loadDataDir), initSchema is a no-op (schema is already
   // present + migrations already applied). Saves ~1-3s per fresh test PGLite.
@@ -240,7 +211,6 @@ export class PGLiteEngine implements BrainEngine {
 
   // Lifecycle
   async connect(config: EngineConfig): Promise<void> {
-    this._savedConfig = config; // #2034: remember for reconnect()
     const dataDir = config.database_path || undefined; // undefined = in-memory
 
     // Acquire file lock to prevent concurrent PGLite access (crashes with Aborted())
@@ -264,20 +234,12 @@ export class PGLiteEngine implements BrainEngine {
       }
     }
 
-    // NOTE (#2084): PGLite's Emscripten runtime writes the WASM backend's
-    // proc_exit status into `process.exitCode` (initdb here at create-time,
-    // the postmaster at close-time), and the writes land asynchronously —
-    // a snapshot/restore around these awaits does NOT contain them. That is
-    // why the CLI's exit paths read gbrain's own verdict
-    // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
     try {
-      this._db = await preservingProcessExitCode(() =>
-        PGlite.create({
-          dataDir,
-          loadDataDir,
-          extensions: { vector, pg_trgm },
-        }),
-      );
+      this._db = await PGlite.create({
+        dataDir,
+        loadDataDir,
+        extensions: { vector, pg_trgm },
+      });
     } catch (err) {
       // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.8.0
       // (#1340): the previous error hint hardcoded the macOS 26.3 link, but
@@ -317,12 +279,6 @@ export class PGLiteEngine implements BrainEngine {
     this._lock = null;
     try {
       if (db) {
-        // Deliberately NOT wrapped in preservingProcessExitCode: close's
-        // status write (0) is long-standing baseline behavior that test-runner
-        // processes depend on (wrapping it flipped bun test's own exit code —
-        // #2084 implementation note), and the CLI's exit verdict doesn't read
-        // process.exitCode at all — it lives in the gbrain-owned channel
-        // (setCliExitVerdict/currentExitCode in cli-force-exit.ts).
         await db.close();
       }
     } finally {
@@ -330,27 +286,6 @@ export class PGLiteEngine implements BrainEngine {
         await releaseLock(lock);
       }
     }
-  }
-
-  /**
-   * #2034: engine-parity reconnect. PGLite is single-writer in-process so it
-   * doesn't suffer the pool-drop class PostgresEngine.reconnect() handles, but
-   * the method MUST exist so callers (autopilot health probe, worker/queue
-   * claim-error recovery) can call `engine.reconnect()` uniformly.
-   *
-   * IN-MEMORY (no `database_path`) is a NO-OP: there is no persistent backing,
-   * the connection can't recoverably "drop" in-process, and a disconnect+reopen
-   * would DISCARD all state. This matches the long-standing assumption the
-   * worker/queue recovery paths are written against ("PGLite has no pooler
-   * reaping so reconnect is absent" — src/core/minions/queue.ts). A FILE-backed
-   * engine genuinely re-opens the same data dir (state persists on disk).
-   */
-  async reconnect(_ctx?: { error?: unknown }): Promise<void> {
-    if (!this._savedConfig) return; // never connected — nothing to restore
-    if (!this._savedConfig.database_path) return; // in-memory — no-op, preserve state
-    const config = this._savedConfig;
-    await this.disconnect();
-    await this.connect(config);
   }
 
   async initSchema(): Promise<void> {
@@ -3663,25 +3598,7 @@ export class PGLiteEngine implements BrainEngine {
     return { inserted: ids.length, ids };
   }
 
-  async deleteFactsForPage(
-    slug: string,
-    source_id: string,
-    opts?: { excludeSourcePrefixes?: string[] },
-  ): Promise<{ deleted: number }> {
-    const prefixes = opts?.excludeSourcePrefixes;
-    if (prefixes && prefixes.length > 0) {
-      // #1928: keep rows whose `source` matches an excluded prefix (e.g.
-      // `cli:` conversation facts). COALESCE so NULL/empty-source fence rows
-      // stay deletable — only the explicitly-protected prefixes survive.
-      const patterns = prefixes.map(p => `${p}%`);
-      const result = await this.db.query(
-        `DELETE FROM facts
-           WHERE source_id = $1 AND source_markdown_slug = $2
-             AND NOT (COALESCE(source, '') LIKE ANY($3::text[]))`,
-        [source_id, slug, patterns],
-      );
-      return { deleted: result.affectedRows ?? 0 };
-    }
+  async deleteFactsForPage(slug: string, source_id: string): Promise<{ deleted: number }> {
     const result = await this.db.query(
       `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2`,
       [source_id, slug],
@@ -4991,7 +4908,7 @@ export class PGLiteEngine implements BrainEngine {
           e.from_chunk_id, e.to_chunk_id, e.from_symbol_qualified,
           e.to_symbol_qualified, e.edge_type,
           JSON.stringify(e.edge_metadata ?? {}),
-          e.source_id ?? 'default',
+          e.source_id ?? null,
         );
       }
       const res = await this.db.query(
@@ -5012,7 +4929,7 @@ export class PGLiteEngine implements BrainEngine {
         params.push(
           e.from_chunk_id, e.from_symbol_qualified, e.to_symbol_qualified, e.edge_type,
           JSON.stringify(e.edge_metadata ?? {}),
-          e.source_id ?? 'default',
+          e.source_id ?? null,
         );
       }
       const res = await this.db.query(
