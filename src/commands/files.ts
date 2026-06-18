@@ -159,9 +159,9 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
   }
 
   await sql`
-    INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-    VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
-    ON CONFLICT (storage_path) DO UPDATE SET
+    INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+    VALUES ('default', ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
+    ON CONFLICT (source_id, storage_path) DO UPDATE SET
       content_hash = EXCLUDED.content_hash,
       size_bytes = EXCLUDED.size_bytes,
       mime_type = EXCLUDED.mime_type
@@ -254,9 +254,9 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
   // an actual object, not a JSON-encoded string (D1 wave).
   await executeRawJsonb(
     engine,
-    `INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-     ON CONFLICT (storage_path) DO UPDATE SET
+    `INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+     VALUES ('default', $1, $2, $3, $4, $5, $6, $7::jsonb)
+     ON CONFLICT (source_id, storage_path) DO UPDATE SET
        content_hash = EXCLUDED.content_hash,
        size_bytes = EXCLUDED.size_bytes,
        mime_type = EXCLUDED.mime_type`,
@@ -339,9 +339,9 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
     const pageSlug = pathParts.length > 1 ? pathParts.slice(0, -1).join('/') : null;
 
     await sql`
-      INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-      VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
-      ON CONFLICT (storage_path) DO UPDATE SET
+      INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+      VALUES ('default', ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET
         content_hash = EXCLUDED.content_hash,
         size_bytes = EXCLUDED.size_bytes,
         mime_type = EXCLUDED.mime_type

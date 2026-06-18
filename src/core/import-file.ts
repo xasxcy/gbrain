@@ -1326,29 +1326,36 @@ export interface ImportTransactionSpec {
   file?: FileSpec;
   /** Inside-transaction hook for type-specific work (tags, links). */
   after?: (tx: BrainEngine) => Promise<void>;
+  // FORK-FIX: sourceId must be threaded through so every per-page engine call
+  // targets the correct (source_id, slug) row. putPage/createVersion/upsertChunks
+  // etc. all default to 'default' when opts.sourceId is absent — PageInput has
+  // no source_id field that putPage reads.
+  sourceId?: string;
 }
 
 export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (spec.hadExisting) await tx.createVersion(spec.slug);
-    await tx.putPage(spec.slug, spec.page);
+    if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
+    await tx.putPage(spec.slug, spec.page, txOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug);
+      const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
+        source_id: spec.sourceId ?? 'default',
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks);
+        await tx.upsertChunks(spec.slug, spec.chunks, txOpts);
       } else {
-        await tx.deleteChunks(spec.slug);
+        await tx.deleteChunks(spec.slug, txOpts);
       }
     }
     if (spec.after) await spec.after(tx);
@@ -1626,8 +1633,20 @@ export async function importImageFile(
   const isDashScope = multimodalModelEnv.startsWith('dashscope:');
 
   const stat = statSync(filePath);
+  const ext = extname(relativePath).toLowerCase();
   const preflightLimit = isDashScope ? DASHSCOPE_MAX_PREFLIGHT_BYTES : MAX_IMAGE_BYTES;
   if (stat.size > preflightLimit) {
+    // GIF files can't be losslessly compressed by sips (it flattens animation to frame 1).
+    // Return error instead of skipped so automation sees the failure.
+    if (isDashScope && ext === '.gif') {
+      return {
+        slug: slugifyPath(relativePath),
+        status: 'error',
+        chunks: 0,
+        error: `Animated GIF exceeds DashScope preflight cap (${(stat.size / 1024 / 1024).toFixed(1)} MB). ` +
+          `sips would flatten to frame 1 and lose animation content. Resize manually or split frames.`,
+      };
+    }
     const limit = isDashScope
       ? `DashScope preflight cap is ${DASHSCOPE_MAX_PREFLIGHT_BYTES / 1024 / 1024} MB (compresses down to 10 MB)`
       : `Voyage multimodal caps at ${MAX_IMAGE_BYTES / 1024 / 1024} MB per input`;
@@ -1638,8 +1657,6 @@ export async function importImageFile(
       error: `Image too large (${(stat.size / 1024 / 1024).toFixed(1)} MB). ${limit}.`,
     };
   }
-
-  const ext = extname(relativePath).toLowerCase();
   const slug = slugifyPath(relativePath); // strips .md/.mdx; for images ext stays in path
   // Image slug includes the extension (otherwise foo.png and foo.jpg collide
   // and slugifyPath would already preserve it). Recompute with the file
@@ -1648,7 +1665,9 @@ export async function importImageFile(
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const existing = await engine.getPage(imageSlug);
+  // FORK-FIX: must pass sourceId so the dedup check scopes to the correct source.
+  // Without it, a same-hash image in source='default' causes this source to silently skip.
+  const existing = await engine.getPage(imageSlug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
   if (existing?.content_hash === hash && !opts.forceReembed) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1682,9 +1701,23 @@ export async function importImageFile(
   // PNG transparency.
   let embeddingPayload = decoded;
   if (decoded.buf.length > DASHSCOPE_MAX_EMBED_BYTES && isDashScope) {
+    // Animated GIF: sips flattens to the first frame, silently losing all other
+    // frames. Return error (not skipped) so runImport increments its error
+    // counter and CLI exits non-zero, making automation failures visible.
+    if (ext === '.gif') {
+      return {
+        slug: imageSlug,
+        status: 'error',
+        chunks: 0,
+        error: `Animated GIF exceeds DashScope 10 MB limit (${(decoded.buf.length / 1024 / 1024).toFixed(1)} MB). ` +
+          `sips would flatten to frame 1 and lose animation content. Resize manually or split frames.`,
+      };
+    }
     if (process.platform === 'darwin') {
       // macOS-only: sips. On Linux/Windows, add a compressor in compressViaSips()
       // (e.g. ImageMagick `convert`, ffmpeg, or sharp npm package).
+      // PNG/WebP alpha transparency is lost on JPEG conversion; this is acceptable
+      // for semantic embedding (alpha does not affect visual content understanding).
       try {
         embeddingPayload = await compressViaSips(decoded.buf);
       } catch (err) {
@@ -1763,9 +1796,14 @@ export async function importImageFile(
     content_hash: hash,
   };
 
+  const sourceId = opts.sourceId;
   await withImportTransaction(engine, {
     slug: imageSlug,
     hadExisting: !!existing,
+    // FORK-FIX: sourceId is threaded through withImportTransaction so
+    // putPage/createVersion/upsertChunks/upsertFile all target the correct
+    // (source_id, slug) row. putPage ignores PageInput fields — only opts.sourceId matters.
+    sourceId,
     page: {
       type: 'image',
       page_kind: 'image',
@@ -1782,14 +1820,16 @@ export async function importImageFile(
       // matching candidate gets an image_of edge. Best-effort — addLink
       // throws when the target doesn't exist; we silently skip for now and
       // let `gbrain reconcile-links` pick up later additions.
+      const txOpts = sourceId ? { sourceId } : undefined;
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate);
+        const sibling = await tx.getPage(candidate, txOpts);
         if (sibling) {
           try {
             await tx.addLink(
               imageSlug, candidate,
               filename,
               'image_of', 'manual', imageSlug, 'frontmatter',
+              sourceId ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId } : undefined,
             );
           } catch { /* sibling vanished mid-tx; skip */ }
           break; // one canonical link per image
