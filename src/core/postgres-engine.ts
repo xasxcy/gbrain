@@ -3514,7 +3514,7 @@ export class PostgresEngine implements BrainEngine {
     const rows = await sql<Array<{ id: number; created: boolean }>>`
       INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
       VALUES (${sourceId}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
-      ON CONFLICT (storage_path) DO UPDATE SET
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET
         page_slug = EXCLUDED.page_slug,
         page_id = EXCLUDED.page_id,
         filename = EXCLUDED.filename,

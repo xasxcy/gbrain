@@ -597,7 +597,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
   const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
-  if (gitFiles) return excludeNorm.length > 0 ? gitFiles.filter(f => !isExcluded(f)) : gitFiles;
+  if (gitFiles) return excludeNorm.length > 0 ? gitFiles.filter(f => !isExcluded(relative(dir, f))) : gitFiles;
 
   const maxDepth = resolveMaxWalkDepth();
   const visitedInodes = new Map<string, true>();

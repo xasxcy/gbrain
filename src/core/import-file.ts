@@ -1311,29 +1311,33 @@ export interface ImportTransactionSpec {
   file?: FileSpec;
   /** Inside-transaction hook for type-specific work (tags, links). */
   after?: (tx: BrainEngine) => Promise<void>;
+  /** Route all writes to a named source; mirrors importFromContent's threading. */
+  sourceId?: string;
 }
 
 export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (spec.hadExisting) await tx.createVersion(spec.slug);
-    await tx.putPage(spec.slug, spec.page);
+    if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
+    await tx.putPage(spec.slug, spec.page, txOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug);
+      const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
+        source_id: spec.sourceId,
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks);
+        await tx.upsertChunks(spec.slug, spec.chunks, txOpts);
       } else {
-        await tx.deleteChunks(spec.slug);
+        await tx.deleteChunks(spec.slug, txOpts);
       }
     }
     if (spec.after) await spec.after(tx);
@@ -1566,7 +1570,8 @@ export async function importImageFile(
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const existing = await engine.getPage(imageSlug);
+  const srcOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const existing = await engine.getPage(imageSlug, srcOpts);
   if (existing?.content_hash === hash) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1642,6 +1647,7 @@ export async function importImageFile(
   await withImportTransaction(engine, {
     slug: imageSlug,
     hadExisting: !!existing,
+    sourceId: opts.sourceId,
     page: {
       type: 'image',
       page_kind: 'image',
@@ -1658,14 +1664,19 @@ export async function importImageFile(
       // matching candidate gets an image_of edge. Best-effort — addLink
       // throws when the target doesn't exist; we silently skip for now and
       // let `gbrain reconcile-links` pick up later additions.
+      const linkSourceId = opts.sourceId;
+      const linkOpts = linkSourceId
+        ? { fromSourceId: linkSourceId, toSourceId: linkSourceId, originSourceId: linkSourceId }
+        : undefined;
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate);
+        const sibling = await tx.getPage(candidate, srcOpts);
         if (sibling) {
           try {
             await tx.addLink(
               imageSlug, candidate,
               filename,
               'image_of', 'manual', imageSlug, 'frontmatter',
+              linkOpts,
             );
           } catch { /* sibling vanished mid-tx; skip */ }
           break; // one canonical link per image

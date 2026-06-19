@@ -5397,6 +5397,7 @@ export const MIGRATIONS: Migration[] = [
       postgres: `
         DO $$ BEGIN
           ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key;
+          ALTER TABLE files DROP CONSTRAINT IF EXISTS files_source_storage_key;
           ALTER TABLE files ADD CONSTRAINT files_source_storage_key
             UNIQUE (source_id, storage_path);
         EXCEPTION WHEN duplicate_table THEN NULL;
@@ -5405,6 +5406,7 @@ export const MIGRATIONS: Migration[] = [
       `,
       pglite: `
         ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key;
+        ALTER TABLE files DROP CONSTRAINT IF EXISTS files_source_storage_key;
         ALTER TABLE files ADD CONSTRAINT files_source_storage_key
           UNIQUE (source_id, storage_path);
       `,

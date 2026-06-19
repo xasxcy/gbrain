@@ -3443,7 +3443,7 @@ export class PGLiteEngine implements BrainEngine {
     const result = await this.db.query<{ id: number; created: boolean }>(
       `INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-       ON CONFLICT (storage_path) DO UPDATE SET
+       ON CONFLICT (source_id, storage_path) DO UPDATE SET
          page_slug = EXCLUDED.page_slug,
          page_id = EXCLUDED.page_id,
          filename = EXCLUDED.filename,
