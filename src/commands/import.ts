@@ -526,6 +526,11 @@ function isCollectibleForWalker(
  * survives paths with spaces/newlines. Each path is lstat-checked to preserve
  * the walker's no-symlink policy and to drop submodule gitlinks (which surface
  * as a single non-regular entry).
+ *
+ * IMPORTANT: returned paths are ABSOLUTE (prefixed with `dir + '/'`). Callers
+ * that compare against repo-relative strings (e.g. `excludePaths`) MUST
+ * convert with `relative(dir, absolutePath)` before any prefix comparison.
+ * Passing raw results to a relative-path filter silently drops all exclusions.
  */
 function gitListSyncableFiles(
   dir: string,
