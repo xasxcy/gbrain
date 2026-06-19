@@ -27,8 +27,6 @@ export const dashscope: Recipe = {
       models: ['text-embedding-v3', 'text-embedding-v2'],
       default_dims: 1024,
       dims_options: [64, 128, 256, 512, 768, 1024],
-      supports_multimodal: true,
-      multimodal_models: ['qwen3-vl-embedding'],
       // Alibaba doesn't publish a hard batch-token cap for the OpenAI-compat
       // path. Conservative declaration so the gateway pre-splits before
       // hitting whatever undocumented server-side limit exists.

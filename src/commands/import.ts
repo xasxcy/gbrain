@@ -11,6 +11,7 @@ import {
   isCodeFilePath,
   isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
+  pruneDir,
   type SyncStrategy,
 } from '../core/sync.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
@@ -484,7 +485,6 @@ function resolveMaxWalkDepth(): number {
 
 interface CollectOpts {
   strategy?: SyncStrategy;
-  /** Relative path prefixes (from root of scan dir) to skip, e.g. ["01-raw/canvas"]. */
   excludePaths?: string[];
 }
 
@@ -515,6 +515,51 @@ function isCollectibleForWalker(
 }
 
 /**
+ * Git-aware fast path for `collectSyncableFiles`. Returns the strategy-filtered
+ * list of syncable files when `dir` is inside a git work tree (paths absolute,
+ * sorted), or `null` when `dir` is not a git repo / git is unavailable — in
+ * which case the caller falls back to the recursive FS walk.
+ *
+ * Honors `.gitignore` (the whole point): `git ls-files --cached --others
+ * --exclude-standard` lists tracked + untracked-not-ignored files, so vendored
+ * / build / generated trees never reach the importer. `-z` (NUL-delimited)
+ * survives paths with spaces/newlines. Each path is lstat-checked to preserve
+ * the walker's no-symlink policy and to drop submodule gitlinks (which surface
+ * as a single non-regular entry).
+ */
+function gitListSyncableFiles(
+  dir: string,
+  strategy: SyncStrategy,
+  multimodalOn: boolean,
+): string[] | null {
+  let stdout: string;
+  try {
+    stdout = execFileSync(
+      'git',
+      ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+  } catch {
+    return null; // not a git work tree, or git not on PATH → FS-walk fallback
+  }
+  const files: string[] = [];
+  for (const rel of stdout.split('\0')) {
+    if (!rel) continue;
+    if (!isCollectibleForWalker(rel, strategy, multimodalOn)) continue;
+    const full = join(dir, rel);
+    let st;
+    try {
+      st = lstatSync(full);
+    } catch {
+      continue; // ls-files raced a deletion, or unreadable
+    }
+    if (st.isSymbolicLink() || !st.isFile()) continue;
+    files.push(full);
+  }
+  return files.sort();
+}
+
+/**
  * v0.31.2 (codex C4 + C5 + C8): unified walker with five hardenings:
  *
  * 1. `lstatSync` + explicit `isSymbolicLink()` skip — never follow symlinks.
@@ -534,17 +579,29 @@ function isCollectibleForWalker(
 export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): string[] {
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const multimodalOn = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+  // Normalize excludePaths once: no trailing slash, forward slashes only.
+  const excludeNorm = (opts.excludePaths ?? []).map(p => p.replace(/\\/g, '/').replace(/\/$/, ''));
+  const isExcluded = (rel: string) => {
+    if (excludeNorm.length === 0) return false;
+    const n = rel.replace(/\\/g, '/');
+    return excludeNorm.some(ep => n === ep || n.startsWith(ep + '/'));
+  };
+
+  // v0.42.x (#1159 --respect-gitignore / #1483 .gbrainignore): when `dir` is a
+  // git work tree, enumerate via `git ls-files` so the walk honors
+  // `.gitignore`. Pre-fix the recursive FS walk below descended into every
+  // git-ignored tree — `vendor/` (PHP Composer), `storage/`, `public/build/`,
+  // etc. — so a Laravel/PHP repo's `--strategy code` sync tried to import ~50k
+  // dependency/build files (and bloated DB + embedding cost on any repo with
+  // vendored data/fixtures). `--cached --others --exclude-standard` = tracked
+  // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
+  // dirs (or git unavailable) fall through to the FS walk below.
+  const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
+  if (gitFiles) return excludeNorm.length > 0 ? gitFiles.filter(f => !isExcluded(f)) : gitFiles;
+
   const maxDepth = resolveMaxWalkDepth();
   const visitedInodes = new Map<string, true>();
   const files: string[] = [];
-  // Normalize excludePaths once: ensure no trailing slash, use forward slashes.
-  const excludePaths = (opts.excludePaths ?? []).map(p => p.replace(/\\/g, '/').replace(/\/$/, ''));
-
-  function isExcluded(relPath: string): boolean {
-    if (excludePaths.length === 0) return false;
-    const normalized = relPath.replace(/\\/g, '/');
-    return excludePaths.some(ep => normalized === ep || normalized.startsWith(ep + '/'));
-  }
 
   function walk(d: string, depth: number): void {
     if (depth >= maxDepth) {
@@ -558,16 +615,13 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
       return;
     }
     for (const entry of entries) {
-      // Skip hidden dirs (.git, .claude, .raw, etc.) and `node_modules`/`ops`.
-      // Same set the legacy walkers honored, surfaced once at the top of
-      // every iteration.
-      if (entry.startsWith('.')) continue;
-      if (entry === 'node_modules' || entry === 'ops') continue;
+      // Descent-time prune through the canonical gate (single source of truth
+      // in core/sync.ts) instead of a hand-maintained inline list that drifted
+      // from it. Skips hidden dirs (`.git`, `.raw`, etc.), `node_modules`,
+      // `vendor`, `dist`, `build`, `venv` (#2020), `ops`, and git submodules.
+      if (!pruneDir(entry, d)) continue;
 
       const full = join(d, entry);
-      const rel = full.slice(dir.length + 1).replace(/\\/g, '/');
-      if (isExcluded(rel)) continue;
-
       let stat;
       try {
         stat = lstatSync(full);
@@ -580,6 +634,9 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         console.warn(`[gbrain import] Skipping symlink: ${full}`);
         continue;
       }
+
+      const rel = full.slice(dir.length + 1);
+      if (isExcluded(rel)) continue;
 
       if (stat.isDirectory()) {
         const inodeKey = `${stat.dev}:${stat.ino}`;

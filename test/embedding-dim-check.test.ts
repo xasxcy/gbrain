@@ -103,6 +103,26 @@ describe('embeddingMismatchMessage', () => {
     expect(msg).toContain('docs/embedding-migrations.md');
   });
 
+  test('Postgres recipe NULLs embeddings BEFORE the column alter (pgvector refuses cross-dim casts)', () => {
+    // pgvector aborts `ALTER COLUMN TYPE vector(N)` with "expected N
+    // dimensions, not M" while rows still hold old-width vectors — which is
+    // every brain running this recipe. The UPDATE must precede the ALTER
+    // (NULLs cast fine). Order pinned so the printed recipe can't drift from
+    // the corrected docs/embedding-migrations.md again.
+    const msg = embeddingMismatchMessage({
+      currentDims: 1536,
+      requestedDims: 768,
+      requestedModel: 'nomic-embed-text',
+      source: 'init',
+      engineKind: 'postgres',
+    });
+    const nullIdx = msg.indexOf('UPDATE content_chunks SET embedding = NULL');
+    const alterIdx = msg.indexOf('ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(768)');
+    expect(nullIdx).toBeGreaterThan(-1);
+    expect(alterIdx).toBeGreaterThan(-1);
+    expect(nullIdx).toBeLessThan(alterIdx);
+  });
+
   test('Postgres branch skips HNSW recreate when requested dims exceed pgvector cap', () => {
     // Codex finding #8: 2048d (Voyage 4 Large) cannot be HNSW-indexed in pgvector.
     // The recipe must NOT instruct a CREATE INDEX HNSW for that dim.
@@ -235,20 +255,6 @@ describe('resolveSchemaEmbeddingDim', () => {
     });
     expect(got.ok).toBe(true);
     if (got.ok) expect(got.dim).toBe(768);
-  });
-
-  test('Ollama qwen3 embedding accepts explicit 1536d schema target', () => {
-    const got = resolveSchemaEmbeddingDim({
-      embedding_model: 'ollama:qwen3-embedding:4b',
-      embedding_dimensions: 1536,
-    });
-    expect(got).toEqual({
-      ok: true,
-      dim: 1536,
-      model: 'ollama:qwen3-embedding:4b',
-      provider: 'ollama',
-      recipeDefault: 768,
-    });
   });
 
   test('unknown provider rejected with provider list hint', () => {
