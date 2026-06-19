@@ -63,6 +63,7 @@ CHECKS=(
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:worker-lock-renewal-shape"
+  "check:fork-migration-parity"
   "typecheck"
 )
 
