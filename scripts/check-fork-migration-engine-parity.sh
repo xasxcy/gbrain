@@ -14,7 +14,7 @@
 #      the ADD (or an exception handler that follows it):
 #        - DROP CONSTRAINT IF EXISTS <name>  BEFORE the ADD  (our pre-DROP style)
 #        - SELECT ... pg_constraint WHERE conname='<name>'   BEFORE the ADD
-#        - WHEN duplicate_object THEN NULL                   (exception handler)
+#        - WHEN duplicate_object THEN NULL                   (after ADD in same DO block)
 #      Non-idempotent DDL crashes on migration replay / interrupted stamp.
 #
 # Run: bash scripts/check-fork-migration-engine-parity.sh
@@ -38,53 +38,184 @@ with open(migrate_ts) as f:
     migrate_src = f.read()
 
 # ---------------------------------------------------------------------------
-# Extract all migrations that have sqlFor (engine-split SQL).
+# Extract sqlFor objects with a small boundary-aware TypeScript scanner.
 #
-# SQLFPR uses a tempered greedy token `(?:(?!name:\s*')[\s\S])*?` instead of
-# plain `.*?` to prevent cross-object attribution: without it, a migration
-# without its own sqlFor would match the nearest sqlFor in a *later* object.
-#
-# BRANCH_RE may still fail to extract branches when the SQL between backticks
-# contains '}' characters (TypeScript template expressions or PL/pgSQL blocks),
-# causing branches_raw to be truncated by SQLFPR's `}` stop.  Those are put
-# in `skipped`.  We fail closed if any skipped migration contains ADD CONSTRAINT
-# UNIQUE — that would be a real gap in coverage.
+# Regex cannot safely delimit an object containing template strings: SQL may
+# contain literal braces, `${...}` expressions, or text that looks like another
+# `name:` property.  The scanner below skips comments and quoted strings while
+# tracking object braces, then reads each sqlFor branch as one complete quoted
+# value.  Any unsupported shape fails closed instead of silently reducing
+# coverage to whichever branch happened to parse first.
 # ---------------------------------------------------------------------------
-SQLFPR = re.compile(
-    r"name:\s*'([^']+)'(?:(?!name:\s*')[\s\S])*?sqlFor:\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}",
-    re.DOTALL,
-)
-BRANCH_RE = re.compile(r"(postgres|pglite)\s*:\s*`([^`]*)`", re.DOTALL)
+class ParseError(ValueError):
+    pass
 
-all_migrations = []
-skipped = []
-for m in SQLFPR.finditer(migrate_src):
-    name = m.group(1)
-    branches_raw = m.group(2)
+
+def skip_trivia(src: str, pos: int) -> int:
+    while pos < len(src):
+        if src[pos].isspace() or src[pos] == ',':
+            pos += 1
+        elif src.startswith('//', pos):
+            end = src.find('\n', pos + 2)
+            pos = len(src) if end == -1 else end + 1
+        elif src.startswith('/*', pos):
+            end = src.find('*/', pos + 2)
+            if end == -1:
+                raise ParseError('unterminated block comment')
+            pos = end + 2
+        else:
+            break
+    return pos
+
+
+def read_identifier(src: str, pos: int) -> tuple[str, int]:
+    m = re.match(r'[A-Za-z_$][A-Za-z0-9_$]*', src[pos:])
+    if not m:
+        raise ParseError(f'expected identifier at offset {pos}')
+    return m.group(0), pos + len(m.group(0))
+
+
+def read_quoted(src: str, pos: int) -> tuple[str, int]:
+    if pos >= len(src) or src[pos] not in "'\"`":
+        raise ParseError(f'expected quoted string at offset {pos}')
+    quote = src[pos]
+    start = pos + 1
+    pos = start
+    while pos < len(src):
+        if src[pos] == '\\':
+            pos += 2
+            continue
+        if src[pos] == quote:
+            return src[start:pos], pos + 1
+        pos += 1
+    raise ParseError(f'unterminated {quote} string at offset {start - 1}')
+
+
+def find_migration_name(src: str, object_start: int, limit: int) -> str:
+    pos = object_start + 1
+    depth = 0
+    while pos < limit:
+        pos = skip_trivia(src, pos)
+        if pos >= limit:
+            break
+        if src[pos] in "'\"`":
+            _, pos = read_quoted(src, pos)
+            continue
+        if src[pos] in '([{':
+            depth += 1
+            pos += 1
+            continue
+        if src[pos] in ')]}':
+            depth -= 1
+            pos += 1
+            continue
+        if re.match(r'[A-Za-z_$]', src[pos]):
+            key, end = read_identifier(src, pos)
+            if depth == 0 and key == 'name':
+                value_pos = skip_trivia(src, end)
+                if value_pos >= limit or src[value_pos] != ':':
+                    raise ParseError(f"migration name property lacks ':' at offset {pos}")
+                value_pos = skip_trivia(src, value_pos + 1)
+                value, _ = read_quoted(src, value_pos)
+                return value
+            pos = end
+            continue
+        pos += 1
+    raise ParseError(f'could not find migration name before sqlFor at offset {limit}')
+
+
+def parse_sql_for(src: str, object_start: int, sql_for_pos: int) -> tuple[dict, int]:
+    pos = skip_trivia(src, sql_for_pos + len('sqlFor'))
+    if pos >= len(src) or src[pos] != ':':
+        raise ParseError(f"sqlFor lacks ':' at offset {sql_for_pos}")
+    pos = skip_trivia(src, pos + 1)
+    if pos >= len(src) or src[pos] != '{':
+        raise ParseError(f'sqlFor value is not an object at offset {pos}')
+    pos += 1
     branches = {}
-    for bm in BRANCH_RE.finditer(branches_raw):
-        branches[bm.group(1)] = bm.group(2)
-    if branches:
-        all_migrations.append({'name': name, 'sqlFor': branches})
-    else:
-        skipped.append((name, m.group(0)))  # keep full match for safety check
+    while True:
+        pos = skip_trivia(src, pos)
+        if pos >= len(src):
+            raise ParseError(f'unterminated sqlFor object at offset {sql_for_pos}')
+        if src[pos] == '}':
+            if not branches:
+                raise ParseError(f'empty sqlFor object at offset {sql_for_pos}')
+            return branches, pos + 1
+        key, pos = read_identifier(src, pos)
+        pos = skip_trivia(src, pos)
+        if pos >= len(src) or src[pos] != ':':
+            raise ParseError(f"sqlFor branch '{key}' lacks ':' at offset {pos}")
+        pos = skip_trivia(src, pos + 1)
+        value, pos = read_quoted(src, pos)
+        if key in branches:
+            raise ParseError(f"duplicate sqlFor branch '{key}'")
+        branches[key] = value
 
-# Fail closed: if a skipped migration has ADD CONSTRAINT … UNIQUE in its full
-# match block, we can't safely skip it — the check has a coverage gap.
-for sname, sblock in skipped:
-    if re.search(r'ADD\s+CONSTRAINT.*?UNIQUE', sblock, re.IGNORECASE | re.DOTALL):
-        print(
-            f'[check-fork-migration-engine-parity] FAILED: migration \'{sname}\' '
-            f'has ADD CONSTRAINT UNIQUE but its sqlFor branches could not be parsed '
-            f'(SQL contains }} chars that truncate the regex). '
-            f'Extract via a TS AST parser or rewrite the SQL to avoid }} inside template literals.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-skipped_names = [n for n, _ in skipped]
+def extract_sql_for_migrations(src: str) -> list[dict]:
+    migrations = []
+    object_stack = []
+    pos = 0
+    while pos < len(src):
+        if src.startswith('//', pos) or src.startswith('/*', pos) or src[pos].isspace():
+            pos = skip_trivia(src, pos)
+            continue
+        if src[pos] in "'\"`":
+            _, pos = read_quoted(src, pos)
+            continue
+        if src[pos] == '{':
+            object_stack.append(pos)
+            pos += 1
+            continue
+        if src[pos] == '}':
+            if object_stack:
+                object_stack.pop()
+            pos += 1
+            continue
+        if re.match(r'[A-Za-z_$]', src[pos]):
+            token, end = read_identifier(src, pos)
+            if token == 'sqlFor':
+                value_pos = skip_trivia(src, end)
+                if value_pos >= len(src) or src[value_pos] != ':':
+                    pos = end
+                    continue
+                value_pos = skip_trivia(src, value_pos + 1)
+                if value_pos >= len(src) or src[value_pos] != '{':
+                    if object_stack:
+                        try:
+                            name = find_migration_name(src, object_stack[-1], pos)
+                        except ParseError:
+                            pass  # Type/interface declaration or another non-migration use.
+                        else:
+                            raise ParseError(
+                                f"migration '{name}' has a non-inline sqlFor value "
+                                f'at offset {value_pos}'
+                            )
+                    pos = end
+                    continue
+                if not object_stack:
+                    raise ParseError(f'sqlFor outside an object at offset {pos}')
+                name = find_migration_name(src, object_stack[-1], pos)
+                branches, pos = parse_sql_for(src, object_stack[-1], pos)
+                migrations.append({'name': name, 'sqlFor': branches})
+                continue
+            pos = end
+            continue
+        pos += 1
+    return migrations
 
-if not all_migrations and not skipped_names:
+
+try:
+    all_migrations = extract_sql_for_migrations(migrate_src)
+except ParseError as exc:
+    print(
+        f'[check-fork-migration-engine-parity] FAILED: cannot safely parse '
+        f'src/core/migrate.ts: {exc}',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if not all_migrations:
     print('[check-fork-migration-engine-parity] No sqlFor migrations found — skipping checks.')
     sys.exit(0)
 
@@ -160,8 +291,26 @@ for mig in all_migrations:
 # Accepted guards:
 #   1. DROP CONSTRAINT IF EXISTS <name>           BEFORE add_pos
 #   2. pg_constraint WHERE conname = '<name>'     BEFORE add_pos
-#   3. WHEN duplicate_object THEN NULL            (anywhere — exception handler)
+#   3. WHEN duplicate_object THEN NULL            AFTER the ADD, in the same DO block
 # ---------------------------------------------------------------------------
+DO_BLOCK_RE = re.compile(
+    r'DO\s+(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)(.*?)\1',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def has_scoped_duplicate_object_handler(sql: str, add_pos: int) -> bool:
+    for block in DO_BLOCK_RE.finditer(sql):
+        body_start, body_end = block.span(2)
+        if body_start <= add_pos < body_end:
+            return bool(re.search(
+                r'WHEN\s+duplicate_object\s+THEN',
+                sql[add_pos:body_end],
+                re.IGNORECASE,
+            ))
+    return False
+
+
 def has_idempotency_guard(name: str, sql: str, add_pos: int) -> bool:
     # Guard 1: pre-DROP — must appear before ADD
     m = re.search(
@@ -177,8 +326,8 @@ def has_idempotency_guard(name: str, sql: str, add_pos: int) -> bool:
     )
     if m and m.start() < add_pos:
         return True
-    # Guard 3: exception handler — syntactically after ADD, so no position check
-    if re.search(r'WHEN\s+duplicate_object\s+THEN', sql, re.IGNORECASE):
+    # Guard 3: handler must protect this ADD in the same DO dollar-quoted block
+    if has_scoped_duplicate_object_handler(sql, add_pos):
         return True
     return False
 
@@ -206,12 +355,8 @@ if errors:
         print(f'  {e}', file=sys.stderr)
     sys.exit(1)
 
-skip_note = (
-    f', {len(skipped_names)} skipped (unparseable branches: {", ".join(skipped_names)})'
-    if skipped_names else ''
-)
 print(
     f'[check-fork-migration-engine-parity] OK — '
-    f'{len(all_migrations)} sqlFor migration(s) checked (Check A + B){skip_note}.'
+    f'{len(all_migrations)} sqlFor migration(s) checked (Check A + B).'
 )
 PYEOF
