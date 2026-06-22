@@ -51,6 +51,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import { embedMultimodalDashScope } from './dashscope-multimodal.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
@@ -1391,6 +1392,7 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
     modelId,
     effectiveDims,
     opts?.inputType,
+    recipe.id,
   );
   const expected = effectiveDims;
 
@@ -1702,6 +1704,26 @@ export async function embedMultimodal(
       `${recipe.id}:${parsed.modelId} is not a multimodal-capable model.`,
       `Use one of: ${touchpoint.multimodal_models.map(m => `${recipe.id}:${m}`).join(', ')}.`,
     );
+  }
+
+  // DashScope uses a private multimodal endpoint, NOT the OpenAI-compat path.
+  // Must be checked before the generic openai-compatible branch below because
+  // dashscope.implementation === 'openai-compatible' (for text embedding) and
+  // would otherwise be incorrectly routed to embedMultimodalOpenAICompat().
+  if (recipe.id === 'dashscope') {
+    const apiKey =
+      cfg.env['DASHSCOPE_MULTIMODAL_API_KEY'] ??
+      cfg.env['QWEN3_VL_EMBEDDING_API_KEY'] ??
+      cfg.env['DASHSCOPE_API_KEY'];
+    if (!apiKey) {
+      throw new AIConfigError(
+        'DashScope multimodal embedding requires DASHSCOPE_MULTIMODAL_API_KEY ' +
+        '(or QWEN3_VL_EMBEDDING_API_KEY / DASHSCOPE_API_KEY as fallback).',
+        recipe.setup_hint,
+      );
+    }
+    const dim = touchpoint.default_dims ?? 1024;
+    return embedMultimodalDashScope(inputs, parsed.modelId, apiKey, { dimension: dim });
   }
 
   // v0.34.1 (#875): route by recipe.implementation so openai-compat

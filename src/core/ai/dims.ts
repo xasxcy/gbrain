@@ -114,6 +114,7 @@ export function dimsProviderOptions(
   modelId: string,
   dims: number,
   inputType?: 'query' | 'document',
+  recipeId?: string,
 ): Record<string, any> | undefined {
   switch (implementation) {
     case 'native-openai': {
@@ -227,6 +228,14 @@ export function dimsProviderOptions(
       // inputType==='query' → type:'query', else 'db'.
       if (modelId === 'embo-01') {
         return { openaiCompatible: { type: 'db' } };
+      }
+      // Ollama local models: the /v1/embeddings endpoint accepts a top-level
+      // `dimensions` parameter for Matryoshka-capable models (e.g.
+      // qwen3-embedding:4b native dim=2560, truncatable to 2000 via this param).
+      // Without this, Ollama returns the model's native dimension, which
+      // mismatches a pgvector column created at the configured embedding_dimensions.
+      if (recipeId === 'ollama') {
+        return { openaiCompatible: { dimensions: dims } };
       }
       return undefined;
   }

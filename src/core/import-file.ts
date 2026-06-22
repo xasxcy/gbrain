@@ -1,5 +1,5 @@
-import { readFileSync, statSync, lstatSync } from 'fs';
-import { basename, extname } from 'path';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, statSync, lstatSync } from 'fs';
+import { basename, extname, join } from 'path';
 import { createHash } from 'crypto';
 import { marked } from 'marked';
 import type { BrainEngine, FileSpec } from './engine.ts';
@@ -1289,6 +1289,21 @@ export const SUPPORTED_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '
 /** Voyage caps each multimodal input at 20MB. We honor that as the size limit. */
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
+/**
+ * DashScope qwen3-vl-embedding hard cap per image (raw bytes; base64 would be
+ * 1.33× this). Images decoded to a buffer larger than this are compressed via
+ * compressViaSips before embedding.
+ */
+const DASHSCOPE_MAX_EMBED_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Pre-decode file-size gate for DashScope images. Larger than MAX_IMAGE_BYTES
+ * so that 20-50 MB originals (e.g. phone JPEGs) reach compressViaSips and can
+ * be brought within DASHSCOPE_MAX_EMBED_BYTES. Originals larger than this are
+ * skipped unconditionally — sips cannot reliably compress them below 10 MB.
+ */
+const DASHSCOPE_MAX_PREFLIGHT_BYTES = 50 * 1024 * 1024;
+
 /** Extensions that need WASM decode before Voyage embedding. */
 const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
 
@@ -1437,6 +1452,53 @@ async function decodeIfNeeded(ext: string, buf: Buffer): Promise<{ buf: Buffer; 
   return { buf, mime: mimeMap[ext] ?? 'application/octet-stream' };
 }
 
+/**
+ * Compress an image buffer to fit within DASHSCOPE_MAX_EMBED_BYTES using
+ * macOS `sips`. Two-stage: JPEG quality=80 first, then downscale long edge
+ * to 2048px if still over the limit.
+ *
+ * macOS-only: `sips` ships on every macOS release but is unavailable on
+ * Linux / Windows. On those platforms, use an equivalent tool:
+ *   - ImageMagick: `convert -quality 80 -resize '2048x2048>' in.jpg out.jpg`
+ *   - ffmpeg:      `ffmpeg -i in.jpg -vf scale='min(2048,iw):-1' -q:v 5 out.jpg`
+ *   - sharp (npm): `sharp(buf).resize(2048,2048,{fit:'inside'}).jpeg({quality:80})`
+ *
+ * Returns { buf, mime:'image/jpeg' } on success, throws on sips failure.
+ */
+async function compressViaSips(buf: Buffer): Promise<{ buf: Buffer; mime: string }> {
+  const { execFile } = await import('child_process');
+  const { promisify } = await import('util');
+  const { tmpdir } = await import('os');
+  const execFileAsync = promisify(execFile);
+
+  // mkdtempSync creates a 0700 private directory — avoids TOCTOU races in
+  // shared tmpdir that random-suffix filenames cannot prevent.
+  const tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-cmp-'));
+  const tmpIn = join(tmpDir, 'in.jpg');
+  const tmpOut = join(tmpDir, 'out.jpg');
+  writeFileSync(tmpIn, buf);
+  try {
+    // Stage 1: convert to JPEG at quality 80.
+    // sips detects format by magic bytes, not extension, so any input format works.
+    await execFileAsync('sips', [
+      '-s', 'format', 'jpeg',
+      '-s', 'formatOptions', '80',
+      tmpIn, '--out', tmpOut,
+    ]);
+    let out = readFileSync(tmpOut);
+
+    // Stage 2: downscale if still over DashScope limit.
+    if (out.length > DASHSCOPE_MAX_EMBED_BYTES) {
+      await execFileAsync('sips', ['--resampleHeightWidthMax', '2048', tmpOut, '--out', tmpOut]);
+      out = readFileSync(tmpOut);
+    }
+
+    return { buf: out, mime: 'image/jpeg' };
+  } finally {
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 /** EXIF metadata stamped onto image-page frontmatter (cherry-2). */
 async function readExifSafe(buf: Buffer): Promise<Record<string, unknown>> {
   try {
@@ -1529,6 +1591,12 @@ export interface ImportImageOptions {
    * with sourceId would TS-error on the importImageFile branch.
    */
   sourceId?: string;
+  /**
+   * Skip the content_hash short-circuit even if the file is unchanged.
+   * Use during provider migration after clearing embedding_image in SQL so
+   * unchanged images get re-embedded with the new provider.
+   */
+  forceReembed?: boolean;
 }
 
 /** Module-level limiter so concurrent imports across files share the budget. */
@@ -1551,13 +1619,27 @@ export async function importImageFile(
   if (lstat.isSymbolicLink()) {
     return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
   }
+
+  // Resolve provider early so the file-size gate uses the right limit.
+  // Gateway falls back: embedding_multimodal_model ?? embedding_model.
+  // Both are mirrored to env by cli.ts after loadConfigWithEngine.
+  const multimodalModelEnv =
+    process.env.GBRAIN_EMBEDDING_MULTIMODAL_MODEL ??
+    process.env.GBRAIN_EMBEDDING_MODEL ??
+    '';
+  const isDashScope = multimodalModelEnv.startsWith('dashscope:');
+
   const stat = statSync(filePath);
-  if (stat.size > MAX_IMAGE_BYTES) {
+  const preflightLimit = isDashScope ? DASHSCOPE_MAX_PREFLIGHT_BYTES : MAX_IMAGE_BYTES;
+  if (stat.size > preflightLimit) {
+    const limit = isDashScope
+      ? `DashScope preflight cap is ${DASHSCOPE_MAX_PREFLIGHT_BYTES / 1024 / 1024} MB (compresses down to 10 MB)`
+      : `Voyage multimodal caps at ${MAX_IMAGE_BYTES / 1024 / 1024} MB per input`;
     return {
       slug: slugifyPath(relativePath),
       status: 'skipped',
       chunks: 0,
-      error: `Image too large (${stat.size} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+      error: `Image too large (${(stat.size / 1024 / 1024).toFixed(1)} MB). ${limit}.`,
     };
   }
 
@@ -1572,9 +1654,18 @@ export async function importImageFile(
 
   const srcOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   const existing = await engine.getPage(imageSlug, srcOpts);
-  if (existing?.content_hash === hash) {
+  if (existing?.content_hash === hash && !opts.forceReembed) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
+
+  // Derive the original file MIME from the extension BEFORE decode so metadata
+  // records the on-disk format even when HEIC/AVIF is decoded to PNG for embedding.
+  const ORIG_MIME_MAP: Record<string, string> = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.webp': 'image/webp',
+    '.heic': 'image/heic', '.heif': 'image/heif', '.avif': 'image/avif',
+  };
+  const originalMime = ORIG_MIME_MAP[ext] ?? 'application/octet-stream';
 
   // Decode HEIC/AVIF; pass-through for universal codecs.
   let decoded: { buf: Buffer; mime: string };
@@ -1589,21 +1680,54 @@ export async function importImageFile(
     };
   }
 
+  // Compress for DashScope's 10 MB per-image limit.
+  // isDashScope was resolved at the top of this function from env vars mirrored
+  // by cli.ts. Non-DashScope providers (Voyage, OpenAI-compat) accept up to
+  // 20 MB and must not be JPEG-converted — that would break GIF animation /
+  // PNG transparency.
+  let embeddingPayload = decoded;
+  if (decoded.buf.length > DASHSCOPE_MAX_EMBED_BYTES && isDashScope) {
+    if (process.platform === 'darwin') {
+      // macOS-only: sips. On Linux/Windows, add a compressor in compressViaSips()
+      // (e.g. ImageMagick `convert`, ffmpeg, or sharp npm package).
+      try {
+        embeddingPayload = await compressViaSips(decoded.buf);
+      } catch (err) {
+        return {
+          slug: imageSlug,
+          status: 'error',
+          chunks: 0,
+          error: `sips compression failed for ${relativePath}: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+    // Enforce the limit regardless of platform or compression outcome.
+    if (embeddingPayload.buf.length > DASHSCOPE_MAX_EMBED_BYTES) {
+      return {
+        slug: imageSlug,
+        status: 'skipped',
+        chunks: 0,
+        error: `Image exceeds DashScope 10 MB limit after compression (${(embeddingPayload.buf.length / 1024 / 1024).toFixed(1)} MB). Resize manually or configure a larger model.`,
+      };
+    }
+  }
+
   // EXIF metadata (cherry-2). Pure JS, sub-ms; no concurrency knob needed.
   const exif = await readExifSafe(buf);
 
   // OCR opt-in (cherry-1). Runs through the per-process limiter so 100
   // images first-import doesn't serialize into 200s of OCR latency.
+  // Uses embeddingPayload (possibly compressed) — OCR works fine on JPEG.
   const ocrText: string = opts.noEmbed
     ? ''
-    : await _ocrLimiter(() => maybeOcr(engine, decoded.buf, decoded.mime));
+    : await _ocrLimiter(() => maybeOcr(engine, embeddingPayload.buf, embeddingPayload.mime));
 
   // Multimodal embed.
   let embedding: Float32Array | null = null;
   if (!opts.noEmbed) {
     try {
       const [vec] = await embedMultimodal([
-        { kind: 'image_base64', data: decoded.buf.toString('base64'), mime: decoded.mime },
+        { kind: 'image_base64', data: embeddingPayload.buf.toString('base64'), mime: embeddingPayload.mime },
       ]);
       embedding = vec;
     } catch (err) {
@@ -1620,7 +1744,7 @@ export async function importImageFile(
   const frontmatter: Record<string, unknown> = {
     type: 'image',
     title: filename,
-    mime_type: decoded.mime,
+    mime_type: originalMime,
     bytes: stat.size,
     ...exif,
   };
@@ -1639,7 +1763,7 @@ export async function importImageFile(
   const fileSpec: FileSpec = {
     filename,
     storage_path: relativePath.replace(/[\\\/]/g, '/'),
-    mime_type: decoded.mime,
+    mime_type: originalMime,
     size_bytes: stat.size,
     content_hash: hash,
   };
