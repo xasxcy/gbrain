@@ -1687,6 +1687,17 @@ export async function importImageFile(
   // PNG transparency.
   let embeddingPayload = decoded;
   if (decoded.buf.length > DASHSCOPE_MAX_EMBED_BYTES && isDashScope) {
+    // GIFs are not safe to pass through sips: it converts them to JPEG and
+    // retains only one frame, silently discarding animation. Skip oversized
+    // GIFs rather than producing a corrupt single-frame embedding.
+    if (ext === '.gif') {
+      return {
+        slug: imageSlug,
+        status: 'skipped',
+        chunks: 0,
+        error: `Animated GIF too large for DashScope (${(decoded.buf.length / 1024 / 1024).toFixed(1)} MB, limit ${DASHSCOPE_MAX_EMBED_BYTES / 1024 / 1024} MB). sips cannot safely compress animated GIFs — resize manually.`,
+      };
+    }
     if (process.platform === 'darwin') {
       // macOS-only: sips. On Linux/Windows, add a compressor in compressViaSips()
       // (e.g. ImageMagick `convert`, ffmpeg, or sharp npm package).
