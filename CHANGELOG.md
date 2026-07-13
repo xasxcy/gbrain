@@ -2,6 +2,33 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.0] - 2026-07-06
+
+**gbrain now runs cleanly on the stack you already have — a local Ollama box, a self-hosted LiteLLM proxy, llama.cpp's llama-server, or gbrain running as a Claude Code MCP subprocess — instead of silently degrading or hard-failing when you're not on a raw OpenAI/Anthropic key.** A provider-agnostic plumbing pass across the AI gateway: environment handling, base-URL normalization, and embedding-dimension validation all stop tripping on the non-frontier-vendor setups that used to fail without a clear signal.
+
+### Fixed
+- **Running gbrain as a Claude Code MCP subprocess no longer breaks every AI call.** Some hosts inject an empty `ANTHROPIC_API_KEY` into the subprocess environment; that empty value used to override a real key set in your `~/.gbrain/config.json`, so every gateway call failed with a missing-key error. Empty environment values no longer clobber a configured key. (#1249)
+- **A custom Anthropic or OpenAI base URL without a `/v1` suffix no longer 404s.** When the base URL comes from the environment as a bare host, gbrain normalizes it before the call instead of posting to a path the provider doesn't serve. Unset base URLs are untouched, so the default hosted endpoints are unaffected. (#1250)
+- **Vector search stops silently going dark on a LiteLLM or llama-server embedding model.** A model-availability check was rejecting user-provided embedding recipes even when a model was configured, quietly disabling vector search so results looked empty. The check now validates what actually matters — that a dimension is set — and reports a clear, actionable message when it isn't. (#1292, #2295)
+- **Local embedding models with non-standard dimensions are accepted.** Ollama, llama-server, and LiteLLM models (e.g. modern 1024- or 4096-dimension embedders) no longer get hard-rejected by the dimension validator; you declare the dimension and gbrain trusts it. Hosted fixed-dimension providers stay strictly validated. Modern Ollama embed models are recognized. (#2271)
+
+### Changed
+- **LiteLLM setup guidance now names the `/v1` path convention** so OpenAI-shaped proxies that only serve the `/v1` route don't fail authentication with no hint. (#2209)
+
+### To take advantage of v0.42.58.0
+`gbrain upgrade`. If you run on Ollama, a LiteLLM proxy, llama-server, or as a Claude Code MCP subprocess, the fixes apply automatically — no migration, no config change. If you use a user-provided embedding recipe (LiteLLM / llama-server) and see a "no default embedding dimension" message, set it with `gbrain init --embedding-dimensions <N>`.
+
+## [0.42.57.0] - 2026-07-02
+
+**PGLite incident fix: a busy `gbrain dream` (or `embed`) could have its data-directory lock stolen and get its brain corrupted beyond in-place repair. The lock will no longer be taken from a process that is alive, and an already-corrupted store now tells you exactly how to recover.**
+
+### Fixed
+- **A live PGLite holder is never stolen.** The data-directory lock used to be reaped if the holder's heartbeat went stale past a grace window. But the heartbeat runs on the JS event loop, which is blocked during long synchronous WASM imports/checkpoints, so a genuinely working `gbrain dream`/`embed` could look stale while fully alive. Reaping it let a second process open the same store and corrupt the catalog + pgvector extension (surfacing later as `relation "content_chunks" does not exist` / `type "vector" does not exist`, only recoverable by wipe-and-restore). The lock is now reaped only when the holder process is actually dead; a wedged-but-alive or PID-reused holder makes the acquire time out with a clear message naming the PID, instead of risking corruption.
+- **A corrupted PGLite store now explains how to recover.** When the store's catalog or pgvector extension can no longer load, the error names the cause and points at `gbrain reinit-pglite --embedding-model <id> --embedding-dimensions <N>` (or restoring a backup), instead of the unrelated "macOS WASM bug" hint. It also notes that deleting the lock dir or `postmaster.pid` does not fix it.
+
+### To take advantage of v0.42.57.0
+`gbrain upgrade`. No migration. New corruption is prevented going forward. A brain already corrupted by a prior concurrent open cannot be repaired in place; the upgraded error message walks you through `gbrain reinit-pglite` or restoring a backup.
+
 ## [0.42.56.0] - 2026-07-02
 
 **Life Chronicle: gbrain gains a temporal spine. Meetings and transcripts project into a queryable timeline, entities carry a bi-temporal ontology (sourced, confidence-weighted properties that supersede over time), and a low-friction diary captures interiority — so an agent can reconstruct "what happened the week of X", answer "when did I last interact with Y", and see how an entity's role or stance changed, instead of re-deriving chronology from scratch every session.** Built entirely on existing primitives (pages, the `facts` table, `timeline_entries`) — no new datastore. Auto-emission is off by default; opt in per below.
