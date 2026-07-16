@@ -1,6 +1,7 @@
 node_modules/
 bin/
 .DS_Store
+.codebase-memory/
 *.log
 .env
 .env.*

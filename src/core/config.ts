@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs';
-import { isAbsolute, join } from 'path';
+import { dirname, isAbsolute, join, resolve } from 'path';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 
 /**
@@ -431,6 +432,56 @@ export function loadConfigFileOnly(): GBrainConfig | null {
  */
 const CWD_DOTENV_FILES = ['.env', '.env.local', '.env.development', '.env.production', '.env.test'];
 
+let repoDotenvLoaded = false;
+
+function parseDotenvAssignments(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const assignment = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(assignment);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
+        (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) {
+      v = v.slice(1, -1);
+    } else {
+      const hash = v.indexOf(' #');
+      if (hash !== -1) v = v.slice(0, hash).trim();
+    }
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+function loadRepoDotenv(): void {
+  if (repoDotenvLoaded || process.env.NODE_ENV === 'test') return;
+  repoDotenvLoaded = true;
+
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  let parsed: Record<string, string>;
+  try {
+    parsed = parseDotenvAssignments(readFileSync(join(repoRoot, '.env'), 'utf-8'));
+  } catch {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+
+  if (!process.env.GBRAIN_DATABASE_URL && process.env.PG_APP_PWD) {
+    const user = process.env.PG_APP_USER || 'gbrain';
+    const host = process.env.NAS_IP || 'localhost';
+    const port = process.env.PG_PORT || '5432';
+    const db = process.env.PG_APP_DB || 'gbrain';
+    process.env.GBRAIN_DATABASE_URL =
+      `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(process.env.PG_APP_PWD)}` +
+      `@${host}:${port}/${encodeURIComponent(db)}`;
+  }
+}
+
 /**
  * All values assigned to `key` across the .env files in `dir`. Collecting
  * every assignment (rather than emulating override order) keeps the guard
@@ -476,6 +527,7 @@ let warnedCwdEnvDbUrlIgnored = false;
  * `dir` is injectable for tests; callers use the default.
  */
 export function effectiveEnvDatabaseUrl(dir: string = process.cwd()): string | undefined {
+  loadRepoDotenv();
   if (process.env.GBRAIN_DATABASE_URL) return process.env.GBRAIN_DATABASE_URL;
   const url = process.env.DATABASE_URL;
   if (!url) return undefined;
@@ -495,6 +547,7 @@ export function effectiveEnvDatabaseUrl(dir: string = process.cwd()): string | u
 }
 
 export function loadConfig(): GBrainConfig | null {
+  loadRepoDotenv();
   let fileConfig: GBrainConfig | null = null;
   try {
     const raw = readFileSync(getConfigPath(), 'utf-8');
