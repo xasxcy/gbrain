@@ -1,5 +1,6 @@
 import type { BrainEngine } from './engine.ts';
 import { slugifyPath } from './sync.ts';
+import { getFtsLanguage } from './fts-language.ts';
 
 /**
  * Schema migrations — run automatically on initSchema().
@@ -5507,28 +5508,112 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 123,
+    name: 'configurable_fts_language',
+    // Recreate the two search_vector trigger functions using the language
+    // configured via GBRAIN_FTS_LANGUAGE (default 'english'). Idempotent:
+    // CREATE OR REPLACE swaps the function body atomically; no trigger
+    // recreation needed since the trigger references the function by name.
+    //
+    // Why a handler instead of a static SQL string: Postgres tsvector
+    // functions don't accept parameterized config names — the language
+    // must be a literal in the SQL. getFtsLanguage() validates the value
+    // (lowercase letters/digits/underscores only) before interpolation.
+    //
+    // Function bodies mirror schema.sql / pglite-schema.ts exactly —
+    // INCLUDING the `SET search_path = pg_catalog, public` hardening from
+    // v120/#1647 (CREATE OR REPLACE resets proconfig, so omitting it here
+    // would silently strip the hardening on every upgraded brain). Only
+    // the text-search config name is parameterized. Keep all copies in
+    // sync when the trigger logic changes.
+    //
+    // Backfill: after recreating the functions, re-tokenize existing rows
+    // under the new language. Skipped when the configured language is
+    // 'english' (trigger output identical — re-tokenizing is wasted I/O).
+    // To change language after this migration has run, use
+    // `gbrain reindex-search-vector`.
+    sql: '',
+    handler: async (engine) => {
+      const lang = getFtsLanguage();
+
+      const recreatePagesFn = `
+        CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
+        DECLARE
+          timeline_text TEXT;
+        BEGIN
+          SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+          INTO timeline_text
+          FROM timeline_entries
+          WHERE page_id = NEW.id;
+
+          NEW.search_vector :=
+            setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') ||
+            setweight(to_tsvector('${lang}', coalesce(NEW.compiled_truth, '')), 'B') ||
+            setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') ||
+            setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
+
+          RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql;
+      `;
+
+      const recreateChunksFn = `
+        CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS $fn$
+        BEGIN
+          NEW.search_vector :=
+            setweight(to_tsvector('${lang}', COALESCE(NEW.doc_comment, '')), 'A') ||
+            setweight(to_tsvector('${lang}', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
+            setweight(to_tsvector('${lang}', COALESCE(NEW.chunk_text, '')), 'B');
+          RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql;
+      `;
+
+      await engine.executeRaw(recreatePagesFn);
+      await engine.executeRaw(recreateChunksFn);
+
+      if (lang === 'english') {
+        console.log(`  v123: trigger functions recreated with language='english' (default — no backfill needed)`);
+        return;
+      }
+
+      // Backfill existing rows under the new tokenizer. UPDATE-to-same-value
+      // re-fires the pages trigger; chunks are rewritten directly with the
+      // same expression as the trigger.
+      await engine.executeRaw(`
+        UPDATE pages SET id = id
+        WHERE search_vector IS NOT NULL;
+      `);
+
+      await engine.executeRaw(`
+        UPDATE content_chunks
+        SET search_vector =
+          setweight(to_tsvector('${lang}', COALESCE(doc_comment, '')), 'A') ||
+          setweight(to_tsvector('${lang}', COALESCE(symbol_name_qualified, '')), 'A') ||
+          setweight(to_tsvector('${lang}', COALESCE(chunk_text, '')), 'B')
+        WHERE search_vector IS NOT NULL;
+      `);
+
+      console.log(`  v123: trigger functions recreated with language='${lang}' + backfilled existing rows`);
+    },
+  },
+  {
+    version: 124,
     name: 'pgroonga_fts_chinese',
-    // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
-    // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
     idempotent: true,
     sql: '',
     sqlFor: {
       postgres: `
         CREATE EXTENSION IF NOT EXISTS pgroonga;
         CREATE INDEX IF NOT EXISTS idx_content_chunks_pgroonga
-          ON content_chunks
-          USING pgroonga (chunk_text)
+          ON content_chunks USING pgroonga (chunk_text)
           WITH (tokenizer='TokenBigram("unify_alphabet", true)');
       `,
       pglite: ``,
     },
   },
   {
-    version: 124,
+    version: 125,
     name: 'files_source_id_storage_path_unique',
-    // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
-    // Two sources importing the same relative path would fight over one row,
-    // causing cross-source metadata misassociation. Replace with composite key.
     idempotent: true,
     sql: '',
     sqlFor: {
@@ -5551,33 +5636,35 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 125,
+    version: 126,
     name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
-    // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
-    // (code_edges_source_backfill_and_callee_index). This repair applies
-    // the same idempotent DDL to preserve full gbrain call-graph functionality.
     idempotent: true,
     sql: `
-      UPDATE code_edges_symbol e
-         SET source_id = COALESCE(p.source_id, 'default')
-        FROM content_chunks c
-        JOIN pages p ON p.id = c.page_id
-       WHERE c.id = e.from_chunk_id
-         AND e.source_id IS NULL;
-
-      UPDATE code_edges_chunk e
-         SET source_id = COALESCE(p.source_id, 'default')
-        FROM content_chunks c
-        JOIN pages p ON p.id = c.page_id
-       WHERE c.id = e.from_chunk_id
-         AND e.source_id IS NULL;
-
+      UPDATE code_edges_symbol e SET source_id = COALESCE(p.source_id, 'default')
+        FROM content_chunks c JOIN pages p ON p.id = c.page_id
+       WHERE c.id = e.from_chunk_id AND e.source_id IS NULL;
+      UPDATE code_edges_chunk e SET source_id = COALESCE(p.source_id, 'default')
+        FROM content_chunks c JOIN pages p ON p.id = c.page_id
+       WHERE c.id = e.from_chunk_id AND e.source_id IS NULL;
       CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_from_symbol
         ON code_edges_symbol (from_symbol_qualified);
-
       CREATE INDEX IF NOT EXISTS idx_code_edges_chunk_from_symbol
         ON code_edges_chunk (from_symbol_qualified);
     `,
+  },
+  {
+    // Fork databases previously recorded PGroonga as v123, so they skipped
+    // upstream's v123 configurable_fts_language handler. Re-run that idempotent
+    // handler after the renumbered fork migrations.
+    version: 127,
+    name: 'repair_configurable_fts_language_skipped_by_fork_v123',
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      const upstreamV123 = MIGRATIONS.find(m => m.version === 123);
+      if (!upstreamV123?.handler) throw new Error('missing configurable FTS v123 handler');
+      await upstreamV123.handler(engine);
+    },
   },
 ];
 

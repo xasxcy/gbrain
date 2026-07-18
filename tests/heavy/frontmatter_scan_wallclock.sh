@@ -90,21 +90,17 @@ timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&
   exit 1
 }
 
-# Register the brain dir as a source. Use raw SQL since `gbrain sources add`
-# might not exist in this version-window; the schema is what doctor reads.
+# Register the brain dir through the configured engine. An in-process
+# PGLiteEngine without database_path would create a separate in-memory DB,
+# so doctor would see no source; `bun run -e` also treats `-e` as a `run`
+# argument rather than Bun's eval flag on current Bun releases.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
-bun run -e "
-import { PGLiteEngine } from './src/core/pglite-engine.ts';
-const e = new PGLiteEngine();
-await e.connect({});
-await e.initSchema();
-await e.executeRaw(
-  \"INSERT INTO sources (id, name, local_path) VALUES ('fm-wallclock', 'Frontmatter wallclock test', \\\$1)\",
-  ['$BRAIN_DIR'],
-);
-await e.disconnect();
-console.log('source registered');
-" 2>&1 | tee -a "$LOG"
+timeout 30s bun run src/cli.ts sources add fm-wallclock \
+  --path "$BRAIN_DIR" --name 'Frontmatter wallclock test' >> "$LOG" 2>&1 || {
+  echo "[fm_wallclock] FAIL: source registration exited non-zero" >&2
+  tail -30 "$LOG" >&2
+  exit 1
+}
 
 # Step 3: run gbrain doctor; capture wall-clock + exit + frontmatter_integrity status.
 echo "[fm_wallclock] running gbrain doctor (budget ${WALLCLOCK_BUDGET_S}s)..." | tee -a "$LOG"

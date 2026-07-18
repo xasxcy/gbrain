@@ -51,6 +51,8 @@ with open(migrate_ts) as f:
 class ParseError(ValueError):
     pass
 
+IDENT_RE = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
+
 
 def skip_trivia(src: str, pos: int) -> int:
     while pos < len(src):
@@ -70,10 +72,12 @@ def skip_trivia(src: str, pos: int) -> int:
 
 
 def read_identifier(src: str, pos: int) -> tuple[str, int]:
-    m = re.match(r'[A-Za-z_$][A-Za-z0-9_$]*', src[pos:])
+    # Match at an offset instead of slicing src[pos:], which copies the whole
+    # remaining migration file at every identifier and grows quadratically.
+    m = IDENT_RE.match(src, pos)
     if not m:
         raise ParseError(f'expected identifier at offset {pos}')
-    return m.group(0), pos + len(m.group(0))
+    return m.group(0), m.end()
 
 
 def read_quoted(src: str, pos: int) -> tuple[str, int]:
