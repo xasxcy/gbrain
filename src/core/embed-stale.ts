@@ -4,8 +4,9 @@
  * outside-voice catch).
  *
  * Single source of truth for the cursor-paginated, source-grouped, rate-limit-
- * aware embedding pipeline. Both `gbrain embed --stale` (CLI) and the
- * `embed-backfill` job (Minion) call this helper so the working machinery
+ * aware embedding pipeline. The `embed-backfill` job (Minion) calls this
+ * helper, and the foreground stale path shares its fallback state machine, so
+ * the working machinery
  * — keyset pagination, batch grouping by `source_id::slug`, merge-with-existing
  * via `getChunks` + `upsertChunks`, AbortSignal threading into in-flight HTTPs,
  * 429 backoff — lives in exactly one place.
@@ -22,6 +23,7 @@ import type { ChunkInput } from './types.ts';
 import { embedBatchWithBackoff } from '../commands/embed.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
+import { embedWithTruncationFallback } from './embed-fallback.ts';
 
 /** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
@@ -132,63 +134,6 @@ export async function embedStaleForSource(
     aborted: false,
   };
   const signature = opts.embeddingSignature;
-
-  // ---- helpers ----
-
-  /** True for Ollama llama-server OOM/crash errors that truncation can work around. */
-  function isOllamaOomLikeError(e: unknown): boolean {
-    const msg = e instanceof Error ? e.message : String(e);
-    return /EOF|timed out|llama-server process no longer running/i.test(msg);
-  }
-
-  /**
-   * Try embedding `texts` via `embedFn`. On OOM-like failure, fall back to embedding
-   * each chunk individually with progressive truncation: 5500 → 5000 → 4500 chars.
-   * This handles the case where one overlong chunk in a batch crashes llama-server.
-   */
-  async function embedWithTruncationFallback(
-    texts: string[],
-    fn: (ts: string[], o: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>,
-    fnOpts: { abortSignal?: AbortSignal },
-  ): Promise<Float32Array[]> {
-    try {
-      return await fn(texts, fnOpts);
-    } catch (e) {
-      if (!isOllamaOomLikeError(e)) throw e;
-    }
-    // Batch crashed — retry each chunk individually with progressive truncation.
-    const FALLBACK_LEVELS = [5500, 5000, 4500] as const;
-    const results: Float32Array[] = [];
-    for (const text of texts) {
-      if (fnOpts.abortSignal?.aborted) throw new Error('embed budget aborted');
-      let embedded = false;
-      let lastError: unknown;
-      // Try original length first (single chunk avoids batch-size pressure), then truncate.
-      // Only include fallback levels that are strictly shorter than the text — retrying the
-      // same length after an OOM crash wastes time and never recovers.
-      const effectiveLevels = [text.length, ...FALLBACK_LEVELS.filter(l => l < text.length)];
-      for (const maxLen of effectiveLevels) {
-        if (fnOpts.abortSignal?.aborted) throw new Error('embed budget aborted');
-        const t = text.length > maxLen ? text.slice(0, maxLen) : text;
-        try {
-          const [vec] = await fn([t], fnOpts);
-          if (t.length < text.length) {
-            process.stderr.write(
-              `  [embed-fallback] chunk truncated ${text.length}→${t.length} chars for embedding\n`,
-            );
-          }
-          results.push(vec);
-          embedded = true;
-          break;
-        } catch (e2) {
-          if (!isOllamaOomLikeError(e2)) throw e2;
-          lastError = e2;
-        }
-      }
-      if (!embedded) throw lastError;
-    }
-    return results;
-  }
 
   // ---- main loop ----
 

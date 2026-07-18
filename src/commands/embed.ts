@@ -19,6 +19,7 @@ import {
 } from '../core/pace-mode.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
+import { embedWithTruncationFallback } from '../core/embed-fallback.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -576,7 +577,11 @@ async function embedPage(
     return;
   }
 
-  const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text), { abortSignal: signal });
+  const embeddings = await embedWithTruncationFallback(
+    toEmbed.map(c => c.chunk_text),
+    (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
+    { abortSignal: signal },
+  );
   const embeddingMap = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
     embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
@@ -1005,7 +1010,11 @@ async function embedAllStale(
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
-          const embeddings = await embedBatchWithBackoff(stale.map(c => c.chunk_text), { abortSignal: effectiveSignal });
+          const embeddings = await embedWithTruncationFallback(
+            stale.map(c => c.chunk_text),
+            (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
+            { abortSignal: effectiveSignal },
+          );
           // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
           const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
           const staleIdxToEmbedding = new Map<number, Float32Array>();

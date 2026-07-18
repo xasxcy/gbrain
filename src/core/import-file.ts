@@ -9,6 +9,7 @@ import { chunkCodeText, chunkCodeTextFull, detectCodeLanguage, CHUNKER_VERSION }
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+import { embedWithTruncationFallback } from './embed-fallback.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
@@ -704,7 +705,12 @@ export async function importFromContent(
     const wrappedTexts = prefix
       ? chunks.map((c) => wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source))
       : chunks.map((c) => c.chunk_text);
-    const embeddings = await embedBatch(wrappedTexts);
+    // P2B: share the EOF/timeout truncation fallback with the sync/stale
+    // embed paths (embed-fallback.ts). Pre-fix this was a bare embedBatch
+    // call — a single Ollama EOF/timeout on this batch propagated straight
+    // out of importFromContent and aborted the whole sync (BRIEF-P2B). No
+    // backoff/abortSignal threaded through — same semantics as before.
+    const embeddings = await embedWithTruncationFallback(wrappedTexts, (texts) => embedBatch(texts), {});
     for (let i = 0; i < chunks.length; i++) {
       chunks[i].embedding = embeddings[i];
       // token_count tracks the wrapped string length so cost reporting
