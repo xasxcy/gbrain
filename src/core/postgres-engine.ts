@@ -1667,6 +1667,8 @@ export class PostgresEngine implements BrainEngine {
     // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
     // to the transaction so it can never leak onto a pooled connection.
     const rows = await sql.begin(async sql => {
+      // Keep lexical search fail-fast. Its indexed query is normally
+      // millisecond-scale, so a longer budget only masks a plan regression.
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
@@ -1969,7 +1971,11 @@ export class PostgresEngine implements BrainEngine {
     `;
 
     const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
+      // Vector retrieval can fault a large HNSW index back into a remote
+      // database cache. 15s is the operator budget for this path; keep it
+      // transaction-local so it cannot leak into the shared pool.
+      // Configuration location: PostgresEngine.searchVector.
+      await sql`SET LOCAL statement_timeout = '15s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);

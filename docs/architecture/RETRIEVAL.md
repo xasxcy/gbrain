@@ -111,6 +111,21 @@ Expansion is opt-in per mode bundle (`tokenmax` on by default; `balanced` + `con
 
 ## Putting it together
 
+## Postgres vector-search timeout
+
+`PostgresEngine.searchVector` sets `SET LOCAL statement_timeout = '15s'` in
+[`src/core/postgres-engine.ts`](../../src/core/postgres-engine.ts). This is a
+per-vector-query budget, scoped to its transaction, so it cannot alter other
+queries using the shared pool. It was raised from 8 seconds on 2026-07-19 after
+a 2,000-dimension, 445 MB HNSW index on a NAS-hosted database exceeded the
+previous limit during a cold-cache read. Keyword search deliberately remains at
+8 seconds because its indexed path was measured in milliseconds; a larger limit
+there would hide a query-plan regression.
+
+Change this value only when a measured vector index read approaches the limit;
+verify with the affected `gbrain query --source <id> ...` command both after a
+cold start and when warm.
+
 The full pipeline for a `query` op:
 
 ```
