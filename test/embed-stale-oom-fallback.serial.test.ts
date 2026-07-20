@@ -16,6 +16,10 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { embedStaleForSource } from '../src/core/embed-stale.ts';
+import {
+  embedWithTruncationFallback,
+  embedWithTruncationFallbackPartial,
+} from '../src/core/embed-fallback.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -96,7 +100,7 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
   });
 
-  test('OOM on short chunk: only ONE retry (no no-op fallback levels)', async () => {
+  test('OOM on short chunk: initial single-text batch is not retried', async () => {
     // Chunk is 1000 chars — FALLBACK_LEVELS [5500, 5000, 4500] are all > 1000,
     // so effectiveLevels = [1000] only. After the single OOM the chunk stays NULL.
     const text = 'c'.repeat(1000);
@@ -110,10 +114,9 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
       },
     });
 
-    // 1 batch call + 1 individual retry at original length = 2 calls total.
-    // No extra retries at 5500/5000/4500 since those are >= text.length (filtered out).
-    // embedOneKey caught the final error and logged it — chunk stays NULL.
-    expect(callCount).toBe(2);
+    // The initial batch is already this chunk's original attempt; there is no
+    // duplicate [1000] call and no shorter ladder level.
+    expect(callCount).toBe(1);
     expect(result.embedded).toBe(0);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
@@ -123,8 +126,8 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     await seedChunk('long-oom', text);
 
     const seenLengths: number[] = [];
-    // Batch call (len=6000) → OOM. Individual retry:
-    //   len=6000 → OOM, len=5500 → OOM, len=5000 → OOM, len=4500 → success.
+    // Batch call (len=6000) is this one chunk's original attempt. The ladder
+    // starts directly at 5500 rather than retrying 6000.
     await embedStaleForSource(engine, 'default', {
       embedFn: async (texts) => {
         seenLengths.push(...texts.map(t => t.length));
@@ -133,8 +136,7 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
       },
     });
 
-    // Calls: [6000] (batch, OOM), then [6000], [5500], [5000], [4500] (individual)
-    expect(seenLengths).toEqual([6000, 6000, 5500, 5000, 4500]);
+    expect(seenLengths).toEqual([6000, 5500, 5000, 4500]);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
   });
 
@@ -152,8 +154,8 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
       },
     });
 
-    // 1 batch + 4 individual (6000, 5500, 5000, 4500) = 5 calls
-    expect(callCount).toBe(5);
+    // Original batch + 3 shorter ladder calls = 4 calls.
+    expect(callCount).toBe(4);
     expect(result.embedded).toBe(0);
     expect(result.done).toBe(true); // loop completed without crashing
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
@@ -179,9 +181,7 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
   });
 
   test('OOM at boundary: text.length === FALLBACK_LEVEL[0] (5500) gets filtered correctly', async () => {
-    // text.length = 5500 = FALLBACK_LEVELS[0]. filter: 5500 < 5500 → false, filtered out.
-    // effectiveLevels = [5500, 5000, 4500]. 5500-level retry is no-op but still present;
-    // 5000-level succeeds. Confirms strict-< is the right condition.
+    // The initial 5500 call is not retried; strict-< leaves 5000 then 4500.
     const text = 'e'.repeat(5500);
     await seedChunk('boundary-5500', text);
 
@@ -194,8 +194,7 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
       },
     });
 
-    // Calls: [5500] (batch OOM), [5500] (individual OOM), [5000] (success)
-    expect(seenLengths).toEqual([5500, 5500, 5000]);
+    expect(seenLengths).toEqual([5500, 5000]);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
   });
 
@@ -226,5 +225,156 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     //   longText (6000): effectiveLevels=[6000, 5500, 5000, 4500]:
     //     len=6000 → OOM, len=5500 → OOM, len=5000 → success (≤5000).
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+});
+
+describe('SPEC V4 fallback contracts', () => {
+  test('batch timeout splits once per chunk and all chunks converge', async () => {
+    const calls: number[] = [];
+    const partial = await embedWithTruncationFallbackPartial(['a', 'b'], async (texts) => {
+      calls.push(texts.length);
+      if (texts.length > 1) throw new Error('The operation timed out');
+      return [makeVec(texts[0]!.length)];
+    }, {});
+    expect(calls).toEqual([2, 1, 1]);
+    expect(partial.vectors.every((vector) => vector !== null)).toBe(true);
+    expect(partial.failures).toEqual([]);
+  });
+
+  test('single timeout calls once; partial records it and legacy throws the same object', async () => {
+    const timeout = new Error('The operation timed out');
+    let partialCalls = 0;
+    const partial = await embedWithTruncationFallbackPartial(['a'], async () => {
+      partialCalls++;
+      throw timeout;
+    }, {});
+    expect(partialCalls).toBe(1);
+    expect(partial.failures).toEqual([{ index: 0, error: timeout }]);
+
+    let legacyCalls = 0;
+    try {
+      await embedWithTruncationFallback(['a'], async () => {
+        legacyCalls++;
+        throw timeout;
+      }, {});
+      throw new Error('expected legacy helper to throw');
+    } catch (error) {
+      expect(error).toBe(timeout);
+    }
+    expect(legacyCalls).toBe(1);
+  });
+
+  test('single EOF has one original call at <=4500 and at most four calls above 5500', async () => {
+    const shortCalls: number[] = [];
+    const eof = oomError();
+    await embedWithTruncationFallbackPartial(['s'.repeat(4500)], async (texts) => {
+      shortCalls.push(texts[0]!.length);
+      throw eof;
+    }, {});
+    expect(shortCalls).toEqual([4500]);
+
+    const longCalls: number[] = [];
+    await embedWithTruncationFallbackPartial(['l'.repeat(6000)], async (texts) => {
+      longCalls.push(texts[0]!.length);
+      throw eof;
+    }, {});
+    expect(longCalls).toEqual([6000, 5500, 5000, 4500]);
+  });
+
+  test('short single EOF preserves the initial error identity in partial and legacy modes', async () => {
+    const eof = new Error('EOF original');
+    const partial = await embedWithTruncationFallbackPartial(['s'.repeat(4500)], async () => {
+      throw eof;
+    }, {});
+    expect(partial.failures[0]?.error).toBe(eof);
+    try {
+      await embedWithTruncationFallback(['s'.repeat(4500)], async () => {
+        throw eof;
+      }, {});
+      throw new Error('expected legacy helper to throw');
+    } catch (error) {
+      expect(error).toBe(eof);
+    }
+  });
+
+  test('split fallback preserves an AbortError thrown by the in-flight chunk request', async () => {
+    const controller = new AbortController();
+    const abortError = new DOMException('aborted', 'AbortError');
+    try {
+      await embedWithTruncationFallback(['a', 'b'], async (texts) => {
+        if (texts.length > 1) throw oomError();
+        controller.abort();
+        throw abortError;
+      }, { abortSignal: controller.signal });
+      throw new Error('expected legacy helper to throw');
+    } catch (error) {
+      expect(error).toBe(abortError);
+    }
+  });
+
+  test('legacy batch fallback short-circuits on chunk zero and preserves error identity', async () => {
+    const batchEof = oomError();
+    const chunkZeroTimeout = new Error('The operation timed out');
+    const calls: string[][] = [];
+    try {
+      await embedWithTruncationFallback(['zero', 'one'], async (texts) => {
+        calls.push(texts);
+        if (texts.length === 2) throw batchEof;
+        if (texts[0] === 'zero') throw chunkZeroTimeout;
+        return [makeVec(1)];
+      }, {});
+      throw new Error('expected legacy helper to throw');
+    } catch (error) {
+      expect(error).toBe(chunkZeroTimeout);
+    }
+    expect(calls).toEqual([['zero', 'one'], ['zero']]);
+  });
+
+  test('partial retains prefix vectors, reports fatal, and does not try later chunks', async () => {
+    const calls: string[][] = [];
+    const fatal = new Error('rate_limit_exceeded: 429');
+    const partial = await embedWithTruncationFallbackPartial(['good', 'fatal', 'later'], async (texts) => {
+      calls.push(texts);
+      if (texts.length > 1) throw oomError();
+      if (texts[0] === 'fatal') throw fatal;
+      return [makeVec(1)];
+    }, {});
+    expect(calls).toEqual([['good', 'fatal', 'later'], ['good'], ['fatal']]);
+    expect(partial.vectors[0]).not.toBeNull();
+    expect(partial.vectors.slice(1)).toEqual([null, null]);
+    expect(partial.fatalError).toBe(fatal);
+    expect(partial.fatalIndexes).toEqual([1]);
+    expect(partial.aborted).toBe(false);
+  });
+
+  test('initial non-split batch fatal identifies every affected input index', async () => {
+    const fatal = new Error('rate_limit_exceeded: 429');
+    const partial = await embedWithTruncationFallbackPartial(['a', 'b'], async () => {
+      throw fatal;
+    }, {});
+    expect(partial.fatalError).toBe(fatal);
+    expect(partial.fatalIndexes).toEqual([0, 1]);
+
+    const one = await embedWithTruncationFallbackPartial(['a'], async () => {
+      throw fatal;
+    }, {});
+    expect(one.fatalIndexes).toEqual([0]);
+  });
+
+  test('partial terminal state is mutually exclusive between abort and fatal error', async () => {
+    const abortController = new AbortController();
+    const aborted = await embedWithTruncationFallbackPartial(['a'], async () => {
+      abortController.abort();
+      throw new Error('ordinary failure');
+    }, { abortSignal: abortController.signal });
+    expect(aborted.aborted).toBe(true);
+    expect(aborted.fatalError).toBeUndefined();
+
+    const fatal = new Error('ordinary failure');
+    const notAborted = await embedWithTruncationFallbackPartial(['a'], async () => {
+      throw fatal;
+    }, {});
+    expect(notAborted.aborted).toBe(false);
+    expect(notAborted.fatalError).toBe(fatal);
   });
 });

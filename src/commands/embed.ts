@@ -8,7 +8,7 @@ import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
-import { runSlidingPool } from '../core/worker-pool.ts';
+import { isMustAbortError, runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted, anySignal, AbortError } from '../core/abort-check.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
 import {
@@ -19,7 +19,7 @@ import {
 } from '../core/pace-mode.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
-import { embedWithTruncationFallback } from '../core/embed-fallback.ts';
+import { embedWithTruncationFallback, embedWithTruncationFallbackPartial } from '../core/embed-fallback.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -1009,49 +1009,78 @@ async function embedAllStale(
         const stale = byKey.get(key)!;
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
-        try {
-          const embeddings = await embedWithTruncationFallback(
-            stale.map(c => c.chunk_text),
-            (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
-            { abortSignal: effectiveSignal },
-          );
-          // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
-          const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
-          const staleIdxToEmbedding = new Map<number, Float32Array>();
-          for (let j = 0; j < stale.length; j++) {
-            staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+        // Embed phase: partial helper never throws and preserves every vector
+        // produced before a fatal error or cooperative abort.
+        const partial = await embedWithTruncationFallbackPartial(
+          stale.map(c => c.chunk_text),
+          (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
+          { abortSignal: effectiveSignal },
+        );
+        let pageHadFailure = partial.failures.length > 0 || partial.fatalError !== undefined;
+        if (partial.failures.length > 0 || partial.fatalError !== undefined) {
+          const chunkIndexes = [
+            ...partial.failures.map(failure => failure.index),
+            ...(partial.fatalIndexes ?? []),
+          ].map(index => stale[index]?.chunk_index).filter((index): index is number => index !== undefined);
+          const firstError = partial.failures[0]?.error ?? partial.fatalError;
+          serr(`\n  Error embedding ${slug}: failed chunk_index [${chunkIndexes.join(', ')}]${firstError instanceof Error ? `: ${firstError.message}` : firstError === undefined ? '' : `: ${String(firstError)}`}`);
+        }
+
+        const successCount = partial.vectors.filter((vector): vector is Float32Array => vector !== null).length;
+        if (successCount > 0) {
+          // Persist phase deliberately has its own unconditional catch: abort
+          // does not silence a getChunks/upsert/signature failure.
+          try {
+            const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
+            const staleIdxToEmbedding = new Map<number, Float32Array>();
+            for (let j = 0; j < stale.length; j++) {
+              const vector = partial.vectors[j];
+              if (vector !== null) staleIdxToEmbedding.set(stale[j].chunk_index, vector);
+            }
+            const merged: ChunkInput[] = existing.map(c => ({
+              chunk_index: c.chunk_index,
+              chunk_text: c.chunk_text,
+              chunk_source: c.chunk_source,
+              embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+              token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+            }));
+            await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
+            result.embedded += successCount;
+
+            if (signature) {
+              const rows = (await observed(pacer, () => engine.executeRaw<{ embedding_signature: string | null }>(
+                'SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = $2',
+                [slug, keySourceId],
+              ))) ?? [];
+              const storedSignature = rows[0]?.embedding_signature ?? null;
+              // Correctness here assumes no concurrent rechunk/upsert writer:
+              // invalidation made a drifted page NULL, so this pass owns every
+              // non-NULL vector it now stamps, even across cursor batches.
+              const shouldStamp = storedSignature !== null
+                ? storedSignature !== signature
+                : stale.length === existing.length;
+              if (shouldStamp) {
+                await observed(pacer, () =>
+                  engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+                );
+              }
+            }
+          } catch (e: unknown) {
+            pageHadFailure = true;
+            serr(`\n  Error persisting ${slug}${effectiveSignal.aborted ? ' (aborted context)' : ''}: ${e instanceof Error ? e.message : e}`);
           }
-          const merged: ChunkInput[] = existing.map(c => ({
-            chunk_index: c.chunk_index,
-            chunk_text: c.chunk_text,
-            chunk_source: c.chunk_source,
-            embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-            token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
-          }));
-          await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-          // v0.41.31: stamp provenance after the page's chunks are embedded —
-          // but only when EVERY chunk was stale (fully re-embedded this pass).
-          // A partially-stale page keeps preserved chunks of unknown/old
-          // provenance, so don't claim it's current. (After invalidate, a
-          // signature-drifted page IS fully stale → this stamps it.)
-          if (signature && stale.length === existing.length) {
-            await observed(pacer, () =>
-              engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
-            );
-          }
-          result.embedded += stale.length;
-        } catch (e: unknown) {
-          // Budget/abort-fired cancellations are expected on the way out; don't
-          // spam per-page "Error embedding" lines when we're shutting down.
-          if (effectiveSignal.aborted) return;
-          embedFailures++;
-          serr(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
         }
         totalProcessedPages++;
         result.pages_processed++;
+        if (pageHadFailure) embedFailures++;
         // Use staleCount as the estimated total for progress (not exact after
         // pagination starts, but directionally correct).
         onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
+        // Propagate typed hard-aborts only after partial successes were given a
+        // chance to persist. Keep the original error object for worker-pool.
+        if (partial.fatalError !== undefined && isMustAbortError(partial.fatalError)) {
+          throw partial.fatalError;
+        }
         // Cooperative DB-contention pace between keys (no-op when unpaced).
         // E-4 (Codex P1): pace() is subject to the EXTERNAL abort only, NOT the
         // wall-clock budget — a contended DB's sleep must not be cut by the
@@ -1093,16 +1122,14 @@ async function embedAllStale(
 
   slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
 
-  // #1946 (OV2a): a catch-up pass that completed without being aborted but left
-  // chunks unembedded means those chunks are stuck (a non-transient embed
-  // failure), not that we ran out of time. Surface it loudly so it doesn't read
-  // as a clean run — re-running won't help until the underlying failure is fixed.
+  // A catch-up pass that completed with stale chunks needs an explicit, page-
+  // scoped warning; retryability is intentionally not asserted here.
   if (staleOpts?.catchUp && !effectiveSignal.aborted && embedFailures > 0) {
     const remaining = await engine.countStaleChunks(
       signature ? { signature, ...(sourceId ? { sourceId } : {}) } : (sourceId ? { sourceId } : undefined),
     );
     if (remaining > 0) {
-      serr(`\n  [embed] catch-up finished but ${remaining} chunk(s) remain stale after ${embedFailures} embed failure(s). These are not embeddable as-is; re-running won't clear them until the underlying error is resolved.`);
+      serr(`\n  [embed] ${embedFailures} page(s) had chunk failures; ${remaining} chunk(s) remain stale`);
     }
   }
 }

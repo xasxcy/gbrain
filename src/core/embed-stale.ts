@@ -5,27 +5,20 @@
  *
  * Single source of truth for the cursor-paginated, source-grouped, rate-limit-
  * aware embedding pipeline. The `embed-backfill` job (Minion) calls this
- * helper, and the foreground stale path shares its fallback state machine, so
- * the working machinery
- * — keyset pagination, batch grouping by `source_id::slug`, merge-with-existing
- * via `getChunks` + `upsertChunks`, AbortSignal threading into in-flight HTTPs,
- * 429 backoff — lives in exactly one place.
- *
- * Why a separate file (vs. exporting from embed.ts): embed.ts is a CLI command
- * with logging side-effects and EmbedResult-shaped aggregation. The handler
- * needs a tighter functional surface (returns embedded count + done state, no
- * console.log). Extracting kept embed.ts's outer flow intact while letting the
- * handler call a clean primitive.
+ * helper, and the foreground stale path shares its fallback state machine.
+ * Keyset pagination, grouping by `source_id::slug`, merge-with-existing via
+ * `getChunks` + `upsertChunks`, and AbortSignal threading into HTTP all live
+ * here. Foreground-only aggregation and CLI logging deliberately remain in
+ * `embed.ts`.
  */
-
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput } from './types.ts';
 import { embedBatchWithBackoff } from '../commands/embed.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
-import { embedWithTruncationFallback } from './embed-fallback.ts';
+import { isMustAbortError } from './worker-pool.ts';
+import { embedWithTruncationFallbackPartial } from './embed-fallback.ts';
 
-/** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
   afterPageId: number;
   afterChunkIndex: number;
@@ -38,38 +31,21 @@ export interface EmbedStaleOpts {
   concurrency?: number;
   /** Resume cursor from a prior run. Default: from start. */
   cursor?: StaleCursor;
-  /** AbortSignal honored at three sites: batch claim, retry sleep, HTTP body. */
+  /** AbortSignal honored at batch claim, retry sleep, and HTTP body. */
   signal?: AbortSignal;
-  /**
-   * Fired once per batch with the cursor after that batch finishes. Caller
-   * uses this for crash-resumable progress (Minion `job.updateProgress`).
-   */
-  onProgress?: (state: {
-    embedded: number;
-    chunksProcessed: number;
-    cursor: StaleCursor;
-  }) => void;
-  /**
-   * Optional caller-supplied embed fn. Defaults to `embedBatchWithBackoff`.
-   * Test seam: lets unit tests inject a deterministic fake without mocking
-   * the gateway. Production callers leave it unset.
-   */
+  /** Fired after each completed batch for crash-resumable Minion progress. */
+  onProgress?: (state: { embedded: number; chunksProcessed: number; cursor: StaleCursor }) => void;
+  /** Optional deterministic test seam; production uses embedBatchWithBackoff. */
   embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
   /**
-   * v0.41.31: current embedding provenance signature (`<provider:model>:<dims>`).
-   * When set, embeddings stamped under a DIFFERENT signature are invalidated
-   * (NULLed) at the start so they flow through the NULL cursor and get
-   * re-embedded; each page's signature is stamped after its chunks land.
-   * Omit to keep the legacy `embedding IS NULL`-only behavior.
+   * Current embedding provenance signature (`<provider:model>:<dims>`). When
+   * set, embeddings from a different signature are invalidated before the
+   * NULL cursor walks them; omit for legacy NULL-only stale mode.
    */
   embeddingSignature?: string;
   /**
-   * DB-contention pacer (paced-backfill). When enabled it (a) supplies the
-   * worker count via the caller passing `concurrency = bundle.maxConcurrency`
-   * — E-1: no separate permit on this single-pool path — and (b) the loop
-   * `observe()`s its DB-op latency and `pace()`s between keys. Omit (or pass a
-   * disabled bundle) for a no-op. The pacer is NEVER used to acquire permits
-   * here; concurrency is the worker count.
+   * Optional DB-contention pacer. It observes DB latency and paces between
+   * keys, but never acquires an additional permit on this worker pool.
    */
   pacer?: DbPacer;
 }
@@ -79,34 +55,24 @@ export interface EmbedStaleResult {
   embedded: number;
   /** Total chunks pulled across all batches (including ones that errored). */
   chunksProcessed: number;
-  /** Pages whose embeddings landed. */
+  /** Pages whose partial/full vectors landed. */
   pagesProcessed: number;
-  /** Last cursor reached. null iff zero stale chunks existed at start. */
+  /** Last cursor reached; null iff no stale chunks existed at start. */
   lastCursor: StaleCursor | null;
   /** True iff the loop exited because every stale chunk was processed. */
   done: boolean;
-  /** True iff the loop exited because `signal.aborted` fired. */
+  /** True iff the supplied signal fired. */
   aborted: boolean;
 }
 
 /**
- * Embed every stale chunk (embedding IS NULL) for a source.
+ * Embed every stale (`embedding IS NULL`) chunk for one source.
  *
- * Re-entrancy contract: if interrupted, the next call resumes from the next
- * stale row. Idempotent — `embedding IS NULL` predicate naturally excludes
- * already-embedded chunks even without cursor persistence. The cursor is a
- * progress optimization, not a correctness mechanism.
- *
- * Returns when:
- *   - every stale chunk has been embedded (`done: true`), OR
- *   - `signal.aborted` fired (`aborted: true`), OR
- *   - the per-batch `embedFn` threw with the signal aborted (treated as abort).
- *
- * Per-page embed failures (network blip, dim mismatch) do NOT throw — the
- * embedding stays NULL and the next call retries the chunk. This matches the
- * existing CLI's "log + skip" semantics so a single bad page doesn't poison
- * the run. Caller is responsible for surfacing partial-success via the
- * returned `embedded` vs `chunksProcessed` delta.
+ * Re-entrancy contract: if interrupted, a later call resumes from the next
+ * stale row. The cursor is a progress optimization, not a correctness
+ * mechanism: completed vectors are naturally excluded on a later NULL-only
+ * pass. Ordinary per-page failures do not poison the run; partial successes
+ * persist before return or a typed must-abort is propagated to the handler.
  */
 export async function embedStaleForSource(
   engine: BrainEngine,
@@ -118,13 +84,9 @@ export async function embedStaleForSource(
   const signal = opts.signal;
   const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
     embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
-  // Defaulted no-op when pacing is off, so the observe()/pace() call sites
-  // below are unconditional and cost ~nothing on the unpaced path.
   const pacer = opts.pacer ?? createNoopPacer();
-
   let afterPageId = opts.cursor?.afterPageId ?? 0;
   let afterChunkIndex = opts.cursor?.afterChunkIndex ?? -1;
-
   const result: EmbedStaleResult = {
     embedded: 0,
     chunksProcessed: 0,
@@ -135,16 +97,11 @@ export async function embedStaleForSource(
   };
   const signature = opts.embeddingSignature;
 
-  // ---- main loop ----
-
-  // v0.41.31: invalidate embeddings stamped under a prior model signature so
-  // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
-  // untouched. Best-effort — a failure here must not abort the backfill.
   if (signature) {
     try {
       await engine.invalidateStaleSignatureEmbeddings({ signature, sourceId });
     } catch {
-      // Non-fatal: fall through to the NULL-only stale loop.
+      // Existing best-effort invalidation contract: proceed with NULL cursor.
     }
   }
 
@@ -153,30 +110,23 @@ export async function embedStaleForSource(
       result.aborted = true;
       return result;
     }
-
-    const batch = await observed(pacer, () =>
-      engine.listStaleChunks({
-        batchSize,
-        afterPageId,
-        afterChunkIndex,
-        sourceId,
-      }),
-    );
+    const batch = await observed(pacer, () => engine.listStaleChunks({
+      batchSize,
+      afterPageId,
+      afterChunkIndex,
+      sourceId,
+    }));
     if (batch.length === 0) {
       result.done = true;
       return result;
     }
 
     result.chunksProcessed += batch.length;
-    const last = batch[batch.length - 1];
+    const last = batch[batch.length - 1]!;
     afterPageId = last.page_id;
     afterChunkIndex = last.chunk_index;
     result.lastCursor = { afterPageId, afterChunkIndex };
 
-    // Group by composite key (source_id::slug). Within a source-scoped run
-    // every row carries the same source_id, but the helper accepts batches
-    // shaped by `listStaleChunks` which carry source_id per row for parity
-    // with the cross-source CLI path.
     const byKey = new Map<string, typeof batch>();
     for (const row of batch) {
       const key = `${row.source_id}::${row.slug}`;
@@ -184,70 +134,93 @@ export async function embedStaleForSource(
       if (list) list.push(row);
       else byKey.set(key, [row]);
     }
-
     const keys = Array.from(byKey.keys());
     let nextIdx = 0;
 
     async function embedOneKey(key: string): Promise<void> {
       const stale = byKey.get(key)!;
       const keySourceId = stale[0]?.source_id ?? sourceId;
-      const slug = stale[0].slug;
-      try {
-        const embeddings = await embedWithTruncationFallback(
-          stale.map((c) => c.chunk_text),
-          embedFn,
-          { abortSignal: signal },
-        );
-        const existing = await observed(pacer, () =>
-          engine.getChunks(slug, { sourceId: keySourceId }),
-        );
-        const staleIdxToEmbedding = new Map<number, Float32Array>();
-        for (let j = 0; j < stale.length; j++) {
-          staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
-        }
-        const merged: ChunkInput[] = existing.map((c) => ({
-          chunk_index: c.chunk_index,
-          chunk_text: c.chunk_text,
-          chunk_source: c.chunk_source,
-          embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-          token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
-        }));
-        await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-        // v0.41.31: stamp provenance only when EVERY chunk was stale (fully
-        // re-embedded this pass) — a partially-stale page keeps preserved
-        // chunks of unknown provenance, so don't claim current. After the
-        // invalidate pass above, signature-drifted pages ARE fully stale.
-        if (signature && stale.length === existing.length) {
-          await observed(pacer, () =>
-            engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
-          );
-        }
-        result.embedded += stale.length;
-        result.pagesProcessed += 1;
-      } catch (e: unknown) {
-        // Aborted mid-fetch is expected; treat as graceful exit.
-        if (signal?.aborted) return;
-        // Otherwise log and skip — the chunk stays NULL and next call retries.
+      const slug = stale[0]!.slug;
+      const partial = await embedWithTruncationFallbackPartial(
+        stale.map((chunk) => chunk.chunk_text),
+        embedFn,
+        { abortSignal: signal },
+      );
+      if (partial.failures.length > 0 || partial.fatalError !== undefined) {
+        const indexes = [
+          ...partial.failures.map((failure) => failure.index),
+          ...(partial.fatalIndexes ?? []),
+        ].map((index) => stale[index]?.chunk_index)
+          .filter((index): index is number => index !== undefined);
+        const firstError = partial.failures[0]?.error ?? partial.fatalError;
         process.stderr.write(
-          `\n  [embed-stale] error on ${keySourceId}/${slug}: ${
-            e instanceof Error ? e.message : String(e)
+          `\n  [embed-stale] error on ${keySourceId}/${slug}: failed chunk_index [${indexes.join(', ')}]${
+            firstError instanceof Error ? `: ${firstError.message}` : firstError === undefined ? '' : `: ${String(firstError)}`
           }\n`,
         );
+      }
+
+      const successCount = partial.vectors.filter((vector): vector is Float32Array => vector !== null).length;
+      if (successCount > 0) {
+        // No signal-based early return: abort-time DB failures must remain
+        // observable. Correctness of this stamp assumes no concurrent
+        // rechunk/upsert writer, as accepted by SPEC V4.
+        try {
+          const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
+          const staleIdxToEmbedding = new Map<number, Float32Array>();
+          for (let index = 0; index < stale.length; index++) {
+            const vector = partial.vectors[index];
+            if (vector !== null) staleIdxToEmbedding.set(stale[index]!.chunk_index, vector);
+          }
+          const merged: ChunkInput[] = existing.map((chunk) => ({
+            chunk_index: chunk.chunk_index,
+            chunk_text: chunk.chunk_text,
+            chunk_source: chunk.chunk_source,
+            embedding: staleIdxToEmbedding.get(chunk.chunk_index) ?? undefined,
+            token_count: chunk.token_count || Math.ceil(chunk.chunk_text.length / 4),
+          }));
+          await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
+          result.embedded += successCount;
+          result.pagesProcessed += 1;
+
+          if (signature) {
+            const rows = (await observed(pacer, () => engine.executeRaw<{ embedding_signature: string | null }>(
+              'SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = $2',
+              [slug, keySourceId],
+            ))) ?? [];
+            const storedSignature = rows[0]?.embedding_signature ?? null;
+            const shouldStamp = storedSignature !== null
+              ? storedSignature !== signature
+              : stale.length === existing.length;
+            if (shouldStamp) {
+              await observed(pacer, () =>
+                engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+              );
+            }
+          }
+        } catch (error) {
+          process.stderr.write(
+            `\n  [embed-stale] persist error on ${keySourceId}/${slug}${signal?.aborted ? ' (aborted context)' : ''}: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+          );
+        }
+      }
+
+      if (partial.fatalError !== undefined && isMustAbortError(partial.fatalError)) {
+        throw partial.fatalError;
       }
     }
 
     async function worker(): Promise<void> {
       while (nextIdx < keys.length && !signal?.aborted) {
-        const idx = nextIdx++;
-        await embedOneKey(keys[idx]);
-        // Cooperative DB-contention pace between keys (no-op when unpaced).
-        // pace() throws AbortError on cancel — treat as graceful worker exit;
-        // the for(;;) loop sees signal.aborted and returns aborted next tick.
+        const index = nextIdx++;
+        await embedOneKey(keys[index]!);
         try {
           await pacer.pace(signal);
-        } catch (e) {
-          if (e instanceof AbortError) return;
-          throw e;
+        } catch (error) {
+          if (error instanceof AbortError) return;
+          throw error;
         }
       }
     }
@@ -255,15 +228,17 @@ export async function embedStaleForSource(
     const numWorkers = Math.min(concurrency, keys.length);
     await Promise.all(Array.from({ length: numWorkers }, () => worker()));
 
-    if (opts.onProgress) {
-      opts.onProgress({
-        embedded: result.embedded,
-        chunksProcessed: result.chunksProcessed,
-        cursor: { afterPageId, afterChunkIndex },
-      });
+    // A final short batch can be aborted inside its embedFn. Check before the
+    // short-batch done path so the Minion handler cannot report false success.
+    if (signal?.aborted) {
+      result.aborted = true;
+      return result;
     }
-
-    // Short batch = end of stale set; advance and exit.
+    opts.onProgress?.({
+      embedded: result.embedded,
+      chunksProcessed: result.chunksProcessed,
+      cursor: { afterPageId, afterChunkIndex },
+    });
     if (batch.length < batchSize) {
       result.done = true;
       return result;

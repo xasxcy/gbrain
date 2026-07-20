@@ -16,6 +16,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { embedStaleForSource } from '../src/core/embed-stale.ts';
 import type { ChunkInput } from '../src/core/types.ts';
+import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 
 let engine: PGLiteEngine;
 
@@ -61,6 +62,12 @@ function fakeEmbedFn(texts: string[]): Promise<Float32Array[]> {
       return v;
     }),
   );
+}
+
+function fakeVector(): Float32Array {
+  const vector = new Float32Array(1536);
+  vector[0] = 1;
+  return vector;
 }
 
 describe('embedStaleForSource', () => {
@@ -194,6 +201,168 @@ describe('embedStaleForSource', () => {
     expect(result.embedded).toBe(2);
     const stale = await engine.countStaleChunks({ sourceId: 'default' });
     expect(stale).toBe(2);
+  });
+
+  test('SPEC V4: good/bad chunks on one page persist the good vector only', async () => {
+    await engine.putPage('mixed', { type: 'note', title: 'mixed', compiled_truth: '# mixed' });
+    await engine.upsertChunks('mixed', [
+      { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+      { chunk_index: 1, chunk_text: 'bad', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+    const result = await embedStaleForSource(engine, 'default', {
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'bad') throw new Error('The operation timed out');
+        return [fakeVector()];
+      },
+    });
+    expect(result.embedded).toBe(1);
+    expect(result.pagesProcessed).toBe(1);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+    const persisted = await engine.executeRaw<{ chunk_index: number; has_embedding: boolean }>(
+      `SELECT chunk_index, embedding IS NOT NULL AS has_embedding
+         FROM content_chunks
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'mixed' AND source_id = 'default')
+        ORDER BY chunk_index`,
+    );
+    expect(persisted).toEqual([
+      { chunk_index: 0, has_embedding: true },
+      { chunk_index: 1, has_embedding: false },
+    ]);
+  });
+
+  test('SPEC V4: abort inside final short batch persists prefix and returns done:false', async () => {
+    await engine.putPage('final-batch', { type: 'note', title: 'final-batch', compiled_truth: '# final' });
+    await engine.upsertChunks('final-batch', [
+      { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+      { chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+    const controller = new AbortController();
+    const result = await embedStaleForSource(engine, 'default', {
+      signal: controller.signal,
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'abort') {
+          controller.abort();
+          throw new Error('EOF');
+        }
+        return [fakeVector()];
+      },
+    });
+    expect(result).toMatchObject({ embedded: 1, pagesProcessed: 1, aborted: true, done: false });
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('SPEC V4: must-abort is rethrown after prefix partial persistence', async () => {
+    await engine.putPage('budget', { type: 'note', title: 'budget', compiled_truth: '# budget' });
+    await engine.upsertChunks('budget', [
+      { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+      { chunk_index: 1, chunk_text: 'budget', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+    const exhausted = new BudgetExhausted('budget exhausted', {
+      reason: 'cost', spent: 1, cap: 1,
+    });
+    try {
+      await embedStaleForSource(engine, 'default', {
+        embedFn: async (texts) => {
+          if (texts.length > 1) throw new Error('EOF');
+          if (texts[0] === 'budget') throw exhausted;
+          return [fakeVector()];
+        },
+      });
+      throw new Error('expected BudgetExhausted');
+    } catch (error) {
+      expect(error).toBe(exhausted);
+    }
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('SPEC V4: drifted page split across cursor batches stamps once and is not invalidated next run', async () => {
+    await seedPageWithStaleChunks('signature-split', 3);
+    await engine.executeRaw(
+      `UPDATE content_chunks
+          SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'signature-split' AND source_id = 'default')`,
+    );
+    await engine.setPageEmbeddingSignature('signature-split', { signature: 'old:model:1536' });
+
+    const first = await embedStaleForSource(engine, 'default', {
+      batchSize: 2,
+      embeddingSignature: 'new:model:1536',
+      embedFn: fakeEmbedFn,
+    });
+    expect(first.embedded).toBe(3);
+    const signature = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'signature-split' AND source_id = 'default'`,
+    );
+    expect(signature[0]?.embedding_signature).toBe('new:model:1536');
+
+    let secondRunCalls = 0;
+    const second = await embedStaleForSource(engine, 'default', {
+      batchSize: 2,
+      embeddingSignature: 'new:model:1536',
+      embedFn: async (texts) => {
+        secondRunCalls++;
+        return fakeEmbedFn(texts);
+      },
+    });
+    expect(second).toMatchObject({ embedded: 0, done: true, aborted: false });
+    expect(secondRunCalls).toBe(0);
+  });
+
+  test('SPEC V4: whole-page drift partial stamps good vector and preserves it on the next run', async () => {
+    await seedPageWithStaleChunks('signature-partial', 2);
+    await engine.executeRaw(
+      `UPDATE content_chunks
+          SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'signature-partial' AND source_id = 'default')`,
+    );
+    await engine.setPageEmbeddingSignature('signature-partial', { signature: 'old:model:1536' });
+    const first = await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'new:model:1536',
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0]?.includes('chunk 1')) throw new Error('The operation timed out');
+        return [fakeVector()];
+      },
+    });
+    expect(first.embedded).toBe(1);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+
+    const secondCalls: string[][] = [];
+    await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'new:model:1536',
+      embedFn: async (texts) => {
+        secondCalls.push(texts);
+        return [fakeVector()];
+      },
+    });
+    expect(secondCalls).toEqual([['chunk 1 of signature-partial']]);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+
+  test('SPEC V4: Minion logs the actual chunk_index for a fatal after a prefix', async () => {
+    await engine.putPage('fatal-index', { type: 'note', title: 'fatal-index', compiled_truth: '# fatal-index' });
+    await engine.upsertChunks('fatal-index', [
+      { chunk_index: 3, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+      { chunk_index: 9, chunk_text: 'fatal', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+    const originalWrite = process.stderr.write;
+    let stderr = '';
+    (process.stderr.write as any) = (chunk: string) => { stderr += chunk; return true; };
+    try {
+      const result = await embedStaleForSource(engine, 'default', {
+        embedFn: async (texts) => {
+          if (texts.length > 1) throw new Error('EOF');
+          if (texts[0] === 'fatal') throw new Error('fatal embedding');
+          return [fakeVector()];
+        },
+      });
+      expect(result.embedded).toBe(1);
+    } finally {
+      (process.stderr.write as any) = originalWrite;
+    }
+    expect(stderr).toContain('failed chunk_index [9]: fatal embedding');
   });
 
   test('source-scoped: does not touch other sources', async () => {

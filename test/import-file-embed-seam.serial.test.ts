@@ -95,4 +95,28 @@ describe('markdown import inline-embed fallback (import-file.ts:707 seam)', () =
     const err = new Error('Cannot connect to API: The socket connection was closed unexpectedly');
     expect(isOllamaOomLikeError(err)).toBe(true);
   });
+
+  test('inline-import legacy seam preserves the chunk AbortError object', async () => {
+    embedCalls = [];
+    const abortError = new DOMException('aborted', 'AbortError');
+    embedImpl = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      throw abortError;
+    };
+    const engine = mockEngine({
+      getPage: async () => null,
+      putPage: async () => {},
+      updatePageContextualRetrievalState: async () => {},
+      upsertChunks: async () => {},
+      setPageEmbeddingSignature: async () => {},
+      setPageAliases: async () => {},
+    });
+    try {
+      await importFromContent(engine, 'seam-abort', LOREM, { sourceId: 'default' });
+      throw new Error('expected import to throw');
+    } catch (error) {
+      expect(error).toBe(abortError);
+    }
+    expect(embedCalls.map((call) => call.length)).toEqual([2, 1]);
+  });
 });

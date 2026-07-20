@@ -20,6 +20,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { makeEmbedBackfillHandler } from '../src/core/minions/handlers/embed-backfill.ts';
 import { tryAcquireDbLock } from '../src/core/db-lock.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
+import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 
 let engine: PGLiteEngine;
 
@@ -40,8 +41,7 @@ beforeEach(async () => {
 });
 
 /** Build a minimal MinionJobContext for testing. */
-function fakeJob(data: Record<string, unknown>): MinionJobContext {
-  const controller = new AbortController();
+function fakeJob(data: Record<string, unknown>, controller = new AbortController()): MinionJobContext {
   return {
     id: 1,
     name: 'embed-backfill',
@@ -55,6 +55,17 @@ function fakeJob(data: Record<string, unknown>): MinionJobContext {
     isActive: async () => true,
     readInbox: async () => [],
   };
+}
+
+async function seedStale(slug: string, texts: string[]): Promise<void> {
+  await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `# ${slug}` });
+  await engine.upsertChunks(slug, texts.map((chunk_text, chunk_index) => ({
+    chunk_index,
+    chunk_text,
+    chunk_source: 'compiled_truth' as const,
+    token_count: 1,
+    embedding: undefined,
+  })));
 }
 
 describe('embed-backfill handler — happy path', () => {
@@ -139,5 +150,40 @@ describe('embed-backfill handler — D2 lock contract', () => {
     const lock = await tryAcquireDbLock(engine, 'gbrain-embed-backfill:default', 60);
     expect(lock).not.toBeNull();
     await lock?.release();
+  });
+});
+
+describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
+  test('internal final-batch abort maps to status:aborted after prefix persistence', async () => {
+    await seedStale('abort', ['good', 'abort']);
+    const controller = new AbortController();
+    const handler = makeEmbedBackfillHandler(engine, {
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'abort') {
+          controller.abort();
+          throw new Error('EOF');
+        }
+        return [new Float32Array(1536)];
+      },
+    });
+    const result = await handler(fakeJob({ sourceId: 'default' }, controller));
+    expect(result).toMatchObject({ status: 'aborted', embedded: 1, pagesProcessed: 1 });
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('BudgetExhausted maps to status:budget_exhausted after prefix persistence', async () => {
+    await seedStale('budget', ['good', 'budget']);
+    const exhausted = new BudgetExhausted('budget exhausted', { reason: 'cost', spent: 1, cap: 1 });
+    const handler = makeEmbedBackfillHandler(engine, {
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'budget') throw exhausted;
+        return [new Float32Array(1536)];
+      },
+    });
+    const result = await handler(fakeJob({ sourceId: 'default' }));
+    expect(result.status).toBe('budget_exhausted');
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
 });

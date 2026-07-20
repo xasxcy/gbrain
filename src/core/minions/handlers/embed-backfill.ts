@@ -129,7 +129,10 @@ function parseParams(data: Record<string, unknown>): EmbedBackfillJobData {
   return { sourceId, batchSize, reason };
 }
 
-export function makeEmbedBackfillHandler(engine: BrainEngine) {
+export function makeEmbedBackfillHandler(
+  engine: BrainEngine,
+  testOpts?: { embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]> },
+) {
   return async function embedBackfillHandler(
     job: MinionJobContext,
   ): Promise<EmbedBackfillResult> {
@@ -174,6 +177,7 @@ export function makeEmbedBackfillHandler(engine: BrainEngine) {
           // v0.41.31: re-embed pages whose model signature drifted + stamp
           // provenance as chunks land.
           embeddingSignature: currentEmbeddingSignature(),
+          ...(testOpts?.embedFn && { embedFn: testOpts.embedFn }),
           onProgress: ({ embedded, chunksProcessed, cursor }) => {
             // Fire-and-forget; updateProgress returns a Promise but the
             // handler is sync inside the loop.

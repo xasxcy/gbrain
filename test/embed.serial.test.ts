@@ -803,3 +803,191 @@ describe('embedAllStale --source threading (D7)', () => {
     expect((firstCallOpts as { sourceId?: string }).sourceId).toBe('media-corpus');
   });
 });
+
+describe('SPEC V4 foreground stale partial persistence', () => {
+  test('good/bad page upserts only successful vectors and counts one embedded chunk', async () => {
+    const stale = [
+      { slug: 'partial', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'partial', chunk_index: 1, chunk_text: 'bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    ];
+    let upserted: any[] = [];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
+      upsertChunks: async (_slug: string, chunks: any[]) => { upserted = chunks; },
+      executeRaw: async () => [{ embedding_signature: 'old:model:1536' }],
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0] === 'bad') throw new Error('The operation timed out');
+      return [new Float32Array(1536)];
+    };
+
+    const result = await runEmbedCore(engine, { stale: true });
+    expect(result.embedded).toBe(1);
+    expect(result.pages_processed).toBe(1);
+    expect(upserted[0]?.embedding).toBeInstanceOf(Float32Array);
+    expect(upserted[1]?.embedding).toBeUndefined();
+  });
+
+  test('fatal after a prefix logs the actual foreground chunk_index', async () => {
+    const stale = [
+      { slug: 'fatal-index', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'fatal-index', chunk_index: 7, chunk_text: 'fatal', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
+      upsertChunks: async () => {},
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0] === 'fatal') throw new Error('fatal embedding');
+      return [new Float32Array(1536)];
+    };
+    const originalError = console.error;
+    let stderr = '';
+    (console.error as any) = (chunk: string) => { stderr += chunk; };
+    try {
+      const result = await runEmbedCore(engine, { stale: true });
+      expect(result.embedded).toBe(1);
+    } finally {
+      (console.error as any) = originalError;
+    }
+    expect(stderr).toContain('failed chunk_index [7]: fatal embedding');
+  });
+
+  test('catch-up reports one page failure when chunk and persist failures coincide', async () => {
+    const stale = [
+      { slug: 'persist-fails', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'persist-fails', chunk_index: 1, chunk_text: 'bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
+      upsertChunks: async () => { throw new Error('database unavailable'); },
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0] === 'bad') throw new Error('The operation timed out');
+      return [new Float32Array(1536)];
+    };
+    const originalError = console.error;
+    let stderr = '';
+    (console.error as any) = (chunk: string) => { stderr += chunk; };
+    try {
+      const result = await runEmbedCore(engine, { stale: true, catchUp: true });
+      expect(result.embedded).toBe(0);
+    } finally {
+      (console.error as any) = originalError;
+    }
+    expect(stderr).toContain('1 page(s) had chunk failures; 2 chunk(s) remain stale');
+  });
+
+  test('catch-up counts multiple failed chunks on one page as one page failure', async () => {
+    const stale = [0, 1, 2].map((chunk_index) => ({
+      slug: 'many-failures', chunk_index, chunk_text: `bad-${chunk_index}`,
+      chunk_source: 'compiled_truth' as const, model: null, token_count: 1,
+      source_id: 'default', page_id: 1,
+    }));
+    const engine = mockEngine({
+      countStaleChunks: async () => 3,
+      listStaleChunks: async () => stale,
+      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async () => { throw new Error('The operation timed out'); };
+    const originalError = console.error;
+    let stderr = '';
+    (console.error as any) = (chunk: string) => { stderr += chunk; };
+    try {
+      const result = await runEmbedCore(engine, { stale: true, catchUp: true });
+      expect(result.embedded).toBe(0);
+      expect(result.pages_processed).toBe(1);
+    } finally {
+      (console.error as any) = originalError;
+    }
+    expect(stderr).toContain('1 page(s) had chunk failures; 3 chunk(s) remain stale');
+  });
+
+  test('abort still records a persist failure and does not count unpersisted vectors', async () => {
+    const stale = [
+      { slug: 'abort-persist', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'abort-persist', chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    ];
+    const controller = new AbortController();
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
+      upsertChunks: async () => { throw new Error('write failed'); },
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0] === 'abort') {
+        controller.abort();
+        throw new Error('EOF');
+      }
+      return [new Float32Array(1536)];
+    };
+    const originalError = console.error;
+    let stderr = '';
+    (console.error as any) = (chunk: string) => { stderr += chunk; };
+    try {
+      const result = await runEmbedCore(engine, { stale: true, signal: controller.signal });
+      expect(result.embedded).toBe(0);
+      expect(result.pages_processed).toBe(1);
+    } finally {
+      (console.error as any) = originalError;
+    }
+    expect(stderr).toContain('Error persisting abort-persist (aborted context): write failed');
+  });
+
+  test('two in-flight stale keys persist prefixes once each after a barrier abort', async () => {
+    const stale = [
+      { slug: 'a', chunk_index: 0, chunk_text: 'a-good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'a', chunk_index: 1, chunk_text: 'a-bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'b', chunk_index: 0, chunk_text: 'b-good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'other', page_id: 2 },
+      { slug: 'b', chunk_index: 1, chunk_text: 'b-bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'other', page_id: 2 },
+    ];
+    const controller = new AbortController();
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+    let arrivals = 0;
+    const upserts = new Map<string, any[]>();
+    const engine = mockEngine({
+      countStaleChunks: async () => stale.length,
+      listStaleChunks: async () => stale,
+      getChunks: async (slug: string) => stale.filter((row) => row.slug === slug).map((row) => ({ ...row, embedded_at: null })),
+      upsertChunks: async (slug: string, chunks: any[]) => { upserts.set(slug, chunks); },
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    process.env.GBRAIN_EMBED_CONCURRENCY = '2';
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0]!.endsWith('good')) return [new Float32Array(1536)];
+      arrivals++;
+      if (arrivals === 2) {
+        controller.abort();
+        releaseBarrier();
+      }
+      await barrier;
+      throw new Error('EOF');
+    };
+    const result = await runEmbedCore(engine, { stale: true, signal: controller.signal });
+    expect(result.embedded).toBe(2);
+    expect(result.pages_processed).toBe(2);
+    expect(Array.from(upserts.keys()).sort()).toEqual(['a', 'b']);
+    for (const chunks of upserts.values()) {
+      expect(chunks[0]?.embedding).toBeInstanceOf(Float32Array);
+      expect(chunks[1]?.embedding).toBeUndefined();
+    }
+  });
+});
