@@ -81,6 +81,76 @@ export interface FileRow {
   created_at: Date;
 }
 
+/** A chunk-local embedding failure eligible for the retry ledger. */
+export type EmbedFailureClass =
+  | 'provider_timeout'
+  | 'provider_conn'
+  | 'provider_other'
+  | 'invalid_input';
+
+export type PersistEmbedOutcomeEntry = {
+  chunkIndex: number;
+  /** md5(chunk_text) calculated by the stale-row caller. */
+  chunkHash: string;
+  outcome:
+    | { vector: Float32Array }
+    | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string } };
+};
+
+export interface PersistEmbedOutcomeRequest {
+  sourceId: string;
+  pageId: number;
+  slug: string;
+  embeddingSignature: string;
+  entries: PersistEmbedOutcomeEntry[];
+}
+
+export interface PersistEmbedOutcomeResult {
+  committedChunks: number;
+  /** Successful vector UPDATEs only; failures committed to the ledger do not count. */
+  vectorCommittedChunks: number;
+  staleSkippedChunks: number;
+  /** Present only when a concurrent rechunk made one or more entry MD5 guards stale. */
+  staleSkippedChunkIndexes?: number[];
+  ledgerUpserts: number;
+  ledgerDeletes: number;
+}
+
+/** Operator-visible row from the durable chunk embedding failure ledger. */
+export interface EmbedFailureRecord {
+  source_id: string;
+  page_id: number;
+  slug: string;
+  chunk_index: number;
+  embedding_signature: string;
+  chunk_hash: string;
+  error_class: EmbedFailureClass;
+  error_fingerprint: string;
+  attempt_count: number;
+  first_seen: Date;
+  last_seen: Date;
+  next_retry_at: Date;
+  quarantined_at: Date | null;
+  quarantine_reason: string | null;
+}
+
+/** Shared stale-embedding retry-ledger observability payload. */
+export interface EmbedFailureSummary {
+  counts: {
+    total_null: number;
+    eligible_now: number;
+    backoff_deferred: number;
+    quarantined: number;
+  };
+  by_error_class: Array<{ error_class: EmbedFailureClass; count: number }>;
+  quarantined_top: Array<{
+    slug: string;
+    chunk_index: number;
+    error_class: EmbedFailureClass;
+    attempt_count: number;
+  }>;
+}
+
 /**
  * v0.27.1: spec for upsertFile. Identity is (source_id, storage_path).
  * Re-upserting the same identity with a different content_hash updates the
@@ -959,6 +1029,22 @@ export interface BrainEngine {
    */
   upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string } & BatchOpts): Promise<void>;
   /**
+   * Atomically checkpoint one stale-embedding slice. Each entry is guarded by
+   * its stale-row md5 so a concurrent rechunk skips rather than mutates the
+   * replacement content or its retry ledger.
+   */
+  persistEmbedOutcome(request: PersistEmbedOutcomeRequest): Promise<PersistEmbedOutcomeResult>;
+  /** List durable embedding failures for operator inspection. */
+  listEmbedFailures(opts?: { sourceId?: string; slug?: string }): Promise<EmbedFailureRecord[]>;
+  /** Release matching durable embedding failures so they are eligible again. */
+  releaseEmbedFailures(opts: { sourceId?: string; slug: string; chunkIndex?: number }): Promise<number>;
+  /**
+   * Four-way NULL-embedding backlog summary, using the same retry eligibility
+   * predicate as stale list/count/sum selection. `signature` is required so
+   * the current generation's ledger rows are classified exactly.
+   */
+  getEmbedFailureSummary(opts: { sourceId?: string; signature: string }): Promise<EmbedFailureSummary>;
+  /**
    * Read every chunk for a page. `opts.sourceId` source-scopes the page
    * lookup; without it, multi-source brains return chunks from every
    * same-slug source (importCodeFile uses this for incremental embedding
@@ -1028,6 +1114,8 @@ export interface BrainEngine {
     afterPageId?: number;
     afterChunkIndex?: number;
     sourceId?: string;
+    /** Current embedding signature; enables retry-ledger eligibility filtering. */
+    signature?: string;
     // v0.41.18.0 (A13, codex #9): pagination order. Default 'page_id'
     // (legacy stable cursor). 'updated_desc' joins pages and orders by
     // p.updated_at DESC NULLS LAST, p.id, cc.chunk_index — backed by

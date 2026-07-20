@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 
 // Mock the embedding module BEFORE importing runEmbed, so runEmbed picks up
 // the mocked embedBatch. We track max concurrent invocations via a counter
@@ -56,6 +57,18 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const track = (method: string) => (...args: any[]) => {
     calls.push({ method, args });
     if (overrides[method]) return overrides[method](...args);
+    if (method === 'persistEmbedOutcome') {
+      const entries = args[0]?.entries ?? [];
+      const vectors = entries.filter((entry: any) => 'vector' in entry.outcome).length;
+      const failures = entries.length - vectors;
+      return Promise.resolve({
+        committedChunks: vectors,
+        vectorCommittedChunks: vectors,
+        staleSkippedChunks: 0,
+        ledgerUpserts: failures,
+        ledgerDeletes: 0,
+      });
+    }
     return Promise.resolve(null);
   };
   const engine = new Proxy({} as any, {
@@ -410,24 +423,16 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
       { slug: 'page-b', chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth' as const, model: null, token_count: null, source_id: 'default', page_id: 2 },
       { slug: 'page-b', chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth' as const, model: null, token_count: null, source_id: 'default', page_id: 2 },
     ];
-    // page-b has a FRESH chunk at index 0 that must be preserved through the upsert.
-    const fullChunks: Record<string, any[]> = {
-      'page-a': [
-        { chunk_index: 0, chunk_text: 'x', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-      ],
-      'page-b': [
-        { chunk_index: 0, chunk_text: 'fresh', chunk_source: 'compiled_truth', embedded_at: '2026-01-01', token_count: 5 },
-        { chunk_index: 1, chunk_text: 'y', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-        { chunk_index: 2, chunk_text: 'z', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
-      ],
-    };
-    const upsertCalls: Array<{ slug: string; chunks: any[] }> = [];
+    const persistCalls: any[] = [];
     const engine = mockEngine({
       countStaleChunks: async () => 3,
       listStaleChunks: async () => stale,
       listPages: async () => { listPagesCalled = true; return []; },
-      getChunks: async (slug: string) => fullChunks[slug] || [],
-      upsertChunks: async (slug: string, chunks: any[]) => { upsertCalls.push({ slug, chunks }); },
+      persistEmbedOutcome: async (request: any) => {
+        persistCalls.push(request);
+        const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
+        return { committedChunks: vectors, vectorCommittedChunks: vectors, staleSkippedChunks: 0, ledgerUpserts: 0, ledgerDeletes: 0 };
+      },
     });
 
     const result = await runEmbedCore(engine, { stale: true });
@@ -439,18 +444,11 @@ describe('runEmbedCore --stale egress fix (SQL-side filter)', () => {
     expect(result.embedded).toBe(3);
     expect(result.pages_processed).toBe(2);
 
-    // page-b's upsert MUST include the fresh chunk (chunk_index=0) — otherwise
-    // it would be deleted by the upsertChunks != ALL filter. Critical regression check.
-    const pageBUpsert = upsertCalls.find(u => u.slug === 'page-b');
-    expect(pageBUpsert).toBeDefined();
-    const freshChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 0);
-    expect(freshChunkInUpsert).toBeDefined();
-    // Fresh chunk has no `embedding` field (preserved via COALESCE in upsertChunks SQL).
-    expect(freshChunkInUpsert.embedding).toBeUndefined();
-    // Previously-stale chunks come through WITH a new embedding.
-    const staleChunkInUpsert = pageBUpsert!.chunks.find((c: any) => c.chunk_index === 1);
-    expect(staleChunkInUpsert.embedding).toBeDefined();
-    expect(staleChunkInUpsert.embedding).toBeInstanceOf(Float32Array);
+    // Atomic outcomes target only the stale rows; a fresh chunk at index 0 is
+    // untouched rather than being re-sent through a page-wide merge-upsert.
+    const pageBOutcome = persistCalls.find((request) => request.slug === 'page-b');
+    expect(pageBOutcome.entries.map((entry: any) => entry.chunkIndex)).toEqual([1, 2]);
+    expect(pageBOutcome.entries.every((entry: any) => entry.outcome.vector instanceof Float32Array)).toBe(true);
   });
 
   test('--stale dry-run: counts stale via countStaleChunks (no listStaleChunks call), no embedBatch or upsertChunks', async () => {
@@ -683,7 +681,7 @@ describe('runEmbed CLI flag wiring (--stale --source)', () => {
       },
     });
     await runEmbed(engine, ['--stale', '--source', 'media-corpus']);
-    expect(receivedOpts).toEqual({ sourceId: 'media-corpus' });
+    expect(receivedOpts).toEqual({ sourceId: 'media-corpus', signature: 'test:model:1536' });
   });
 
   test('--stale without --source passes undefined opts (back-compat fast path)', async () => {
@@ -695,7 +693,7 @@ describe('runEmbed CLI flag wiring (--stale --source)', () => {
       },
     });
     await runEmbed(engine, ['--stale']);
-    expect(receivedOpts).toBeUndefined();
+    expect(receivedOpts).toEqual({ signature: 'test:model:1536' });
   });
 });
 
@@ -768,7 +766,7 @@ describe('embedAllStale --source threading (D7)', () => {
       },
     });
     await runEmbedCore(engine, { stale: true, sourceId: 'media-corpus' });
-    expect(receivedOpts).toEqual({ sourceId: 'media-corpus' });
+    expect(receivedOpts).toEqual({ sourceId: 'media-corpus', signature: 'test:model:1536' });
   });
 
   test('countStaleChunks receives undefined opts when --source omitted (back-compat)', async () => {
@@ -781,7 +779,7 @@ describe('embedAllStale --source threading (D7)', () => {
       },
     });
     await runEmbedCore(engine, { stale: true });
-    expect(receivedOpts).toBeUndefined();
+    expect(receivedOpts).toEqual({ signature: 'test:model:1536' });
   });
 
   test('listStaleChunks receives the sourceId in opts when running source-scoped', async () => {
@@ -810,13 +808,14 @@ describe('SPEC V4 foreground stale partial persistence', () => {
       { slug: 'partial', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
       { slug: 'partial', chunk_index: 1, chunk_text: 'bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
     ];
-    let upserted: any[] = [];
+    let persisted: any;
     const engine = mockEngine({
       countStaleChunks: async () => 2,
       listStaleChunks: async () => stale,
-      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
-      upsertChunks: async (_slug: string, chunks: any[]) => { upserted = chunks; },
-      executeRaw: async () => [{ embedding_signature: 'old:model:1536' }],
+      persistEmbedOutcome: async (request: any) => {
+        persisted = request;
+        return { committedChunks: 1, vectorCommittedChunks: 1, staleSkippedChunks: 0, ledgerUpserts: 1, ledgerDeletes: 0 };
+      },
       invalidateStaleSignatureEmbeddings: async () => 0,
     });
     embedBatchBehavior = async (texts) => {
@@ -828,8 +827,8 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     const result = await runEmbedCore(engine, { stale: true });
     expect(result.embedded).toBe(1);
     expect(result.pages_processed).toBe(1);
-    expect(upserted[0]?.embedding).toBeInstanceOf(Float32Array);
-    expect(upserted[1]?.embedding).toBeUndefined();
+    expect(persisted.entries[0]?.outcome.vector).toBeInstanceOf(Float32Array);
+    expect(persisted.entries[1]?.outcome.failure.errorClass).toBe('provider_timeout');
   });
 
   test('fatal after a prefix logs the actual foreground chunk_index', async () => {
@@ -858,7 +857,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     } finally {
       (console.error as any) = originalError;
     }
-    expect(stderr).toContain('failed chunk_index [7]: fatal embedding');
+    expect(stderr).toContain('[embed-fail] slug=fatal-index chunk_index=7 class=provider_other');
   });
 
   test('catch-up reports one page failure when chunk and persist failures coincide', async () => {
@@ -869,8 +868,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     const engine = mockEngine({
       countStaleChunks: async () => 2,
       listStaleChunks: async () => stale,
-      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
-      upsertChunks: async () => { throw new Error('database unavailable'); },
+      persistEmbedOutcome: async () => { throw new Error('database unavailable'); },
       invalidateStaleSignatureEmbeddings: async () => 0,
     });
     embedBatchBehavior = async (texts) => {
@@ -887,7 +885,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     } finally {
       (console.error as any) = originalError;
     }
-    expect(stderr).toContain('1 page(s) had chunk failures; 2 chunk(s) remain stale');
+    expect(stderr).toContain('[embed-persist-fail] slug=persist-fails slice=1/1 err=database unavailable');
   });
 
   test('catch-up counts multiple failed chunks on one page as one page failure', async () => {
@@ -909,7 +907,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     try {
       const result = await runEmbedCore(engine, { stale: true, catchUp: true });
       expect(result.embedded).toBe(0);
-      expect(result.pages_processed).toBe(1);
+      expect(result.pages_processed).toBe(0);
     } finally {
       (console.error as any) = originalError;
     }
@@ -925,8 +923,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     const engine = mockEngine({
       countStaleChunks: async () => 2,
       listStaleChunks: async () => stale,
-      getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
-      upsertChunks: async () => { throw new Error('write failed'); },
+      persistEmbedOutcome: async () => { throw new Error('write failed'); },
       invalidateStaleSignatureEmbeddings: async () => 0,
     });
     embedBatchBehavior = async (texts) => {
@@ -943,11 +940,51 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     try {
       const result = await runEmbedCore(engine, { stale: true, signal: controller.signal });
       expect(result.embedded).toBe(0);
-      expect(result.pages_processed).toBe(1);
+      expect(result.pages_processed).toBe(0);
     } finally {
       (console.error as any) = originalError;
     }
-    expect(stderr).toContain('Error persisting abort-persist (aborted context): write failed');
+    expect(stderr).toContain('[embed-persist-fail] slug=abort-persist slice=1/1 err=write failed');
+  });
+
+  test('rethrows the original BudgetExhausted after a failed checkpoint', async () => {
+    const exhausted = new BudgetExhausted('budget exhausted', { reason: 'cost', spent: 1, cap: 1 });
+    const stale = [
+      { slug: 'budget-persist', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'budget-persist', chunk_index: 1, chunk_text: 'budget', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => stale,
+      persistEmbedOutcome: async () => { throw new Error('write failed'); },
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    embedBatchBehavior = async (texts) => {
+      if (texts.length > 1) throw new Error('EOF');
+      if (texts[0] === 'budget') throw exhausted;
+      return [new Float32Array(1536)];
+    };
+    await expect(runEmbedCore(engine, { stale: true })).rejects.toBe(exhausted);
+  });
+
+  test('writes structured slice and true md5 stale-skip chunk indexes', async () => {
+    const stale = [{ slug: 'logged', chunk_index: 9, chunk_text: 'same', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 }];
+    const engine = mockEngine({
+      countStaleChunks: async () => 1,
+      listStaleChunks: async () => stale,
+      persistEmbedOutcome: async () => ({ committedChunks: 0, vectorCommittedChunks: 0, staleSkippedChunks: 1, staleSkippedChunkIndexes: [9], ledgerUpserts: 0, ledgerDeletes: 0 }),
+      invalidateStaleSignatureEmbeddings: async () => 0,
+    });
+    const originalError = console.error;
+    let stderr = '';
+    (console.error as any) = (chunk: string) => { stderr += chunk; };
+    try {
+      await runEmbedCore(engine, { stale: true });
+    } finally {
+      (console.error as any) = originalError;
+    }
+    expect(stderr).toContain('[embed-slice] slug=logged slice=1/1 chunks=1');
+    expect(stderr).toContain('[embed-stale-skip] slug=logged chunk_index=9');
   });
 
   test('two in-flight stale keys persist prefixes once each after a barrier abort', async () => {
@@ -961,12 +998,15 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     let releaseBarrier!: () => void;
     const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
     let arrivals = 0;
-    const upserts = new Map<string, any[]>();
+    const outcomes = new Map<string, any>();
     const engine = mockEngine({
       countStaleChunks: async () => stale.length,
       listStaleChunks: async () => stale,
-      getChunks: async (slug: string) => stale.filter((row) => row.slug === slug).map((row) => ({ ...row, embedded_at: null })),
-      upsertChunks: async (slug: string, chunks: any[]) => { upserts.set(slug, chunks); },
+      persistEmbedOutcome: async (request: any) => {
+        outcomes.set(request.slug, request);
+        const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
+        return { committedChunks: vectors, vectorCommittedChunks: vectors, staleSkippedChunks: 0, ledgerUpserts: request.entries.length - vectors, ledgerDeletes: 0 };
+      },
       invalidateStaleSignatureEmbeddings: async () => 0,
     });
     process.env.GBRAIN_EMBED_CONCURRENCY = '2';
@@ -984,10 +1024,9 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     const result = await runEmbedCore(engine, { stale: true, signal: controller.signal });
     expect(result.embedded).toBe(2);
     expect(result.pages_processed).toBe(2);
-    expect(Array.from(upserts.keys()).sort()).toEqual(['a', 'b']);
-    for (const chunks of upserts.values()) {
-      expect(chunks[0]?.embedding).toBeInstanceOf(Float32Array);
-      expect(chunks[1]?.embedding).toBeUndefined();
+    expect(Array.from(outcomes.keys()).sort()).toEqual(['a', 'b']);
+    for (const outcome of outcomes.values()) {
+      expect(outcome.entries[0]?.outcome.vector).toBeInstanceOf(Float32Array);
     }
   });
 });

@@ -32,7 +32,20 @@ __setEmbedTransportForTests(async () => ({ embeddings: [], usage: { tokens: 0 } 
 function mockEngine(overrides: Partial<Record<string, any>>): BrainEngine {
   return new Proxy({} as BrainEngine, {
     get(_, prop: string) {
-      return overrides[prop] ?? (async () => null);
+      if (overrides[prop]) return overrides[prop];
+      if (prop === 'persistEmbedOutcome') {
+        return async (request: any) => {
+          const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
+          return {
+            committedChunks: vectors,
+            vectorCommittedChunks: vectors,
+            staleSkippedChunks: 0,
+            ledgerUpserts: request.entries.length - vectors,
+            ledgerDeletes: 0,
+          };
+        };
+      }
+      return async () => null;
     },
   });
 }
@@ -48,13 +61,16 @@ describe('foreground stale embed fallback', () => {
       { slug: 'mixed', chunk_index: 0, chunk_text: 'short', chunk_source: 'compiled_truth' as const, token_count: 2, source_id: 'default', page_id: 1 },
       { slug: 'mixed', chunk_index: 1, chunk_text: 'long'.repeat(2000), chunk_source: 'compiled_truth' as const, token_count: 2000, source_id: 'default', page_id: 1 },
     ];
-    const stored: any[][] = [];
+    const stored: any[] = [];
     const engine = mockEngine({
       invalidateStaleSignatureEmbeddings: async () => 0,
       countStaleChunks: async () => stale.length,
       listStaleChunks: async ({ afterPageId }: { afterPageId: number }) => afterPageId === 0 ? stale : [],
-      getChunks: async () => stale.map(({ source_id, page_id, ...chunk }) => ({ ...chunk, embedded_at: null })),
-      upsertChunks: async (_slug: string, chunks: any[]) => { stored.push(chunks); },
+      persistEmbedOutcome: async (request: any) => {
+        stored.push(request);
+        const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
+        return { committedChunks: vectors, vectorCommittedChunks: vectors, staleSkippedChunks: 0, ledgerUpserts: 0, ledgerDeletes: 0 };
+      },
       setPageEmbeddingSignature: async () => {},
     });
 

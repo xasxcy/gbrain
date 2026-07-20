@@ -260,6 +260,28 @@ CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
+-- Per-chunk retry state for partial stale embedding. Current state only:
+-- successful checkpoints and content/signature generation changes delete it.
+CREATE TABLE IF NOT EXISTS embed_failures (
+  source_id           TEXT NOT NULL,
+  page_id             BIGINT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  slug                TEXT NOT NULL,
+  chunk_index         INT NOT NULL,
+  embedding_signature TEXT NOT NULL,
+  chunk_hash          TEXT NOT NULL,
+  error_class         TEXT NOT NULL,
+  error_fingerprint   TEXT NOT NULL,
+  attempt_count       INT NOT NULL DEFAULT 1,
+  first_seen          TIMESTAMPTZ NOT NULL,
+  last_seen           TIMESTAMPTZ NOT NULL,
+  next_retry_at       TIMESTAMPTZ NOT NULL,
+  quarantined_at      TIMESTAMPTZ,
+  quarantine_reason   TEXT,
+  PRIMARY KEY (source_id, page_id, chunk_index, embedding_signature, chunk_hash)
+);
+CREATE INDEX IF NOT EXISTS embed_failures_active_idx
+  ON embed_failures (page_id, chunk_index, embedding_signature, chunk_hash);
+
 -- ============================================================
 -- links: cross-references between pages
 -- ============================================================

@@ -17,6 +17,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { embedStaleForSource } from '../src/core/embed-stale.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
+import { AIConfigError } from '../src/core/ai/errors.ts';
 
 let engine: PGLiteEngine;
 
@@ -79,6 +80,7 @@ describe('embedStaleForSource', () => {
       embedded: 0,
       chunksProcessed: 0,
       pagesProcessed: 0,
+      persistFailures: 0,
       lastCursor: null,
       done: true,
       aborted: false,
@@ -195,7 +197,9 @@ describe('embedStaleForSource', () => {
 
     // The helper itself didn't throw
     expect(result.done).toBe(true);
-    expect(badCount).toBe(1);
+    // partial-stale now isolates unknown provider failures one chunk at a
+    // time, so the initial batch plus its two leaf attempts are expected.
+    expect(badCount).toBe(3);
 
     // 'good' chunks got embedded; 'bad' chunks stayed NULL
     expect(result.embedded).toBe(2);
@@ -277,6 +281,58 @@ describe('embedStaleForSource', () => {
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
 
+  test('partial stale: AIConfigError is run-global and never enters the ledger', async () => {
+    await seedPageWithStaleChunks('config-fatal', 1);
+    const fatal = new AIConfigError('401 invalid key');
+    await expect(embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: async () => { throw fatal; },
+    })).rejects.toBe(fatal);
+    expect(await engine.executeRaw(`SELECT 1 FROM embed_failures`)).toHaveLength(0);
+  });
+
+  test('partial stale: batch invalid-input is bisected to one ledger row', async () => {
+    await seedPageWithStaleChunks('invalid-batch', 4);
+    await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: async (texts) => {
+        if (texts.some((text) => text.includes('chunk 2'))) throw new Error('422 unprocessable entity: invalid input');
+        return texts.map(() => fakeVector());
+      },
+    });
+    expect(await engine.executeRaw<{ chunk_index: number; error_class: string }>(
+      `SELECT chunk_index, error_class FROM embed_failures WHERE slug = 'invalid-batch'`,
+    )).toEqual([{ chunk_index: 2, error_class: 'invalid_input' }]);
+  });
+
+  test('partial stale: a single toxic input is ledgered without poisoning siblings', async () => {
+    await seedPageWithStaleChunks('invalid-single', 2);
+    await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: async (texts) => {
+        if (texts.some((text) => text.includes('chunk 1'))) throw new Error('invalid input: token limit');
+        return texts.map(() => fakeVector());
+      },
+    });
+    expect(await engine.executeRaw<{ chunk_index: number }>(
+      `SELECT chunk_index FROM embed_failures WHERE slug = 'invalid-single' AND error_class = 'invalid_input'`,
+    )).toEqual([{ chunk_index: 1 }]);
+  });
+
+  test('partial stale: unknown transient provider errors enter the provider_other ledger', async () => {
+    await seedPageWithStaleChunks('unknown-transient', 2);
+    await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: async (texts) => {
+        if (texts.some((text) => text.includes('chunk 1'))) throw new Error('provider 502 upstream reset');
+        return texts.map(() => fakeVector());
+      },
+    });
+    expect(await engine.executeRaw<{ chunk_index: number; error_class: string }>(
+      `SELECT chunk_index, error_class FROM embed_failures WHERE slug = 'unknown-transient'`,
+    )).toEqual([{ chunk_index: 1, error_class: 'provider_other' }]);
+  });
+
   test('SPEC V4: drifted page split across cursor batches stamps once and is not invalidated next run', async () => {
     await seedPageWithStaleChunks('signature-split', 3);
     await engine.executeRaw(
@@ -337,8 +393,38 @@ describe('embedStaleForSource', () => {
         return [fakeVector()];
       },
     });
-    expect(secondCalls).toEqual([['chunk 1 of signature-partial']]);
-    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+    // The failed chunk is now ledger-deferred for its current signature; its
+    // already-committed sibling remains stamped and is never invalidated.
+    expect(secondCalls).toEqual([]);
+    // The legacy no-signature count remains a raw NULL count; the active
+    // signed stale pipeline is what excludes this backoff-deferred row.
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('SPEC V4: a NULL-signature page with pre-existing vectors never stamps from a partial stale slice', async () => {
+    await seedPageWithStaleChunks('signature-null-partial', 2);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'signature-null-partial') AND chunk_index = 0`,
+    );
+    await embedStaleForSource(engine, 'default', { embeddingSignature: 'new:model:1536', embedFn: fakeEmbedFn });
+    const rows = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'signature-null-partial'`,
+    );
+    expect(rows[0]?.embedding_signature).toBeNull();
+  });
+
+  test('signature-write failure preserves committed vector and page counters', async () => {
+    await seedPageWithStaleChunks('signature-write-fail', 1);
+    await engine.setPageEmbeddingSignature('signature-write-fail', { signature: 'old:model:1536' });
+    const originalStamp = engine.setPageEmbeddingSignature.bind(engine);
+    engine.setPageEmbeddingSignature = async () => { throw new Error('signature write failed'); };
+    try {
+      const result = await embedStaleForSource(engine, 'default', { embeddingSignature: 'new:model:1536', embedFn: fakeEmbedFn });
+      expect(result).toMatchObject({ embedded: 1, pagesProcessed: 1, persistFailures: 0 });
+    } finally {
+      engine.setPageEmbeddingSignature = originalStamp;
+    }
   });
 
   test('SPEC V4: Minion logs the actual chunk_index for a fatal after a prefix', async () => {
@@ -362,7 +448,7 @@ describe('embedStaleForSource', () => {
     } finally {
       (process.stderr.write as any) = originalWrite;
     }
-    expect(stderr).toContain('failed chunk_index [9]: fatal embedding');
+    expect(stderr).toContain('[embed-fail] slug=fatal-index chunk_index=9 class=provider_other');
   });
 
   test('source-scoped: does not touch other sources', async () => {

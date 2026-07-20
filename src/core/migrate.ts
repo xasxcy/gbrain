@@ -5579,6 +5579,41 @@ export const MIGRATIONS: Migration[] = [
         ON code_edges_chunk (from_symbol_qualified);
     `,
   },
+  {
+    version: 126,
+    name: 'embed_failures_ledger',
+    // Current-state retry ledger for partial stale embedding. The DDL is
+    // intentionally identical to the fresh schemas and safe to replay.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS embed_failures (
+        source_id           TEXT NOT NULL,
+        page_id             BIGINT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        slug                TEXT NOT NULL,
+        chunk_index         INT NOT NULL,
+        embedding_signature TEXT NOT NULL,
+        chunk_hash          TEXT NOT NULL,
+        error_class         TEXT NOT NULL,
+        error_fingerprint   TEXT NOT NULL,
+        attempt_count       INT NOT NULL DEFAULT 1,
+        first_seen          TIMESTAMPTZ NOT NULL,
+        last_seen           TIMESTAMPTZ NOT NULL,
+        next_retry_at       TIMESTAMPTZ NOT NULL,
+        quarantined_at      TIMESTAMPTZ,
+        quarantine_reason   TEXT,
+        PRIMARY KEY (source_id, page_id, chunk_index, embedding_signature, chunk_hash)
+      );
+      CREATE INDEX IF NOT EXISTS embed_failures_active_idx
+        ON embed_failures (page_id, chunk_index, embedding_signature, chunk_hash);
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_exists: boolean; index_exists: boolean }>(
+        `SELECT to_regclass('public.embed_failures') IS NOT NULL AS table_exists,
+                to_regclass('public.embed_failures_active_idx') IS NOT NULL AS index_exists`,
+      );
+      return rows[0]?.table_exists === true && rows[0]?.index_exists === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

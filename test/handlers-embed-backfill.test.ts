@@ -21,6 +21,7 @@ import { makeEmbedBackfillHandler } from '../src/core/minions/handlers/embed-bac
 import { tryAcquireDbLock } from '../src/core/db-lock.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
+import { _registeredShutdownWorkCountForTests } from '../src/core/process-cleanup.ts';
 
 let engine: PGLiteEngine;
 
@@ -89,6 +90,40 @@ describe('embed-backfill handler — happy path', () => {
   test('throws when sourceId is empty string', async () => {
     const handler = makeEmbedBackfillHandler(engine);
     await expect(handler(fakeJob({ sourceId: '' }))).rejects.toThrow(/sourceId is required/);
+  });
+
+  test('worker shutdownSignal aborts the stale pipeline', async () => {
+    const jobAbort = new AbortController();
+    const shutdownAbort = new AbortController();
+    shutdownAbort.abort(new Error('shutdown'));
+    const handler = makeEmbedBackfillHandler(engine);
+    const result = await handler({
+      ...fakeJob({ sourceId: 'default' }, jobAbort),
+      shutdownSignal: shutdownAbort.signal,
+    });
+    expect(result.status).toBe('aborted');
+  });
+
+  test('registers the in-flight handler and deregisters after its drain', async () => {
+    await seedStale('shutdown-registry', ['blocked']);
+    const jobAbort = new AbortController();
+    let allowEmbed!: () => void;
+    let embedStarted!: () => void;
+    const handler = makeEmbedBackfillHandler(engine, {
+      embedFn: async () => {
+        embedStarted();
+        await new Promise<void>((resolve) => { allowEmbed = resolve; });
+        return [new Float32Array(1536)];
+      },
+    });
+
+    const running = handler(fakeJob({ sourceId: 'default' }, jobAbort));
+    await new Promise<void>((resolve) => { embedStarted = resolve; });
+    expect(_registeredShutdownWorkCountForTests()).toBe(1);
+    jobAbort.abort();
+    allowEmbed();
+    await expect(running).resolves.toMatchObject({ status: 'aborted' });
+    expect(_registeredShutdownWorkCountForTests()).toBe(0);
   });
 });
 
@@ -185,5 +220,24 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
     const result = await handler(fakeJob({ sourceId: 'default' }));
     expect(result.status).toBe('budget_exhausted');
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('BudgetExhausted still maps correctly when its slice checkpoint rolls back', async () => {
+    await seedStale('budget-persist-fail', ['good', 'budget']);
+    const originalPersist = engine.persistEmbedOutcome.bind(engine);
+    engine.persistEmbedOutcome = async () => { throw new Error('write failed'); };
+    const exhausted = new BudgetExhausted('budget exhausted', { reason: 'cost', spent: 1, cap: 1 });
+    try {
+      const handler = makeEmbedBackfillHandler(engine, {
+        embedFn: async (texts) => {
+          if (texts.length > 1) throw new Error('EOF');
+          if (texts[0] === 'budget') throw exhausted;
+          return [new Float32Array(1536)];
+        },
+      });
+      expect((await handler(fakeJob({ sourceId: 'default' }))).status).toBe('budget_exhausted');
+    } finally {
+      engine.persistEmbedOutcome = originalPersist;
+    }
   });
 });

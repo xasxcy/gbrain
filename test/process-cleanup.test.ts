@@ -21,6 +21,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   registerCleanup,
+  registerShutdownWork,
+  triggerCooperativeShutdownAndExit,
   triggerCleanupAndExit,
   installSignalHandlers,
   _registeredCleanupCountForTests,
@@ -164,6 +166,39 @@ describe('triggerCleanupAndExit', () => {
 
     expect(fired).toEqual(['kept']);
     expect(codes).toEqual([0]);
+  });
+});
+
+describe('cooperative shutdown work registry', () => {
+  function patchExit(): { codes: number[]; restore: () => void } {
+    const codes: number[] = [];
+    const orig = process.exit;
+    (process as any).exit = (code?: number) => { codes.push(code ?? 0); };
+    return { codes, restore: () => { (process as any).exit = orig; } };
+  }
+
+  // SIGTERM/SIGHUP must first abort in-flight embed work, then wait for its
+  // checkpoint/drain before releasing database locks through cleanup callbacks.
+  test('aborts work, drains it, then runs cleanup before exiting', async () => {
+    const order: string[] = [];
+    const abort = new AbortController();
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    abort.signal.addEventListener('abort', () => order.push('abort'));
+    registerShutdownWork({ abort, drain: drain.then(() => { order.push('drain'); }) });
+    registerCleanup('lock', async () => { order.push('cleanup'); });
+
+    const { codes, restore } = patchExit();
+    try {
+      const shutdown = triggerCooperativeShutdownAndExit(143);
+      await Promise.resolve();
+      expect(order).toEqual(['abort']);
+      releaseDrain();
+      await shutdown;
+    } finally { restore(); }
+
+    expect(order).toEqual(['abort', 'drain', 'cleanup']);
+    expect(codes).toEqual([143]);
   });
 });
 

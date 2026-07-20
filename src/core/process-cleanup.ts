@@ -10,8 +10,10 @@
  *
  * Design (per eng-review D7 + outside-voice F9-F11, 2026-05-24):
  *
- *  - Signal scope: SIGTERM, SIGHUP, SIGPIPE, uncaughtException,
- *    unhandledRejection. **NOT SIGINT** — gbrain has an existing
+ *  - SIGTERM/SIGHUP are cooperative: abort registered work units, wait up to
+ *    30s for their drains, then release locks. SIGPIPE, uncaughtException,
+ *    and unhandledRejection retain the fast cleanup path. **NOT SIGINT** —
+ *    gbrain has an existing
  *    SIGINT-via-AbortController path at cli.ts:254 that propagates
  *    abort to in-flight operations (clean cancel). Installing cleanup
  *    on SIGINT here would preempt that flow. Lock release on user
@@ -28,8 +30,9 @@
  *    internally, so the registration happens there). No double-register.
  *
  *  - Best-effort: cleanup callbacks run via Promise.allSettled with a
- *    3s deadline. Throws don't block other callbacks. Engine pool
- *    already closed → DELETE fails silently → process exits anyway.
+ *    3s deadline after any cooperative drain. Throws don't block other
+ *    callbacks. Engine pool already closed → DELETE fails silently → process
+ *    exits anyway.
  *
  *  - Normal exit path unchanged: try/finally in `tryAcquireDbLock` and
  *    `withRefreshingLock` already releases on normal completion;
@@ -38,6 +41,7 @@
  */
 
 const CLEANUP_DEADLINE_MS = 3_000;
+const SHUTDOWN_DRAIN_DEADLINE_MS = 30_000;
 
 interface CleanupEntry {
   name: string;
@@ -45,8 +49,15 @@ interface CleanupEntry {
 }
 
 const registry = new Map<symbol, CleanupEntry>();
+interface ShutdownWork {
+  abort: AbortController;
+  drain: Promise<unknown>;
+}
+
+const shutdownWorkRegistry = new Map<symbol, ShutdownWork>();
 let installed = false;
 let cleanupInFlight = false;
+let cooperativeShutdownInFlight: Promise<void> | undefined;
 
 /**
  * Register a cleanup callback. Returns a deregister handle (idempotent
@@ -68,12 +79,33 @@ export function registerCleanup(name: string, fn: () => Promise<void>): () => vo
 }
 
 /**
+ * Register an in-flight unit that must checkpoint before SIGTERM/SIGHUP can
+ * release locks and close database resources. Callers own both the controller
+ * and the drain promise; deregister immediately after the operation settles.
+ */
+export function registerShutdownWork(work: ShutdownWork): () => void {
+  const key = Symbol('shutdown-work');
+  shutdownWorkRegistry.set(key, work);
+  let deregistered = false;
+  return () => {
+    if (deregistered) return;
+    deregistered = true;
+    shutdownWorkRegistry.delete(key);
+  };
+}
+
+/**
  * Read the currently registered cleanup count. Test seam.
  *
  * @internal
  */
 export function _registeredCleanupCountForTests(): number {
   return registry.size;
+}
+
+/** @internal */
+export function _registeredShutdownWorkCountForTests(): number {
+  return shutdownWorkRegistry.size;
 }
 
 /**
@@ -84,6 +116,36 @@ export function _registeredCleanupCountForTests(): number {
 export async function triggerCleanupAndExit(code: number): Promise<void> {
   await runCleanupPass();
   process.exit(code);
+}
+
+/**
+ * SIGTERM/SIGHUP path: tell work to stop at its next cooperative checkpoint,
+ * wait at most 30 seconds for those checkpoints, then release locks/resources.
+ */
+export async function triggerCooperativeShutdownAndExit(code: number): Promise<void> {
+  await runCooperativeShutdown();
+  process.exit(code);
+}
+
+function runCooperativeShutdown(): Promise<void> {
+  if (cooperativeShutdownInFlight) return cooperativeShutdownInFlight;
+  cooperativeShutdownInFlight = (async () => {
+    const work = Array.from(shutdownWorkRegistry.values());
+    for (const unit of work) {
+      if (!unit.abort.signal.aborted) unit.abort.abort(new Error('shutdown'));
+    }
+
+    if (work.length > 0) {
+      const deadline = new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, SHUTDOWN_DRAIN_DEADLINE_MS);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      });
+      await Promise.race([Promise.allSettled(work.map((unit) => unit.drain)), deadline]);
+    }
+
+    await runCleanupPass();
+  })();
+  return cooperativeShutdownInFlight;
 }
 
 async function runCleanupPass(): Promise<void> {
@@ -126,7 +188,7 @@ export function installSignalHandlers(): void {
   if (installed) return;
   installed = true;
 
-  const handleSignal = (signal: NodeJS.Signals) => {
+  const handleFastSignal = (signal: NodeJS.Signals) => {
     void runCleanupPass().finally(() => {
       // Match GNU `kill` exit-code convention: 128 + signal number for
       // signal-terminated processes. The actual integer doesn't matter
@@ -137,12 +199,12 @@ export function installSignalHandlers(): void {
     });
   };
 
-  process.on('SIGTERM', () => handleSignal('SIGTERM'));
-  process.on('SIGHUP', () => handleSignal('SIGHUP'));
+  process.on('SIGTERM', () => { void triggerCooperativeShutdownAndExit(143); });
+  process.on('SIGHUP', () => { void triggerCooperativeShutdownAndExit(129); });
   // SIGPIPE in Node is rarely raised directly (Node ignores it by default
   // and surfaces an EPIPE write error on the stream instead). Listen anyway
   // for environments where it does fire.
-  process.on('SIGPIPE', () => handleSignal('SIGPIPE'));
+  process.on('SIGPIPE', () => handleFastSignal('SIGPIPE'));
 
   process.on('uncaughtException', (err) => {
     try { process.stderr.write(`[uncaughtException] ${err instanceof Error ? err.stack ?? err.message : err}\n`); }
@@ -180,6 +242,8 @@ export function installSignalHandlers(): void {
  */
 export function _resetForTests(): void {
   registry.clear();
+  shutdownWorkRegistry.clear();
   installed = false;
   cleanupInFlight = false;
+  cooperativeShutdownInFlight = undefined;
 }

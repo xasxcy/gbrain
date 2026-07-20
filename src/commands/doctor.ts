@@ -51,6 +51,7 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { currentEmbeddingSignature } from '../core/embedding.ts';
 
 export interface Check {
   name: string;
@@ -2095,6 +2096,44 @@ export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promi
       status: 'warn',
       message: `Could not check embedding width: ${msg}`,
     };
+  }
+}
+
+/**
+ * Durable partial-stale embedding failures. The engine owns the candidate and
+ * eligibility SQL so doctor observes exactly the rows a stale run can claim.
+ */
+export async function checkEmbedFailuresHealth(
+  engine: BrainEngine,
+  opts: { sourceId?: string; signature: string },
+): Promise<Check> {
+  try {
+    const summary = await engine.getEmbedFailureSummary(opts);
+    const { counts } = summary;
+    const classes = summary.by_error_class.length === 0
+      ? 'none'
+      : summary.by_error_class.map((entry) => `${entry.error_class}=${entry.count}`).join(', ');
+    const quarantinedTop = summary.quarantined_top.length === 0
+      ? 'none'
+      : summary.quarantined_top.map((entry) =>
+        `${entry.slug}#${entry.chunk_index} (${entry.error_class}, attempts=${entry.attempt_count})`,
+      ).join('; ');
+    const blocked = counts.backoff_deferred + counts.quarantined;
+    return {
+      name: 'embed_failures',
+      status: blocked > 0 ? 'warn' : 'ok',
+      message:
+        `total_null=${counts.total_null}; eligible_now=${counts.eligible_now}; ` +
+        `backoff_deferred=${counts.backoff_deferred}; quarantined=${counts.quarantined}. ` +
+        `error_class: ${classes}. quarantined top: ${quarantinedTop}.`,
+      details: summary as unknown as Record<string, unknown>,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/relation .*embed_failures.*does not exist|no such table.*embed_failures/i.test(message)) {
+      return { name: 'embed_failures', status: 'ok', message: 'embed_failures table not present (migration pending)' };
+    }
+    return { name: 'embed_failures', status: 'warn', message: `embed_failures probe failed: ${message}` };
   }
 }
 
@@ -7281,6 +7320,11 @@ export async function buildChecks(
     checks.push(await checkZeEmbeddingHealth(engine));
     progress.heartbeat('embedding_width_consistency');
     checks.push(await checkEmbeddingWidthConsistency(engine));
+    progress.heartbeat('embed_failures');
+    checks.push(await checkEmbedFailuresHealth(engine, {
+      ...(orphanRatioSourceId && { sourceId: orphanRatioSourceId }),
+      signature: currentEmbeddingSignature(),
+    }));
     // v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift
     // parity check. Same drift class as content_chunks, separate column.
     progress.heartbeat('facts_embedding_width_consistency');

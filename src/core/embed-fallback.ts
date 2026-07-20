@@ -1,3 +1,6 @@
+import { classifyEmbedFailure, isInvalidInputError } from './embed-failure.ts';
+import { isMustAbortError } from './worker-pool.ts';
+
 /**
  * Shared Ollama fallback for foreground and Minion embedding callers.
  *
@@ -14,6 +17,17 @@ export type EmbedFn = (
 export function isOllamaBatchSplitWorthyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /EOF|timed out|llama-server process no longer running|socket connection was closed/i.test(message);
+}
+
+/**
+ * Batch-1 policy for the stale-only partial pipeline. It deliberately widens
+ * only that caller's salvage set; legacy inline/single-page callers retain the
+ * V4 Ollama predicate and first-failure semantics.
+ */
+export function isPartialStaleSplitWorthyError(error: unknown): boolean {
+  // Only explicit configuration faults are run-global. Every other provider
+  // error gets a one-chunk salvage attempt in the stale-only pipeline.
+  return classifyEmbedFailure(error).kind === 'failure';
 }
 
 /** Ladder layer: failures for which shorter text can plausibly succeed. */
@@ -38,6 +52,14 @@ type SingleAttempt =
   | { kind: 'aborted'; error?: unknown };
 
 const FALLBACK_LEVELS = [5500, 5000, 4500] as const;
+export type PartialFallbackPolicy = 'legacy' | 'partial-stale';
+
+function isSplitWorthy(error: unknown, policy: PartialFallbackPolicy): boolean {
+  if (isMustAbortError(error)) return false;
+  return policy === 'partial-stale'
+    ? isPartialStaleSplitWorthyError(error)
+    : isOllamaBatchSplitWorthyError(error);
+}
 
 /**
  * One chunk's original attempt plus, only after an OOM-like failure, its
@@ -50,6 +72,7 @@ async function attemptSingleChunk(
   opts: { abortSignal?: AbortSignal },
   originalAlreadyTried: boolean,
   previousError?: unknown,
+  policy: PartialFallbackPolicy = 'legacy',
 ): Promise<SingleAttempt> {
   const levels = originalAlreadyTried
     ? FALLBACK_LEVELS.filter((level) => level < text.length)
@@ -72,7 +95,7 @@ async function attemptSingleChunk(
     } catch (error) {
       if (opts.abortSignal?.aborted) return { kind: 'aborted', error };
       if (!isOllamaOomLikeError(error)) {
-        return isOllamaBatchSplitWorthyError(error)
+        return isSplitWorthy(error, policy)
           ? { kind: 'ollamaFailure', error }
           : { kind: 'fatal', error };
       }
@@ -96,6 +119,39 @@ function terminalResult(
     : { vectors, failures, aborted: false, fatalError: error, fatalIndexes };
 }
 
+async function bisectInvalidInputs(
+  texts: string[],
+  embedFn: EmbedFn,
+  opts: { abortSignal?: AbortSignal },
+  vectors: (Float32Array | null)[],
+  failures: { index: number; error: unknown }[],
+  offset: number,
+  depth: number,
+  invalidError: unknown,
+): Promise<{ fatalError?: unknown; fatalIndexes?: number[]; aborted?: boolean }> {
+  if (opts.abortSignal?.aborted) return { aborted: true };
+  if (texts.length === 1) {
+    failures.push({ index: offset, error: invalidError });
+    return {};
+  }
+  if (depth >= 5) return { fatalError: new Error('invalid input could not be localized'), fatalIndexes: texts.map((_, index) => offset + index) };
+
+  const mid = Math.ceil(texts.length / 2);
+  for (const [start, end] of [[0, mid], [mid, texts.length]] as const) {
+    const group = texts.slice(start, end);
+    try {
+      const embedded = await embedFn(group, opts);
+      for (let index = 0; index < embedded.length; index++) vectors[offset + start + index] = embedded[index]!;
+    } catch (error) {
+      if (opts.abortSignal?.aborted) return { aborted: true };
+      if (!isInvalidInputError(error)) return { fatalError: error, fatalIndexes: group.map((_, index) => offset + start + index) };
+      const nested = await bisectInvalidInputs(group, embedFn, opts, vectors, failures, offset + start, depth + 1, error);
+      if (nested.aborted || nested.fatalError !== undefined) return nested;
+    }
+  }
+  return {};
+}
+
 /**
  * Never-throwing partial variant for stale callers. At every error boundary it
  * returns either `aborted` or `fatalError`, never both, preserving vectors that
@@ -104,7 +160,7 @@ function terminalResult(
 export async function embedWithTruncationFallbackPartial(
   texts: string[],
   embedFn: EmbedFn,
-  opts: { abortSignal?: AbortSignal },
+  opts: { abortSignal?: AbortSignal; policy?: PartialFallbackPolicy },
 ): Promise<PartialEmbedResult> {
   const vectors: (Float32Array | null)[] = Array.from({ length: texts.length }, () => null);
   const failures: { index: number; error: unknown }[] = [];
@@ -116,10 +172,10 @@ export async function embedWithTruncationFallbackPartial(
     if (opts.abortSignal?.aborted) return terminalResult(vectors, failures, opts.abortSignal);
     if (texts.length === 1) {
       if (!isOllamaOomLikeError(error)) {
-        if (isOllamaBatchSplitWorthyError(error)) failures.push({ index: 0, error });
+        if (isSplitWorthy(error, opts.policy ?? 'legacy')) failures.push({ index: 0, error });
         else return terminalResult(vectors, failures, opts.abortSignal, error, [0]);
       } else {
-        const attempt = await attemptSingleChunk(texts[0]!, embedFn, opts, true, error);
+        const attempt = await attemptSingleChunk(texts[0]!, embedFn, opts, true, error, opts.policy ?? 'legacy');
         if (attempt.kind === 'success') vectors[0] = attempt.vector;
         else if (attempt.kind === 'ollamaFailure') failures.push({ index: 0, error: attempt.error });
         else if (attempt.kind === 'fatal') return terminalResult(vectors, failures, opts.abortSignal, attempt.error, [0]);
@@ -127,14 +183,18 @@ export async function embedWithTruncationFallbackPartial(
       }
       return terminalResult(vectors, failures, opts.abortSignal);
     }
-    if (!isOllamaBatchSplitWorthyError(error)) {
+    if (opts.policy === 'partial-stale' && isInvalidInputError(error)) {
+      const isolated = await bisectInvalidInputs(texts, embedFn, opts, vectors, failures, 0, 0, error);
+      return terminalResult(vectors, failures, opts.abortSignal, isolated.fatalError, isolated.fatalIndexes);
+    }
+    if (!isSplitWorthy(error, opts.policy ?? 'legacy')) {
       return terminalResult(vectors, failures, opts.abortSignal, error, texts.map((_, index) => index));
     }
   }
 
   for (let index = 0; index < texts.length; index++) {
     if (opts.abortSignal?.aborted) return terminalResult(vectors, failures, opts.abortSignal);
-    const attempt = await attemptSingleChunk(texts[index]!, embedFn, opts, false);
+    const attempt = await attemptSingleChunk(texts[index]!, embedFn, opts, false, undefined, opts.policy ?? 'legacy');
     if (attempt.kind === 'success') vectors[index] = attempt.vector;
     else if (attempt.kind === 'ollamaFailure') failures.push({ index, error: attempt.error });
     else if (attempt.kind === 'fatal') return terminalResult(vectors, failures, opts.abortSignal, attempt.error, [index]);

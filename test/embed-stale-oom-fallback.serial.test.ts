@@ -67,6 +67,34 @@ async function seedChunk(slug: string, chunkText: string): Promise<void> {
 
 describe('embedWithTruncationFallback — injected embedFn', () => {
 
+  test('stale caller checkpoints outer slices independently and counts one page once', async () => {
+    await engine.putPage('sliced', { type: 'note', title: 'sliced', compiled_truth: '# sliced' });
+    await engine.upsertChunks('sliced', Array.from({ length: 9 }, (_, chunk_index) => ({
+      chunk_index,
+      chunk_text: `slice-${chunk_index}`,
+      chunk_source: 'compiled_truth' as const,
+      token_count: 1,
+      embedding: undefined,
+    })));
+    const calls: number[] = [];
+    const previous = process.env.GBRAIN_EMBED_SUBBATCH_SIZE;
+    process.env.GBRAIN_EMBED_SUBBATCH_SIZE = '8';
+    try {
+      const result = await embedStaleForSource(engine, 'default', {
+        embedFn: async (texts) => {
+          calls.push(texts.length);
+          return texts.map((_, index) => makeVec(index));
+        },
+      });
+      expect(calls).toEqual([8, 1]);
+      expect(result.embedded).toBe(9);
+      expect(result.pagesProcessed).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.GBRAIN_EMBED_SUBBATCH_SIZE;
+      else process.env.GBRAIN_EMBED_SUBBATCH_SIZE = previous;
+    }
+  });
+
   test('happy path: short chunk embeds without truncation', async () => {
     const text = 'a'.repeat(1000);
     await seedChunk('short-happy', text);
@@ -239,6 +267,27 @@ describe('SPEC V4 fallback contracts', () => {
     expect(calls).toEqual([2, 1, 1]);
     expect(partial.vectors.every((vector) => vector !== null)).toBe(true);
     expect(partial.failures).toEqual([]);
+  });
+
+  test('partial-stale policy salvages ECONNRESET while legacy preserves first-failure identity', async () => {
+    const reset = new Error('read ECONNRESET from embedding provider');
+    const calls: string[][] = [];
+    const partial = await embedWithTruncationFallbackPartial(['good', 'bad'], async (texts) => {
+      calls.push(texts);
+      if (texts.length > 1) throw reset;
+      if (texts[0] === 'bad') throw reset;
+      return [makeVec(1)];
+    }, { policy: 'partial-stale' });
+    expect(calls).toEqual([['good', 'bad'], ['good'], ['bad']]);
+    expect(partial.vectors[0]).not.toBeNull();
+    expect(partial.failures).toEqual([{ index: 1, error: reset }]);
+
+    try {
+      await embedWithTruncationFallback(['good', 'bad'], async () => { throw reset; }, {});
+      throw new Error('expected legacy helper to throw');
+    } catch (error) {
+      expect(error).toBe(reset);
+    }
   });
 
   test('single timeout calls once; partial records it and legacy throws the same object', async () => {

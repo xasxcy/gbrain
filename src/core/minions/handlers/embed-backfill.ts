@@ -41,6 +41,8 @@ import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../../pace-mod
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext } from '../types.ts';
 import { parseUsdLimit, usdLimitToCap, resolveSpendPosture } from '../../spend-posture.ts';
+import { anySignal } from '../../abort-check.ts';
+import { registerShutdownWork } from '../../process-cleanup.ts';
 
 import { embedBackfillLockId, EMBED_BACKFILL_LOCK_TTL_MIN } from '../../embed-backfill-lock.ts';
 
@@ -166,12 +168,20 @@ export function makeEmbedBackfillHandler(
     // hatch). No-op when off. This is the prod path that originally starved
     // the supervisor, so pacing it is the headline win.
     const { pacer, concurrency } = await resolveBackfillPacer(engine, job.data);
+    const shutdownAbort = new AbortController();
+    const signal = anySignal(
+      job.signal,
+      anySignal(job.shutdownSignal, shutdownAbort.signal),
+    );
+    let resolveDrain!: () => void;
+    const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
+    const deregisterShutdownWork = registerShutdownWork({ abort: shutdownAbort, drain });
 
     try {
       const result = await withBudgetTracker(tracker, async () =>
         embedStaleForSource(engine, sourceId, {
           batchSize,
-          signal: job.signal,
+          signal,
           pacer,
           ...(concurrency !== undefined && { concurrency }),
           // v0.41.31: re-embed pages whose model signature drifted + stamp
@@ -233,6 +243,8 @@ export function makeEmbedBackfillHandler(
         // Lock release best-effort; TTL fallback covers the case where the
         // row was already cleared by a parallel writer.
       }
+      resolveDrain();
+      deregisterShutdownWork();
     }
   };
 }

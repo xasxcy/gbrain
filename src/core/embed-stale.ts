@@ -12,12 +12,11 @@
  * `embed.ts`.
  */
 import type { BrainEngine } from './engine.ts';
-import type { ChunkInput } from './types.ts';
 import { embedBatchWithBackoff } from '../commands/embed.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
-import { isMustAbortError } from './worker-pool.ts';
-import { embedWithTruncationFallbackPartial } from './embed-fallback.ts';
+import { persistStaleSlice } from './embed-slice-persist.ts';
+import { resolveEmbedSubBatchSize } from './embed-slices.ts';
 
 export interface StaleCursor {
   afterPageId: number;
@@ -63,6 +62,8 @@ export interface EmbedStaleResult {
   done: boolean;
   /** True iff the supplied signal fired. */
   aborted: boolean;
+  /** Atomic DB checkpoint attempts that rolled back; never enter the ledger. */
+  persistFailures?: number;
 }
 
 /**
@@ -94,7 +95,10 @@ export async function embedStaleForSource(
     lastCursor: null,
     done: false,
     aborted: false,
+    persistFailures: 0,
   };
+  const committedPages = new Set<string>();
+  const subBatchSize = resolveEmbedSubBatchSize();
   const signature = opts.embeddingSignature;
 
   if (signature) {
@@ -115,6 +119,7 @@ export async function embedStaleForSource(
       afterPageId,
       afterChunkIndex,
       sourceId,
+      ...(signature && { signature }),
     }));
     if (batch.length === 0) {
       result.done = true;
@@ -139,76 +144,30 @@ export async function embedStaleForSource(
 
     async function embedOneKey(key: string): Promise<void> {
       const stale = byKey.get(key)!;
-      const keySourceId = stale[0]?.source_id ?? sourceId;
-      const slug = stale[0]!.slug;
-      const partial = await embedWithTruncationFallbackPartial(
-        stale.map((chunk) => chunk.chunk_text),
-        embedFn,
-        { abortSignal: signal },
-      );
-      if (partial.failures.length > 0 || partial.fatalError !== undefined) {
-        const indexes = [
-          ...partial.failures.map((failure) => failure.index),
-          ...(partial.fatalIndexes ?? []),
-        ].map((index) => stale[index]?.chunk_index)
-          .filter((index): index is number => index !== undefined);
-        const firstError = partial.failures[0]?.error ?? partial.fatalError;
-        process.stderr.write(
-          `\n  [embed-stale] error on ${keySourceId}/${slug}: failed chunk_index [${indexes.join(', ')}]${
-            firstError instanceof Error ? `: ${firstError.message}` : firstError === undefined ? '' : `: ${String(firstError)}`
-          }\n`,
-        );
-      }
-
-      const successCount = partial.vectors.filter((vector): vector is Float32Array => vector !== null).length;
-      if (successCount > 0) {
-        // No signal-based early return: abort-time DB failures must remain
-        // observable. Correctness of this stamp assumes no concurrent
-        // rechunk/upsert writer, as accepted by SPEC V4.
-        try {
-          const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
-          const staleIdxToEmbedding = new Map<number, Float32Array>();
-          for (let index = 0; index < stale.length; index++) {
-            const vector = partial.vectors[index];
-            if (vector !== null) staleIdxToEmbedding.set(stale[index]!.chunk_index, vector);
-          }
-          const merged: ChunkInput[] = existing.map((chunk) => ({
-            chunk_index: chunk.chunk_index,
-            chunk_text: chunk.chunk_text,
-            chunk_source: chunk.chunk_source,
-            embedding: staleIdxToEmbedding.get(chunk.chunk_index) ?? undefined,
-            token_count: chunk.token_count || Math.ceil(chunk.chunk_text.length / 4),
-          }));
-          await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-          result.embedded += successCount;
-          result.pagesProcessed += 1;
-
-          if (signature) {
-            const rows = (await observed(pacer, () => engine.executeRaw<{ embedding_signature: string | null }>(
-              'SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = $2',
-              [slug, keySourceId],
-            ))) ?? [];
-            const storedSignature = rows[0]?.embedding_signature ?? null;
-            const shouldStamp = storedSignature !== null
-              ? storedSignature !== signature
-              : stale.length === existing.length;
-            if (shouldStamp) {
-              await observed(pacer, () =>
-                engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
-              );
-            }
-          }
-        } catch (error) {
-          process.stderr.write(
-            `\n  [embed-stale] persist error on ${keySourceId}/${slug}${signal?.aborted ? ' (aborted context)' : ''}: ${
-              error instanceof Error ? error.message : String(error)
-            }\n`,
-          );
+      const slices = Math.ceil(stale.length / subBatchSize);
+      for (let offset = 0; offset < stale.length; offset += subBatchSize) {
+        if (signal?.aborted) return;
+        const sliceRows = stale.slice(offset, offset + subBatchSize);
+        const checkpoint = await persistStaleSlice({
+          engine,
+          rows: sliceRows,
+          embeddingSignature: signature,
+          embedFn,
+          signal,
+          slice: { index: (offset / subBatchSize) + 1, total: slices },
+          write: (message) => process.stderr.write(`\n  ${message}\n`),
+        });
+        result.embedded += checkpoint.embedded;
+        if (checkpoint.persistFailed) result.persistFailures = (result.persistFailures ?? 0) + 1;
+        const pageKey = `${sliceRows[0]!.source_id}:${sliceRows[0]!.page_id}`;
+        if (checkpoint.pageCommitted && !committedPages.has(pageKey)) {
+          committedPages.add(pageKey);
+          result.pagesProcessed++;
         }
-      }
-
-      if (partial.fatalError !== undefined && isMustAbortError(partial.fatalError)) {
-        throw partial.fatalError;
+        if (checkpoint.aborted) {
+          result.aborted = true;
+          return;
+        }
       }
     }
 

@@ -10,6 +10,7 @@ import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { embedWithTruncationFallback } from './embed-fallback.ts';
+import { registerShutdownWork } from './process-cleanup.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
@@ -696,6 +697,14 @@ export async function importFromContent(
     effectiveCRMode = resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;
   }
 
+  // Keep this registered through the page/chunk/signature transaction, not
+  // merely through the provider call. SIGTERM/SIGHUP must drain the durable
+  // checkpoint before process cleanup can release its writer lock or DB.
+  const shutdownAbort = new AbortController();
+  let resolveDrain!: () => void;
+  const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
+  const deregisterShutdown = registerShutdownWork({ abort: shutdownAbort, drain });
+  try {
   if (!opts.noEmbed && chunks.length > 0) {
     const safeTitle = sanitizeTitle(parsed.title);
     const prefix =
@@ -710,7 +719,15 @@ export async function importFromContent(
     // call — a single Ollama EOF/timeout on this batch propagated straight
     // out of importFromContent and aborted the whole sync (BRIEF-P2B). No
     // backoff/abortSignal threaded through — same semantics as before.
-    const embeddings = await embedWithTruncationFallback(wrappedTexts, (texts) => embedBatch(texts), {});
+    // Inline import remains a legacy caller: its fallback classifier and
+    // first-failure behavior are unchanged. It still participates in the
+    // cooperative shutdown registry so SIGTERM/SIGHUP waits for this in-flight
+    // provider request before cleanup releases DB/lock resources.
+    const embeddings = await embedWithTruncationFallback(
+      wrappedTexts,
+      (texts, fallbackOpts) => embedBatch(texts, { abortSignal: fallbackOpts.abortSignal }),
+      { abortSignal: shutdownAbort.signal },
+    );
     for (let i = 0; i < chunks.length; i++) {
       chunks[i].embedding = embeddings[i];
       // token_count tracks the wrapped string length so cost reporting
@@ -869,6 +886,10 @@ export async function importFromContent(
       } catch { /* same reason — silent skip */ }
     }
   });
+  } finally {
+    resolveDrain();
+    deregisterShutdown();
+  }
 
   // T3 — project frontmatter `aliases:` into page_aliases (free-text alias
   // resolution for search). Runs AFTER the page write commits so the slug

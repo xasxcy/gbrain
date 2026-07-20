@@ -1,4 +1,4 @@
-import type { BrainEngine } from '../core/engine.ts';
+import type { BrainEngine, EmbedFailureSummary } from '../core/engine.ts';
 import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
@@ -8,7 +8,7 @@ import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
 import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
-import { isMustAbortError, runSlidingPool } from '../core/worker-pool.ts';
+import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted, anySignal, AbortError } from '../core/abort-check.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
 import {
@@ -19,7 +19,10 @@ import {
 } from '../core/pace-mode.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
-import { embedWithTruncationFallback, embedWithTruncationFallbackPartial } from '../core/embed-fallback.ts';
+import { embedWithTruncationFallback } from '../core/embed-fallback.ts';
+import { registerShutdownWork } from '../core/process-cleanup.ts';
+import { persistStaleSlice } from '../core/embed-slice-persist.ts';
+import { resolveEmbedSubBatchSize } from '../core/embed-slices.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -149,6 +152,24 @@ export interface EmbedResult {
     /** High-water mark of acquirers blocked on the permit (sync path). */
     maxWaiters: number;
   };
+  /** Atomic outcome transactions that rolled back (never ledger failures). */
+  persistFailures?: number;
+  /** Final four-way retry-ledger state for a stale run. */
+  embedFailureSummary?: EmbedFailureSummary;
+}
+
+/** Stable human summary for completed stale runs and their retry backlog. */
+export function formatStaleRunSummary(input: {
+  embedded: number;
+  pagesProcessed: number;
+  persistFailures: number;
+  counts: EmbedFailureSummary['counts'];
+}): string {
+  const { counts } = input;
+  return `Embedded ${input.embedded} chunks across ${input.pagesProcessed} pages; ` +
+    `persistFailures=${input.persistFailures}; total_null=${counts.total_null}; ` +
+    `eligible_now=${counts.eligible_now}; backoff_deferred=${counts.backoff_deferred}; ` +
+    `quarantined=${counts.quarantined}`;
 }
 
 /**
@@ -217,6 +238,23 @@ async function preflightDimMismatch(engine: BrainEngine, dryRun: boolean): Promi
 }
 
 export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promise<EmbedResult> {
+  const shutdownAbort = new AbortController();
+  const effectiveOpts: EmbedOpts = {
+    ...opts,
+    signal: anySignal(shutdownAbort.signal, opts.signal),
+  };
+  let resolveDrain!: () => void;
+  const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
+  const deregister = registerShutdownWork({ abort: shutdownAbort, drain });
+  try {
+    return await runEmbedCoreInner(engine, effectiveOpts);
+  } finally {
+    resolveDrain();
+    deregister();
+  }
+}
+
+async function runEmbedCoreInner(engine: BrainEngine, opts: EmbedOpts): Promise<EmbedResult> {
   // v0.37.10.0 T7 (D9): refuse cleanly when init persisted the deferred-setup
   // sentinel. Skipped in dryRun mode so plan-mode introspection still works.
   if (!opts.dryRun) {
@@ -830,15 +868,33 @@ async function embedAllStale(
   }
 
   // Pre-flight: 0 stale chunks → nothing to do, no further DB reads.
-  // dry-run includes signature-drift in the count without mutating.
+  // The same current signature also excludes ledger-deferred/quarantined rows.
   const staleCount = await engine.countStaleChunks(
-    dryRun && signature ? { ...sourceOpt, signature } : sourceOpt,
+    signature ? { ...sourceOpt, signature } : sourceOpt,
   );
+  let totalProcessedPages = 0;
+  const emitStaleRunSummary = async (): Promise<void> => {
+    const failureSummary = await engine.getEmbedFailureSummary({
+      ...(sourceId && { sourceId }),
+      signature: signature ?? currentEmbeddingSignature(),
+    }) ?? {
+      counts: { total_null: 0, eligible_now: 0, backoff_deferred: 0, quarantined: 0 },
+      by_error_class: [],
+      quarantined_top: [],
+    } satisfies EmbedFailureSummary;
+    result.embedFailureSummary = failureSummary;
+    slog(formatStaleRunSummary({
+      embedded: result.embedded,
+      pagesProcessed: totalProcessedPages,
+      persistFailures: result.persistFailures ?? 0,
+      counts: failureSummary.counts,
+    }));
+  };
   if (staleCount === 0) {
     if (dryRun) {
       slog('[dry-run] Would embed 0 chunks (0 stale found)');
     } else {
-      slog('Embedded 0 chunks (0 stale found)');
+      await emitStaleRunSummary();
     }
     return;
   }
@@ -910,7 +966,6 @@ async function embedAllStale(
     ? 'updated_desc'
     : 'page_id';
 
-  let totalProcessedPages = 0;
   let afterPageId = 0;
   let afterChunkIndex = -1;
   let afterUpdatedAt: string | null = null;
@@ -920,6 +975,8 @@ async function embedAllStale(
   // with stale chunks still remaining (un-embeddable for a non-transient reason)
   // surfaces that loudly instead of looking like a clean run.
   let embedFailures = 0;
+  const committedPages = new Set<string>();
+  const subBatchSize = resolveEmbedSubBatchSize(undefined, (message) => serr(message));
 
   // E-3 (paced-backfill): bounded end-of-run re-entry. A longer paced run gives
   // a live writer (sync / put_page) more time to insert NEW stale rows BEHIND
@@ -936,7 +993,7 @@ async function embedAllStale(
     if (!pacer.snapshot().enabled) return false;
     if (effectiveSignal.aborted) return false;
     if (reentries >= MAX_REENTRIES) return false;
-    const remaining = await engine.countStaleChunks(sourceOpt);
+    const remaining = await engine.countStaleChunks(signature ? { ...sourceOpt, signature } : sourceOpt);
     if (remaining === 0) return false;
     if (result.embedded === lastReentryEmbedded) return false; // no forward progress
     lastReentryEmbedded = result.embedded;
@@ -972,6 +1029,7 @@ async function embedAllStale(
             afterUpdatedAt,
           }),
           ...(sourceId && { sourceId }),
+          ...(signature && { signature }),
         }),
       );
       if (batch.length === 0) {
@@ -1007,80 +1065,38 @@ async function embedAllStale(
 
       async function embedOneKey(key: string) {
         const stale = byKey.get(key)!;
-        const keySourceId = stale[0]?.source_id ?? 'default';
-        const slug = stale[0].slug;
-        // Embed phase: partial helper never throws and preserves every vector
-        // produced before a fatal error or cooperative abort.
-        const partial = await embedWithTruncationFallbackPartial(
-          stale.map(c => c.chunk_text),
-          (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
-          { abortSignal: effectiveSignal },
-        );
-        let pageHadFailure = partial.failures.length > 0 || partial.fatalError !== undefined;
-        if (partial.failures.length > 0 || partial.fatalError !== undefined) {
-          const chunkIndexes = [
-            ...partial.failures.map(failure => failure.index),
-            ...(partial.fatalIndexes ?? []),
-          ].map(index => stale[index]?.chunk_index).filter((index): index is number => index !== undefined);
-          const firstError = partial.failures[0]?.error ?? partial.fatalError;
-          serr(`\n  Error embedding ${slug}: failed chunk_index [${chunkIndexes.join(', ')}]${firstError instanceof Error ? `: ${firstError.message}` : firstError === undefined ? '' : `: ${String(firstError)}`}`);
-        }
-
-        const successCount = partial.vectors.filter((vector): vector is Float32Array => vector !== null).length;
-        if (successCount > 0) {
-          // Persist phase deliberately has its own unconditional catch: abort
-          // does not silence a getChunks/upsert/signature failure.
-          try {
-            const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
-            const staleIdxToEmbedding = new Map<number, Float32Array>();
-            for (let j = 0; j < stale.length; j++) {
-              const vector = partial.vectors[j];
-              if (vector !== null) staleIdxToEmbedding.set(stale[j].chunk_index, vector);
-            }
-            const merged: ChunkInput[] = existing.map(c => ({
-              chunk_index: c.chunk_index,
-              chunk_text: c.chunk_text,
-              chunk_source: c.chunk_source,
-              embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-              token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
-            }));
-            await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-            result.embedded += successCount;
-
-            if (signature) {
-              const rows = (await observed(pacer, () => engine.executeRaw<{ embedding_signature: string | null }>(
-                'SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = $2',
-                [slug, keySourceId],
-              ))) ?? [];
-              const storedSignature = rows[0]?.embedding_signature ?? null;
-              // Correctness here assumes no concurrent rechunk/upsert writer:
-              // invalidation made a drifted page NULL, so this pass owns every
-              // non-NULL vector it now stamps, even across cursor batches.
-              const shouldStamp = storedSignature !== null
-                ? storedSignature !== signature
-                : stale.length === existing.length;
-              if (shouldStamp) {
-                await observed(pacer, () =>
-                  engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
-                );
-              }
-            }
-          } catch (e: unknown) {
+        const slices = Math.ceil(stale.length / subBatchSize);
+        let pageHadFailure = false;
+        for (let offset = 0; offset < stale.length; offset += subBatchSize) {
+          if (effectiveSignal.aborted) return;
+          const sliceRows = stale.slice(offset, offset + subBatchSize);
+          const checkpoint = await persistStaleSlice({
+            engine,
+            rows: sliceRows,
+            embeddingSignature: signature,
+            embedFn: (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
+            signal: effectiveSignal,
+            slice: { index: (offset / subBatchSize) + 1, total: slices },
+            write: (message) => serr(`\n  ${message}`),
+          });
+          result.embedded += checkpoint.embedded;
+          if (checkpoint.failureCount > 0) pageHadFailure = true;
+          if (checkpoint.persistFailed) {
+            result.persistFailures = (result.persistFailures ?? 0) + 1;
             pageHadFailure = true;
-            serr(`\n  Error persisting ${slug}${effectiveSignal.aborted ? ' (aborted context)' : ''}: ${e instanceof Error ? e.message : e}`);
           }
+          const pageKey = `${sliceRows[0]!.source_id}:${sliceRows[0]!.page_id}`;
+          if (checkpoint.pageCommitted && !committedPages.has(pageKey)) {
+            committedPages.add(pageKey);
+            totalProcessedPages++;
+            result.pages_processed++;
+          }
+          if (checkpoint.aborted) return;
         }
-        totalProcessedPages++;
-        result.pages_processed++;
         if (pageHadFailure) embedFailures++;
         // Use staleCount as the estimated total for progress (not exact after
         // pagination starts, but directionally correct).
         onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
-        // Propagate typed hard-aborts only after partial successes were given a
-        // chance to persist. Keep the original error object for worker-pool.
-        if (partial.fatalError !== undefined && isMustAbortError(partial.fatalError)) {
-          throw partial.fatalError;
-        }
         // Cooperative DB-contention pace between keys (no-op when unpaced).
         // E-4 (Codex P1): pace() is subject to the EXTERNAL abort only, NOT the
         // wall-clock budget — a contended DB's sleep must not be cut by the
@@ -1120,7 +1136,7 @@ async function embedAllStale(
     if (budgetTimer) clearTimeout(budgetTimer);
   }
 
-  slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
+  await emitStaleRunSummary();
 
   // A catch-up pass that completed with stale chunks needs an explicit, page-
   // scoped warning; retryability is intentionally not asserted here.
