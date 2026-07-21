@@ -257,6 +257,13 @@ export class PGLiteEngine implements BrainEngine {
   // PGlite.create(loadDataDir), initSchema is a no-op (schema is already
   // present + migrations already applied). Saves ~1-3s per fresh test PGLite.
   private _snapshotLoaded = false;
+  /**
+   * #2026-07-21: reentrancy marker for transaction(). Only ever defined on a
+   * txEngine (via Object.defineProperty in transaction()), never on the
+   * top-level engine, so `this._inTransaction` is falsy at the outer call
+   * and true inside a nested transaction() call on the same tx scope.
+   */
+  private readonly _inTransaction?: boolean;
 
   get db(): PGLiteDB {
     if (!this._db) throw new Error('PGLite not connected. Call connect() first.');
@@ -912,9 +919,17 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // #2026-07-21: reentrancy short-circuit — see PostgresEngine.transaction
+    // for rationale. If already inside a transaction() scope, reuse it
+    // instead of calling this.db.transaction() again (PGLite tx objects
+    // have no .transaction() method either).
+    if (this._inTransaction) {
+      return fn(this);
+    }
     return this.db.transaction(async (tx) => {
       const txEngine = Object.create(this) as PGLiteEngine;
       Object.defineProperty(txEngine, 'db', { get: () => tx });
+      Object.defineProperty(txEngine, '_inTransaction', { value: true });
       return fn(txEngine);
     });
   }

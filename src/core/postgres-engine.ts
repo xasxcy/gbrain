@@ -104,6 +104,13 @@ export class PostgresEngine implements BrainEngine {
   /** Whether a reconnect is in progress (prevents concurrent reconnects). */
   private _reconnecting = false;
   /**
+   * #2026-07-21: reentrancy marker for transaction(). Only ever defined on a
+   * txEngine (via Object.defineProperty in transaction()), never on the
+   * top-level engine, so `this._inTransaction` is falsy at the outer call
+   * and true inside a nested transaction() call on the same tx scope.
+   */
+  private readonly _inTransaction?: boolean;
+  /**
    * #1471: module-singleton OWNERSHIP token. `true` only for the engine whose
    * connect() actually created the shared db.ts `sql` singleton (returned
    * atomically by db.connect()). Borrowers — probe engines constructed while the
@@ -881,12 +888,22 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // #2026-07-21: reentrancy short-circuit. If we're already inside a
+    // transaction() scope (this._inTransaction is true on the txEngine),
+    // reuse it instead of calling conn.begin() again — postgres.js tx
+    // objects have no .begin(), and Postgres has no true nested
+    // transactions anyway. Reusing means inner writes live/die with the
+    // outer transaction, which is the correct semantics here.
+    if (this._inTransaction) {
+      return fn(this);
+    }
     const conn = this.sql;
     return conn.begin(async (tx) => {
       // Create a scoped engine with tx as its connection, no shared state mutation
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      Object.defineProperty(txEngine, '_inTransaction', { value: true });
       return fn(txEngine);
     }) as Promise<T>;
   }
