@@ -2755,18 +2755,35 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // filter it out of `renamesToDo` forever, and once a later clean run hits
       // the failure gate's fast path it advances `last_commit` past the rename
       // — the index and the repo then diverge permanently.
-      let renameImportOk = true;
-      if (existsSync(filePath) && isPathSafe(filePath, gitContextRoot)) {
+      // FORK-FIX (2026-07-22, batch 2): default must be `false`. The batch-1
+      // fix above only covers "import ran and failed" — it left this whole
+      // block skipped (destination missing, or path escapes gitContextRoot
+      // via a symlink) still defaulting to `true` and writing the
+      // checkpoint. updateSlug() already ran by this point, so that left the
+      // page renamed with stale body/chunks/embeddings and a checkpoint that
+      // permanently suppresses retry. Both skip reasons now record to
+      // failedFiles instead, matching the add/modify path's unsafe-path
+      // handling (line ~2940).
+      let renameImportOk = false;
+      if (!existsSync(filePath)) {
+        failedFiles.push({ path: to, error: 'renamed file missing at destination path' });
+      } else if (!isPathSafe(filePath, gitContextRoot)) {
+        failedFiles.push({ path: to, error: 'path resolves outside git repo (symlink escape)' });
+      } else {
         try {
           const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
-          if (result.status === 'imported') chunksCreated += result.chunks;
-          else if (result.status === 'skipped' && (result as { error?: string }).error) {
+          if (result.status === 'imported') {
+            chunksCreated += result.chunks;
+            renameImportOk = true;
+          } else if (result.status === 'skipped' && (result as { error?: string }).error) {
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
-            renameImportOk = false;
+          } else {
+            // status 'skipped' with no error == content_hash short-circuit
+            // (already imported, unchanged) — done for checkpoint purposes.
+            renameImportOk = true;
           }
         } catch (e: unknown) {
           failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
-          renameImportOk = false;
         }
       }
       pagesAffected.push(newSlug);
