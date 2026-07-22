@@ -155,4 +155,56 @@ describe('Reranker invocation receives query + documents', () => {
     expect(received!.documents.length).toBe(3);
     expect(received!.documents[0]).toContain('doc 0');
   });
+
+  test('removes a dangling high surrogate after document truncation', async () => {
+    const results = makeResults(1);
+    results[0]!.chunk_text = `${'a'.repeat(599)}😀`;
+    let received: string[] = [];
+    await applyReranker('test query', results, {
+      enabled: true,
+      topNIn: 1,
+      topNOut: null,
+      maxDocumentChars: 600,
+      rerankerFn: async ({ documents }) => {
+        received = documents;
+        return [{ index: 0, relevanceScore: 1 }];
+      },
+    });
+    expect(received[0]!.length).toBe(599);
+    expect(received[0]!.isWellFormed()).toBe(true);
+  });
+
+  test('preserves normal BMP truncation behavior', async () => {
+    const results = makeResults(1);
+    results[0]!.chunk_text = 'abcdef';
+    let received: string[] = [];
+    await applyReranker('test query', results, {
+      enabled: true,
+      topNIn: 1,
+      topNOut: null,
+      maxDocumentChars: 4,
+      rerankerFn: async ({ documents }) => {
+        received = documents;
+        return [{ index: 0, relevanceScore: 1 }];
+      },
+    });
+    expect(received).toEqual(['abcd']);
+  });
+
+  test('keeps a complete surrogate pair at the truncation boundary', async () => {
+    const results = makeResults(1);
+    results[0]!.chunk_text = 'ab😀c';
+    let received: string[] = [];
+    await applyReranker('test query', results, {
+      enabled: true,
+      topNIn: 1,
+      topNOut: null,
+      maxDocumentChars: 4,
+      rerankerFn: async ({ documents }) => {
+        received = documents;
+        return [{ index: 0, relevanceScore: 1 }];
+      },
+    });
+    expect(received).toEqual(['ab😀']);
+  });
 });

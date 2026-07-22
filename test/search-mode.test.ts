@@ -18,6 +18,7 @@ import {
   SEARCH_MODE_CONFIG_KEYS,
   type SearchMode,
 } from '../src/core/search/mode.ts';
+import { cacheRowId } from '../src/core/search/query-cache.ts';
 
 describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
   test('SEARCH_MODES is exactly the 3 expected values', () => {
@@ -326,6 +327,24 @@ describe('reranker_max_document_chars config', () => {
     expect(overrides.reranker_max_document_chars).toBe(321);
     expect(resolveSearchMode({ mode: 'balanced', overrides }).reranker_max_document_chars).toBe(321);
     expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.reranker.max_document_chars');
+  });
+
+  test('per-call document limits produce distinct cache hashes for the same query and mode', () => {
+    const query = 'how does cache isolation work?';
+    const mode = 'balanced';
+    const max600 = knobsHash(resolveSearchMode({
+      mode,
+      perCall: { reranker_max_document_chars: 600 },
+    }));
+    const max1200 = knobsHash(resolveSearchMode({
+      mode,
+      perCall: { reranker_max_document_chars: 1200 },
+    }));
+
+    expect(max600).not.toBe(max1200);
+    expect(cacheRowId(query, 'default', max600)).not.toBe(
+      cacheRowId(query, 'default', max1200),
+    );
   });
 });
 
