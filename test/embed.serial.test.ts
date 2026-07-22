@@ -1079,7 +1079,7 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
     };
   }
 
-  // ADR-076: the fork's --stale (autopilot) path does NOT go through
+  // ADR-077: the fork's --stale (autopilot) path does NOT go through
   // upsertChunks at all — embedAllStale (src/commands/embed.ts) routes every
   // chunk through persistStaleSlice (src/core/embed-slice-persist.ts) into
   // engine.persistEmbedOutcome (src/core/postgres-engine.ts), which only

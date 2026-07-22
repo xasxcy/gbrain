@@ -165,7 +165,7 @@ describe('persistEmbedOutcome', () => {
   // SQL only does `SET embedding = ..., embedded_at = now()` and never
   // touches the 8 code-metadata columns. This is the real-engine proof that
   // persistEmbedOutcome leaves pre-existing code metadata untouched when it
-  // fills in a NULL embedding. See ADR-076 and the routing-assertion test in
+  // fills in a NULL embedding. See ADR-077 and the routing-assertion test in
   // test/embed.serial.test.ts ("--stale (autopilot path) routes through
   // persistEmbedOutcome, not upsertChunks").
   test('persists a vector while leaving all code-chunk metadata columns untouched', async () => {
