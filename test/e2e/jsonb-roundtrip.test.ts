@@ -93,13 +93,23 @@ describeE2E('E2E: JSONB roundtrip — v0.12.1 reliability wave', () => {
   // `${JSON.stringify({...})}::jsonb` to `${sql.json({...})}` in v0.12.1.
   // The function reads config and touches cloud storage, so we exercise the
   // driver-level pattern directly against the same table/column.
+  //
+  // Conflict target is (source_id, storage_path), NOT (storage_path): the
+  // fork's migration v124 files_source_id_storage_path_unique replaced the
+  // global UNIQUE(storage_path) with the composite key so two sources can't
+  // fight over one row. Every production write site (files.ts:163/258/343,
+  // postgres-engine.ts:4451, pglite-engine.ts:4269, operations.ts:2793)
+  // already names the composite; this fixture was the last caller left on the
+  // dropped constraint, and it failed with 42P10 before the assertions below
+  // ever ran — invisible until 2026-07-22, when the e2e lane executed on a
+  // fork branch for the first time.
   test('files.metadata writes as object via sql.json(), not double-encoded string', async () => {
     const sql = getConn();
     const payload = { type: 'pdf', upload_method: 'TUS resumable' };
     await sql`
       INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
       VALUES (NULL, 'jsonb-check.bin', 'unsorted/jsonb-check.bin', 'application/octet-stream', 1, 'sha256:deadbeef', ${sql.json(payload)})
-      ON CONFLICT (storage_path) DO UPDATE SET metadata = EXCLUDED.metadata
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET metadata = EXCLUDED.metadata
     `;
     const [row] = await sql`
       SELECT jsonb_typeof(metadata) AS t,
