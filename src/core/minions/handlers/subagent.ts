@@ -475,6 +475,61 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       // covers the whole request. A mid-call renewal loop would add
       // complexity; for v0.15 we lean on the 120s TTL + abort-on-signal.
       try {
+        // --- Patch B (borrow-ahead, hand-authored): rolling conversation prompt-cache ---
+        // Direct path marks cache_control only on static system(485)+last-tool(498) ~5.2K;
+        // the growing anthroMessages conversation is re-billed every turn (6/18 v0.42.51
+        // regression). Anthropic caches up to the last cache_control block, so mark the last
+        // content block of the last message and keep the 4-breakpoint API limit
+        // (system + last-tool + 2 rolling = 4).
+        //
+        // Two rolling markers, not one: Anthropic's automatic cache lookup only walks
+        // back up to 20 content blocks from a breakpoint to find a prior cached prefix
+        // (see prompt-caching docs, "20-block lookback window"). A turn that adds more
+        // than 20 blocks since the last marker (e.g. a large parallel tool_use/tool_result
+        // round) would make a freshly-placed single marker miss the previous cache
+        // entirely. Keeping the immediately-preceding rolling marker in place — and only
+        // evicting anything older than that — guarantees at least that marker's prefix is
+        // still a valid, already-written cache read even when this turn's new marker's
+        // lookback comes up empty.
+        if (anthroMessages.length > 0) {
+          const markerIndices: number[] = [];
+          for (let i = 0; i < anthroMessages.length; i++) {
+            const m = anthroMessages[i] as any;
+            if (Array.isArray(m.content)) {
+              for (const b of m.content) {
+                if (b && typeof b === 'object' && 'cache_control' in b) {
+                  markerIndices.push(i);
+                  break;
+                }
+              }
+            }
+          }
+          const keepIdx = markerIndices.length > 0 ? markerIndices[markerIndices.length - 1] : -1;
+          for (const i of markerIndices) {
+            if (i === keepIdx) continue;
+            const m = anthroMessages[i] as any;
+            for (const b of m.content) {
+              if (b && typeof b === 'object' && 'cache_control' in b) delete b.cache_control;
+            }
+          }
+          const lastMsg = anthroMessages[anthroMessages.length - 1] as any;
+          // A fresh job's seed message has string content (see the
+          // `[{ role: 'user', content: data.prompt }]` init above), which
+          // the array-only check below would silently skip — leaving the
+          // very first call, and thus the common single-tool round-trip,
+          // with no rolling breakpoint at all. Normalize to a one-block
+          // array first so it gets the marker like every later turn.
+          if (typeof lastMsg.content === 'string') {
+            lastMsg.content = [{ type: 'text', text: lastMsg.content }];
+          }
+          if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+            const lastBlock = lastMsg.content[lastMsg.content.length - 1];
+            if (lastBlock && typeof lastBlock === 'object') {
+              lastBlock.cache_control = { type: 'ephemeral' };
+            }
+          }
+        }
+        // --- end Patch B ---
         const params: Anthropic.MessageCreateParamsNonStreaming = {
           // v0.41 Bug 3: strip `provider:` prefix at the SDK call site only.
           // `model` stays qualified everywhere else (persistence, recipe
@@ -777,22 +832,57 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     });
   }
 
-  // Convert prior Anthropic-shape messages → ChatMessage with ChatBlock content.
-  // v1 rows store Anthropic content blocks ({type:'tool_use'|'tool_result'|...});
-  // we adapt them to ChatBlock shape (type: 'tool-call' | 'tool-result' | 'text').
-  const priorChatMessages: ChatMessage[] = priorMessages.map(m => ({
-    role: m.role as 'user' | 'assistant',
-    content: adaptContentBlocksToChatBlocks(m.content_blocks),
-  }));
+  // Token rollup across the prior transcript (returned as-is on the terminal
+  // early-return path; the loop adds only NEW-turn usage otherwise).
+  const priorTokens = { in: 0, out: 0, cache_read: 0, cache_create: 0 };
+  for (const m of priorMessages) {
+    if (m.tokens_in) priorTokens.in += m.tokens_in;
+    if (m.tokens_out) priorTokens.out += m.tokens_out;
+    if (m.tokens_cache_read) priorTokens.cache_read += m.tokens_cache_read;
+    if (m.tokens_cache_create) priorTokens.cache_create += m.tokens_cache_create;
+  }
+
+  // Reconcile an unbalanced transcript from a prior crashed/resumed run. The
+  // gateway loop persists each assistant turn but (pre-fix) never persisted the
+  // following tool-result user turn, so a resumed job reloads assistant
+  // tool-calls with no matching results — which non-Anthropic (openai-compat)
+  // providers reject with AI_MissingToolResultsError, dead-lettering the job.
+  // reconcileGatewayReplay heals every such dangling turn from settled tool
+  // executions (mirroring the legacy Anthropic path) and reports the terminal
+  // case where the prior run already reached end_turn.
+  const priorToolsV1 = await loadPriorTools(engine, ctx.id);
+  const { chatMessages: priorChatMessages, nextMessageIdx: reconciledNextIdx, terminalText } =
+    await reconcileGatewayReplay({
+      engine,
+      jobId: ctx.id,
+      priorMessages,
+      priorTools: priorToolsV1,
+      toolDefs,
+      signal: ctx.signal,
+    });
+
+  // Terminal early-return (#1151 parity): the prior run already reached
+  // end_turn. Non-Anthropic providers reject a trailing assistant "prefill",
+  // so surface the persisted text and skip the loop entirely.
+  if (terminalText !== null) {
+    return {
+      result: terminalText,
+      turns_count: priorChatMessages.filter(m => m.role === 'assistant').length,
+      stop_reason: 'end_turn',
+      tokens: priorTokens,
+    };
+  }
 
   // Initial seed message if no prior state.
   const initialMessages: ChatMessage[] = priorChatMessages.length === 0
     ? [{ role: 'user', content: data.prompt }]
     : [];
 
-  // Persist seed user message at idx 0 if fresh start.
-  let nextMessageIdx = priorChatMessages.length;
-  if (nextMessageIdx === 0) {
+  // Persist seed user message at idx 0 if fresh start. reconciledNextIdx is
+  // max(known message_idx) + 1 (0 when no prior rows), which keeps the loop's
+  // subsequent writes clear of any healed tool-result turn we just inserted.
+  let nextMessageIdx = reconciledNextIdx;
+  if (priorChatMessages.length === 0) {
     await persistMessage(engine, ctx.id, {
       message_idx: 0,
       role: 'user',
@@ -904,6 +994,22 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
         [errorMsg, gbrainToolUseId],
       );
     },
+    // Persist the tool-result user turn so a resume reloads a balanced
+    // transcript. JSON.stringify inside persistMessage ISO-izes any Date in
+    // tool output, and the value binds through $N::text::jsonb (never
+    // JSON.stringify into a bare ::jsonb).
+    onToolResultTurn: async (_turnIdx, messageIdx, blocks) => {
+      await persistMessage(engine, ctx.id, {
+        message_idx: messageIdx,
+        role: 'user',
+        content_blocks: blocks as unknown as ContentBlock[],
+        tokens_in: null,
+        tokens_out: null,
+        tokens_cache_read: null,
+        tokens_cache_create: null,
+        model: null,
+      });
+    },
     onHeartbeat: heartbeat,
   });
 
@@ -932,6 +1038,158 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       cache_create: result.totalUsage.cache_creation_tokens,
     },
   };
+}
+
+interface ReconcileArgs {
+  engine: BrainEngine;
+  jobId: number;
+  priorMessages: PersistedMessage[];
+  priorTools: PersistedToolExec[];
+  toolDefs: ToolDef[];
+  signal: AbortSignal;
+}
+
+interface ReconcileResult {
+  chatMessages: ChatMessage[];
+  /** max(known/healed message_idx) + 1 — 0 when there is no prior transcript. */
+  nextMessageIdx: number;
+  /** Non-null when the transcript already ended on an assistant text turn. */
+  terminalText: string | null;
+}
+
+/**
+ * Heal an unbalanced gateway replay transcript before it reaches the provider.
+ *
+ * The gateway loop persists each assistant turn but historically never
+ * persisted the following tool-result user turn, so a resumed job reloaded
+ * assistant tool-calls with no matching results. Non-Anthropic (openai-compat)
+ * providers reject that with AI_MissingToolResultsError and the job
+ * dead-letters. This walks EVERY prior assistant turn that carries tool-call
+ * blocks (not just the tail — a pre-fix multi-turn job persisted several
+ * consecutive dangling assistant turns) and, if the turn isn't already answered
+ * by the following tool-result user turn, synthesizes that turn from the
+ * settled `subagent_tool_executions` rows with the same semantics as the legacy
+ * Anthropic replay path:
+ *   - complete            → stored output
+ *   - failed              → stored error (isError)
+ *   - idempotent-pending / missing row → re-dispatch, persist, use output
+ *   - non-idempotent-pending           → throw (cannot safely re-run)
+ *   - tool no longer registered        → persist failed + error stub
+ * Each synthesized turn is persisted at `assistant.message_idx + 1` (the free
+ * slot the pre-fix loop skipped) via `ON CONFLICT DO NOTHING`, so the next
+ * resume stays balanced.
+ */
+async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileResult> {
+  const { engine, jobId, priorMessages, priorTools, toolDefs, signal } = args;
+
+  const work = priorMessages.map(m => {
+    const adapted = adaptContentBlocksToChatBlocks(m.content_blocks);
+    return {
+      message_idx: m.message_idx,
+      role: m.role,
+      blocks: typeof adapted === 'string' ? [{ type: 'text', text: adapted } as ChatBlock] : adapted,
+    };
+  });
+
+  // Settled executions, looked up by (assistant message_idx, provider
+  // tool_use_id) with an ordinal-position fallback for legacy rows.
+  const execByKey = new Map<string, PersistedToolExec>();
+  const execByMsg = new Map<number, PersistedToolExec[]>();
+  for (const t of priorTools) {
+    execByKey.set(`${t.message_idx}:${t.tool_use_id}`, t);
+    const arr = execByMsg.get(t.message_idx) ?? [];
+    arr.push(t);
+    execByMsg.set(t.message_idx, arr);
+  }
+
+  let maxIdx = work.reduce((mx, w) => Math.max(mx, w.message_idx), -1);
+
+  for (let i = 0; i < work.length; i++) {
+    const msg = work[i];
+    if (msg.role !== 'assistant') continue;
+    const toolCalls = msg.blocks.filter(
+      (b): b is Extract<ChatBlock, { type: 'tool-call' }> => b.type === 'tool-call',
+    );
+    if (toolCalls.length === 0) continue;
+
+    // Skip if a following tool-result user turn exists AT ALL. A fully-answered
+    // turn is already balanced; a PARTIALLY-answered turn (only reachable from
+    // externally-corrupted data — gbrain persists all of a turn's results in one
+    // message) is left for repairToolPairing() at the chat() boundary, which
+    // back-fills only the missing ids. Synthesizing a full turn here would
+    // duplicate the answered results and collide with the persisted row.
+    const next = work[i + 1];
+    if (next && next.role === 'user' && next.blocks.some(b => b.type === 'tool-result')) continue;
+
+    const results: ChatBlock[] = [];
+    for (let callIdx = 0; callIdx < toolCalls.length; callIdx++) {
+      const call = toolCalls[callIdx];
+      // Prefer an exact (message_idx, provider tool_use_id) match. The
+      // positional fallback is used only when the row at that ordinal is for
+      // the SAME tool, so a missing row can't mis-attribute a sibling's output.
+      const fallback = execByMsg.get(msg.message_idx)?.[callIdx];
+      const exec = execByKey.get(`${msg.message_idx}:${call.toolCallId}`)
+        ?? (fallback && fallback.tool_name === call.toolName ? fallback : undefined);
+      if (exec?.status === 'complete') {
+        results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: exec.output ?? null });
+        continue;
+      }
+      if (exec?.status === 'failed') {
+        results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: exec.error ?? 'tool failed', isError: true });
+        continue;
+      }
+      const toolDef = toolDefs.find(t => t.name === call.toolName);
+      if (!toolDef) {
+        await persistToolExecFailed(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input, `tool "${call.toolName}" is not in the registry for this subagent`);
+        results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: `tool "${call.toolName}" is not available`, isError: true });
+        continue;
+      }
+      if (exec?.status === 'pending' && !toolDef.idempotent) {
+        throw new Error(`non-idempotent tool "${call.toolName}" pending on resume; cannot safely re-run`);
+      }
+      await persistToolExecPending(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input);
+      try {
+        const output = await toolDef.execute(call.input, { engine, jobId, remote: true, signal });
+        await persistToolExecComplete(engine, jobId, call.toolCallId, output);
+        results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output });
+      } catch (e) {
+        const errText = e instanceof Error ? (e.stack ?? e.message) : String(e);
+        await persistToolExecFailed(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input, errText);
+        results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: errText, isError: true });
+      }
+    }
+
+    const resultIdx = msg.message_idx + 1;
+    await persistMessage(engine, jobId, {
+      message_idx: resultIdx,
+      role: 'user',
+      content_blocks: results as unknown as ContentBlock[],
+      tokens_in: null, tokens_out: null, tokens_cache_read: null, tokens_cache_create: null, model: null,
+    });
+    maxIdx = Math.max(maxIdx, resultIdx);
+    work.splice(i + 1, 0, { message_idx: resultIdx, role: 'user' as const, blocks: results });
+    i++; // skip the turn we just inserted
+  }
+
+  const chatMessages: ChatMessage[] = work.map(w => ({ role: w.role, content: w.blocks }));
+
+  // Terminal case: the transcript already ends on an assistant turn that
+  // carried real text and made no tool calls (prior run reached end_turn).
+  // Surface its text; skip the loop. An assistant turn whose blocks are all
+  // empty (e.g. a reasoning-only/null-text turn that adaptation dropped) is NOT
+  // terminal — falling through lets the loop re-issue the call rather than
+  // returning an empty result.
+  const lastMsg = work[work.length - 1];
+  let terminalText: string | null = null;
+  if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.blocks.some(b => b.type === 'tool-call')) {
+    const text = lastMsg.blocks
+      .filter((b): b is Extract<ChatBlock, { type: 'text' }> => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+    if (text.trim() !== '') terminalText = text;
+  }
+
+  return { chatMessages, nextMessageIdx: maxIdx + 1, terminalText };
 }
 
 function recipeIdFromModel(modelString: string): string {
@@ -1087,7 +1345,8 @@ async function loadPriorTools(engine: BrainEngine, jobId: number): Promise<Persi
   const rows = await engine.executeRaw<Record<string, unknown>>(
     `SELECT message_idx, tool_use_id, tool_name, input, status, output, error
        FROM subagent_tool_executions
-      WHERE job_id = $1`,
+      WHERE job_id = $1
+      ORDER BY message_idx, COALESCE(ordinal, 0), id`,
     [jobId],
   );
   return rows.map(r => ({

@@ -117,6 +117,17 @@ async function extractFencedChunks(
   startChunkIndex: number,
 ): Promise<ChunkInput[]> {
   const out: ChunkInput[] = [];
+  // Fast path: most pages (prose, tables, converted docs) contain no code
+  // fence at all, so there is nothing for this function to extract. marked's
+  // lexer still allocates transient memory proportional to page size on every
+  // call — a ~2MB table-heavy page spikes ~110MB of heap just to produce zero
+  // fenced chunks. During bulk import those per-page spikes stack on top of
+  // accumulated chunk/embedding memory and can OOM the worker, and the
+  // try/catch below cannot rescue an OOM (it is process death, not a throw).
+  // Skip the lexer entirely when no fence marker (``` or ~~~) is present.
+  // The `\r` in the line-start class mirrors marked's own `\r\n|\r → \n`
+  // normalization, so CR/CRLF-only documents don't lose a real fence.
+  if (!/(^|[\r\n])[ \t]{0,3}(```|~~~)/.test(markdown)) return out;
   let tokens: ReturnType<typeof marked.lexer>;
   try {
     tokens = marked.lexer(markdown);
@@ -1346,6 +1357,11 @@ const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
 export interface ImportTransactionSpec {
   slug: string;
   hadExisting: boolean;
+  /**
+   * Source containing the page, chunks, file row, and type-specific writes.
+   * Routes all writes to a named source; mirrors importFromContent's threading.
+   */
+  sourceId?: string;
   page: PageInput;
   /** When undefined, no chunk write happens. When [], deletes any prior chunks. */
   chunks?: ChunkInput[];
@@ -1353,14 +1369,13 @@ export interface ImportTransactionSpec {
   file?: FileSpec;
   /** Inside-transaction hook for type-specific work (tags, links). */
   after?: (tx: BrainEngine) => Promise<void>;
-  /** Route all writes to a named source; mirrors importFromContent's threading. */
-  sourceId?: string;
 }
 
 export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const sourceId = spec.sourceId ?? 'default';
   const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
     if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
@@ -1370,7 +1385,7 @@ export async function withImportTransaction(
       const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
-        source_id: spec.sourceId,
+        source_id: sourceId,
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
@@ -1676,11 +1691,17 @@ export async function importImageFile(
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
   const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
+  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const linkOpts = opts.sourceId
+    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+    : undefined;
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const srcOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const existing = await engine.getPage(imageSlug, srcOpts);
+  // FORK: `!opts.forceReembed` keeps the hash-skip bypass (7bbd6308). Upstream
+  // has no forceReembed concept, so a plain "take theirs" here silently drops it
+  // and re-embedding an unchanged image becomes impossible.
+  const existing = await engine.getPage(imageSlug, sourceOpts);
   if (existing?.content_hash === hash && !opts.forceReembed) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1831,7 +1852,7 @@ export async function importImageFile(
         ? { fromSourceId: linkSourceId, toSourceId: linkSourceId, originSourceId: linkSourceId }
         : undefined;
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate, srcOpts);
+        const sibling = await tx.getPage(candidate, sourceOpts);
         if (sibling) {
           try {
             await tx.addLink(

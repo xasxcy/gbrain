@@ -68,6 +68,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cross_modal_modality_backfill',
   'cycle_freshness',
   'effective_date_health',
+  'embed_failures',
   'embedding_column_registry',
   'embedding_env_override',
   'embedding_provider',
