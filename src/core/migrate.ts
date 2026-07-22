@@ -5622,12 +5622,23 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       const lang = getFtsLanguage();
+      // #2704 fix (batch 2 merge regression): install the FINAL trigger form
+      // right away — compiled_truth is never indexed, even transiently.
+      // Originally this migration still built search_vector from
+      // compiled_truth (an unbounded whole-page body) and then ran a
+      // full-table `UPDATE pages SET id = id` to backfill non-English
+      // languages, which overflows Postgres's 1MB tsvector cap on large
+      // pages (`string is too long for tsvector`) and aborts the whole
+      // migration before v128 ever runs. Dropping compiled_truth here
+      // removes the overflow risk entirely, so the pages backfill is no
+      // longer needed in this step — v128 now owns backfilling *all*
+      // existing rows (any language) in controlled batches.
       await engine.executeRaw(`
         CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
         DECLARE timeline_text TEXT;
         BEGIN
           SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '') INTO timeline_text FROM timeline_entries WHERE page_id = NEW.id;
-          NEW.search_vector := setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') || setweight(to_tsvector('${lang}', coalesce(NEW.compiled_truth, '')), 'B') || setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') || setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
+          NEW.search_vector := setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') || setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') || setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
           RETURN NEW;
         END;
         $fn$ LANGUAGE plpgsql;
@@ -5641,12 +5652,14 @@ export const MIGRATIONS: Migration[] = [
         $fn$ LANGUAGE plpgsql;
       `);
       if (lang === 'english') {
-        process.stderr.write(`  v127: trigger functions recreated with language='english' (default — no backfill needed)\n`);
+        process.stderr.write(`  v127: trigger functions recreated with language='english', compiled_truth dropped from pages trigger (no chunk backfill needed)\n`);
         return;
       }
-      await engine.executeRaw(`UPDATE pages SET id = id WHERE search_vector IS NOT NULL;`);
+      // Non-English: content_chunks rows are chunk-grain (bounded per-chunk
+      // text), so backfilling them here carries none of the pages-table
+      // overflow risk described above.
       await engine.executeRaw(`UPDATE content_chunks SET search_vector = setweight(to_tsvector('${lang}', COALESCE(doc_comment, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(symbol_name_qualified, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(chunk_text, '')), 'B') WHERE search_vector IS NOT NULL;`);
-      process.stderr.write(`  v127: trigger functions recreated with language='${lang}' + backfilled existing rows\n`);
+      process.stderr.write(`  v127: trigger functions recreated with language='${lang}', compiled_truth dropped from pages trigger, content_chunks backfilled\n`);
     },
   },
   {
@@ -5655,6 +5668,9 @@ export const MIGRATIONS: Migration[] = [
     idempotent: true,
     sql: '',
     handler: async (engine) => {
+      // v127 already installs the final (no-compiled_truth) trigger
+      // function; CREATE OR REPLACE here again is a defensive no-op so this
+      // step is still correct standalone (e.g. partial migration history).
       const lang = getFtsLanguage();
       await engine.executeRaw(`
         CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
@@ -5666,7 +5682,35 @@ export const MIGRATIONS: Migration[] = [
         END;
         $fn$ LANGUAGE plpgsql;
       `);
-      process.stderr.write(`  v128: update_page_search_vector() no longer indexes compiled_truth (was overflowing tsvector on large pages, #2704)\n`);
+      // Explicit, batched backfill of every existing row whose search_vector
+      // is non-null — regardless of language. Pre-fix, this step only did
+      // CREATE OR REPLACE and never touched existing rows, so upgraded
+      // brains kept compiled_truth baked into search_vector forever (page/
+      // title-arm hits on body text, double-counted against the chunk arm
+      // in RRF) while freshly created brains never had it. Batched by id
+      // range (SERIAL PK) so a huge pages table can't hold one giant
+      // transaction/lock for the whole backfill.
+      const batchSize = 500;
+      let lastId = 0;
+      let totalBackfilled = 0;
+      for (;;) {
+        const rows = await engine.executeRaw<{ id: number }>(
+          `UPDATE pages SET id = id
+             WHERE id IN (
+               SELECT id FROM pages
+                WHERE id > $1 AND search_vector IS NOT NULL
+                ORDER BY id
+                LIMIT $2
+             )
+           RETURNING id`,
+          [lastId, batchSize],
+        );
+        if (rows.length === 0) break;
+        totalBackfilled += rows.length;
+        lastId = Math.max(...rows.map((r) => r.id));
+        if (rows.length < batchSize) break;
+      }
+      process.stderr.write(`  v128: update_page_search_vector() no longer indexes compiled_truth (was overflowing tsvector on large pages, #2704); backfilled ${totalBackfilled} existing row(s)\n`);
     },
   },
 ];

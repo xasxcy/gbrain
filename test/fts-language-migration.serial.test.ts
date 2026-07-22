@@ -70,7 +70,15 @@ describe('configurable_fts_language migration', () => {
     expect(calls[1]).toContain('SET search_path = pg_catalog, public');
   });
 
-  test('non-english language triggers backfill', async () => {
+  test('non-english language triggers content_chunks backfill only (pages backfill moved to v128)', async () => {
+    // FORK-FIX (2026-07-22, batch 2, item 2): v127 now installs the FINAL
+    // (no-compiled_truth) pages trigger from the start instead of a
+    // transitional compiled_truth-including one, which removes the
+    // overflow risk that made the old `UPDATE pages SET id = id` backfill
+    // in this migration crash on large pages (#2704 follow-up). Backfilling
+    // EXISTING pages.search_vector rows is now v128's job \u2014 batched, and
+    // for every language, not just non-English (see v128's own tests) \u2014
+    // so v127 no longer touches the pages table at all.
     const ftsMig = MIGRATIONS.find(m => m.name === 'configurable_fts_language');
     const calls: string[] = [];
 
@@ -86,13 +94,18 @@ describe('configurable_fts_language migration', () => {
 
     await ftsMig?.handler?.(mockEngine);
 
-    // pt_br \u2014 2 CREATE + 2 backfill UPDATEs = 4 calls
-    expect(calls.length).toBe(4);
+    // pt_br \u2014 2 CREATE (pages fn, chunk fn) + 1 content_chunks backfill = 3 calls.
+    expect(calls.length).toBe(3);
     expect(calls[0]).toContain("to_tsvector('pt_br'");
+    expect(calls[0]).toContain('update_page_search_vector');
+    expect(calls[0]).not.toContain('compiled_truth');
     expect(calls[1]).toContain("to_tsvector('pt_br'");
-    expect(calls[2]).toMatch(/UPDATE pages/);
-    expect(calls[3]).toContain("to_tsvector('pt_br'");
-    expect(calls[3]).toMatch(/UPDATE content_chunks/);
+    expect(calls[1]).toContain('update_chunk_search_vector');
+    expect(calls[2]).toContain("to_tsvector('pt_br'");
+    expect(calls[2]).toMatch(/UPDATE content_chunks/);
+    for (const sql of calls) {
+      expect(sql).not.toMatch(/UPDATE pages/);
+    }
   });
 
   test('invalid language falls back to english (no SQL injection)', async () => {
