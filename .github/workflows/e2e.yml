@@ -87,8 +87,23 @@ jobs:
         with:
           bun-version: 1.3.13
       - run: bun install
+      - name: Require DATABASE_URL (no silent skip)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL must be set for Tier 1 — engine-parity-stale-signature skips its Postgres half without it, which is the exact divergence it exists to catch. Failing the job." >&2
+            exit 1
+          fi
       - name: Run Tier 1 E2E tests
-        run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts
+        # engine-parity-stale-signature guards the Postgres side of
+        # list/count/sumStaleChunks({ signature }) — backoff and quarantine
+        # eligibility. Production runs Postgres; the PGLite half in the unit
+        # shard cannot catch a Postgres-only regression. It lived in the unit
+        # shard until 2026-07-22, where it had no DATABASE_URL and its Postgres
+        # cases counted as passes; moving it here without adding it to this
+        # list would have dropped the guard from CI entirely.
+        run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts test/e2e/engine-parity-stale-signature.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
 

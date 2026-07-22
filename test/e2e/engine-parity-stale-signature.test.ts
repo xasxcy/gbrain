@@ -21,7 +21,9 @@
  * to this move it lived in the root unit shard, where the two Postgres
  * cases silently warn+return "pass" whenever `DATABASE_URL` is unset — a
  * false-green protection net for exactly the regression this file exists to
- * catch. See scripts/run-e2e.sh + docs/TESTING.md for how the E2E lane runs.
+ * catch. It is wired into the e2e workflow's Tier 1 job, which provisions
+ * pgvector and hard-fails on a missing DATABASE_URL: moving a guard out of
+ * the unit shard only helps if something in CI actually runs it there.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -150,52 +152,49 @@ describe.each([
   });
 });
 
-// Postgres-half — same assertions, runs only when DATABASE_URL is set.
-describe('listStaleChunks/countStaleChunks/sumStaleChunkChars — signature eligibility (Postgres)', () => {
+// Postgres-half — same assertions. Gated at the SUITE level, not inside each
+// case: a per-case `if (!pg) return` reports as a PASS, so a runner without
+// DATABASE_URL produced a green tick for the exact Postgres branch this file
+// exists to guard. `skipIf` reports skipped, which is the truth. The e2e
+// workflow's Tier 1 job hard-fails when DATABASE_URL is missing, so on CI
+// these always run.
+describe.skipIf(!process.env.DATABASE_URL)('listStaleChunks/countStaleChunks/sumStaleChunkChars — signature eligibility (Postgres)', () => {
   test('Postgres: only the plain + signature-mismatch chunks (index 0, 3) are signature-eligible', async () => {
-    if (!pg) {
-      console.warn('[engine-parity-stale-signature] DATABASE_URL not set — skipping Postgres half');
-      return;
-    }
-    await seedFourChunkStates(pg, 'parity/stale-sig');
+    await seedFourChunkStates(pg!, 'parity/stale-sig');
 
-    expect(await pg.countStaleChunks({ signature: 'sig' })).toBe(2);
+    expect(await pg!.countStaleChunks({ signature: 'sig' })).toBe(2);
 
-    const listed = await pg.listStaleChunks({ signature: 'sig' });
+    const listed = await pg!.listStaleChunks({ signature: 'sig' });
     expect(listed.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
-    const listedSourceScoped = await pg.listStaleChunks({ signature: 'sig', sourceId: 'default' });
+    const listedSourceScoped = await pg!.listStaleChunks({ signature: 'sig', sourceId: 'default' });
     expect(listedSourceScoped.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
-    const listedRecent = await pg.listStaleChunks({ signature: 'sig', orderBy: 'updated_desc' });
+    const listedRecent = await pg!.listStaleChunks({ signature: 'sig', orderBy: 'updated_desc' });
     expect(listedRecent.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
     // Legacy callers (no signature) ignore the ledger entirely — all 4
     // NULL-embedding chunks are "stale". This is the exact regression:
     // pre-fix, Postgres's listStaleChunks({signature}) returned this same
     // unfiltered [0,1,2,3] set instead of respecting the ledger.
-    expect(await pg.countStaleChunks()).toBe(4);
-    expect((await pg.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2, 3]);
+    expect(await pg!.countStaleChunks()).toBe(4);
+    expect((await pg!.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2, 3]);
   });
 
   test('Postgres parity with PGLite on the identical fixture', async () => {
-    if (!pg) {
-      console.warn('[engine-parity-stale-signature] DATABASE_URL not set — skipping Postgres half');
-      return;
-    }
     await seedFourChunkStates(pglite, 'parity/stale-sig-cmp');
-    await seedFourChunkStates(pg, 'parity/stale-sig-cmp');
+    await seedFourChunkStates(pg!, 'parity/stale-sig-cmp');
 
     const pgliteListed = (await pglite.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index);
-    const pgListed = (await pg.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index);
+    const pgListed = (await pg!.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index);
     expect(pgListed).toEqual(pgliteListed);
 
     const pgliteCount = await pglite.countStaleChunks({ signature: 'sig' });
-    const pgCount = await pg.countStaleChunks({ signature: 'sig' });
+    const pgCount = await pg!.countStaleChunks({ signature: 'sig' });
     expect(pgCount).toBe(pgliteCount);
 
     const pgliteSum = await pglite.sumStaleChunkChars({ signature: 'sig' });
-    const pgSum = await pg.sumStaleChunkChars({ signature: 'sig' });
+    const pgSum = await pg!.sumStaleChunkChars({ signature: 'sig' });
     expect(pgSum).toBe(pgliteSum);
   });
 });
