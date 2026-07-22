@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { LATEST_VERSION, MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
 
 let engine: PGLiteEngine;
 
@@ -60,15 +60,21 @@ describe('persistEmbedOutcome', () => {
     expect(await v126!.verify!(engine)).toBe(true);
 
     // Upgrade starts at v125 with the v126 objects absent, then executes the
-    // real migration entry and its verify hook.
+    // real migration entry and its verify hook. runMigrations always drives
+    // the schema to LATEST_VERSION (not just v126), so the assertion here
+    // targets v126's own behavior — the migration count pending after v125
+    // and v126's verify — instead of hardcoding "latest == 126", which broke
+    // (applied:1,current:126 → applied:3,current:128) the moment v127/v128
+    // were added.
+    const pendingFromV125 = MIGRATIONS.filter((m) => m.version > 125).length;
     await engine.executeRaw(`DROP TABLE embed_failures`);
     await engine.setConfig('version', '125');
-    expect(await runMigrations(engine)).toMatchObject({ applied: 1, current: 126 });
+    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromV125, current: LATEST_VERSION });
     expect(await v126!.verify!(engine)).toBe(true);
 
     // Replay is the migration body again, not a second fresh-schema init.
     await engine.setConfig('version', '125');
-    expect(await runMigrations(engine)).toMatchObject({ applied: 1, current: 126 });
+    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromV125, current: LATEST_VERSION });
     expect(await v126!.verify!(engine)).toBe(true);
   });
 

@@ -20,9 +20,33 @@
  * Hermetic PGLite. The gateway is pinned with an EMPTY env so embedding is
  * deterministically unavailable — hybridSearch takes the keyword(+title)
  * no-embed path with zero network, regardless of host API keys.
+ *
+ * FORK-FIX (2026-07-22, batch 2): configureGateway's empty env only pins
+ * the gateway SINGLETON's own config. hybridSearch resolves its embedding
+ * column via `loadConfigWithEngine()`, which falls through to the FILE-PLANE
+ * `loadConfig()` (reads `$GBRAIN_HOME/config.json`, default `~/.gbrain/config.json`)
+ * whenever DB-plane config is absent — true for every fresh PGLite test
+ * engine here. On any machine with a real gbrain install, that pulls in the
+ * REAL configured provider (verified: an Ollama model with a local base URL
+ * override) as the `providerProbe` for `isAvailable('embedding', …)`. Ollama
+ * needs no auth token, so `isAvailable` reports "available" regardless of
+ * the pinned empty env, hybridSearch attempts a real query embedding, and —
+ * because the *base URL* override lives on the gateway singleton, not the
+ * file-plane config the model name came from — the fetch goes to Ollama's
+ * un-overridden default (`http://localhost:11434`), where nothing is
+ * listening, and idles for ~5s until the AI SDK's own timeout, racing with
+ * (and losing to) bun's 5000ms test timeout. That's the entire 4-test
+ * failure mode this fix addresses. GBRAIN_HOME is pointed at an empty,
+ * never-created directory for this file's tests so `loadConfig()` finds no
+ * file and returns null — isolating this suite from whatever gbrain config
+ * happens to exist on the machine running it, matching the file's stated
+ * hermetic-PGLite contract.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
@@ -33,7 +57,18 @@ let engine: PGLiteEngine;
 
 const DIM = 1536;
 
+let origGbrainHome: string | undefined;
+let fakeGbrainHome: string;
+
 beforeAll(async () => {
+  // Isolate loadConfig()'s file-plane read from any real gbrain install on
+  // the host — see the file-header FORK-FIX note. The directory is created
+  // (mkdtemp) but intentionally never populated with a config.json, so
+  // loadConfig() sees "no config file" and returns null.
+  origGbrainHome = process.env.GBRAIN_HOME;
+  fakeGbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-title-arm-test-'));
+  process.env.GBRAIN_HOME = fakeGbrainHome;
+
   // Pin 1536-d (matches the preload schema default) with an EMPTY env so
   // isAvailable('embedding') is false → hybridSearch never embeds.
   configureGateway({
@@ -48,6 +83,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = origGbrainHome;
+  try { rmSync(fakeGbrainHome, { recursive: true, force: true }); } catch { /* best-effort */ }
   // Restore the preload-equivalent gateway for sibling files in this shard.
   configureGateway({
     embedding_model: 'openai:text-embedding-3-large',
@@ -258,9 +296,23 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
 });
 
 describe('hybridSearch wiring — title arm reaches the fused result set', () => {
+  // These 4 cases assert C1/C2 wiring (title arm + AND→OR fallback), not
+  // reranker behavior. hybridSearch defaults to MODE_BUNDLES.balanced,
+  // which has reranker_enabled: true — with no rerankerFn override,
+  // applyReranker() calls the real gateway.rerank() (a live fetch to the
+  // configured reranker endpoint), which isn't gated by the embedding
+  // gateway's empty env from beforeAll and isn't stubbed anywhere in this
+  // file. That fetch has nothing to talk to in the test environment, so it
+  // idles until gateway.rerank's own 5000ms internal timeout — racing (and
+  // usually losing to) bun's 5000ms test timeout. Disabling the reranker
+  // per-call keeps these cases hermetic/zero-network as documented at the
+  // top of this file, matching how test/balanced-reranker-default.test.ts
+  // isolates reranker behavior instead of exercising it here.
+  const noReranker = { reranker: { enabled: false, topNIn: 0, topNOut: null } } as const;
+
   test('exact-title query surfaces the page through hybridSearch (keyword-only path)', async () => {
     await seedTitleOnlyPage();
-    const results = await hybridSearch(engine, 'Chronomancer Codex Ledger', { limit: 5 });
+    const results = await hybridSearch(engine, 'Chronomancer Codex Ledger', { limit: 5, ...noReranker });
     expect(results.map(r => r.slug)).toContain('projects/chronomancer');
   });
 
@@ -274,13 +326,13 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
     await engine.upsertChunks('reports/emerald-falcon', [
       { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
     ]);
-    const results = await hybridSearch(engine, longTitle, { limit: 5 });
+    const results = await hybridSearch(engine, longTitle, { limit: 5, ...noReranker });
     expect(results.map(r => r.slug)).toContain('reports/emerald-falcon');
   });
 
   test('body-only queries still work (no regression from the extra arm)', async () => {
     await seedTitleOnlyPage();
-    const results = await hybridSearch(engine, 'scheduling practices planning', { limit: 5 });
+    const results = await hybridSearch(engine, 'scheduling practices planning', { limit: 5, ...noReranker });
     expect(results.map(r => r.slug)).toContain('projects/chronomancer');
   });
 
@@ -290,7 +342,7 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
     // nothing, but hybridSearch sets orFallback for its recall arm.
     const q = 'scheduling practices zzzmissingtoken';
     expect((await engine.searchKeyword(q, { limit: 5 })).length).toBe(0);
-    const results = await hybridSearch(engine, q, { limit: 5 });
+    const results = await hybridSearch(engine, q, { limit: 5, ...noReranker });
     expect(results.map(r => r.slug)).toContain('projects/chronomancer');
   });
 });
