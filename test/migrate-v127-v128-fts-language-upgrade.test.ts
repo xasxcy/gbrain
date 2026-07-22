@@ -32,7 +32,7 @@
  * v126 install would have accumulated the row before this fix ever ran).
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -51,10 +51,23 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetFtsLanguageCache();
 });
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  resetFtsLanguageCache();
+});
+
+// withEnv restores process.env, but getFtsLanguage() memoizes the value it
+// read into a module-level cache that outlives the env restore — and the
+// module lives for the whole shard process. Without this, the last case here
+// leaves the cache pinned to 'simple' and every later file in the same shard
+// silently indexes/searches with the wrong FTS configuration. Cost the
+// NamedThingBench gate its alias-synonym hit@1 (rank 1 → 2) when a shard
+// reshuffle first put that suite behind this file. Env-restoring helpers do
+// not cover caches seeded from env; reset both.
+afterEach(() => {
   resetFtsLanguageCache();
 });
 
