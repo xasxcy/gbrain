@@ -2275,8 +2275,13 @@ export class PostgresEngine implements BrainEngine {
     // RLS scope binding + search-only timeout. alwaysTransaction: master
     // already wrapped this in sql.begin() for the SET LOCAL; flag off is
     // identical to that wrap, flag on adds set_config in the same tx.
+    // 15s (not the 8s keyword-path budget): the operator budget for this
+    // path, upsized for ~445MB HNSW cold-cache reads (batch-2 merge
+    // regression restored this — the merge had silently collapsed all 4
+    // statement_timeout call sites to 8s, which made a vector-arm timeout
+    // fail silently into a keyword-only degrade, see hybridSearch's catch).
     const rows = await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-      await tx`SET LOCAL statement_timeout = '8s'`;
+      await tx`SET LOCAL statement_timeout = '15s'`;
       return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
     }, { alwaysTransaction: true });
     return rows.map(rowToSearchResult);
@@ -2914,15 +2919,21 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
-  private async listSignatureEligibleStaleChunks(opts: {
-    batchSize?: number;
-    afterPageId?: number;
-    afterChunkIndex?: number;
-    sourceId?: string;
-    signature: string;
-    orderBy?: 'page_id' | 'updated_desc';
-    afterUpdatedAt?: string | null;
-  }): Promise<StaleChunkRow[]> {
+  // Accepts the scoped transaction handle from withScopedReadTransaction so
+  // the signature-eligible query runs inside the same RLS-scoped tx as the
+  // rest of listStaleChunks, instead of falling back to the unscoped pool.
+  private async listSignatureEligibleStaleChunks(
+    tx: ReturnType<typeof postgres>,
+    opts: {
+      batchSize?: number;
+      afterPageId?: number;
+      afterChunkIndex?: number;
+      sourceId?: string;
+      signature: string;
+      orderBy?: 'page_id' | 'updated_desc';
+      afterUpdatedAt?: string | null;
+    },
+  ): Promise<StaleChunkRow[]> {
     const limit = opts.batchSize ?? 2000;
     const afterPid = opts.afterPageId ?? 0;
     const afterIdx = opts.afterChunkIndex ?? -1;
@@ -2939,20 +2950,20 @@ export class PostgresEngine implements BrainEngine {
           OR (p.updated_at = $${p - 1}::timestamptz AND p.id = $${p} AND cc.chunk_index > $${p + 1}))`;
       }
       params.push(limit);
-      const rows = await this.sql.unsafe(
+      const rows = await tx.unsafe(
         `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
                 cc.model, cc.token_count, p.source_id, cc.page_id, p.updated_at
            FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
           WHERE ${where}${cursor}
           ORDER BY p.updated_at DESC NULLS LAST, p.id ASC, cc.chunk_index ASC
           LIMIT $${params.length}`,
-        params as Parameters<typeof this.sql.unsafe>[1],
+        params as Parameters<typeof tx.unsafe>[1],
       );
       return rows as unknown as StaleChunkRow[];
     }
     params.push(afterPid, afterIdx, limit);
     const p = params.length;
-    const rows = await this.sql.unsafe(
+    const rows = await tx.unsafe(
       `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
               cc.model, cc.token_count, p.source_id, cc.page_id
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
@@ -2960,7 +2971,7 @@ export class PostgresEngine implements BrainEngine {
           AND (cc.page_id, cc.chunk_index) > ($${p - 2}, $${p - 1})
         ORDER BY cc.page_id, cc.chunk_index
         LIMIT $${p}`,
-      params as Parameters<typeof this.sql.unsafe>[1],
+      params as Parameters<typeof tx.unsafe>[1],
     );
     return rows as unknown as StaleChunkRow[];
   }
@@ -2981,6 +2992,12 @@ export class PostgresEngine implements BrainEngine {
 
     // RLS scope binding (opt-in via GBRAIN_RLS_SCOPE_BINDING).
     return await this.withScopedReadTransaction(undefined, opts?.sourceId, async (tx) => {
+      // signature-aware routing: eligibility/backoff/quarantine filtering
+      // from embed_failures only applies on this path (restored after the
+      // upstream RLS transaction-wrapper refactor dropped the dispatch).
+      if (opts?.signature !== undefined) {
+        return this.listSignatureEligibleStaleChunks(tx, opts as typeof opts & { signature: string });
+      }
       // v0.41.18.0 (A13, codex #9): --priority recent path. Composite cursor
       // (updated_at DESC NULLS LAST, page_id ASC, chunk_index ASC). Backed by
       // idx_pages_updated_at_desc + content_chunks_stale_idx partial.
