@@ -8,6 +8,7 @@ export interface PersistStaleSliceOptions {
   engine: BrainEngine;
   rows: StaleChunkRow[];
   embeddingSignature?: string;
+  signatureInvalidationFailed?: boolean;
   embedFn: EmbedFn;
   signal?: AbortSignal;
   slice: { index: number; total: number };
@@ -31,7 +32,7 @@ const hashChunk = (text: string): string => createHash('md5').update(text).diges
  * checkpoint. Legacy callers intentionally never invoke this function.
  */
 export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise<PersistStaleSliceResult> {
-  const { engine, rows, embeddingSignature, embedFn, signal, slice, write } = opts;
+  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write } = opts;
   const first = rows[0];
   if (!first) return { embedded: 0, pageCommitted: false, persistFailed: false, failureCount: 0, aborted: !!signal?.aborted };
 
@@ -93,19 +94,28 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
   let signatureFailed = false;
   if (embeddingSignature && outcome && outcome.vectorCommittedChunks > 0) {
     try {
-      const canReadSignature = typeof engine.executeRaw === 'function' && typeof engine.getChunks === 'function';
-      const storedRows = canReadSignature
-        ? await engine.executeRaw<{ embedding_signature: string | null }>(
-          'SELECT embedding_signature FROM pages WHERE id = $1 AND source_id = $2',
-          [first.page_id, first.source_id],
-        )
-        : [];
-      const [stored] = Array.isArray(storedRows) ? storedRows : [];
-      const existingRows = canReadSignature ? await engine.getChunks(first.slug, { sourceId: first.source_id }) : rows;
-      const existing = Array.isArray(existingRows) ? existingRows : rows;
-      const storedSignature = stored?.embedding_signature ?? null;
-      const shouldStamp = !canReadSignature || (storedSignature !== embeddingSignature
-        && (storedSignature !== null || rows.length === existing.length));
+      const stateRows = await engine.executeRaw<{
+        embedding_signature: string | null;
+        chunk_count: number;
+      }>(
+        `SELECT p.embedding_signature,
+                COUNT(cc.id)::integer AS chunk_count
+           FROM pages p
+           LEFT JOIN content_chunks cc ON cc.page_id = p.id
+          WHERE p.id = $1 AND p.source_id = $2
+          GROUP BY p.embedding_signature`,
+        [first.page_id, first.source_id],
+      );
+      const [state] = Array.isArray(stateRows) ? stateRows : [];
+      const storedSignature = state?.embedding_signature ?? null;
+      // Successful invalidation proves that any remaining non-NULL vector is
+      // current-generation. NULL chunks stay eligible through the retry ledger
+      // and are pending work, not mixed-generation contamination. Grandfathered
+      // NULL-signature pages were never invalidated, so they still require this
+      // slice to cover the whole page before stamping.
+      const shouldStamp = !signatureInvalidationFailed
+        && storedSignature !== embeddingSignature
+        && (storedSignature !== null || rows.length === Number(state?.chunk_count ?? -1));
       if (shouldStamp) {
         await engine.setPageEmbeddingSignature(first.slug, { sourceId: first.source_id, signature: embeddingSignature });
       }
