@@ -466,6 +466,7 @@ export interface SearchKeyOverrides {
   // number | undefined.
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  reranker_max_document_chars?: number;
   // v0.35.6.0 — floor-ratio gate override.
   floor_ratio?: number;
   // T2 — title-phrase boost override.
@@ -512,6 +513,7 @@ export interface SearchPerCallOpts {
   reranker_top_n_in?: number;
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  reranker_max_document_chars?: number;
   // v0.35.6.0 — floor-ratio per-call override.
   floor_ratio?: number;
   // T2 — title-phrase boost per-call override.
@@ -562,6 +564,8 @@ export interface ResolveSearchModeInput {
 }
 
 export interface ResolvedSearchKnobs extends ModeBundle {
+  /** Global reranker default/config; intentionally not mode-bundle-specific. */
+  reranker_max_document_chars: number;
   /** Which mode bundle supplied the defaults (after fallback). */
   resolved_mode: SearchMode;
   /** True if the caller's `mode` input was a recognized SearchMode. */
@@ -611,6 +615,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     reranker_top_n_in: pick('reranker_top_n_in'),
     reranker_top_n_out: pick('reranker_top_n_out'),
     reranker_timeout_ms: pickRerankerTimeoutMs(),
+    reranker_max_document_chars:
+      pc.reranker_max_document_chars ?? ov.reranker_max_document_chars ?? 600,
     // v0.35.6.0 — floor-ratio resolved via the same pick chain.
     floor_ratio: pick('floor_ratio'),
     title_boost: pick('title_boost'),
@@ -756,7 +762,11 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // slugs written by a process without it, and vice versa. Same one-time
 // global cold-miss pattern as the bumps above; refills within
 // cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 12;
+//
+// bump 12→13: reranker_max_document_chars changes the text scored by the
+// cross-encoder, so cached rankings from a different truncation threshold
+// must not be reused. Same one-time global cold-miss pattern.
+export const KNOBS_HASH_VERSION = 13;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -888,6 +898,9 @@ export function knobsHash(
     // across processes. Sorted copy so ['a/','b/'] and ['b/','a/'] hash
     // identically; undefined falls back to 'none' for legacy callers.
     `hx=${ctx?.hardExcludes ? [...ctx.hardExcludes].sort().join(',') : 'none'}`,
+    // v=13 addition (append-only): candidate text truncation changes the
+    // cross-encoder input and therefore can change the ranking.
+    `rrc=${knobs.reranker_max_document_chars}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -973,6 +986,11 @@ export function loadOverridesFromConfig(
   if (rt !== undefined) {
     const n = parseInt(rt, 10);
     if (Number.isFinite(n) && n > 0) out.reranker_timeout_ms = n;
+  }
+  const rmc = get('search.reranker.max_document_chars');
+  if (rmc !== undefined) {
+    const n = parseInt(rmc, 10);
+    if (Number.isFinite(n) && n > 0) out.reranker_max_document_chars = n;
   }
 
   // v0.35.6.0 — floor-ratio config key. Accepts a number in [0, 1]; values
@@ -1084,6 +1102,7 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.reranker.top_n_in',
   'search.reranker.top_n_out',
   'search.reranker.timeout_ms',
+  'search.reranker.max_document_chars',
   // v0.35.6.0 — floor-ratio gate
   'search.floor_ratio',
   'search.title_boost',
@@ -1159,4 +1178,3 @@ export async function loadSearchModeConfig(
     overrides: loadOverridesFromConfig(configMap),
   };
 }
-

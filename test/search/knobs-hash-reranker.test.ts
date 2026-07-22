@@ -2,11 +2,10 @@
  * v0.35.0.0 — knobsHash reranker-field participation tests.
  *
  * Pins:
- *  - KNOBS_HASH_VERSION === 3 (bumped 1→2 v0.35.0.0 for reranker; 2→3 v0.35.6.0
- *    for floor_ratio — codex outside-voice T1 cross-floor cache contamination).
- *  - All 5 new reranker fields participate in the hash:
+ *  - KNOBS_HASH_VERSION follows the current cache protocol.
+ *  - All reranker fields participate in the hash:
  *      reranker_enabled, reranker_model, reranker_top_n_in,
- *      reranker_top_n_out, reranker_timeout_ms.
+ *      reranker_top_n_out, reranker_timeout_ms, reranker_max_document_chars.
  *    Each one flipping changes the hash → no two reranker configs share
  *    a cache row.
  *  - top_n_out=null vs unset shows up as 'none' in the hash (no NaN).
@@ -38,13 +37,14 @@ function baseKnobs(): ResolvedSearchKnobs {
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
+    reranker_max_document_chars: 600,
     resolved_mode: 'balanced',
     mode_valid: true,
   };
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 12 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825)', () => {
+  test('version is 13 (…; 11→12 hard-excludes #2825; 12→13 reranker document truncation)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -64,7 +64,9 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // pre-fix document-side query vectors must not be served.
     // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
     // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // Candidate-document truncation: 12→13 because changing cross-encoder
+    // input text can change the cached ordering.
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
@@ -108,6 +110,12 @@ describe('Each reranker field flips the hash (cache-row separation)', () => {
     const t5 = knobsHash({ ...baseKnobs(), reranker_timeout_ms: 5000 });
     const t1 = knobsHash({ ...baseKnobs(), reranker_timeout_ms: 1000 });
     expect(t5).not.toBe(t1);
+  });
+
+  test('reranker_max_document_chars differs → different hash', () => {
+    const c600 = knobsHash({ ...baseKnobs(), reranker_max_document_chars: 600 });
+    const c1200 = knobsHash({ ...baseKnobs(), reranker_max_document_chars: 1200 });
+    expect(c600).not.toBe(c1200);
   });
 });
 

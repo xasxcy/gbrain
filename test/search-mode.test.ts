@@ -314,6 +314,21 @@ describe('v0.40.6.1 — reranker_timeout_ms threads recipe default through resol
   });
 });
 
+describe('reranker_max_document_chars config', () => {
+  test('defaults to 600 characters and accepts a positive config override', () => {
+    for (const mode of SEARCH_MODES) {
+      expect(resolveSearchMode({ mode }).reranker_max_document_chars).toBe(600);
+    }
+
+    const overrides = loadOverridesFromConfig({
+      'search.reranker.max_document_chars': '321',
+    });
+    expect(overrides.reranker_max_document_chars).toBe(321);
+    expect(resolveSearchMode({ mode: 'balanced', overrides }).reranker_max_document_chars).toBe(321);
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.reranker.max_document_chars');
+  });
+});
+
 describe('attributeKnob source attribution', () => {
   test('per-call source labeled correctly', () => {
     const input = { mode: 'conservative', perCall: { tokenBudget: 999 } };
@@ -410,7 +425,9 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // #2825: bumped 11→12 to fold the resolved hard-exclude prefix list
     // (hx=) — cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across
     // processes.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // Candidate-document truncation: bumped 12→13 because changing the
+    // reranker input text can change result ordering.
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -575,8 +592,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 12 (11→12 hard-exclude fold, #2825)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(12);
+  test('KNOBS_HASH_VERSION is 13 (12→13 reranker document truncation)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
