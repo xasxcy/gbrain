@@ -52,6 +52,21 @@ function captureConsole(): { lines: string[]; restore: () => void } {
 }
 
 describe('embed-failures operator command', () => {
+  test('serializes native BigInt page ids from Postgres ledger rows', async () => {
+    const captured = captureConsole();
+    const postgresShapedEngine = {
+      listEmbedFailures: async () => [{ page_id: 1n }],
+    } as unknown as PGLiteEngine;
+
+    try {
+      await expect(runEmbedFailures(postgresShapedEngine, ['list'])).resolves.toBeUndefined();
+    } finally {
+      captured.restore();
+    }
+
+    expect(JSON.parse(captured.lines[0]!)).toEqual([{ page_id: '1' }]);
+  });
+
   test('lists source-scoped ledger rows and releases the selected chunk', async () => {
     const captured = captureConsole();
     try {

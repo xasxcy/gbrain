@@ -5,6 +5,7 @@
  *   gbrain embed-failures release <slug> [--chunk N] [--source X]
  */
 import type { BrainEngine } from '../core/engine.ts';
+import { bigintToStringReplacer } from '../cli.ts';
 
 const HELP = `Usage:
   gbrain embed-failures list [--source X]
@@ -54,7 +55,7 @@ export async function runEmbedFailures(engine: BrainEngine, args: string[]): Pro
   switch (subcommand) {
     case 'list': {
       const rows = await engine.listEmbedFailures({ sourceId });
-      console.log(JSON.stringify(rows, null, 2));
+      console.log(JSON.stringify(rows, bigintToStringReplacer, 2));
       return;
     }
     case 'release': {
