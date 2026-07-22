@@ -366,7 +366,40 @@ describe('embedStaleForSource', () => {
     expect(secondRunCalls).toBe(0);
   });
 
-  test('SPEC V4: whole-page drift partial stamps good vector and preserves it on the next run', async () => {
+  test('B5 regression: a 5-chunk page split into 2+2+1 stamps once and stays current', async () => {
+    await seedPageWithStaleChunks('signature-five-chunks', 5);
+    await engine.executeRaw(
+      `UPDATE content_chunks
+          SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'signature-five-chunks' AND source_id = 'default')`,
+    );
+    await engine.setPageEmbeddingSignature('signature-five-chunks', { signature: 'old:model:1536' });
+
+    const first = await embedStaleForSource(engine, 'default', {
+      batchSize: 2,
+      embeddingSignature: 'new:model:1536',
+      embedFn: fakeEmbedFn,
+    });
+    expect(first).toMatchObject({ embedded: 5, done: true, aborted: false });
+    const signature = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'signature-five-chunks' AND source_id = 'default'`,
+    );
+    expect(signature[0]?.embedding_signature).toBe('new:model:1536');
+
+    let secondRunCalls = 0;
+    const second = await embedStaleForSource(engine, 'default', {
+      batchSize: 2,
+      embeddingSignature: 'new:model:1536',
+      embedFn: async (texts) => {
+        secondRunCalls++;
+        return fakeEmbedFn(texts);
+      },
+    });
+    expect(second).toMatchObject({ embedded: 0, done: true, aborted: false });
+    expect(secondRunCalls).toBe(0);
+  });
+
+  test('SPEC V4: whole-page drift partial stamps after invalidation and retries only the failed chunk', async () => {
     await seedPageWithStaleChunks('signature-partial', 2);
     await engine.executeRaw(
       `UPDATE content_chunks
@@ -384,6 +417,9 @@ describe('embedStaleForSource', () => {
     });
     expect(first.embedded).toBe(1);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+    expect(await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'signature-partial' AND source_id = 'default'`,
+    )).toEqual([{ embedding_signature: 'new:model:1536' }]);
 
     const secondCalls: string[][] = [];
     await embedStaleForSource(engine, 'default', {
@@ -393,12 +429,90 @@ describe('embedStaleForSource', () => {
         return [fakeVector()];
       },
     });
-    // The failed chunk is now ledger-deferred for its current signature; its
-    // already-committed sibling remains stamped and is never invalidated.
+    // The failed chunk is ledger-deferred; the successful sibling remains
+    // attributable to the current page signature and is not invalidated.
     expect(secondCalls).toEqual([]);
+    expect(await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'signature-partial' AND source_id = 'default'`,
+    )).toEqual([{ embedding_signature: 'new:model:1536' }]);
     // The legacy no-signature count remains a raw NULL count; the active
     // signed stale pipeline is what excludes this backoff-deferred row.
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+
+    await engine.executeRaw(
+      `UPDATE embed_failures
+          SET next_retry_at = now() - INTERVAL '1 second'
+        WHERE slug = 'signature-partial' AND embedding_signature = 'new:model:1536'`,
+    );
+    const retryCalls: string[][] = [];
+    await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'new:model:1536',
+      embedFn: async (texts) => {
+        retryCalls.push(texts);
+        return [fakeVector()];
+      },
+    });
+    expect(retryCalls).toEqual([['chunk 1 of signature-partial']]);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+
+  test('B5-storm: a quarantined chunk does not trigger permanent whole-page re-embedding', async () => {
+    const slug = 'signature-quarantined-storm';
+    const signature = 'new:model:1536';
+    await seedPageWithStaleChunks(slug, 5);
+    await engine.executeRaw(
+      `UPDATE content_chunks
+          SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = 'default')`,
+      [slug],
+    );
+    await engine.setPageEmbeddingSignature(slug, { signature: 'old:model:1536' });
+
+    const permanentlyFailingEmbedFn = async (texts: string[]): Promise<Float32Array[]> => {
+      if (texts.some((text) => text.includes('chunk 4'))) {
+        throw new Error('provider 502 permanent toxic chunk');
+      }
+      return fakeEmbedFn(texts);
+    };
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (attempt > 1) {
+        await engine.executeRaw(
+          `UPDATE embed_failures
+              SET next_retry_at = now() - INTERVAL '1 second'
+            WHERE slug = $1 AND embedding_signature = $2`,
+          [slug, signature],
+        );
+      }
+      await embedStaleForSource(engine, 'default', {
+        embeddingSignature: signature,
+        embedFn: permanentlyFailingEmbedFn,
+      });
+    }
+
+    const quarantined = await engine.executeRaw<{ attempt_count: number; quarantined_at: Date | null }>(
+      `SELECT attempt_count, quarantined_at
+         FROM embed_failures
+        WHERE slug = $1 AND embedding_signature = $2 AND chunk_index = 4`,
+      [slug, signature],
+    );
+    expect(quarantined[0]?.attempt_count).toBe(5);
+    expect(quarantined[0]?.quarantined_at).not.toBeNull();
+    expect(await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = 'default'`,
+      [slug],
+    )).toEqual([{ embedding_signature: signature }]);
+
+    let postQuarantineCalls = 0;
+    const afterQuarantine = await embedStaleForSource(engine, 'default', {
+      embeddingSignature: signature,
+      embedFn: async (texts) => {
+        postQuarantineCalls++;
+        return fakeEmbedFn(texts);
+      },
+    });
+    expect(afterQuarantine).toMatchObject({ embedded: 0, done: true, aborted: false });
+    expect(postQuarantineCalls).toBe(0);
   });
 
   test('SPEC V4: a NULL-signature page with pre-existing vectors never stamps from a partial stale slice', async () => {
@@ -412,6 +526,82 @@ describe('embedStaleForSource', () => {
       `SELECT embedding_signature FROM pages WHERE slug = 'signature-null-partial'`,
     );
     expect(rows[0]?.embedding_signature).toBeNull();
+  });
+
+  test('B5 grandfather: a single slice covering the whole page stamps the current signature', async () => {
+    const slug = 'signature-null-whole-page';
+    const signature = 'new:model:1536';
+    await seedPageWithStaleChunks(slug, 3);
+
+    const first = await embedStaleForSource(engine, 'default', {
+      embeddingSignature: signature,
+      embedFn: fakeEmbedFn,
+    });
+    expect(first).toMatchObject({ embedded: 3, done: true, aborted: false });
+    expect(await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = 'default'`,
+      [slug],
+    )).toEqual([{ embedding_signature: signature }]);
+
+    let secondRunCalls = 0;
+    const second = await embedStaleForSource(engine, 'default', {
+      embeddingSignature: signature,
+      embedFn: async (texts) => {
+        secondRunCalls++;
+        return fakeEmbedFn(texts);
+      },
+    });
+    expect(second).toMatchObject({ embedded: 0, done: true, aborted: false });
+    expect(secondRunCalls).toBe(0);
+  });
+
+  test('B5: invalidation failure never stamps a mixed-generation page', async () => {
+    await seedPageWithStaleChunks('signature-invalidation-fail', 2);
+    await engine.executeRaw(
+      `UPDATE content_chunks
+          SET embedding = ('[1,' || array_to_string(array_fill(0.0::real, ARRAY[1535]), ',') || ']')::vector
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'signature-invalidation-fail')
+          AND chunk_index = 0`,
+    );
+    await engine.setPageEmbeddingSignature('signature-invalidation-fail', { signature: 'old:model:1536' });
+
+    const originalInvalidate = engine.invalidateStaleSignatureEmbeddings.bind(engine);
+    const originalWrite = process.stderr.write;
+    let stderr = '';
+    engine.invalidateStaleSignatureEmbeddings = async () => { throw new Error('invalidation unavailable'); };
+    (process.stderr.write as any) = (chunk: string) => { stderr += chunk; return true; };
+    try {
+      const result = await embedStaleForSource(engine, 'default', {
+        embeddingSignature: 'new:model:1536',
+        embedFn: async (texts) => texts.map(() => {
+          const vector = new Float32Array(1536);
+          vector[0] = 9;
+          return vector;
+        }),
+      });
+      expect(result).toMatchObject({ embedded: 1, done: true, aborted: false });
+    } finally {
+      engine.invalidateStaleSignatureEmbeddings = originalInvalidate;
+      (process.stderr.write as any) = originalWrite;
+    }
+
+    const rows = await engine.executeRaw<{
+      chunk_index: number;
+      embedding_text: string;
+      embedding_signature: string | null;
+    }>(
+      `SELECT cc.chunk_index,
+              cc.embedding::text AS embedding_text,
+              p.embedding_signature
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'signature-invalidation-fail'
+        ORDER BY cc.chunk_index`,
+    );
+    expect(rows.map((row) => Number(row.embedding_text.slice(1).split(',', 1)[0]))).toEqual([1, 9]);
+    expect(rows[0]?.embedding_signature).toBe('old:model:1536');
+    expect(await engine.countStaleChunks({ sourceId: 'default', signature: 'new:model:1536' })).toBe(2);
+    expect(stderr).toContain('[embed-signature-invalidation-fail] source_id=default err=invalidation unavailable');
   });
 
   test('signature-write failure preserves committed vector and page counters', async () => {

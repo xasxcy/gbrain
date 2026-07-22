@@ -100,12 +100,15 @@ export async function embedStaleForSource(
   const committedPages = new Set<string>();
   const subBatchSize = resolveEmbedSubBatchSize();
   const signature = opts.embeddingSignature;
+  const write = (message: string): void => { process.stderr.write(`\n  ${message}\n`); };
+  let signatureInvalidationFailed = false;
 
   if (signature) {
     try {
       await engine.invalidateStaleSignatureEmbeddings({ signature, sourceId });
-    } catch {
-      // Existing best-effort invalidation contract: proceed with NULL cursor.
+    } catch (error) {
+      signatureInvalidationFailed = true;
+      write(`[embed-signature-invalidation-fail] source_id=${sourceId} err=${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -152,10 +155,11 @@ export async function embedStaleForSource(
           engine,
           rows: sliceRows,
           embeddingSignature: signature,
+          signatureInvalidationFailed,
           embedFn,
           signal,
           slice: { index: (offset / subBatchSize) + 1, total: slices },
-          write: (message) => process.stderr.write(`\n  ${message}\n`),
+          write,
         });
         result.embedded += checkpoint.embedded;
         if (checkpoint.persistFailed) result.persistFailures = (result.persistFailures ?? 0) + 1;
