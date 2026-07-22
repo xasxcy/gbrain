@@ -58,7 +58,28 @@ import { randomUUIDv7 } from 'bun';
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MAX_TURNS = 20;
+const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 const DEFAULT_RATE_KEY = 'anthropic:messages';
+
+/**
+ * Resolve the per-turn output-token cap (#2778). Per-job data wins, then the
+ * `agent.max_output_tokens` config row, then the 8192 default (was a
+ * hardcoded 4096 that made pages >~12KB unwritable via put_page). Invalid
+ * values (NaN / zero / negative) fall through to the next tier.
+ */
+export function resolveMaxOutputTokens(
+  perJob: number | undefined,
+  configRaw: string | null | undefined,
+): number {
+  if (typeof perJob === 'number' && Number.isFinite(perJob) && perJob > 0) {
+    return Math.floor(perJob);
+  }
+  if (typeof configRaw === 'string' && configRaw.trim() !== '') {
+    const n = Number(configRaw);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return DEFAULT_MAX_OUTPUT_TOKENS;
+}
 
 /**
  * Resolve the rate-lease cap from the env var.
@@ -212,6 +233,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         fallback: TIER_DEFAULTS.subagent,
       });
     const maxTurns = data.max_turns ?? DEFAULT_MAX_TURNS;
+    // #2778: per-turn output cap — data.max_tokens → config → 8192 default.
+    const maxOutputTokens = resolveMaxOutputTokens(
+      data.max_tokens,
+      await engine.getConfig('agent.max_output_tokens').catch(() => null),
+    );
     // v0.41 Approach C: systemPrompt is now built AFTER toolDefs (a few
     // lines below) so the renderer can splice a tool-usage preamble
     // listing each available tool's usage_hint. The renderer is
@@ -246,6 +272,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       config,
       brainId: data.brain_id,
       allowedSlugPrefixes: data.allowed_slug_prefixes,
+      // #1586: cycle-resolved source scope for tool-call OperationContexts.
+      sourceId: data.source_id,
     });
     const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
       ? filterAllowedTools(registry, data.allowed_tools)
@@ -277,6 +305,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         systemPrompt,
         toolDefs,
         maxTurns,
+        maxOutputTokens,
       });
     }
 
@@ -535,7 +564,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           // `model` stays qualified everywhere else (persistence, recipe
           // lookup at recipeIdFromModel(), capability gate).
           model: stripProviderPrefix(model),
-          max_tokens: 4096,
+          max_tokens: maxOutputTokens,
           system: [
             { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
           ] as any,
@@ -628,7 +657,10 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           b.type === 'tool_use',
       );
       if (toolUses.length === 0) {
-        stopReason = 'end_turn';
+        // #2778: an output-cap hit is NOT end_turn — the text (and possibly a
+        // dropped trailing tool_use block) is truncated. Surface it as its own
+        // stop_reason instead of silently reporting a clean end_turn.
+        stopReason = assistantMsg.stop_reason === 'max_tokens' ? 'max_tokens' : 'end_turn';
         // Concatenate text blocks as the final answer.
         finalText = blocks
           .filter(b => b.type === 'text' && typeof b.text === 'string')
@@ -741,6 +773,24 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         }
       }
 
+      // #2778: a max_tokens stop with tool_use blocks means the API dropped an
+      // incomplete trailing block (e.g. a large put_page body that overflowed
+      // the cap). Tell the model so it re-issues the cut-off call (split, or
+      // smaller pages) instead of assuming the write happened.
+      if (assistantMsg.stop_reason === 'max_tokens') {
+        toolResults.push({
+          type: 'text',
+          text: `[system] Your previous response hit the ${maxOutputTokens}-token output cap and was truncated; ` +
+            `any tool call cut off by the cap was DROPPED and did not execute. Re-issue it, splitting large content if needed.`,
+        } as ContentBlock);
+        logSubagentHeartbeat({
+          job_id: ctx.id,
+          event: 'llm_call_completed',
+          turn_idx: turnIdx,
+          error: `stop_reason=max_tokens at cap ${maxOutputTokens}; truncation note injected`,
+        });
+      }
+
       // 6. Append the synthesized user turn (tool_result wrappers) to the
       //    conversation and persist it so replay picks it up.
       const userIdx = nextMessageIdx++;
@@ -776,6 +826,8 @@ interface GatewayRunArgs {
   systemPrompt: string;
   toolDefs: ToolDef[];
   maxTurns: number;
+  /** #2778: per-turn output-token cap (resolved by resolveMaxOutputTokens). */
+  maxOutputTokens: number;
 }
 
 /**
@@ -793,7 +845,7 @@ interface GatewayRunArgs {
  * reconciler sees both shapes uniformly.
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
-  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns } = args;
+  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens } = args;
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.
@@ -917,6 +969,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     tools: chatTools,
     toolHandlers,
     maxTurns,
+    maxTokens: maxOutputTokens,
     abortSignal: ctx.signal,
     cacheSystem,
     // ALWAYS pass replayState (even on fresh runs) so the gateway loop's

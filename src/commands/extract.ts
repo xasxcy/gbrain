@@ -188,7 +188,7 @@ export function walkMarkdownFiles(dir: string): { path: string; relPath: string 
   // Pre-fix, this walker had only an ad-hoc dot-prefix exclusion and didn't
   // call isSyncable at all — so it descended into `node_modules/`, emitted
   // markdown files from there, AND ignored the canonical exclusion list
-  // (`.raw/`, `ops/`, README.md, etc.). Now: pruneDir skips entire vendor
+  // (`.raw/`, README.md, etc.). Now: pruneDir skips entire vendor
   // subtrees before recursion (saving IO), and isSyncable filters the emit
   // set against the canonical markdown-strategy rules.
   const files: { path: string; relPath: string }[] = [];
@@ -1651,7 +1651,7 @@ async function extractTimelineFromDB(
  * make re-extraction idempotent). EVERY processed page is stamped, including
  * zero-link pages — they WERE processed.
  */
-async function extractStaleFromDB(
+export async function extractStaleFromDB(
   engine: BrainEngine,
   opts: {
     dryRun: boolean;

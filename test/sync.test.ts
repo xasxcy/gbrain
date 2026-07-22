@@ -95,9 +95,10 @@ describe('isSyncable', () => {
     expect(isSyncable('people/README.md')).toBe(false);
   });
 
-  test('rejects ops/ directory', () => {
-    expect(isSyncable('ops/deploy-log.md')).toBe(false);
-    expect(isSyncable('ops/config.md')).toBe(false);
+  test('accepts ops/ — ordinary content directory, not pruned (#2404)', () => {
+    expect(isSyncable('ops/deploy-log.md')).toBe(true);
+    expect(isSyncable('ops/config.md')).toBe(true);
+    expect(isSyncable('ops/tasks.md')).toBe(true);
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -128,8 +129,15 @@ describe('pruneDir', () => {
     expect(pruneDir('.vscode')).toBe(false);
   });
 
-  test('blocks ops (gbrain operational dir)', () => {
-    expect(pruneDir('ops')).toBe(false);
+  test('allows ops — ordinary content dir, not a vendor tree (#2404)', () => {
+    expect(pruneDir('ops')).toBe(true);
+  });
+
+  test('blocks vendored / generated trees', () => {
+    expect(pruneDir('vendor')).toBe(false);
+    expect(pruneDir('dist')).toBe(false);
+    expect(pruneDir('build')).toBe(false);
+    expect(pruneDir('venv')).toBe(false);
   });
 
   test('blocks *.raw sidecar dirs (gbrain convention)', () => {
