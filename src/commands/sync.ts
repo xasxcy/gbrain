@@ -924,6 +924,16 @@ function git(repoPath: string, args: string[], configs: string[] = [], timeoutMs
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
+    // Pin git's message locale to C. createSyncBaselineCommit below
+    // recognizes one specific advisory by matching git's English stderr
+    // ("ignored by one of your .gitignore files"); on an operator whose
+    // shell locale is not English git emits the translated string, the
+    // match fails, and a benign advisory is rethrown as a hard sync
+    // failure. Caught on a zh_CN machine, where every sync of a brain dir
+    // whose .gitignore also covers a db_only dir aborted. Applied to the
+    // whole helper, not just that call site: any future stderr/stdout
+    // matching on git output has the same hazard.
+    env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
   }).trim();
 }
 
