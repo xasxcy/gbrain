@@ -1602,6 +1602,11 @@ export async function hybridSearchCached(
       // override would write to one cache row but read from a different
       // one on the next call.
       graph_signals: opts?.graph_signals,
+      // F3 — reranker max-document-chars must reach the cache resolver so
+      // knobsHash() separates cache rows whose cross-encoder inputs were
+      // truncated at different lengths. Without this, a 1200-char write
+      // could be served to a 600-char call, bypassing its truncation.
+      reranker_max_document_chars: opts?.reranker?.maxDocumentChars,
       // v0.42.3.0 — autocut threaded through the cache resolver so the
       // knobsHash `ac=` bit reflects the per-call ceiling override. Without
       // this, an `autocut:false` (full top-K) call could be served a trimmed

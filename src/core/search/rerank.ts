@@ -78,9 +78,12 @@ export async function applyReranker(
   const maxDocumentChars = opts.maxDocumentChars ?? DEFAULT_RERANKER_MAX_DOCUMENT_CHARS;
   const documents = head.map(r => {
     const text = r.chunk_text || r.title || '';
-    return maxDocumentChars > 0 && text.length > maxDocumentChars
-      ? text.slice(0, maxDocumentChars)
-      : text;
+    if (maxDocumentChars <= 0 || text.length <= maxDocumentChars) return text;
+    const truncated = text.slice(0, maxDocumentChars);
+    const lastCodeUnit = truncated.charCodeAt(truncated.length - 1);
+    return lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff
+      ? truncated.slice(0, -1)
+      : truncated;
   });
 
   let reranked: RerankResult[];
