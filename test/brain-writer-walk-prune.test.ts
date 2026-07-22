@@ -43,8 +43,10 @@ beforeAll(() => {
   writeFileSync(join(root, '.obsidian', 'workspace.json'), '{}');
   mkdirSync(join(root, 'people', 'pedro.raw'), { recursive: true });
   writeFileSync(join(root, 'people', 'pedro.raw', 'source.md'), '---\ntitle: should not visit\n---\n');
+  // ops/ is ORDINARY content (#2404) — walker MUST descend (it used to be
+  // wrongly pruned, silently excluding user runbooks / ops/tasks).
   mkdirSync(join(root, 'ops', 'logs'), { recursive: true });
-  writeFileSync(join(root, 'ops', 'logs', 'run.md'), '# nope\n');
+  writeFileSync(join(root, 'ops', 'logs', 'run.md'), '---\ntitle: Run\n---\n\nbody\n');
   // Nested node_modules — must also be pruned, not just at the root.
   mkdirSync(join(root, 'people', 'tools', 'node_modules', 'inner'), { recursive: true });
   writeFileSync(join(root, 'people', 'tools', 'node_modules', 'inner', 'a.md'), '---\ntitle: nope\n---\n');
@@ -95,8 +97,11 @@ describe('walkDir (brain-writer.ts) — descent-time pruning', () => {
     walkDir(root, (f) => { files.push(f); }, (dir) => visited.push(dir));
     expect(visited.some(d => d.endsWith('/people'))).toBe(true);
     expect(visited.some(d => d.endsWith('/concepts/subdir'))).toBe(true);
+    // ops/ is ordinary content — descended, not pruned (#2404).
+    expect(visited.some(d => d.endsWith('/ops/logs'))).toBe(true);
     expect(files.some(f => f.endsWith('/people/alice.md'))).toBe(true);
     expect(files.some(f => f.endsWith('/concepts/subdir/thing.md'))).toBe(true);
+    expect(files.some(f => f.endsWith('/ops/logs/run.md'))).toBe(true);
     // And explicitly does NOT visit the file under node_modules.
     expect(files.some(f => f.includes('/node_modules/'))).toBe(false);
   });
@@ -107,7 +112,7 @@ describe('walkDir (brain-writer.ts) — descent-time pruning', () => {
     // visitDir would be called with node_modules paths.
     const descents: string[] = [];
     walkDir(root, () => {}, (d) => descents.push(d));
-    const vendor = descents.filter(d => /\/(node_modules|\.git|\.obsidian|ops)(\/|$)/.test(d) || /\.raw$/.test(d));
+    const vendor = descents.filter(d => /\/(node_modules|\.git|\.obsidian)(\/|$)/.test(d) || /\.raw$/.test(d));
     expect(vendor).toEqual([]);
   });
 });
@@ -119,13 +124,20 @@ describe('collectFiles (frontmatter.ts) — descent-time pruning parity', () => 
     expect(visited.some(d => d.includes('/node_modules'))).toBe(false);
   });
 
-  test('does NOT descend into .git, .obsidian, *.raw, or ops', () => {
+  test('does NOT descend into .git, .obsidian, or *.raw', () => {
     const visited: string[] = [];
     collectFiles(root, (dir) => visited.push(dir));
     expect(visited.some(d => d.includes('/.git'))).toBe(false);
     expect(visited.some(d => d.includes('/.obsidian'))).toBe(false);
     expect(visited.some(d => d.endsWith('.raw'))).toBe(false);
-    expect(visited.some(d => d.endsWith('/ops') || d.includes('/ops/'))).toBe(false);
+  });
+
+  test('DOES descend into ops/ — ordinary content, not a vendor tree (#2404)', () => {
+    const visited: string[] = [];
+    collectFiles(root, (dir) => visited.push(dir));
+    expect(visited.some(d => d.endsWith('/ops') || d.includes('/ops/'))).toBe(true);
+    const files = collectFiles(root);
+    expect(files.some(f => f.endsWith('/ops/logs/run.md'))).toBe(true);
   });
 
   test('does NOT descend into git submodule directories', () => {
