@@ -32,7 +32,15 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Fork-only: migration `pgroonga_fts_chinese` runs
+        # `CREATE EXTENSION IF NOT EXISTS pgroonga`, so upstream's
+        # pgvector-only image cannot bring this schema up at all — every
+        # job here failed at migration time the first time this workflow
+        # was ever run on a fork branch (2026-07-22). This image carries
+        # pgvector AND PGroonga. Keep it in sync with the fork's extension
+        # requirements; a plain pgvector image silently un-runs the whole
+        # Postgres lane.
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -69,7 +77,15 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Fork-only: migration `pgroonga_fts_chinese` runs
+        # `CREATE EXTENSION IF NOT EXISTS pgroonga`, so upstream's
+        # pgvector-only image cannot bring this schema up at all — every
+        # job here failed at migration time the first time this workflow
+        # was ever run on a fork branch (2026-07-22). This image carries
+        # pgvector AND PGroonga. Keep it in sync with the fork's extension
+        # requirements; a plain pgvector image silently un-runs the whole
+        # Postgres lane.
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -118,7 +134,15 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Fork-only: migration `pgroonga_fts_chinese` runs
+        # `CREATE EXTENSION IF NOT EXISTS pgroonga`, so upstream's
+        # pgvector-only image cannot bring this schema up at all — every
+        # job here failed at migration time the first time this workflow
+        # was ever run on a fork branch (2026-07-22). This image carries
+        # pgvector AND PGroonga. Keep it in sync with the fork's extension
+        # requirements; a plain pgvector image silently un-runs the whole
+        # Postgres lane.
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
