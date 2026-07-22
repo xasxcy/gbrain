@@ -1073,6 +1073,7 @@ export interface SearchOpts {
     topNOut: number | null;
     model?: string;
     timeoutMs?: number;
+    maxDocumentChars?: number;
     // Test seam — never set in production code.
     rerankerFn?: (input: { query: string; documents: string[]; topN?: number; model?: string; signal?: AbortSignal; timeoutMs?: number }) => Promise<{ index: number; relevanceScore: number }[]>;
   };

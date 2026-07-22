@@ -105,6 +105,30 @@ describe('applyReranker — happy path', () => {
     const out = await applyReranker('q', results, opts);
     expect((out[0] as any).rerank_score).toBe(0.42);
   });
+
+  test('default truncation affects only oversized reranker documents and not chunk_text', async () => {
+    const longChunk = '甲'.repeat(601);
+    const results = [
+      makeResult('long', 1.0, longChunk),
+      makeResult('short', 0.9, '短文'),
+      { ...makeResult('', 0.8, ''), title: '' },
+    ];
+    let sentDocuments: string[] = [];
+    const opts: RerankerOpts = {
+      enabled: true,
+      topNIn: 3,
+      topNOut: null,
+      rerankerFn: async (input) => {
+        sentDocuments = input.documents;
+        return input.documents.map((_, index) => ({ index, relevanceScore: 1 - index * 0.1 }));
+      },
+    };
+
+    const out = await applyReranker('q', results, opts);
+
+    expect(sentDocuments).toEqual(['甲'.repeat(600), '短文', '']);
+    expect(out[0]?.chunk_text).toBe(longChunk);
+  });
 });
 
 describe('applyReranker — CDX2-F16 null vs undefined semantics', () => {

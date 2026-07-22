@@ -14,13 +14,15 @@
  *
  * Caller (hybridSearch) decides whether the reranker fires via
  * `opts.reranker?.enabled`. Mode-bundle resolution defaults this to `true`
- * for tokenmax and `false` for conservative/balanced.
+ * for balanced/tokenmax and `false` for conservative.
  */
 
 import { createHash } from 'crypto';
 import type { SearchResult } from '../types.ts';
 import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankResult } from '../ai/gateway.ts';
 import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
+
+export const DEFAULT_RERANKER_MAX_DOCUMENT_CHARS = 600;
 
 export interface RerankerOpts {
   enabled: boolean;
@@ -32,6 +34,8 @@ export interface RerankerOpts {
   model?: string;
   /** Per-call timeout in ms (default 5000 — propagates to gateway.rerank). */
   timeoutMs?: number;
+  /** Maximum characters sent per document (default 600; <= 0 disables). */
+  maxDocumentChars?: number;
   /**
    * Test seam — when set, applyReranker calls this instead of gateway.rerank.
    * Production must NEVER set this.
@@ -71,7 +75,13 @@ export async function applyReranker(
   // Document text — chunk_text is the matched span. Fall back to title if
   // empty (shouldn't happen in practice; defensive). Empty docs would
   // confuse the reranker, but we still send them — the upstream model decides.
-  const documents = head.map(r => r.chunk_text || r.title || '');
+  const maxDocumentChars = opts.maxDocumentChars ?? DEFAULT_RERANKER_MAX_DOCUMENT_CHARS;
+  const documents = head.map(r => {
+    const text = r.chunk_text || r.title || '';
+    return maxDocumentChars > 0 && text.length > maxDocumentChars
+      ? text.slice(0, maxDocumentChars)
+      : text;
+  });
 
   let reranked: RerankResult[];
   try {
