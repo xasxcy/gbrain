@@ -135,7 +135,7 @@ export const MIGRATIONS: Migration[] = [
           }
         }
       }
-      if (renamed > 0) console.log(`  Renamed ${renamed} slugs`);
+      if (renamed > 0) console.error(`  Renamed ${renamed} slugs`);
     },
   },
   {

@@ -5,24 +5,30 @@
  * transaction-wrapper refactor — `embed-stale.ts` passes `signature`, but
  * the Postgres path fell through to the plain NULL-embedding cursor,
  * bypassing the `embed_failures` eligibility/backoff/quarantine gate that
- * PGLite still applies. This test pins engine parity for the three chunk
+ * PGLite still applies. This test pins engine parity for the four chunk
  * states the eligibility gate distinguishes: an in-backoff failure record
  * (next_retry_at in the future), a quarantined failure record
- * (quarantined_at set), and a plain not-yet-embedded chunk with no failure
- * record at all (eligible). `countStaleChunks`/`sumStaleChunkChars` are
- * covered too since they share the same `appendEmbedFailureEligibility`
- * helper as `listStaleChunks`.
+ * (quarantined_at set), a plain not-yet-embedded chunk with no failure
+ * record at all (eligible), and a signature-mismatch failure record — one
+ * that LOOKS in-backoff but is stamped with a DIFFERENT (prior-generation)
+ * embedding_signature than the one queried, which must not block the
+ * current generation's re-embed attempt (also eligible). `countStaleChunks`/
+ * `sumStaleChunkChars` are covered too since they share the same
+ * `appendEmbedFailureEligibility` helper as `listStaleChunks`.
  *
- * PGLite-half always runs (hermetic). Postgres-half runs only when
- * `DATABASE_URL` is set — same gate as the other engine-parity tests
- * (see test/phantom-redirect-engine-parity.test.ts).
+ * E2E lane (moved 2026-07-22, batch 2 FIX2 T5): this file requires a real
+ * Postgres to exercise its Postgres-half assertions and parity check. Prior
+ * to this move it lived in the root unit shard, where the two Postgres
+ * cases silently warn+return "pass" whenever `DATABASE_URL` is unset — a
+ * false-green protection net for exactly the regression this file exists to
+ * catch. See scripts/run-e2e.sh + docs/TESTING.md for how the E2E lane runs.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
-import { resetPgliteState } from './helpers/reset-pglite.ts';
-import type { BrainEngine } from '../src/core/engine.ts';
+import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { resetPgliteState } from '../helpers/reset-pglite.ts';
+import type { BrainEngine } from '../../src/core/engine.ts';
 
 let pglite: PGLiteEngine;
 let pg: PostgresEngine | null = null;
@@ -54,19 +60,28 @@ beforeEach(async () => {
 });
 
 /**
- * Seeds a page with 3 not-yet-embedded chunks:
+ * Seeds a page with 4 not-yet-embedded chunks:
  *   0 — plain, no embed_failures row (eligible)
- *   1 — embed_failures row with next_retry_at in the FUTURE, not quarantined
- *       (in-backoff, ineligible)
- *   2 — embed_failures row with quarantined_at SET (quarantined, ineligible)
- * All under the same `sig` embedding_signature ledger entries.
+ *   1 — embed_failures row with next_retry_at in the FUTURE, not quarantined,
+ *       under the SAME signature under test (in-backoff, ineligible)
+ *   2 — embed_failures row with quarantined_at SET, under the SAME signature
+ *       under test (quarantined, ineligible)
+ *   3 — embed_failures row that LOOKS like an in-backoff record (next_retry_at
+ *       in the future, not quarantined) but is stamped with a DIFFERENT
+ *       embedding_signature ('mismatch-sig') than the one queried ('sig')
+ *       (signature mismatch — eligible: appendEmbedFailureEligibility's
+ *       NOT EXISTS anti-join only matches ledger rows whose
+ *       embedding_signature equals the query's signature, so a ledger entry
+ *       from a PRIOR generation must not block the current generation's
+ *       re-embed attempt)
  */
-async function seedThreeChunkStates(engine: BrainEngine, slug: string): Promise<number> {
+async function seedFourChunkStates(engine: BrainEngine, slug: string): Promise<number> {
   await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `# ${slug}` });
   await engine.upsertChunks(slug, [
     { chunk_index: 0, chunk_text: 'eligible chunk text', chunk_source: 'compiled_truth' },
     { chunk_index: 1, chunk_text: 'backoff chunk text', chunk_source: 'compiled_truth' },
     { chunk_index: 2, chunk_text: 'quarantined chunk text', chunk_source: 'compiled_truth' },
+    { chunk_index: 3, chunk_text: 'mismatch chunk text', chunk_source: 'compiled_truth' },
   ]);
   const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(
     `SELECT id FROM pages WHERE slug = $1 AND source_id = 'default'`,
@@ -95,60 +110,72 @@ async function seedThreeChunkStates(engine: BrainEngine, slug: string): Promise<
        FROM content_chunks WHERE page_id = $1 AND chunk_index = 2`,
     [pageId, slug],
   );
+  // chunk_index 3 — signature mismatch: an in-backoff-shaped ledger row
+  // stamped under a PRIOR generation's signature ('mismatch-sig'), queried
+  // under 'sig'. Must NOT block eligibility for the current signature.
+  await engine.executeRaw(
+    `INSERT INTO embed_failures
+       (source_id, page_id, slug, chunk_index, embedding_signature, chunk_hash,
+        error_class, error_fingerprint, first_seen, last_seen, next_retry_at)
+     SELECT 'default', $1::bigint, $2, 3, 'mismatch-sig', md5(chunk_text),
+            'provider_timeout', 'z', now(), now(), now() + INTERVAL '1 hour'
+       FROM content_chunks WHERE page_id = $1 AND chunk_index = 3`,
+    [pageId, slug],
+  );
   return pageId;
 }
 
 describe.each([
   ['PGLite', () => pglite] as const,
 ])('listStaleChunks/countStaleChunks/sumStaleChunkChars — signature eligibility (%s)', (name, getEngine) => {
-  test(`${name}: only the plain chunk (index 0) is signature-eligible`, async () => {
+  test(`${name}: only the plain + signature-mismatch chunks (index 0, 3) are signature-eligible`, async () => {
     const engine = getEngine();
-    await seedThreeChunkStates(engine, 'parity/stale-sig');
+    await seedFourChunkStates(engine, 'parity/stale-sig');
 
-    expect(await engine.countStaleChunks({ signature: 'sig' })).toBe(1);
+    expect(await engine.countStaleChunks({ signature: 'sig' })).toBe(2);
 
     const listed = await engine.listStaleChunks({ signature: 'sig' });
-    expect(listed.map(r => r.chunk_index)).toEqual([0]);
+    expect(listed.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
     const listedSourceScoped = await engine.listStaleChunks({ signature: 'sig', sourceId: 'default' });
-    expect(listedSourceScoped.map(r => r.chunk_index)).toEqual([0]);
+    expect(listedSourceScoped.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
     const listedRecent = await engine.listStaleChunks({ signature: 'sig', orderBy: 'updated_desc' });
-    expect(listedRecent.map(r => r.chunk_index)).toEqual([0]);
+    expect(listedRecent.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
-    // Legacy callers (no signature) ignore the ledger entirely — all 3
+    // Legacy callers (no signature) ignore the ledger entirely — all 4
     // NULL-embedding chunks are "stale".
-    expect(await engine.countStaleChunks()).toBe(3);
-    expect((await engine.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2]);
+    expect(await engine.countStaleChunks()).toBe(4);
+    expect((await engine.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2, 3]);
   });
 });
 
 // Postgres-half — same assertions, runs only when DATABASE_URL is set.
 describe('listStaleChunks/countStaleChunks/sumStaleChunkChars — signature eligibility (Postgres)', () => {
-  test('Postgres: only the plain chunk (index 0) is signature-eligible', async () => {
+  test('Postgres: only the plain + signature-mismatch chunks (index 0, 3) are signature-eligible', async () => {
     if (!pg) {
       console.warn('[engine-parity-stale-signature] DATABASE_URL not set — skipping Postgres half');
       return;
     }
-    await seedThreeChunkStates(pg, 'parity/stale-sig');
+    await seedFourChunkStates(pg, 'parity/stale-sig');
 
-    expect(await pg.countStaleChunks({ signature: 'sig' })).toBe(1);
+    expect(await pg.countStaleChunks({ signature: 'sig' })).toBe(2);
 
     const listed = await pg.listStaleChunks({ signature: 'sig' });
-    expect(listed.map(r => r.chunk_index)).toEqual([0]);
+    expect(listed.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
     const listedSourceScoped = await pg.listStaleChunks({ signature: 'sig', sourceId: 'default' });
-    expect(listedSourceScoped.map(r => r.chunk_index)).toEqual([0]);
+    expect(listedSourceScoped.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
     const listedRecent = await pg.listStaleChunks({ signature: 'sig', orderBy: 'updated_desc' });
-    expect(listedRecent.map(r => r.chunk_index)).toEqual([0]);
+    expect(listedRecent.map(r => r.chunk_index).sort()).toEqual([0, 3]);
 
-    // Legacy callers (no signature) ignore the ledger entirely — all 3
+    // Legacy callers (no signature) ignore the ledger entirely — all 4
     // NULL-embedding chunks are "stale". This is the exact regression:
     // pre-fix, Postgres's listStaleChunks({signature}) returned this same
-    // unfiltered [0,1,2] set instead of respecting the ledger.
-    expect(await pg.countStaleChunks()).toBe(3);
-    expect((await pg.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2]);
+    // unfiltered [0,1,2,3] set instead of respecting the ledger.
+    expect(await pg.countStaleChunks()).toBe(4);
+    expect((await pg.listStaleChunks()).map(r => r.chunk_index).sort()).toEqual([0, 1, 2, 3]);
   });
 
   test('Postgres parity with PGLite on the identical fixture', async () => {
@@ -156,8 +183,8 @@ describe('listStaleChunks/countStaleChunks/sumStaleChunkChars — signature elig
       console.warn('[engine-parity-stale-signature] DATABASE_URL not set — skipping Postgres half');
       return;
     }
-    await seedThreeChunkStates(pglite, 'parity/stale-sig-cmp');
-    await seedThreeChunkStates(pg, 'parity/stale-sig-cmp');
+    await seedFourChunkStates(pglite, 'parity/stale-sig-cmp');
+    await seedFourChunkStates(pg, 'parity/stale-sig-cmp');
 
     const pgliteListed = (await pglite.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index);
     const pgListed = (await pg.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index);

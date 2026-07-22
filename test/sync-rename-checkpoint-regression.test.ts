@@ -35,9 +35,20 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 const repos: string[] = [];
+// #1939 failedFiles cases write sync-failures.jsonl under configDir()
+// (GBRAIN_HOME). Isolate every test's GBRAIN_HOME to a fresh tmpdir so this
+// suite never touches the operator's real ~/.gbrain/sync-failures.jsonl
+// (previously polluted it — see BRIEF T6).
+let gbrainHome: string;
+// The symlink-escape fixture's target file lives outside `repos` (it's
+// created directly under tmpdir, not inside a repo checkout). Tracked here
+// so afterEach reclaims it even when an assertion throws mid-test, instead
+// of relying on the cleanup line at the end of the test body.
+const secretFiles: string[] = [];
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -51,6 +62,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-rename-ckpt-home-'));
 });
 
 afterEach(() => {
@@ -58,6 +70,11 @@ afterEach(() => {
     const d = repos.pop();
     if (d) rmSync(d, { recursive: true, force: true });
   }
+  while (secretFiles.length) {
+    const f = secretFiles.pop();
+    if (f) rmSync(f, { force: true });
+  }
+  rmSync(gbrainHome, { recursive: true, force: true });
 });
 
 function personMd(title: string, body: string): string {
@@ -89,93 +106,96 @@ async function bookmark(): Promise<string | null> {
 
 describe('rename checkpoint regression — reimport block entirely skipped', () => {
   test('missing destination file: no checkpoint advance, page left stale, failedFiles records it, retry on next sync recovers it', async () => {
-    const { performSync } = await import('../src/commands/sync.ts');
-    const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol original body.') });
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const { performSync } = await import('../src/commands/sync.ts');
+      const repo = mkRepo({ 'people/carol.md': personMd('Carol', 'Carol original body.') });
 
-    const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(first.status).toBe('first_sync');
-    expect(await engine.getPage('people/carol')).not.toBeNull();
-    const bookmarkAfterFirst = await bookmark();
+      const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(first.status).toBe('first_sync');
+      expect(await engine.getPage('people/carol')).not.toBeNull();
+      const bookmarkAfterFirst = await bookmark();
 
-    // git mv + commit: the diff says people/carol.md -> people/carol2.md
-    // (R100), but then the destination is removed from the LIVE working
-    // tree without a further commit — importFile reads the live tree, not
-    // the git blob, so this reproduces "renamed here, disk disagrees".
-    execSync('git mv people/carol.md people/carol2.md', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "rename carol"', { cwd: repo, stdio: 'pipe' });
-    const renameCommit = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
-    rmSync(join(repo, 'people/carol2.md'));
+      // git mv + commit: the diff says people/carol.md -> people/carol2.md
+      // (R100), but then the destination is removed from the LIVE working
+      // tree without a further commit — importFile reads the live tree, not
+      // the git blob, so this reproduces "renamed here, disk disagrees".
+      execSync('git mv people/carol.md people/carol2.md', { cwd: repo, stdio: 'pipe' });
+      execSync('git commit -m "rename carol"', { cwd: repo, stdio: 'pipe' });
+      const renameCommit = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
+      rmSync(join(repo, 'people/carol2.md'));
 
-    const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
 
-    // The fail-closed #1939 gate must see this as a fresh failure and
-    // refuse to advance the bookmark — this IS the "checkpoint not
-    // written" contract at the sync-result level (see sync.ts's `advance`
-    // vs. the blocked-return branch: last_commit only moves on `advance`).
-    expect(second.status).toBe('blocked_by_failures');
-    expect(second.failedFiles).toBeGreaterThanOrEqual(1);
-    expect(await bookmark()).toBe(bookmarkAfterFirst);
-    expect(await bookmark()).not.toBe(renameCommit);
+      // The fail-closed #1939 gate must see this as a fresh failure and
+      // refuse to advance the bookmark — this IS the "checkpoint not
+      // written" contract at the sync-result level (see sync.ts's `advance`
+      // vs. the blocked-return branch: last_commit only moves on `advance`).
+      expect(second.status).toBe('blocked_by_failures');
+      expect(second.failedFiles).toBeGreaterThanOrEqual(1);
+      expect(await bookmark()).toBe(bookmarkAfterFirst);
+      expect(await bookmark()).not.toBe(renameCommit);
 
-    // updateSlug already ran (pre-existing batch-1 contract: slug renames
-    // even when reimport later fails) — old slug gone, new slug exists but
-    // was NEVER reimported (still whatever updateSlug left it as, not a
-    // fresh parse of a body that doesn't exist on disk).
-    expect(await engine.getPage('people/carol')).toBeNull();
+      // updateSlug already ran (pre-existing batch-1 contract: slug renames
+      // even when reimport later fails) — old slug gone, new slug exists but
+      // was NEVER reimported (still whatever updateSlug left it as, not a
+      // fresh parse of a body that doesn't exist on disk).
+      expect(await engine.getPage('people/carol')).toBeNull();
 
-    // Fix the underlying problem (restore the file) and re-sync with NO
-    // further git changes — the bookmark never advanced past the rename
-    // commit, so the same diff is re-walked and the file is retried.
-    writeFileSync(join(repo, 'people/carol2.md'), personMd('Carol', 'Carol original body.'));
-    const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(third.status).toBe('synced');
-    expect(await bookmark()).toBe(renameCommit);
-    const recovered = await engine.getPage('people/carol2');
-    expect(recovered).not.toBeNull();
-    expect(recovered!.compiled_truth).toContain('Carol original body');
+      // Fix the underlying problem (restore the file) and re-sync with NO
+      // further git changes — the bookmark never advanced past the rename
+      // commit, so the same diff is re-walked and the file is retried.
+      writeFileSync(join(repo, 'people/carol2.md'), personMd('Carol', 'Carol original body.'));
+      const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(third.status).toBe('synced');
+      expect(await bookmark()).toBe(renameCommit);
+      const recovered = await engine.getPage('people/carol2');
+      expect(recovered).not.toBeNull();
+      expect(recovered!.compiled_truth).toContain('Carol original body');
+    });
   });
 
   test('symlink-escaping destination: no checkpoint advance, failedFiles records it, retry on next sync recovers it', async () => {
-    const { performSync } = await import('../src/commands/sync.ts');
-    const repo = mkRepo({ 'people/dave.md': personMd('Dave', 'Dave original body.') });
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      const { performSync } = await import('../src/commands/sync.ts');
+      const repo = mkRepo({ 'people/dave.md': personMd('Dave', 'Dave original body.') });
 
-    const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(first.status).toBe('first_sync');
-    expect(await engine.getPage('people/dave')).not.toBeNull();
-    const bookmarkAfterFirst = await bookmark();
+      const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(first.status).toBe('first_sync');
+      expect(await engine.getPage('people/dave')).not.toBeNull();
+      const bookmarkAfterFirst = await bookmark();
 
-    // Commit an ordinary rename (R100) so the diff is well-formed...
-    execSync('git mv people/dave.md people/escaped.md', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "rename dave"', { cwd: repo, stdio: 'pipe' });
-    const renameCommit = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
+      // Commit an ordinary rename (R100) so the diff is well-formed...
+      execSync('git mv people/dave.md people/escaped.md', { cwd: repo, stdio: 'pipe' });
+      execSync('git commit -m "rename dave"', { cwd: repo, stdio: 'pipe' });
+      const renameCommit = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
 
-    // ...then swap the LIVE file for a symlink escaping gitContextRoot,
-    // without touching git — the exact TOCTOU shape isPathSafe's docstring
-    // describes ("one swapped in after the scope-entry check").
-    const secretFile = join(tmpdir(), `gbrain-rename-ckpt-secret-${Date.now()}`);
-    writeFileSync(secretFile, 'not part of the repo');
-    unlinkSync(join(repo, 'people/escaped.md'));
-    symlinkSync(secretFile, join(repo, 'people/escaped.md'));
+      // ...then swap the LIVE file for a symlink escaping gitContextRoot,
+      // without touching git — the exact TOCTOU shape isPathSafe's docstring
+      // describes ("one swapped in after the scope-entry check").
+      const secretFile = join(tmpdir(), `gbrain-rename-ckpt-secret-${Date.now()}`);
+      secretFiles.push(secretFile); // afterEach reclaims it even on a mid-test throw
+      writeFileSync(secretFile, 'not part of the repo');
+      unlinkSync(join(repo, 'people/escaped.md'));
+      symlinkSync(secretFile, join(repo, 'people/escaped.md'));
 
-    const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      const second = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
 
-    expect(second.status).toBe('blocked_by_failures');
-    expect(second.failedFiles).toBeGreaterThanOrEqual(1);
-    expect(await bookmark()).toBe(bookmarkAfterFirst);
-    expect(await bookmark()).not.toBe(renameCommit);
-    expect(await engine.getPage('people/dave')).toBeNull();
+      expect(second.status).toBe('blocked_by_failures');
+      expect(second.failedFiles).toBeGreaterThanOrEqual(1);
+      expect(await bookmark()).toBe(bookmarkAfterFirst);
+      expect(await bookmark()).not.toBe(renameCommit);
+      expect(await engine.getPage('people/dave')).toBeNull();
 
-    // Fix it: replace the symlink with a real file, re-sync with no
-    // further git changes.
-    unlinkSync(join(repo, 'people/escaped.md'));
-    writeFileSync(join(repo, 'people/escaped.md'), personMd('Dave', 'Dave original body.'));
-    const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(third.status).toBe('synced');
-    expect(await bookmark()).toBe(renameCommit);
-    const recovered = await engine.getPage('people/escaped');
-    expect(recovered).not.toBeNull();
-    expect(recovered!.compiled_truth).toContain('Dave original body');
-
-    rmSync(secretFile, { force: true });
+      // Fix it: replace the symlink with a real file, re-sync with no
+      // further git changes.
+      unlinkSync(join(repo, 'people/escaped.md'));
+      writeFileSync(join(repo, 'people/escaped.md'), personMd('Dave', 'Dave original body.'));
+      const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(third.status).toBe('synced');
+      expect(await bookmark()).toBe(renameCommit);
+      const recovered = await engine.getPage('people/escaped');
+      expect(recovered).not.toBeNull();
+      expect(recovered!.compiled_truth).toContain('Dave original body');
+    });
   });
 });

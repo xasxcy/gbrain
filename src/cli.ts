@@ -1564,7 +1564,7 @@ async function handleCliOnly(command: string, args: string[]) {
         const hint = userTimeoutMs ? '' : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
         console.error(`${e.label} timed out${hint}.`);
         // Set exitCode and return so the finally block runs engine teardown before exit.
-        process.exitCode = 124;
+        setCliExitVerdict(124);
         return;
       }
       throw e;

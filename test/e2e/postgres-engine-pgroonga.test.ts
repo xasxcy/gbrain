@@ -1,29 +1,33 @@
 /**
  * G2 · TD-2 PGroonga 基线测试
  *
- * Runs 5 read-only baseline test cases against a NAS Postgres DB that has
+ * Runs 5 read-only baseline test cases against a real Postgres DB that has
  * PGroonga installed and the idx_content_chunks_pgroonga index on chunk_text.
  *
  * Design:
  * - No initSchema(), no DDL, read-only
- * - Skips when DATABASE_URL is not set AND no fallback can reach the DB
- * - Falls back to hardcoded NAS URL for local dev convenience
+ * - Skips the whole suite when DATABASE_URL is not set
+ *
+ * FORK-FIX (2026-07-22, batch 2 FIX2 T5): this file previously fell back to
+ * a hardcoded NAS URL (`192.168.50.232:...`) carrying a PLAINTEXT password,
+ * committed to a public fork. It also connected to a LAN-only address on
+ * every CI run regardless of DATABASE_URL, which idled ~10s to a connect
+ * timeout on GitHub-hosted runners (CI `test (4)`, observed 10014ms). Fixed
+ * by reading ONLY `process.env.DATABASE_URL` and skipping the entire suite
+ * (not per-test warn+pass) when it's unset.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
+import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 
-const FALLBACK_DB_URL =
-  'postgres://gbrain:7ecc1375a1bf1aacb9e0e6a0dc614c854c5d8bf3c1ae5e0f@192.168.50.232:55432/gbrain_bge1024';
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const DATABASE_URL = process.env.DATABASE_URL ?? FALLBACK_DB_URL;
-
-describe('PostgresEngine PGroonga baseline', () => {
+describe.skipIf(!DATABASE_URL)('PostgresEngine PGroonga baseline', () => {
   let engine: PostgresEngine;
 
   beforeAll(async () => {
     engine = new PostgresEngine();
-    await engine.connect({ database_url: DATABASE_URL });
+    await engine.connect({ database_url: DATABASE_URL! });
     // Intentionally NOT calling initSchema() — read-only access, do not mutate DB state
   });
 

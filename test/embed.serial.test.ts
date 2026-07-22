@@ -1079,7 +1079,20 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
     };
   }
 
-  test('--stale (autopilot path) carries code metadata into upsertChunks', async () => {
+  // ADR-076: the fork's --stale (autopilot) path does NOT go through
+  // upsertChunks at all — embedAllStale (src/commands/embed.ts) routes every
+  // chunk through persistStaleSlice (src/core/embed-slice-persist.ts) into
+  // engine.persistEmbedOutcome (src/core/postgres-engine.ts), which only
+  // does `UPDATE content_chunks SET embedding = ..., embedded_at = now()`
+  // gated by (page_id, chunk_index, md5(chunk_text)). It never touches the 8
+  // code-metadata columns, so on this path metadata survives structurally
+  // (untouched), not because it was re-threaded through an upsert payload.
+  // This test asserts the ROUTING (persistEmbedOutcome called, upsertChunks
+  // never called); metadata survival across persistEmbedOutcome itself is
+  // covered by the real-engine property test in
+  // test/embed-persist-outcome.test.ts ("persists a vector while leaving all
+  // code-chunk metadata columns untouched").
+  test('--stale (autopilot path) routes through persistEmbedOutcome, not upsertChunks', async () => {
     const stale = [{
       slug: 'code-page',
       chunk_index: 0,
@@ -1087,20 +1100,30 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
       chunk_source: 'compiled_truth',
       model: null,
       token_count: 12,
+      source_id: 'default',
+      page_id: 1,
     }];
-    let upsertChunkArgs: any[] | null = null;
+    let persistEmbedOutcomeRequest: any = null;
+    let upsertChunksCalled = false;
     const engine = mockEngine({
       countStaleChunks: async () => 1,
       listStaleChunks: async () => stale,
-      getChunks: async () => [fullCodeChunk],
-      upsertChunks: async (_slug: string, chunks: any[]) => { upsertChunkArgs = chunks; },
+      persistEmbedOutcome: async (request: any) => {
+        persistEmbedOutcomeRequest = request;
+        return { committedChunks: 1, vectorCommittedChunks: 1, staleSkippedChunks: 0, ledgerUpserts: 0, ledgerDeletes: 0 };
+      },
+      upsertChunks: async () => { upsertChunksCalled = true; },
     });
 
     await runEmbed(engine, ['--stale']);
 
-    expect(upsertChunkArgs).not.toBeNull();
-    expect(upsertChunkArgs!).toHaveLength(1);
-    expect(metadataOf(upsertChunkArgs![0])).toEqual(metadataOf(fullCodeChunk));
+    expect(persistEmbedOutcomeRequest).not.toBeNull();
+    expect(persistEmbedOutcomeRequest.slug).toBe('code-page');
+    expect(persistEmbedOutcomeRequest.sourceId).toBe('default');
+    expect(persistEmbedOutcomeRequest.pageId).toBe(1);
+    expect(persistEmbedOutcomeRequest.entries).toHaveLength(1);
+    expect(persistEmbedOutcomeRequest.entries[0].chunkIndex).toBe(0);
+    expect(upsertChunksCalled).toBe(false);
   });
 
   test('--all (full re-embed) carries code metadata into upsertChunks', async () => {

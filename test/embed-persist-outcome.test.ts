@@ -160,6 +160,77 @@ describe('persistEmbedOutcome', () => {
     expect(await engine.executeRaw(`SELECT 1 FROM embed_failures WHERE source_id = 'other'`)).toHaveLength(1);
   });
 
+  // Regression for #769 (fork routing): the fork's --stale autopilot path
+  // never calls upsertChunks — it routes through persistEmbedOutcome, whose
+  // SQL only does `SET embedding = ..., embedded_at = now()` and never
+  // touches the 8 code-metadata columns. This is the real-engine proof that
+  // persistEmbedOutcome leaves pre-existing code metadata untouched when it
+  // fills in a NULL embedding. See ADR-076 and the routing-assertion test in
+  // test/embed.serial.test.ts ("--stale (autopilot path) routes through
+  // persistEmbedOutcome, not upsertChunks").
+  test('persists a vector while leaving all code-chunk metadata columns untouched', async () => {
+    await engine.upsertChunks('ledger', [
+      {
+        chunk_index: 2,
+        chunk_text: '[Java] foo/Bar.java:10-20 method baz',
+        chunk_source: 'compiled_truth',
+        language: 'java',
+        symbol_name: 'baz',
+        symbol_type: 'function',
+        start_line: 10,
+        end_line: 20,
+        parent_symbol_path: ['Bar'],
+        doc_comment: 'does the thing',
+        symbol_name_qualified: 'Bar.baz',
+      },
+    ]);
+    const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'ledger'`);
+    const before = await engine.executeRaw<{
+      embedding: unknown;
+      language: string; symbol_name: string; symbol_type: string;
+      start_line: number; end_line: number; parent_symbol_path: string[];
+      doc_comment: string; symbol_name_qualified: string;
+    }>(
+      `SELECT embedding, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified
+         FROM content_chunks WHERE page_id = $1 AND chunk_index = 2`,
+      [pageId],
+    );
+    expect(before[0]?.embedding).toBeNull();
+
+    const chunkHash = (await engine.executeRaw<{ md5: string }>(
+      `SELECT md5(chunk_text) FROM content_chunks WHERE page_id = $1 AND chunk_index = 2`,
+      [pageId],
+    ))[0]!.md5;
+    const result = await engine.persistEmbedOutcome({
+      sourceId: 'default',
+      pageId,
+      slug: 'ledger',
+      embeddingSignature: 'sig',
+      entries: [{ chunkIndex: 2, chunkHash, outcome: { vector: new Float32Array(1536) } }],
+    });
+    expect(result.vectorCommittedChunks).toBe(1);
+
+    const after = await engine.executeRaw<{
+      embedding: unknown;
+      language: string; symbol_name: string; symbol_type: string;
+      start_line: number; end_line: number; parent_symbol_path: string[];
+      doc_comment: string; symbol_name_qualified: string;
+    }>(
+      `SELECT embedding, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified
+         FROM content_chunks WHERE page_id = $1 AND chunk_index = 2`,
+      [pageId],
+    );
+    expect(after[0]?.embedding).not.toBeNull();
+    expect(after[0]?.language).toBe(before[0]!.language);
+    expect(after[0]?.symbol_name).toBe(before[0]!.symbol_name);
+    expect(after[0]?.symbol_type).toBe(before[0]!.symbol_type);
+    expect(after[0]?.start_line).toBe(before[0]!.start_line);
+    expect(after[0]?.end_line).toBe(before[0]!.end_line);
+    expect(after[0]?.parent_symbol_path).toEqual(before[0]!.parent_symbol_path);
+    expect(after[0]?.doc_comment).toBe(before[0]!.doc_comment);
+    expect(after[0]?.symbol_name_qualified).toBe(before[0]!.symbol_name_qualified);
+  });
+
   test('fresh ledger schema has FK cascade', async () => {
     const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'ledger'`);
     await engine.executeRaw(

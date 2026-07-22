@@ -32,30 +32,29 @@
  * v126 install would have accumulated the row before this fix ever ran).
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { runMigrations } from '../src/core/migrate.ts';
 import { resetFtsLanguageCache } from '../src/core/fts-language.ts';
 
 const ENV_KEY = 'GBRAIN_FTS_LANGUAGE';
-const originalLang = process.env[ENV_KEY];
 
 let engine: PGLiteEngine;
 
-beforeEach(async () => {
+beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema(); // brings up tables at LATEST_VERSION; we roll back below.
-  await resetPgliteState(engine);
-  delete process.env[ENV_KEY];
-  resetFtsLanguageCache();
 });
 
-afterEach(async () => {
+afterAll(async () => {
   await engine.disconnect();
-  delete process.env[ENV_KEY];
-  if (originalLang !== undefined) process.env[ENV_KEY] = originalLang;
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
   resetFtsLanguageCache();
 });
 
@@ -92,28 +91,29 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
       compiled_truth: 'zzBodyOnlyTokenA short unrelated prose',
     });
 
-    process.env[ENV_KEY] = 'english';
-    resetFtsLanguageCache();
-    const result = await runMigrations(engine);
-    expect(result.applied).toBeGreaterThan(0);
+    await withEnv({ [ENV_KEY]: 'english' }, async () => {
+      resetFtsLanguageCache();
+      const result = await runMigrations(engine);
+      expect(result.applied).toBeGreaterThan(0);
 
-    const src = await getTriggerFunctionSource();
-    expect(src).not.toContain('compiled_truth');
+      const src = await getTriggerFunctionSource();
+      expect(src).not.toContain('compiled_truth');
 
-    // A page whose title/timeline don't contain the body-only token must NOT
-    // match it via search_vector after the upgrade — matches a fresh install,
-    // where compiled_truth was never indexed at all.
-    const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
-      `SELECT search_vector @@ to_tsquery('english', 'zzbodyonlytokena') AS hit
-         FROM pages WHERE slug = 'normal-page'`,
-    );
-    expect(bodyOnlyHit[0]?.hit).toBe(false);
-    // Title tokens still index — the trigger isn't inert, just narrower.
-    const titleHit = await engine.executeRaw<{ hit: boolean }>(
-      `SELECT search_vector @@ to_tsquery('english', 'zztitletokena') AS hit
-         FROM pages WHERE slug = 'normal-page'`,
-    );
-    expect(titleHit[0]?.hit).toBe(true);
+      // A page whose title/timeline don't contain the body-only token must NOT
+      // match it via search_vector after the upgrade — matches a fresh install,
+      // where compiled_truth was never indexed at all.
+      const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
+        `SELECT search_vector @@ to_tsquery('english', 'zzbodyonlytokena') AS hit
+           FROM pages WHERE slug = 'normal-page'`,
+      );
+      expect(bodyOnlyHit[0]?.hit).toBe(false);
+      // Title tokens still index — the trigger isn't inert, just narrower.
+      const titleHit = await engine.executeRaw<{ hit: boolean }>(
+        `SELECT search_vector @@ to_tsquery('english', 'zztitletokena') AS hit
+           FROM pages WHERE slug = 'normal-page'`,
+      );
+      expect(titleHit[0]?.hit).toBe(true);
+    });
   });
 
   test("non-English ('simple'): upgrade does not crash, drops compiled_truth, matches a fresh install", async () => {
@@ -125,25 +125,26 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
       compiled_truth: 'zzBodyOnlyTokenB short unrelated prose',
     });
 
-    process.env[ENV_KEY] = 'simple';
-    resetFtsLanguageCache();
-    const result = await runMigrations(engine);
-    expect(result.applied).toBeGreaterThan(0);
+    await withEnv({ [ENV_KEY]: 'simple' }, async () => {
+      resetFtsLanguageCache();
+      const result = await runMigrations(engine);
+      expect(result.applied).toBeGreaterThan(0);
 
-    const src = await getTriggerFunctionSource();
-    expect(src).not.toContain('compiled_truth');
-    expect(src).toContain("'simple'");
+      const src = await getTriggerFunctionSource();
+      expect(src).not.toContain('compiled_truth');
+      expect(src).toContain("'simple'");
 
-    const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
-      `SELECT search_vector @@ to_tsquery('simple', 'zzbodyonlytokenb') AS hit
-         FROM pages WHERE slug = 'normal-page-simple'`,
-    );
-    expect(bodyOnlyHit[0]?.hit).toBe(false);
-    const titleHit = await engine.executeRaw<{ hit: boolean }>(
-      `SELECT search_vector @@ to_tsquery('simple', 'zztitletokenb') AS hit
-         FROM pages WHERE slug = 'normal-page-simple'`,
-    );
-    expect(titleHit[0]?.hit).toBe(true);
+      const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
+        `SELECT search_vector @@ to_tsquery('simple', 'zzbodyonlytokenb') AS hit
+           FROM pages WHERE slug = 'normal-page-simple'`,
+      );
+      expect(bodyOnlyHit[0]?.hit).toBe(false);
+      const titleHit = await engine.executeRaw<{ hit: boolean }>(
+        `SELECT search_vector @@ to_tsquery('simple', 'zztitletokenb') AS hit
+           FROM pages WHERE slug = 'normal-page-simple'`,
+      );
+      expect(titleHit[0]?.hit).toBe(true);
+    });
   });
 
   test('large page body (>1MB, high-token-diversity): upgrade to a non-English language does not crash', async () => {
@@ -163,28 +164,29 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
     );
     await engine.executeRaw(`ALTER TABLE pages ENABLE TRIGGER trg_pages_search_vector`);
 
-    process.env[ENV_KEY] = 'simple';
-    resetFtsLanguageCache();
+    await withEnv({ [ENV_KEY]: 'simple' }, async () => {
+      resetFtsLanguageCache();
 
-    // Pre-fix, this next call would throw:
-    //   "string is too long for tsvector (2706616 bytes, max 1048575 bytes)"
-    // — reproduced against the OLD migration bodies during diagnosis.
-    const result = await runMigrations(engine);
-    expect(result.applied).toBeGreaterThan(0);
+      // Pre-fix, this next call would throw:
+      //   "string is too long for tsvector (2706616 bytes, max 1048575 bytes)"
+      // — reproduced against the OLD migration bodies during diagnosis.
+      const result = await runMigrations(engine);
+      expect(result.applied).toBeGreaterThan(0);
 
-    const src = await getTriggerFunctionSource();
-    expect(src).not.toContain('compiled_truth');
+      const src = await getTriggerFunctionSource();
+      expect(src).not.toContain('compiled_truth');
 
-    // The oversized row's search_vector must have been backfilled by v128
-    // (not left in its placeholder state) and must not carry compiled_truth
-    // tokens — matches a fresh install.
-    const row = await engine.executeRaw<{ hit_body: boolean; hit_title: boolean }>(
-      `SELECT
-         search_vector @@ to_tsquery('simple', 'token0') AS hit_body,
-         search_vector @@ to_tsquery('simple', 'zztitletokenc') AS hit_title
-       FROM pages WHERE slug = 'oversized-existing'`,
-    );
-    expect(row[0]?.hit_body).toBe(false);
-    expect(row[0]?.hit_title).toBe(true);
+      // The oversized row's search_vector must have been backfilled by v128
+      // (not left in its placeholder state) and must not carry compiled_truth
+      // tokens — matches a fresh install.
+      const row = await engine.executeRaw<{ hit_body: boolean; hit_title: boolean }>(
+        `SELECT
+           search_vector @@ to_tsquery('simple', 'token0') AS hit_body,
+           search_vector @@ to_tsquery('simple', 'zztitletokenc') AS hit_title
+         FROM pages WHERE slug = 'oversized-existing'`,
+      );
+      expect(row[0]?.hit_body).toBe(false);
+      expect(row[0]?.hit_title).toBe(true);
+    });
   }, 30_000);
 });
