@@ -7,7 +7,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { operations, OperationError } from '../core/operations.ts';
+import { operations, OperationError, enforceBoundClientOpAllowList } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
 
@@ -33,6 +33,12 @@ export interface DispatchOpts {
   /** Override the default stderr logger (e.g. CLI uses console.* directly). */
   logger?: OperationContext['logger'];
   /**
+   * #1061: transport marker for auth-less remote surfaces. The stdio MCP
+   * server passes 'stdio' so identity ops (whoami) can report the transport
+   * instead of throwing unknown_transport. Never used for trust decisions.
+   */
+  transport?: OperationContext['transport'];
+  /**
    * v0.28: per-token allow-list for the takes.holder field. Threaded by
    * the HTTP/stdio transport from `access_tokens.permissions.takes_holders`.
    * When set, takes_list / takes_search / query (when it returns takes)
@@ -48,6 +54,13 @@ export interface DispatchOpts {
    * resolves it from the per-token allow-list (eE3).
    */
   sourceId?: string;
+  /**
+   * #3242: federated read set for callers with NO explicit source scope
+   * (stdio without GBRAIN_SOURCE; legacy HTTP tokens without an operator-set
+   * `permissions.source_id` grant). Transport-computed, never derived from
+   * caller params. See OperationContext.localFederatedSourceIds.
+   */
+  localFederatedSourceIds?: string[];
   /**
    * v0.31 (eD3): hook called by the dispatcher AFTER op.handler succeeds
    * to compute `_meta.brain_hot_memory` for the response. Wrapped in its
@@ -203,12 +216,14 @@ export function buildOperationContext(
     logger: opts.logger || stderrLogger,
     dryRun: !!params.dry_run,
     remote: opts.remote ?? true,
+    transport: opts.transport,
     takesHoldersAllowList: opts.takesHoldersAllowList,
     // v0.34 D4: sourceId is REQUIRED at the type level. Auto-fill 'default'
     // for single-source brains and any caller who didn't resolve a sourceId.
     // CLI / HTTP / stdio transports SHOULD pass an explicit sourceId via opts;
     // this fallback covers code paths that historically passed undefined.
     sourceId: opts.sourceId ?? 'default',
+    ...(opts.localFederatedSourceIds ? { localFederatedSourceIds: opts.localFederatedSourceIds } : {}),
     auth: opts.auth,
   };
 }
@@ -247,9 +262,29 @@ export async function dispatchToolCall(
     };
   }
 
+  // Remote callers must arrive with a resolved source scope. Every shipped
+  // transport passes sourceId explicitly (serve-http from the OAuth client
+  // row, http-transport from the legacy token grant, stdio from
+  // GBRAIN_SOURCE); a remote call reaching the 'default' fallback means a
+  // programmatic caller skipped scope resolution, and silently landing in
+  // the shared 'default' source is the cross-source leak class behind
+  // #1924 / #1371. Trusted local callers (remote === false) keep the
+  // historical fallback via buildOperationContext.
+  if ((opts.remote ?? true) && !opts.sourceId) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: 'missing_source_scope', message: `Remote tool call '${name}' carries no resolved sourceId; refusing the shared 'default' source fallback. Pass an explicit sourceId resolved from the caller's grant.` }, null, 2) }],
+      isError: true,
+    };
+  }
+
   const ctx = buildOperationContext(engine, safeParams, opts);
 
   try {
+    // Fail-closed gate for slug-bound OAuth clients, applied here because
+    // this is the one path both MCP transports share. Per-op fences still
+    // run inside the handlers; this stops an unfenced write op from being
+    // a silent hole. See CLIENT_FENCED_WRITE_OPS in operations.ts.
+    enforceBoundClientOpAllowList(ctx.auth, op);
     const result = await op.handler(ctx, safeParams);
     const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     // v0.31 (eD3 + eE4): best-effort _meta.brain_hot_memory injection.

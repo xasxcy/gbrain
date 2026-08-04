@@ -25,6 +25,7 @@
 
 import { createHash } from 'crypto';
 import { CR_MODES, type CRMode } from '../types.ts';
+import { getFtsLanguage } from '../fts-language.ts';
 import { getRecipe } from '../ai/recipes/index.ts';
 
 /**
@@ -763,10 +764,32 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // global cold-miss pattern as the bumps above; refills within
 // cache.ttl_seconds (3600s default).
 //
-// bump 12→13: reranker_max_document_chars changes the text scored by the
-// cross-encoder, so cached rankings from a different truncation threshold
+// bump 12→13 (#3390/#3391): embedding-provider migration wave. The `prov=`
+// component only isolates callers that thread KnobsHashContext.embeddingModel;
+// legacy callers hash `prov=default` before AND after a provider swap, so a
+// cache row computed against the pre-migration embedding space could be
+// served post-migration. `gbrain migrate embeddings` purges query_cache
+// directly at swap time; this version bump is the belt-and-braces for rows
+// written between the #3391 stale-fix (which changes which chunks count as
+// current) and the operator's migration run. Same one-time global cold-miss
+// pattern as the bumps above.
+//
+// bump 14→15: the FTS configuration name (GBRAIN_FTS_LANGUAGE, resolved by
+// getFtsLanguage()) folds into the key via the `fts=` part. It reaches BOTH
+// engines' keyword SQL (websearch_to_tsquery/to_tsvector in postgres-engine
+// and pglite-engine) and the two search_vector trigger functions, so it
+// changes which rows the keyword arm returns — but it only applied at
+// DB-query build time (cache miss). Switching language and running
+// `gbrain reindex-search-vector` therefore left every pre-switch query_cache
+// row reachable: the freshly retokenized index was silently bypassed for up
+// to cache.ttl_seconds, with no warning and no way for an operator to tell.
+// Same one-time global cold-miss pattern as the bumps above; refills within
+// cache.ttl_seconds (3600s default).
+//
+// bump 15→16 (fork): reranker_max_document_chars changes the text scored by
+// the cross-encoder, so cached rankings from a different truncation threshold
 // must not be reused. Same one-time global cold-miss pattern.
-export const KNOBS_HASH_VERSION = 13;
+export const KNOBS_HASH_VERSION = 16;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -901,6 +924,16 @@ export function knobsHash(
     // v=13 addition (append-only): candidate text truncation changes the
     // cross-encoder input and therefore can change the ranking.
     `rrc=${knobs.reranker_max_document_chars}`,
+    // v=15 addition (append-only): the resolved FTS configuration name. Read
+    // from getFtsLanguage() rather than threaded through KnobsHashContext on
+    // purpose — the language is a process-global env read with no per-call
+    // dimension, and the `prov=` bump note above records what threading costs:
+    // a ctx field only isolates callers that pass it, so legacy callers keep
+    // hashing the fallback literal on both sides of a switch. Reading it here
+    // covers every knobsHash() caller, present and future. getFtsLanguage()
+    // memoizes and validates against /^[a-z][a-z0-9_]*$/, so this stays a
+    // cheap, bounded string.
+    `fts=${getFtsLanguage()}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

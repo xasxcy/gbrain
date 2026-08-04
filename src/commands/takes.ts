@@ -3,6 +3,7 @@
  *
  * Subcommands:
  *   takes <slug>                          — list takes for a page
+ *   takes list                            — list all active takes (#2079)
  *   takes search "<query>" [--who h]       — keyword search across all takes
  *   takes add <slug> ...flags              — append a take (markdown + DB)
  *   takes update <slug> --row N ...flags   — update mutable fields
@@ -29,6 +30,7 @@ import {
 } from '../core/takes-fence.ts';
 import { withPageLock } from '../core/page-lock.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
+import { resolveOwnerHolder } from '../core/owner-holder.ts';
 
 // --- Helpers ---
 
@@ -128,11 +130,10 @@ function writeBody(path: string, body: string): void {
 // --- Subcommands ---
 
 async function cmdList(engine: BrainEngine, args: string[]): Promise<void> {
-  const slug = args[0];
-  if (!slug) {
-    console.error('Usage: gbrain takes <slug> [--json]');
-    process.exit(1);
-  }
+  // #2079: slug is optional. `gbrain takes list` (no slug) lists ALL active
+  // takes — CLI parity with the takes_list operation. A leading flag is not
+  // a slug.
+  const slug = args[0] && !args[0].startsWith('-') ? args[0] : undefined;
   const json = flagPresent(args, '--json');
   const holder = flagValue(args, '--who');
   const kind = flagValue(args, '--kind') as string | undefined;
@@ -152,17 +153,19 @@ async function cmdList(engine: BrainEngine, args: string[]): Promise<void> {
     return;
   }
 
+  const scope = slug ?? 'this brain';
   if (takes.length === 0) {
-    console.log(`No takes on ${slug}.`);
+    console.log(`No takes on ${scope}.`);
     return;
   }
-  console.log(`# Takes on ${slug}\n`);
+  console.log(`# Takes on ${scope}\n`);
   for (const t of takes) {
     const tag = t.active ? '' : ' [superseded]';
     const w = Number(t.weight).toFixed(2);
     const since = t.since_date ?? '';
     const src = t.source ? ` — ${t.source}` : '';
-    console.log(`#${t.row_num} [${t.kind} • ${t.holder} • w=${w}${since ? ` • ${since}` : ''}]${tag}\n  ${t.claim}${src}\n`);
+    const where = slug ? '' : `${t.page_slug} `;
+    console.log(`${where}#${t.row_num} [${t.kind} • ${t.holder} • w=${w}${since ? ` • ${since}` : ''}]${tag}\n  ${t.claim}${src}\n`);
   }
 }
 
@@ -291,7 +294,7 @@ async function cmdSupersede(engine: BrainEngine, args: string[], sourceId?: stri
     const pageId = await getPageId(engine, slug, sourceId);
 
     // Read existing row to inherit kind/holder unless overridden
-    const existing = await engine.listTakes({ page_id: pageId, active: false, limit: 500 });
+    const existing = await engine.listTakes({ page_id: pageId, active: true, limit: 500 });
     const target = existing.find(t => t.row_num === rowNum);
     if (!target) {
       console.error(`Row #${rowNum} not found on ${slug}.`);
@@ -364,7 +367,7 @@ async function cmdResolve(engine: BrainEngine, args: string[], sourceId?: string
   // --evidence is the v0.30.0 alias for --source on the resolve subcommand
   // (semantic clarity: "what evidence resolved this bet?").
   const source = flagValue(args, '--evidence') ?? flagValue(args, '--source');
-  const resolvedBy = flagValue(args, '--by') ?? 'garry';
+  const resolvedBy = flagValue(args, '--by') ?? resolveOwnerHolder({ configValue: await engine.getConfig('emotional_weight.user_holder') });
   const dirArg = flagValue(args, '--dir');
 
   const pageId = await getPageId(engine, slug, sourceId);
@@ -554,6 +557,8 @@ export async function runTakes(engine: BrainEngine, args: string[]): Promise<voi
 Subcommands:
   takes <slug> [--json] [--who h] [--kind k] [--sort weight|since_date|created_at] [--expired]
                                           List takes for a page
+  takes list [--json] [--who h] [--kind k] [--sort ...] [--expired]
+                                          List all active takes across the brain (#2079)
   takes search "<query>" [--limit N] [--json]
                                           Keyword search across all takes
   takes add <slug> --claim "..." --kind <fact|take|bet|hunch> --who <holder>
@@ -583,6 +588,9 @@ Common flags:
   const rest = args.slice(1);
 
   switch (sub) {
+    // #2079: `takes list` used to be parsed as page slug "list" and printed
+    // "No takes on list." — reading exactly like an empty takes table.
+    case 'list':        return cmdList(engine, rest);
     case 'search':      return cmdSearch(engine, rest);
     case 'add':         return cmdAdd(engine, rest, await resolveTakesSourceId(engine));
     case 'update':      return cmdUpdate(engine, rest, await resolveTakesSourceId(engine));

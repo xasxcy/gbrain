@@ -10,7 +10,7 @@ import { describe, test, expect } from 'bun:test';
 import { __testing } from '../src/commands/apply-migrations.ts';
 import type { CompletedMigrationEntry } from '../src/core/preferences.ts';
 
-const { parseArgs, indexCompleted, buildPlan, statusForVersion } = __testing;
+const { parseArgs, indexCompleted, buildPlan, statusForVersion, resolveSchemaBehind } = __testing;
 
 describe('parseArgs', () => {
   test('default flags', () => {
@@ -167,6 +167,41 @@ describe('buildPlan — diff against completed + installed VERSION', () => {
   });
 });
 
+describe('force-retry escape hatch', () => {
+  test("complete then retry-latest → pending and buildPlan lists the version as pending", () => {
+    const idx = indexCompleted([
+      { version: '0.11.0', status: 'complete' },
+      { version: '0.11.0', status: 'retry' },
+    ]);
+
+    expect(statusForVersion('0.11.0', idx)).toBe('pending');
+    const plan = buildPlan(idx, '0.11.1', '0.11.0');
+    expect(plan.pending.map(m => m.version)).toEqual(['0.11.0']);
+    expect(plan.applied).toEqual([]);
+    expect(plan.partial).toEqual([]);
+    expect(plan.wedged).toEqual([]);
+  });
+
+  test('complete then stray partial without retry → still complete', () => {
+    const idx = indexCompleted([
+      { version: '0.11.0', status: 'complete' },
+      { version: '0.11.0', status: 'partial' },
+    ]);
+
+    expect(statusForVersion('0.11.0', idx)).toBe('complete');
+  });
+
+  test('retry followed by a newer complete → complete', () => {
+    const idx = indexCompleted([
+      { version: '0.11.0', status: 'complete' },
+      { version: '0.11.0', status: 'retry' },
+      { version: '0.11.0', status: 'complete' },
+    ]);
+
+    expect(statusForVersion('0.11.0', idx)).toBe('complete');
+  });
+});
+
 // v0.36.1.x (cherry-pick #1062): list, dry-run, and "all migrations up to
 // date" paths must exit 0 so shell scripts gating on the exit code work.
 // Pre-fix, these `return` statements left the CLI dispatcher's implicit
@@ -178,5 +213,75 @@ describe('runApplyMigrations exit codes (v0.36.1.x #1062)', () => {
     expect(src).toMatch(/cli\.list\s*\)\s*\{\s*printList\(plan,\s*installed\);\s*process\.exit\(0\);/);
     expect(src).toMatch(/cli\.dryRun\s*\)\s*\{\s*printDryRun\(plan,\s*installed\);\s*process\.exit\(0\);/);
     expect(src).toMatch(/All migrations up to date[\s\S]{0,80}process\.exit\(0\)/);
+  });
+});
+
+// #921: a failed orchestrator must print each failed phase's detail to
+// stderr — not just "reported status=failed" — so the operator can act
+// without digging through the ledger.
+describe('failed migration prints phase detail (#921)', () => {
+  test('runner loops result.phases and console.errors failed phase details', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/commands/apply-migrations.ts', 'utf8');
+    expect(src).toMatch(
+      /reported status=failed[\s\S]{0,400}for \(const p of result\.phases\)[\s\S]{0,200}p\.status === 'failed'[\s\S]{0,200}console\.error\([\s\S]{0,80}p\.name[\s\S]{0,80}p\.detail/,
+    );
+  });
+});
+
+// #1530: apply-migrations must not report "All migrations up to date" (exit 0)
+// while the SCHEMA is behind. --yes runs the schema migrations in the
+// pre-flight; interactive runs flag schemaBehind and exit 1.
+describe('resolveSchemaBehind (#1530)', () => {
+  test('schema up to date → false, migrations not run', async () => {
+    let ran = false;
+    const behind = await resolveSchemaBehind({
+      schemaVer: 5,
+      latest: 5,
+      autoApply: true,
+      run: async () => { ran = true; return { applied: 0, current: 5 }; },
+    });
+    expect(behind).toBe(false);
+    expect(ran).toBe(false);
+  });
+
+  test('behind + autoApply → runs schema migrations, no longer behind', async () => {
+    let ran = false;
+    const behind = await resolveSchemaBehind({
+      schemaVer: 3,
+      latest: 5,
+      autoApply: true,
+      run: async () => { ran = true; return { applied: 2, current: 5 }; },
+    });
+    expect(behind).toBe(false);
+    expect(ran).toBe(true);
+  });
+
+  test('behind + interactive → warns and stays behind, migrations not run', async () => {
+    let ran = false;
+    const behind = await resolveSchemaBehind({
+      schemaVer: 3,
+      latest: 5,
+      autoApply: false,
+      run: async () => { ran = true; return { applied: 2, current: 5 }; },
+    });
+    expect(behind).toBe(true);
+    expect(ran).toBe(false);
+  });
+
+  test('behind + autoApply + migration failure → stays behind', async () => {
+    const behind = await resolveSchemaBehind({
+      schemaVer: 3,
+      latest: 5,
+      autoApply: true,
+      run: async () => { throw new Error('boom'); },
+    });
+    expect(behind).toBe(true);
+  });
+
+  test('up-to-date branch exits 1 when schemaBehind (source shape)', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/commands/apply-migrations.ts', 'utf8');
+    expect(src).toMatch(/if \(schemaBehind\)[\s\S]{0,300}process\.exit\(1\)[\s\S]{0,120}All migrations up to date/);
   });
 });

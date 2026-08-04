@@ -143,6 +143,31 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
   return parsed;
 }
 
+/**
+ * #3026: the thin-client `list`/`get` branches receive jobs as parsed JSON
+ * off the MCP wire, where every timestamp is an ISO string — but formatJob /
+ * formatJobDetail (and the stalled-detection comparison) hold a Date
+ * contract, hydrated locally by MinionQueue.rowToJob. Rehydrate once at the
+ * unpack boundary so both paths hand the formatters real Dates. Exported for
+ * unit tests.
+ */
+const JOB_DATE_FIELDS = [
+  'created_at', 'updated_at', 'started_at', 'finished_at', 'lock_until', 'delay_until',
+] as const;
+
+export function rehydrateJobDates<T>(job: T): T {
+  if (!job || typeof job !== 'object') return job;
+  const rec = job as { [k: string]: unknown };
+  for (const field of JOB_DATE_FIELDS) {
+    const v = rec[field];
+    if (typeof v === 'string') {
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) rec[field] = d;
+    }
+  }
+  return job;
+}
+
 function formatJob(job: MinionJob): string {
   const dur = job.finished_at && job.started_at
     ? `${((job.finished_at.getTime() - job.started_at.getTime()) / 1000).toFixed(1)}s`
@@ -208,7 +233,7 @@ USAGE
   gbrain jobs get <id>
   gbrain jobs cancel <id>
   gbrain jobs retry <id>
-  gbrain jobs prune [--older-than 30d]
+  gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
   gbrain jobs stats
   gbrain jobs smoke
@@ -496,7 +521,7 @@ HANDLER TYPES (built in)
         const raw = await callRemoteTool(cfg!, 'list_jobs', {
           status, queue: queueName, limit,
         }, { timeoutMs: 30_000 });
-        jobs = unpackToolResult<MinionJob[]>(raw);
+        jobs = unpackToolResult<MinionJob[]>(raw).map((j) => rehydrateJobDates(j));
       } else {
         try { await queue.ensureSchema(); }
         catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
@@ -525,7 +550,7 @@ HANDLER TYPES (built in)
       if (isThinClient(cfg)) {
         try {
           const raw = await callRemoteTool(cfg!, 'get_job', { id }, { timeoutMs: 30_000 });
-          job = unpackToolResult<MinionJob | null>(raw);
+          job = rehydrateJobDates(unpackToolResult<MinionJob | null>(raw));
         } catch (e) {
           // The remote op throws `invalid_params` on not-found; surface as
           // the same "Job not found" exit-1 the local path produces.
@@ -608,8 +633,15 @@ HANDLER TYPES (built in)
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
-      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000) });
-      console.log(`Pruned ${count} jobs older than ${days} days.`);
+      // #2712: --dry-run previews the count without deleting. It used to be
+      // silently ignored (the destructive default ran anyway).
+      const dryRun = hasFlag(args, '--dry-run');
+      const count = await queue.prune({ olderThan: new Date(Date.now() - days * 86400000), dryRun });
+      if (dryRun) {
+        console.log(`[dry-run] Would prune ${count} jobs older than ${days} days. Nothing deleted.`);
+      } else {
+        console.log(`Pruned ${count} jobs older than ${days} days.`);
+      }
       break;
     }
 
@@ -1664,7 +1696,13 @@ export async function registerBuiltinHandlers(
 
   worker.register('backlinks', async (job) => {
     const { runBacklinksCore } = await import('./backlinks.ts');
-    const action: 'check' | 'fix' = job.data.action === 'check' ? 'check' : 'fix';
+    // Default to 'check', not 'fix': backlinks jobs submitted with an empty
+    // payload (e.g. the sync→embed→backlinks chains enqueued after ingestion)
+    // must never rewrite tracked brain pages with generated "Referenced in"
+    // timeline bullets. Mirrors the documented intent in src/core/cycle.ts
+    // (runPhaseBacklinks). The filesystem fixer stays available explicitly
+    // via '{"action":"fix"}' or `gbrain check-backlinks fix`.
+    const action: 'check' | 'fix' = job.data.action === 'fix' ? 'fix' : 'check';
     const dir = typeof job.data.dir === 'string'
       ? job.data.dir
       : (await engine.getConfig('sync.repo_path')) ?? '.';
@@ -1879,6 +1917,7 @@ export async function registerBuiltinHandlers(
       signal: job.signal,
       deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       phases,
+      forceGlobalOrphans: true,
       yieldBetweenPhases: async () => { await new Promise<void>((r) => setImmediate(r)); },
     });
 
@@ -2055,11 +2094,26 @@ export async function registerBuiltinHandlers(
         ? job.data.repoPath
         : ((await engine.getConfig('sync.repo_path')) ?? undefined);
     try {
-      return await runExtractAtomsDrainForSource(engine, {
+      const result = await runExtractAtomsDrainForSource(engine, {
         sourceId,
         windowSeconds,
         brainDir: repoPath,
       });
+      // issue #3218: every item the drain attempted failed (0 succeeded, >=1
+      // provider error) — completing this job normally would mark the
+      // durable job done while the backlog sits untouched, and no retry
+      // policy would ever fire on it again. Throw so the worker's ordinary
+      // failJob path (attempt+backoff, or dead-letter once exhausted) takes
+      // over instead — matching the existing behavior for every other
+      // handler failure. Partial success (>=1 item extracted) keeps
+      // completing normally, unchanged.
+      if (result.status === 'provider_failure') {
+        throw new Error(
+          `extract-atoms-drain: all provider calls failed this batch ` +
+          `(batches=${result.batches}, remaining=${result.remaining ?? '?'}) — retrying`,
+        );
+      }
+      return result;
     } catch (e) {
       if (e instanceof LockUnavailableError) {
         return { phase: 'extract_atoms', status: 'skipped', deferred: true, reason: 'cycle_already_running' };
@@ -2140,8 +2194,9 @@ export async function registerBuiltinHandlers(
   // migration that retypes 25K+ pages, creates alias rows, converts edge-
   // shaped pages to link rows, AND flips the active pack at end of run.
   // manual_only via src/core/onboard/render.ts:MANUAL_ONLY_PROTECTED_JOBS.
-  // Operator path: `gbrain jobs submit unify-types --allow-protected --params
-  // '{"target_pack":"gbrain-base-v2"}'`.
+  // Dry-run preview: `gbrain jobs submit unify-types --allow-protected
+  // --params '{"target_pack":"gbrain-base-v2"}'`; apply with
+  // '{"target_pack":"gbrain-base-v2","apply":true}'.
   worker.register('unify-types', async (job) => {
     const { runUnifyTypes } = await import('../core/schema-pack/unify-types-handler.ts');
     const data = (job.data ?? {}) as {
@@ -2159,7 +2214,11 @@ export async function registerBuiltinHandlers(
     } as unknown as import('../core/operations.ts').OperationContext;
     return await runUnifyTypes(ctx, {
       target_pack: data.target_pack,
-      apply: data.apply ?? true,
+      // #1575: default matches the handler interface's "Default false
+      // (dry-run)" — a destructive one-shot migration must be opted into
+      // with apply:true (the onboard remediation + the printed migration
+      // command both carry it explicitly).
+      apply: data.apply ?? false,
       sourceId: data.sourceId,
       onProgress: (msg: string) => {
         job.updateProgress({ phase: 'unify-types', message: msg }).catch(() => {});

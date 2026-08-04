@@ -44,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 13 (…; 11→12 hard-excludes #2825; 12→13 reranker document truncation)', () => {
+  test('version is 16 (…; 11→12 hard-excludes #2825; 12→13 embedding-provider migration #3390; 14→15 FTS language; 15→16 reranker document truncation)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -64,9 +64,16 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // pre-fix document-side query vectors must not be served.
     // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
     // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
-    // Candidate-document truncation: 12→13 because changing cross-encoder
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    // FTS language: 14→15 to fold the resolved GBRAIN_FTS_LANGUAGE config
+    // name (fts=). It retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language
+    // must not survive a `reindex-search-vector` language switch.
+    // Candidate-document truncation: 15→16 because changing cross-encoder
     // input text can change the cached ordering.
-    expect(KNOBS_HASH_VERSION).toBe(13);
+    expect(KNOBS_HASH_VERSION).toBe(16);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

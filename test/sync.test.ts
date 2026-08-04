@@ -422,6 +422,104 @@ describe('performSync dry-run never writes', () => {
     expect(bookmarkAfterDry).toBe(bookmarkAfterReal);
   });
 
+  test('strategy-changing dry-run preserves previously indexed out-of-strategy pages', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+    const pageBefore = await engine.getPage('people/alice');
+    const bookmarkBefore = await engine.getConfig('sync.last_commit');
+    expect(pageBefore).not.toBeNull();
+    expect(bookmarkBefore).not.toBeNull();
+
+    writeFileSync(join(repoPath, 'people/alice.md'), [
+      '---',
+      'type: person',
+      'title: Alice',
+      '---',
+      '',
+      'Alice changed after the initial sync.',
+    ].join('\n'));
+    execSync('git add -A && git commit -m "update alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    const result = await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      dryRun: true,
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(result.status).toBe('dry_run');
+    const pageAfter = await engine.getPage('people/alice');
+    expect(pageAfter).not.toBeNull();
+    expect(pageAfter!.compiled_truth).toBe(pageBefore!.compiled_truth);
+    expect(await engine.getConfig('sync.last_commit')).toBe(bookmarkBefore);
+  });
+
+  test('strategy-changing real sync deletes previously indexed out-of-strategy pages', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+    expect(await engine.getPage('people/alice')).not.toBeNull();
+
+    writeFileSync(join(repoPath, 'people/alice.md'), [
+      '---',
+      'type: person',
+      'title: Alice',
+      '---',
+      '',
+      'Alice changed after the initial sync.',
+    ].join('\n'));
+    execSync('git add -A && git commit -m "update alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(await engine.getPage('people/alice')).toBeNull();
+  });
+
+  test('dry-run does not attempt git pull when origin exists', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const remotePath = mkdtempSync(join(tmpdir(), 'gbrain-sync-dryrun-remote-'));
+
+    try {
+      execSync('git init --bare', { cwd: remotePath, stdio: 'pipe' });
+      execSync(`git remote add origin ${JSON.stringify(remotePath)}`, {
+        cwd: repoPath,
+        stdio: 'pipe',
+      });
+      const messages: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => {
+        messages.push(args.map(String).join(' '));
+      };
+      try {
+        const result = await performSync(engine, {
+          repoPath,
+          dryRun: true,
+          noEmbed: true,
+        });
+        expect(result.status).toBe('dry_run');
+      } finally {
+        console.error = originalError;
+      }
+      expect(messages.some(message => message.includes('sync.git_pull start'))).toBe(false);
+      expect(messages.some(message => message.includes('git pull failed'))).toBe(false);
+    } finally {
+      rmSync(remotePath, { recursive: true, force: true });
+    }
+  });
+
   test('full-sync (--full) dry-run does NOT write to DB or advance the bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     // Seed the bookmark so we hit the full-sync-with-bookmark path when --full is set.
@@ -462,6 +560,59 @@ describe('performSync dry-run never writes', () => {
     });
     // Structural assertion: the contract includes `embedded: number`.
     expect(typeof result.embedded).toBe('number');
+  });
+
+  test('--include-gitignored imports ignored files even when git HEAD is unchanged', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const first = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(first.status).toBe('first_sync');
+
+    writeFileSync(join(repoPath, '.gitignore'), 'Meetings/\n');
+    execSync('git add .gitignore && git commit -m "ignore generated meetings"', { cwd: repoPath, stdio: 'pipe' });
+    const checkpoint = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(checkpoint.status).toBe('up_to_date');
+
+    mkdirSync(join(repoPath, 'Meetings'), { recursive: true });
+    writeFileSync(join(repoPath, 'Meetings/weekly.md'), [
+      '---',
+      'type: meeting',
+      'title: Weekly',
+      '---',
+      '',
+      'Generated meeting notes.',
+    ].join('\n'));
+
+    const withoutFlag = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(withoutFlag.status).toBe('up_to_date');
+    expect(await engine.getPage('meetings/weekly')).toBeNull();
+
+    const withFlag = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+      includeGitignored: true,
+    });
+    expect(withFlag.added).toBe(1);
+
+    const page = await engine.getPage('meetings/weekly');
+    expect(page).not.toBeNull();
+    expect(page!.title).toBe('Weekly');
   });
 
   test('detached HEAD skips git pull and ingests local working-tree files', async () => {

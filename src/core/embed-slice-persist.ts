@@ -13,6 +13,17 @@ export interface PersistStaleSliceOptions {
   signal?: AbortSignal;
   slice: { index: number; total: number };
   write: (message: string) => void;
+  /**
+   * #3507: text to send to the embedding provider for each row, aligned by
+   * index with `rows`. When a page's stored contextual-retrieval mode wraps
+   * chunk_text with a title-tier prefix, the caller precomputes those wrapped
+   * strings (wrapChunkTextsForStoredMode) so a stale re-embed doesn't
+   * silently strip the prefix. Falls back to the raw row.chunk_text when
+   * omitted (legacy callers). The content hash always stays on the raw
+   * chunk_text — hashing the wrapped text would make untouched chunks look
+   * changed to every other staleness check.
+   */
+  embedTexts?: string[];
 }
 
 export interface PersistStaleSliceResult {
@@ -21,8 +32,19 @@ export interface PersistStaleSliceResult {
   persistFailed: boolean;
   signatureFailed?: boolean;
   failureCount: number;
+  /** #3037: the first per-chunk failure's error, for building result.failure_samples. */
+  firstFailureError?: unknown;
   aborted: boolean;
   outcome?: PersistEmbedOutcomeResult;
+  /**
+   * codex review finding #3: a run-global terminal error (e.g. sustained
+   * rate-limit/outage, or a must-abort class like AIConfigError). Any chunk
+   * successes/failures already computed before hitting it are still reflected
+   * in `embedded`/`failureCount`/`outcome` above — the caller decides whether
+   * to record-and-continue or rethrow, but either way it sees the real
+   * partial accounting instead of losing it to a thrown exception.
+   */
+  fatalError?: unknown;
 }
 
 const hashChunk = (text: string): string => createHash('md5').update(text).digest('hex');
@@ -32,14 +54,14 @@ const hashChunk = (text: string): string => createHash('md5').update(text).diges
  * checkpoint. Legacy callers intentionally never invoke this function.
  */
 export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise<PersistStaleSliceResult> {
-  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write } = opts;
+  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write, embedTexts } = opts;
   const first = rows[0];
   if (!first) return { embedded: 0, pageCommitted: false, persistFailed: false, failureCount: 0, aborted: !!signal?.aborted };
 
   write(`[embed-slice] slug=${first.slug} slice=${slice.index}/${slice.total} chunks=${rows.length}`);
 
   const partial = await embedWithTruncationFallbackPartial(
-    rows.map((row) => row.chunk_text),
+    rows.map((row, index) => embedTexts?.[index] ?? row.chunk_text),
     embedFn,
     { abortSignal: signal, policy: 'partial-stale' },
   );
@@ -76,6 +98,7 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
 
   let outcome: PersistEmbedOutcomeResult | undefined;
   let persistFailed = false;
+  let persistError: unknown;
   if (entries.length > 0) {
     try {
       outcome = await engine.persistEmbedOutcome({
@@ -88,8 +111,16 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     } catch (error) {
       write(`[embed-persist-fail] slug=${first.slug} slice=${slice.index}/${slice.total} err=${error instanceof Error ? error.message : String(error)}`);
       persistFailed = true;
+      persistError = error;
     }
   }
+  // codex review finding #4: a persist failure loses every vector that WOULD
+  // have committed — those rows stay stale in the DB but previously vanished
+  // from failureCount entirely (only result.persistFailures, which src/cli.ts
+  // doesn't gate the exit code on, saw it). Count just the vector-success
+  // entries here; the invalid_input-style failure entries are already
+  // counted via partial.failures.length below regardless of persist outcome.
+  const lostVectorCount = persistFailed ? entries.filter((entry) => 'vector' in entry.outcome).length : 0;
 
   let signatureFailed = false;
   if (embeddingSignature && outcome && outcome.vectorCommittedChunks > 0) {
@@ -133,19 +164,23 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
 
   write(`[embed-slice] slug=${first.slug} slice=${slice.index}/${slice.total} committed=${outcome?.vectorCommittedChunks ?? 0} stale_skipped=${outcome?.staleSkippedChunks ?? 0} persist_failed=${persistFailed}`);
 
-  if (partial.fatalError !== undefined) {
-    // The original must-abort object must outlive any failed checkpoint. Other
-    // run-global failures follow the same post-checkpoint path.
-    throw partial.fatalError;
-  }
+  // codex review finding #3: return the fatal error instead of throwing it —
+  // throwing here discarded the embedded/failureCount accounting already
+  // computed above for a MIXED slice (some chunks isolated successfully,
+  // one hit a run-global terminal error). The caller sees the real partial
+  // state via the return value and decides for itself whether to
+  // record-and-continue or rethrow.
+  const fatalChunkCount = partial.fatalError !== undefined ? (partial.fatalIndexes ?? []).length : 0;
 
   return {
     embedded: outcome?.vectorCommittedChunks ?? 0,
     pageCommitted: (outcome?.vectorCommittedChunks ?? 0) > 0,
     persistFailed,
     signatureFailed,
-    failureCount: partial.failures.length + (signatureFailed ? 1 : 0),
+    failureCount: partial.failures.length + fatalChunkCount + lostVectorCount + (signatureFailed ? 1 : 0),
+    firstFailureError: partial.failures[0]?.error ?? partial.fatalError ?? persistError,
     aborted: partial.aborted,
     outcome,
+    fatalError: partial.fatalError,
   };
 }

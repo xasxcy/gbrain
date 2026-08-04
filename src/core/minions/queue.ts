@@ -133,12 +133,27 @@ export class MinionQueue {
       // 1. Idempotency fast path — if a row already exists for this key, return it
       //    without doing any other work. The unique partial index guarantees
       //    no second row can be inserted with the same non-null key.
+      //
+      //    Dead/cancelled jobs represent permanently-failed work whose
+      //    idempotency slot must be freed so a fresh attempt can be inserted.
+      //    We NULL the key (preserving the row for audit) and fall through
+      //    to the INSERT path below.
       if (opts?.idempotency_key) {
         const existing = await tx.executeRaw<Record<string, unknown>>(
           `SELECT * FROM minion_jobs WHERE idempotency_key = $1`,
           [opts.idempotency_key]
         );
-        if (existing.length > 0) return rowToMinionJob(existing[0]);
+        if (existing.length > 0) {
+          const existingJob = rowToMinionJob(existing[0]);
+          if (existingJob.status === 'dead' || existingJob.status === 'cancelled') {
+            await tx.executeRaw(
+              `UPDATE minion_jobs SET idempotency_key = NULL WHERE id = $1`,
+              [existingJob.id]
+            );
+          } else {
+            return existingJob;
+          }
+        }
       }
 
       // 1b. Submission-time backpressure for high-frequency named jobs.
@@ -519,9 +534,20 @@ export class MinionQueue {
   }
 
   /** Prune old jobs in terminal statuses. Returns count of deleted rows. */
-  async prune(opts?: { olderThan?: Date; status?: MinionJobStatus[] }): Promise<number> {
+  async prune(opts?: { olderThan?: Date; status?: MinionJobStatus[]; dryRun?: boolean }): Promise<number> {
     const statuses = opts?.status ?? ['completed', 'dead', 'cancelled'];
     const olderThan = opts?.olderThan ?? new Date(Date.now() - 30 * 86400000);
+
+    // #2712: dryRun counts the would-be-pruned rows without deleting.
+    // Silent-ignoring a safety flag on a delete path is data loss.
+    if (opts?.dryRun) {
+      const rows = await this.engine.executeRaw<{ count: string }>(
+        `SELECT count(*)::text as count FROM minion_jobs
+         WHERE status = ANY($1) AND updated_at < $2`,
+        [statuses, olderThan.toISOString()]
+      );
+      return parseInt(rows[0]?.count ?? '0', 10);
+    }
 
     const rows = await this.engine.executeRaw<{ count: string }>(
       `WITH pruned AS (

@@ -12,7 +12,8 @@
  * `embed.ts`.
  */
 import type { BrainEngine } from './engine.ts';
-import { embedBatchWithBackoff } from '../commands/embed.ts';
+import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from '../commands/embed.ts';
+import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
 import { persistStaleSlice } from './embed-slice-persist.ts';
@@ -62,7 +63,14 @@ export interface EmbedStaleResult {
   done: boolean;
   /** True iff the supplied signal fired. */
   aborted: boolean;
-  /** Atomic DB checkpoint attempts that rolled back; never enter the ledger. */
+  /**
+   * Atomic DB checkpoint attempts that rolled back; never enter the ledger.
+   * Also counts a #3507 contextual-retrieval restamp that failed AFTER its
+   * page's vectors already committed (codex review round 2) — not itself a
+   * rolled-back checkpoint, but reusing this counter (rather than crashing
+   * the whole `embedStaleForSource` call, its pre-existing behavior) is the
+   * cheapest way to surface it without a re-embed-triggering false failure.
+   */
   persistFailures?: number;
 }
 
@@ -147,12 +155,29 @@ export async function embedStaleForSource(
 
     async function embedOneKey(key: string): Promise<void> {
       const stale = byKey.get(key)!;
+      const keySourceId = stale[0]?.source_id ?? sourceId;
+      const slug = stale[0].slug;
+      // #3507: fetch the page row for its title + stored CR mode so the
+      // re-embed reproduces the page's wrapping convention instead of
+      // silently stripping contextual prefixes (mirrors
+      // src/commands/embed.ts:embedAllStale).
+      const pageRow = await observed(pacer, () =>
+        engine.getPage(slug, { sourceId: keySourceId }),
+      );
+      const wrappedTexts = wrapChunkTextsForStoredMode(pageRow, stale);
       const slices = Math.ceil(stale.length / subBatchSize);
+      let pageHadFailure = false;
+      // codex review finding #5: a CAS stale-skip is not a failure, but it
+      // also means those chunks weren't freshly committed THIS pass —
+      // restamping on top of a skip would claim coverage the run didn't
+      // actually verify.
+      let pageStaleSkipped = 0;
       for (let offset = 0; offset < stale.length; offset += subBatchSize) {
         if (signal?.aborted) return;
         const sliceRows = stale.slice(offset, offset + subBatchSize);
         const checkpoint = await persistStaleSlice({
           engine,
+          embedTexts: wrappedTexts.slice(offset, offset + subBatchSize),
           rows: sliceRows,
           embeddingSignature: signature,
           signatureInvalidationFailed,
@@ -162,7 +187,12 @@ export async function embedStaleForSource(
           write,
         });
         result.embedded += checkpoint.embedded;
-        if (checkpoint.persistFailed) result.persistFailures = (result.persistFailures ?? 0) + 1;
+        if (checkpoint.failureCount > 0) pageHadFailure = true;
+        if (checkpoint.persistFailed) {
+          result.persistFailures = (result.persistFailures ?? 0) + 1;
+          pageHadFailure = true;
+        }
+        pageStaleSkipped += checkpoint.outcome?.staleSkippedChunks ?? 0;
         const pageKey = `${sliceRows[0]!.source_id}:${sliceRows[0]!.page_id}`;
         if (checkpoint.pageCommitted && !committedPages.has(pageKey)) {
           committedPages.add(pageKey);
@@ -171,6 +201,39 @@ export async function embedStaleForSource(
         if (checkpoint.aborted) {
           result.aborted = true;
           return;
+        }
+        // SPEC V4: any run-global terminal error must still propagate and
+        // reject the whole embedStaleForSource call — persistStaleSlice
+        // RETURNS fatalError (instead of throwing) so the accounting above
+        // is never lost, but this call site's pre-existing contract has no
+        // #3037 cost-bounding carve-out: rethrow unconditionally.
+        if (checkpoint.fatalError !== undefined) throw checkpoint.fatalError;
+      }
+      // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
+      // title tier — keep the stamped mode honest (mixed pages stay as-is).
+      if (!pageHadFailure && pageStaleSkipped === 0) {
+        const existing = await observed(pacer, () =>
+          engine.getChunks(slug, { sourceId: keySourceId }),
+        );
+        if (stale.length === existing.length) {
+          // codex review round 2 finding #1: a restamp failure here is AFTER
+          // vectors already committed successfully. Left unguarded, it
+          // propagates through this file's Promise.all worker loop (no pool
+          // absorption here, unlike embed.ts) and rejects the whole
+          // embedStaleForSource call — crashing an otherwise-successful
+          // Minion run and getting retried for the wrong reason (the retry's
+          // own listStaleChunks finds nothing stale, since the vectors did
+          // land; only the mode stamp is behind). Record it instead of
+          // crashing the run.
+          try {
+            await observed(pacer, () =>
+              restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
+            );
+          } catch (error) {
+            if (signal?.aborted) return;
+            result.persistFailures = (result.persistFailures ?? 0) + 1;
+            write(`[embed-restamp-fail] slug=${slug} err=${error instanceof Error ? error.message : String(error)}`);
+          }
         }
       }
     }

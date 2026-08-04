@@ -149,6 +149,113 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(pgResults[0]?.slug).toBe(pgliteResults[0]?.slug);
   });
 
+  test('email citation metadata projects identically across engines', async () => {
+    const slug = 'mail/example-citation';
+    const page = {
+      type: 'note' as const,
+      title: 'Generated page title',
+      compiled_truth: 'unique citation projection evidence',
+      timeline: '',
+      frontmatter: {
+        message_id: '<citation@example.com>',
+        thread_id: 'thread-example',
+        subject: 'Example exact email subject',
+      },
+    };
+    const chunks = [{
+      chunk_index: 0,
+      chunk_text: page.compiled_truth,
+      chunk_source: 'compiled_truth' as const,
+      embedding: basisEmbedding(77),
+    }];
+
+    await pgEngine.putPage(slug, page);
+    await pgEngine.upsertChunks(slug, chunks);
+    await pgliteEngine.putPage(slug, page);
+    await pgliteEngine.upsertChunks(slug, chunks);
+
+    const results = [
+      (await pgEngine.searchKeyword('unique citation projection evidence'))[0],
+      (await pgliteEngine.searchKeyword('unique citation projection evidence'))[0],
+      (await pgEngine.searchKeywordChunks('unique citation projection evidence'))[0],
+      (await pgliteEngine.searchKeywordChunks('unique citation projection evidence'))[0],
+      (await pgEngine.searchVector(basisEmbedding(77)))[0],
+      (await pgliteEngine.searchVector(basisEmbedding(77)))[0],
+    ];
+
+    for (const result of results) {
+      expect(result?.message_id).toBe('<citation@example.com>');
+      expect(result?.thread_id).toBe('thread-example');
+      expect(result?.source_subject).toBe('Example exact email subject');
+    }
+
+    const nonEmailSlug = 'notes/generated-title-subject-gate';
+    const nonEmailPage = {
+      type: 'note' as const,
+      title: 'Generated page title must stay a title',
+      compiled_truth: 'unique non-email subject gate evidence',
+      timeline: '',
+      frontmatter: {
+        subject: 'Frontmatter subject without an email identity',
+        thread_id: 'standalone-thread-id',
+      },
+    };
+    const nonEmailChunks = [{
+      chunk_index: 0,
+      chunk_text: nonEmailPage.compiled_truth,
+      chunk_source: 'compiled_truth' as const,
+    }];
+    await pgEngine.putPage(nonEmailSlug, nonEmailPage);
+    await pgEngine.upsertChunks(nonEmailSlug, nonEmailChunks);
+    await pgliteEngine.putPage(nonEmailSlug, nonEmailPage);
+    await pgliteEngine.upsertChunks(nonEmailSlug, nonEmailChunks);
+
+    for (const result of [
+      (await pgEngine.searchKeyword('unique non-email subject gate evidence'))[0],
+      (await pgliteEngine.searchKeyword('unique non-email subject gate evidence'))[0],
+    ]) {
+      expect(result?.message_id).toBeUndefined();
+      expect(result?.thread_id).toBe('standalone-thread-id');
+      expect(result?.source_subject).toBeUndefined();
+    }
+
+    const whitespaceSlug = 'mail/whitespace-message-id';
+    const whitespacePage = {
+      type: 'note' as const,
+      title: 'Whitespace Message-ID',
+      compiled_truth: 'unique whitespace message id evidence',
+      timeline: '',
+      frontmatter: {
+        message_id: ' \t\n ',
+        thread_id: 'thread-whitespace',
+        subject: 'Subject must remain gated',
+      },
+    };
+    const whitespaceChunks = [{
+      chunk_index: 0,
+      chunk_text: whitespacePage.compiled_truth,
+      chunk_source: 'compiled_truth' as const,
+      embedding: basisEmbedding(78),
+    }];
+    await pgEngine.putPage(whitespaceSlug, whitespacePage);
+    await pgEngine.upsertChunks(whitespaceSlug, whitespaceChunks);
+    await pgliteEngine.putPage(whitespaceSlug, whitespacePage);
+    await pgliteEngine.upsertChunks(whitespaceSlug, whitespaceChunks);
+
+    for (const result of [
+      (await pgEngine.searchKeyword('unique whitespace message id evidence'))[0],
+      (await pgliteEngine.searchKeyword('unique whitespace message id evidence'))[0],
+      (await pgEngine.searchKeywordChunks('unique whitespace message id evidence'))[0],
+      (await pgliteEngine.searchKeywordChunks('unique whitespace message id evidence'))[0],
+      (await pgEngine.searchVector(basisEmbedding(78)))[0],
+      (await pgliteEngine.searchVector(basisEmbedding(78)))[0],
+    ]) {
+      expect(result?.message_id).toBeUndefined();
+      expect(result?.thread_id).toBe('thread-whitespace');
+      expect(result?.source_subject).toBeUndefined();
+    }
+  });
+
   test('hard-exclude is consistent across engines', async () => {
     // Both engines should hide test/ pages by default; both should opt
     // them back in via include_slug_prefixes.
@@ -369,6 +476,28 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     // Page title updated (proves the UPDATE actually fired).
     expect(pgPage!.title).toBe('V2');
     expect(pglitePage!.title).toBe('V2');
+  });
+
+  test('putPage restores soft-deleted rows on both engines', async () => {
+    const slug = 'notes/put-page-restore-parity';
+    for (const engine of [pgEngine, pgliteEngine]) {
+      await engine.putPage(slug, {
+        type: 'note',
+        title: 'Before delete',
+        compiled_truth: 'before',
+        timeline: '',
+      });
+      await engine.softDeletePage(slug, { sourceId: 'default' });
+      expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();
+
+      await engine.putPage(slug, {
+        type: 'note',
+        title: 'After restore',
+        compiled_truth: 'after',
+        timeline: '',
+      });
+      expect((await engine.getPage(slug, { sourceId: 'default' }))?.title).toBe('After restore');
+    }
   });
 
   test('v0.41.19.0 deletePages parity: both engines return same confirmed-deleted slugs', async () => {
@@ -726,23 +855,61 @@ describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', 
     expect(pg).toEqual(['beta-tag']); // default decoy excluded
   });
 
+  function exactLinkShape(links: Awaited<ReturnType<BrainEngine['getLinks']>>): string[] {
+    return links.map(link => [
+      link.from_source_id,
+      link.from_slug,
+      link.to_source_id,
+      link.to_slug,
+      link.origin_source_id ?? null,
+      link.origin_slug ?? null,
+      link.link_type,
+    ].join('::')).sort();
+  }
+
   test('getLinks identical under sourceIds[] (all three endpoints scoped)', async () => {
-    const pg = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.to_slug).sort();
-    const pglite = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.to_slug).sort();
-    expect(pg).toEqual(pglite);
-    expect([...new Set(pg)]).toEqual(['fed/target']); // far-endpoint 'fed/outside' excluded
-    // F1: origin_slug nulled identically on both engines when origin is out-of-grant.
-    const pgOrigins = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
-    const pgliteOrigins = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
+    const pgLinks = await pgEngine.getLinks('fed/doc', grant);
+    const pgliteLinks = await pgliteEngine.getLinks('fed/doc', grant);
+    expect(exactLinkShape(pgLinks)).toEqual(exactLinkShape(pgliteLinks));
+    expect([...new Set(pgLinks.map(l => `${l.to_source_id}:${l.to_slug}`))])
+      .toEqual(['beta:fed/target']); // far-endpoint 'fed/outside' excluded
+    // F1: origin identity nulls identically when origin is out-of-grant.
+    const pgOrigins = pgLinks.map(l => [l.origin_source_id ?? null, l.origin_slug ?? null]);
+    const pgliteOrigins = pgliteLinks.map(l => [l.origin_source_id ?? null, l.origin_slug ?? null]);
     expect(pgOrigins.sort()).toEqual(pgliteOrigins.sort());
-    expect(pgOrigins).not.toContain('fed/outside');
+    expect(pgOrigins).not.toContainEqual(['default', 'fed/outside']);
+  });
+
+  test('scalar getLinks preserves cross-source destination identity across engines', async () => {
+    const scalar = { sourceId: 'beta' };
+    const pg = await pgEngine.getLinks('fed/doc', scalar);
+    const pglite = await pgliteEngine.getLinks('fed/doc', scalar);
+    expect(exactLinkShape(pg)).toEqual(exactLinkShape(pglite));
+    expect(pg).toContainEqual(expect.objectContaining({
+      from_source_id: 'beta',
+      from_slug: 'fed/doc',
+      to_source_id: 'default',
+      to_slug: 'fed/outside',
+    }));
+  });
+
+  test('unscoped link reads expose exact endpoint identity across engines', async () => {
+    const pgLinks = await pgEngine.getLinks('fed/doc');
+    const pgliteLinks = await pgliteEngine.getLinks('fed/doc');
+    expect(exactLinkShape(pgLinks)).toEqual(exactLinkShape(pgliteLinks));
+    expect(pgLinks.every(link => link.from_source_id && link.to_source_id)).toBe(true);
+
+    const pgBacklinks = await pgEngine.getBacklinks('fed/doc');
+    const pgliteBacklinks = await pgliteEngine.getBacklinks('fed/doc');
+    expect(exactLinkShape(pgBacklinks)).toEqual(exactLinkShape(pgliteBacklinks));
+    expect(pgBacklinks.every(link => link.from_source_id && link.to_source_id)).toBe(true);
   });
 
   test('getBacklinks identical under sourceIds[] (both endpoints scoped)', async () => {
-    const pg = (await pgEngine.getBacklinks('fed/doc', grant)).map(l => l.from_slug).sort();
-    const pglite = (await pgliteEngine.getBacklinks('fed/doc', grant)).map(l => l.from_slug).sort();
-    expect(pg).toEqual(pglite);
-    expect(pg).toEqual(['fed/target']);
+    const pg = await pgEngine.getBacklinks('fed/doc', grant);
+    const pglite = await pgliteEngine.getBacklinks('fed/doc', grant);
+    expect(exactLinkShape(pg)).toEqual(exactLinkShape(pglite));
+    expect(pg.map(l => `${l.from_source_id}:${l.from_slug}`)).toEqual(['beta:fed/target']);
   });
 
   test('getTimeline identical under sourceIds[]', async () => {

@@ -354,6 +354,22 @@ describe('MinionQueue: #1737 per-handler default timeout', () => {
     expect(sub.timeout_ms).toBe(30 * 60 * 1000);
   });
 
+  // #3207 — facts-absorb is one LLM extraction call per page (same shape as
+  // chronicle_extract) but was missing from HANDLER_DEFAULT_TIMEOUT_MS, so it
+  // inherited the tight null-default wall-clock and was dead-lettered
+  // mid-generation on slow chat providers (facts silently lost).
+  test('facts-absorb gets the 10-min LLM-extraction default (#3207)', async () => {
+    const job = await queue.add('facts-absorb', { slug: 'people/alice-example' });
+    expect(job.timeout_ms).toBe(10 * 60 * 1000);
+  });
+
+  test('contextual per-chunk reindex gets the 60-min default', async () => {
+    const job = await queue.add('contextual_reindex_per_chunk', { page_slug: 'large-transcript' }, undefined, {
+      allowProtectedSubmit: true,
+    });
+    expect(job.timeout_ms).toBe(60 * 60 * 1000);
+  });
+
   test('explicit timeout_ms always wins over the default', async () => {
     const job = await queue.add('embed-backfill', { sourceId: 'x' }, { timeout_ms: 5000 });
     expect(job.timeout_ms).toBe(5000);
@@ -701,6 +717,26 @@ describe('MinionQueue: Prune', () => {
 
     const count = await queue.prune({ olderThan: new Date(Date.now() + 86400000) }); // future date = prune everything old enough
     expect(count).toBe(1); // only the cancelled one
+  });
+
+  // #2712: --dry-run used to be silently ignored — the destructive default
+  // ran and deleted rows while the operator believed they were previewing.
+  test('dryRun counts prunable jobs without deleting', async () => {
+    const job1 = await queue.add('sync', {});
+    await queue.cancelJob(job1.id); // terminal → prunable
+
+    const wouldPrune = await queue.prune({ olderThan: new Date(Date.now() + 86400000), dryRun: true });
+    expect(wouldPrune).toBe(1);
+
+    // The row must still exist after a dry run.
+    const stillThere = await queue.getJob(job1.id);
+    expect(stillThere).not.toBeNull();
+    expect(stillThere!.status).toBe('cancelled');
+
+    // A real prune afterwards actually deletes it.
+    const pruned = await queue.prune({ olderThan: new Date(Date.now() + 86400000) });
+    expect(pruned).toBe(1);
+    expect(await queue.getJob(job1.id)).toBeNull();
   });
 });
 
@@ -1581,6 +1617,73 @@ describe('MinionQueue: Idempotency', () => {
     const j2 = await queue.add('sync', { v: 2 }, { idempotency_key: 'same' });
     expect(j2.id).toBe(j1.id);
     expect(j2.data).toEqual({ v: 1 }); // first wins
+  });
+
+  test('dead job with idempotency_key allows re-submission', async () => {
+    const j1 = await queue.add('test-synth', { prompt: 'synthesize' }, {
+      idempotency_key: 'dream:synth:test:abc123',
+      max_attempts: 1,
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'dead', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('test-synth', { prompt: 'synthesize' }, {
+      idempotency_key: 'dream:synth:test:abc123',
+      max_attempts: 8,
+    });
+    expect(j2.id).not.toBe(j1.id);
+    expect(j2.status).toBe('waiting');
+    const oldRow = await engine.executeRaw<{ idempotency_key: string | null }>(
+      `SELECT idempotency_key FROM minion_jobs WHERE id = $1`,
+      [j1.id]
+    );
+    expect(oldRow[0].idempotency_key).toBeNull();
+  });
+
+  test('cancelled job with idempotency_key allows re-submission', async () => {
+    const j1 = await queue.add('test-synth', {}, {
+      idempotency_key: 'dream:synth:test:cancel',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('test-synth', {}, {
+      idempotency_key: 'dream:synth:test:cancel',
+    });
+    expect(j2.id).not.toBe(j1.id);
+    expect(j2.status).toBe('waiting');
+  });
+
+  test('completed job with idempotency_key still blocks re-submission', async () => {
+    const j1 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:completed',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'completed', finished_at = now() WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:completed',
+    });
+    expect(j2.id).toBe(j1.id);
+    expect(j2.status).toBe('completed');
+  });
+
+  test('active job with idempotency_key still blocks re-submission', async () => {
+    const j1 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:active',
+    });
+    await engine.executeRaw(
+      `UPDATE minion_jobs SET status = 'active' WHERE id = $1`,
+      [j1.id]
+    );
+    const j2 = await queue.add('sync', {}, {
+      idempotency_key: 'dream:synth:test:active',
+    });
+    expect(j2.id).toBe(j1.id);
+    expect(j2.status).toBe('active');
   });
 });
 

@@ -11,7 +11,7 @@ import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
-import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
+import { hybridSearch, hybridSearchCached, stampContentFlags, stampUnverifiedExtractions } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
@@ -21,11 +21,14 @@ import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
 import { getContentFlag } from './quarantine.ts';
+import { unverifiedExtractionFragment, isUnverifiedExtraction, EXTRACTION_STATUS_KEY, STATUS_VERIFIED } from './extraction-review.ts';
+import { buildVisibilityClause } from './search/sql-ranking.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
-import { CJK_SLUG_CHARS } from './cjk.ts';
+import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
+import { ALL_SOURCES } from './source-id.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -160,11 +163,11 @@ export function validatePageSlug(slug: string): void {
   if (slug.length > 255) {
     throw new OperationError('invalid_params', 'page_slug exceeds 255 characters');
   }
-  // v0.32.7: CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) allowed
-  // in segments. ASCII shape rules (lead char, hyphen continuation) preserved.
-  const PAGE_SLUG_SEG = `[a-z0-9${CJK_SLUG_CHARS}][a-z0-9${CJK_SLUG_CHARS}\\-]*`;
-  if (!new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'i').test(slug)) {
-    throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: alphanumeric, CJK, hyphens, forward-slash separated segments)`);
+  // #3417: letters/numbers from any script allowed in segments (u flag required
+  // for the \p{...} classes in PAGE_SLUG_SEG). Shape rules (lead char, hyphen
+  // continuation) preserved.
+  if (!new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'iu').test(slug)) {
+    throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, hyphens, forward-slash separated segments)`);
   }
 }
 
@@ -224,6 +227,148 @@ function enforceSubagentSlugFence(ctx: OperationContext, slug: string, opName: s
       throw new OperationError('permission_denied', `${opName} via subagent must write under '${prefix}...'`);
     }
   }
+}
+
+/**
+ * OAuth-client slug-fence enforcement (v0.42.72.0 — write-side isolation
+ * symmetry). When the authenticated client was registered with
+ * --bound-slug-prefixes, every direct slug-mutating write must target a
+ * slug under one of those prefixes. Shared by put_page, delete_page,
+ * restore_page, add_tag, remove_tag, add_link/remove_link (`from`
+ * endpoint), add_timeline_entry, revert_version, and put_raw_data; runs
+ * BEFORE each op's dry-run short-circuit so preview calls surface the
+ * same rejection.
+ *
+ * Semantics deliberately match submit_agent's bound_slug_prefixes check
+ * (plain startsWith, NOT the `/*` glob grammar of the subagent allow-list
+ * above): a non-null binding fences fail-closed (empty array = deny all
+ * writes), no binding / no auth = no fence (local CLI and unbound clients
+ * keep full-source write authority). Register prefixes with a trailing
+ * slash ('wiki/agents/alice/') — a bare 'notes' also admits
+ * 'notes-archive/...' by startsWith construction.
+ */
+function enforceClientSlugFence(ctx: OperationContext, slug: string, opName: string): void {
+  if (ctx.auth?.fenceProjectionDegraded) {
+    throw new OperationError(
+      'permission_denied',
+      `${opName}: this brain's oauth_clients projection is missing bound_slug_prefixes, so the write fence cannot be evaluated. Refusing the write rather than running unfenced.`,
+      'Run `gbrain apply-migrations --yes` on the brain host.',
+    );
+  }
+  const prefixes = ctx.auth?.boundSlugPrefixes;
+  if (!prefixes) return;
+  if (!slugUnderBoundPrefixes(prefixes, slug)) {
+    throw new OperationError(
+      'permission_denied',
+      `${opName}: slug '${slug}' is not under any of client ${ctx.auth?.clientId ?? '(unknown)'}'s bound_slug_prefixes (${prefixes.join(', ')})`,
+    );
+  }
+}
+
+/**
+ * The one place the fence's match rule lives. Exported so non-op write
+ * surfaces that never build an OperationContext (the `/ingest` route in
+ * serve-http.ts) enforce byte-identical semantics instead of re-deriving
+ * them.
+ *
+ * An empty-string prefix is IGNORED rather than honored: `startsWith('')`
+ * is true for every slug, so a stray `''` (an unset shell variable in a
+ * provisioning template) would silently turn a binding into a wildcard
+ * while still rendering as "fenced" to the operator. Registration now
+ * rejects empty prefixes outright; this is the second line of defence for
+ * rows already in the database.
+ */
+export function slugUnderBoundPrefixes(prefixes: readonly string[], slug: string): boolean {
+  // Compare against the CANONICAL slug. `validateSlug` lowercases before the
+  // row is written, so checking the caller's raw string let `EMP-ALICE/x`
+  // satisfy an `EMP-ALICE/` binding, commit as `emp-alice/x`, and only then
+  // trip the resolved-slug re-check — an error returned after the write had
+  // already landed. Registration rejects non-lowercase prefixes going
+  // forward; lowercasing both sides keeps pre-existing rows meaning what
+  // their operator intended.
+  const canonical = slug.toLowerCase();
+  return prefixes.some((bp) => {
+    const base = normalizeSlugPrefix(bp);
+    if (base === '') return false;
+    // Boundary-aware: a prefix must match whole SEGMENTS. Plain `startsWith`
+    // let a boundary-less `emp-alice` admit `emp-alice-2/onboarding` — and
+    // with the `emp-<slug>` naming this guide recommends, sibling collisions
+    // (`alice` vs `alice-2`) are the common case, not a corner case.
+    return base.endsWith('/')
+      ? canonical.startsWith(base)
+      : canonical === base || canonical.startsWith(`${base}/`);
+  });
+}
+
+/**
+ * Canonical form of one stored prefix, lowercased. `oauth_clients.bound_slug_prefixes`
+ * predates this fence — migration v85 introduced it as submit_agent's binding,
+ * whose grammar is the `<prefix>/*` glob of `matchesSlugAllowList` — so both
+ * spellings have to mean the same span of slugs or upgrading silently changes
+ * what an existing client may write.
+ */
+export function normalizeSlugPrefix(prefix: string): string {
+  return (prefix.endsWith('/*') ? prefix.slice(0, -1) : prefix).toLowerCase();
+}
+
+/**
+ * Write ops a slug-bound client may call: every op that routes through
+ * `enforceClientSlugFence`, plus `think` (scope `write`, but remote callers
+ * cannot persist — `save`/`take` are forced false for `remote !== false`).
+ *
+ * This list is an ALLOW-list on purpose. The fence used to be enforced op
+ * by op, which made every unfenced write op a silent hole — `extract_entities`
+ * mutating `people/*` timelines, `forget_fact` rewriting another source's
+ * page by numeric id, `extract_facts` appending to any entity's fact fence.
+ * Enumerating what is SAFE fails closed instead: a write op added later is
+ * denied to bound clients until someone fences it and adds it here.
+ */
+export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
+  'put_page', 'delete_page', 'restore_page', 'add_tag', 'remove_tag',
+  'add_link', 'remove_link', 'add_timeline_entry', 'revert_version',
+  'put_raw_data', 'think',
+  // submit_agent enforces bound_slug_prefixes itself (it is the op the column
+  // was introduced for — see its bound_* binding check), so denying it here
+  // would break the original feature for clients that legitimately hold both
+  // a binding and `agent` scope.
+  'submit_agent',
+]);
+
+/**
+ * Fail-closed gate for slug-bound clients, applied at dispatch (the single
+ * choke point both MCP transports share) so it cannot be forgotten per op.
+ * Read ops are untouched — read scope is enforced by source federation.
+ */
+export function enforceBoundClientOpAllowList(
+  auth: AuthInfo | undefined,
+  op: Pick<Operation, 'name' | 'scope' | 'mutating'>,
+): void {
+  // A degraded projection means we could not read the binding, not that
+  // there isn't one. Deny every non-read op outright — otherwise the
+  // unfenceable ops stay reachable precisely when the fence is unreadable.
+  const degraded = auth?.fenceProjectionDegraded === true;
+  if (!degraded && !auth?.boundSlugPrefixes) return;
+  // Gate on "mutates, or carries any non-read scope" rather than on the two
+  // literal scope strings 'write'/'admin': `sources_add` / `sources_remove`
+  // carry the bespoke `sources_admin` scope and are `mutating: true`, so a
+  // scope-string check let a bound client DROP AN ENTIRE SOURCE — every page
+  // in it, far outside any prefix. Anything that isn't a plain read must be
+  // explicitly allow-listed.
+  const isRead = op.scope === 'read' && op.mutating !== true;
+  if (isRead) return;
+  if (degraded) {
+    throw new OperationError(
+      'permission_denied',
+      `${op.name}: this brain's oauth_clients projection is missing bound_slug_prefixes, so client write bindings cannot be evaluated. Refusing every non-read operation rather than running unfenced.`,
+      'Run `gbrain apply-migrations --yes` on the brain host.',
+    );
+  }
+  if (CLIENT_FENCED_WRITE_OPS.has(op.name)) return;
+  throw new OperationError(
+    'permission_denied',
+    `${op.name} is not available to slug-bound clients: it can write outside client ${auth?.clientId ?? '(unknown)'}'s bound_slug_prefixes (${(auth?.boundSlugPrefixes ?? []).join(', ')}).`,
+    'Use put_page / add_timeline_entry / add_link under your own prefixes, or ask an operator to clear the binding with `gbrain auth rescope-client <id> --bound-slug-prefixes none`.',
+  );
 }
 
 /**
@@ -305,6 +450,31 @@ export interface AuthInfo {
    * case (back-compat).
    */
   allowedSources?: string[];
+  /**
+   * v0.42.72.0: slug-prefix WRITE binding from
+   * `oauth_clients.bound_slug_prefixes`, threaded at token-verification
+   * time (same JOIN as sourceId/allowedSources — no per-op roundtrip).
+   * When present, every direct slug-mutating write op is fenced to slugs
+   * under one of these prefixes via `enforceClientSlugFence` — the same
+   * plain-startsWith semantics (and the same fail-closed empty-array
+   * posture) as submit_agent's bound_slug_prefixes check, so one column
+   * means one thing everywhere it's read. Closes the write-side half of
+   * shared-source isolation: reads were SQL-fenced via `allowedSources`,
+   * but same-source writes were folder-convention-only.
+   *
+   * Undefined = client has no binding, or the brain predates the
+   * bound_slug_prefixes column → no fence (unbound clients keep
+   * full-source write authority, back-compat).
+   */
+  boundSlugPrefixes?: string[];
+  /**
+   * Set when token verification could not read `bound_slug_prefixes` (the
+   * projection degraded on a brain missing an OAuth column). The fence can't
+   * distinguish "no binding" from "binding unknown" otherwise, so writes are
+   * refused rather than silently unfenced. Read/auth degradation is
+   * unaffected — this axis alone fails closed.
+   */
+  fenceProjectionDegraded?: boolean;
 }
 
 export interface OperationContext {
@@ -332,6 +502,15 @@ export interface OperationContext {
    * remote/untrusted (defense in depth in case the type is bypassed via cast).
    */
   remote: boolean;
+  /**
+   * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
+   * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
+   * untrusted) but has no per-token auth (local pipe), so identity ops like
+   * whoami need a way to distinguish "known auth-less transport" from "a
+   * transport bug forgot to thread ctx.auth". Trust decisions MUST NOT key
+   * off this field — only `ctx.remote === false` grants trust.
+   */
+  transport?: 'stdio';
   /**
    * Subagent runtime context (v0.16+). Set by the subagent tool dispatcher when
    * dispatching an op as a tool call from an LLM loop. Used to enforce per-op
@@ -424,6 +603,28 @@ export interface OperationContext {
    * satisfied even on single-source brains.
    */
   sourceId: string;
+  /**
+   * #2561 / #3242 — federated read scope for UNQUALIFIED reads.
+   *
+   * Set ONLY by trusted server-side context builders — never from caller
+   * params — and only when the caller carries no explicit source scope:
+   *   - local CLI (src/cli.ts makeContext) when the source resolved via a
+   *     non-explicit tier (local_path / brain_default / sole_non_default /
+   *     seed_default — NOT --source, NOT GBRAIN_SOURCE, NOT a dotfile);
+   *   - stdio MCP (src/mcp/server.ts) when GBRAIN_SOURCE is unset;
+   *   - HTTP MCP (src/mcp/http-transport.ts) for legacy bearer tokens with
+   *     NO operator-set `permissions.source_id` grant (the historical
+   *     'default' floor). Tokens WITH an explicit grant never widen.
+   *
+   * Contains the resolved source first, then every other
+   * `config.federated = true` source, so an unqualified read/search spans
+   * federated sources as docs/guides/multi-source-brains.md promises.
+   *
+   * Consumed exclusively by `federatedSearchScope`. Fail-closed remains:
+   * a grant (`ctx.auth.allowedSources`) or a per-call `source_id` always
+   * wins, and a context without this field never widens.
+   */
+  localFederatedSourceIds?: string[];
 }
 
 /**
@@ -454,6 +655,14 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   // value of `[]` MUST NOT widen scope to "all sources" by being interpreted
   // as "no filter."
   if (allowed && allowed.length > 0) return { sourceIds: allowed };
+  // #1712: the __all__ sentinel spans the brain — but ONLY for trusted local
+  // callers (strictly `remote === false`). For remote/untrusted callers the
+  // literal stays as-is: it can never match a real source id (underscores are
+  // rejected at creation), so the read fail-closes to empty rather than
+  // widening past the caller's grant. Do NOT "simplify" this to `{}`.
+  if (ctx.sourceId === ALL_SOURCES) {
+    return ctx.remote === false ? {} : { sourceId: ctx.sourceId };
+  }
   if (ctx.sourceId) return { sourceId: ctx.sourceId };
   return {};
 }
@@ -521,7 +730,7 @@ export function resolveRequestedScope(
   sourceIdParam: string | undefined,
   allSourcesParam = false,
 ): { sourceId?: string; sourceIds?: string[] } {
-  const wantsAll = allSourcesParam || sourceIdParam === '__all__';
+  const wantsAll = allSourcesParam || sourceIdParam === ALL_SOURCES;
   if (wantsAll) {
     return ctx.remote === false ? {} : sourceScopeOpts(ctx);
   }
@@ -537,6 +746,45 @@ export function resolveRequestedScope(
     return { sourceId: sourceIdParam };
   }
   return sourceScopeOpts(ctx);
+}
+
+/**
+ * #2561 / #3242 — source scope for the page-visibility read ops (`search`,
+ * `query`, `get_page`, `list_pages`, `resolve_slugs`).
+ *
+ * Delegates to `resolveRequestedScope` (the single trust+grant resolver), then
+ * widens an UNQUALIFIED scalar scope to the transport-computed federated set
+ * (`ctx.localFederatedSourceIds`, resolved source first). This is what makes
+ * `sources add --federated` mean something: a federated source participates in
+ * unqualified reads (#3242 — pages ingested into a `federated: true` source
+ * were invisible to get_page/search/list_pages while resolve_slugs leaked them).
+ *
+ * The expansion NEVER applies when:
+ *   - a per-call `source_id` was passed (explicit wins, including `__all__`);
+ *   - the resolver already produced a federated array (OAuth grant governs);
+ *   - the transport didn't populate `localFederatedSourceIds` (see that
+ *     field's doc: it is only set for callers with NO explicit source scope,
+ *     and never from caller-controlled params — so trust stays fail-closed).
+ *
+ * Deliberately NOT inside `sourceScopeOpts`: code-intel ops collapse a
+ * multi-element scope to an error (`resolveCodeIntelScope`), and the remaining
+ * scalar reads (get_links, get_chunks, …) keep their long-standing behavior.
+ */
+export function federatedSearchScope(
+  ctx: OperationContext,
+  sourceIdParam?: string,
+): { sourceId?: string; sourceIds?: string[] } {
+  const scope = resolveRequestedScope(ctx, sourceIdParam);
+  if (
+    sourceIdParam === undefined &&
+    scope.sourceId !== undefined &&
+    scope.sourceIds === undefined &&
+    ctx.localFederatedSourceIds !== undefined &&
+    ctx.localFederatedSourceIds.length > 1
+  ) {
+    return { sourceIds: ctx.localFederatedSourceIds };
+  }
+  return scope;
 }
 
 /**
@@ -684,7 +932,9 @@ const get_page: Operation = {
     // with a federated `allowedSources` grant (and no single ctx.sourceId) got
     // an UNSCOPED exact lookup — a cross-source read of any page by slug. getPage
     // now honors sourceIds[] (both engines), so the same scope closes both paths.
-    const sourceOpts = sourceScopeOpts(ctx);
+    // #3242: federatedSearchScope (not bare sourceScopeOpts) so an unqualified
+    // read sees pages in `federated: true` sources, matching search/query.
+    const sourceOpts = federatedSearchScope(ctx);
     const fuzzyScope = sourceOpts;
 
     let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
@@ -773,6 +1023,7 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
     // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
@@ -820,8 +1071,33 @@ const put_page: Operation = {
     // short-circuit so preview calls surface the same rejection. See
     // enforceSubagentSlugFence for the fail-closed policy.
     enforceSubagentSlugFence(ctx, slug, 'put_page');
+    enforceClientSlugFence(ctx, slug, 'put_page');
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
+
+    // Empty-overwrite guard: empty/whitespace-only content over an existing
+    // non-empty page is almost always an input-plumbing failure (e.g. a
+    // caller that meant file input — put has no --file flag — so the missing
+    // --content fell back to reading an empty non-interactive stdin), not an
+    // intentional write. Refuse loudly unless the caller opts in with
+    // allow_empty. The read is scoped to the exact (source_id, slug) row the
+    // write below targets (engine.putPage defaults to 'default' when
+    // sourceId is unset). New-slug creates and soft-deleted-page overwrites
+    // stay allowed — nothing recoverable is lost there.
+    if ((p.content as string).trim() === '' && p.allow_empty !== true) {
+      const existing = await ctx.engine.getPage(slug, { sourceId: ctx.sourceId ?? 'default' });
+      const existingBody = existing
+        ? `${existing.compiled_truth ?? ''}\n${existing.timeline ?? ''}`.trim()
+        : '';
+      if (existingBody !== '') {
+        throw new OperationError(
+          'invalid_params',
+          `Refusing to overwrite existing non-empty page '${slug}' with empty content.`,
+          'For file input use `gbrain capture --file PATH --slug SLUG` (put has no --file flag). To intentionally blank the page, pass allow_empty: true (CLI: --allow-empty).',
+        );
+      }
+    }
+
     // Skip embedding when the AI gateway has no embedding provider configured.
     // Checks all auth env vars for the resolved provider, not just OPENAI_API_KEY,
     // so Gemini / Ollama / Voyage brains don't silently drop embeddings (Codex C2).
@@ -869,6 +1145,29 @@ const put_page: Operation = {
       source_uri: provenanceUri,
       ingested_via: provenanceVia,
     });
+
+    // The dedup pre-check in importFromContent can resolve the write to a
+    // DIFFERENT page than the one requested (same content_hash, or the same
+    // `frontmatter.id`), and the disk write-through below runs against that
+    // RESOLVED slug. Fence it too: a bound client can read a victim page's
+    // frontmatter id over its federated grant, echo it back in an in-prefix
+    // put_page, and otherwise have write-through rewrite the victim's file
+    // with falsified provenance. Dedup returns status 'skipped' without
+    // touching the DB, so throwing here leaves nothing to roll back.
+    if (result.slug && result.slug !== slug) {
+      // Deliberately does NOT name the resolved slug: it belongs to a page
+      // outside the binding, and echoing it would turn frontmatter-id guessing
+      // into a slug-enumeration oracle.
+      if (!slugUnderBoundPrefixes(ctx.auth?.boundSlugPrefixes ?? [], result.slug)
+          && ctx.auth?.boundSlugPrefixes) {
+        ctx.logger.warn(`[put_page] dedup resolved '${slug}' to an out-of-fence page; refusing (client ${ctx.auth.clientId ?? 'unknown'})`);
+        throw new OperationError(
+          'permission_denied',
+          `put_page: this content already exists on a page outside your bound_slug_prefixes, so the write would have modified that page instead.`,
+          'Remove the `id:` frontmatter field (or change the content) to write a new page under your own prefix.',
+        );
+      }
+    }
 
     // v0.39 T13 — auto-prompt on first unknown-type write.
     //
@@ -1019,6 +1318,22 @@ const put_page: Operation = {
     // (MEDIUM facts wait for the dream cycle but DO land via put_page,
     // matching the pre-fix behavior on this surface).
     let factsQueued: { queued: boolean } | { skipped: string } | undefined;
+    // Slug-bound clients do not get the facts backstop. It extracts entities
+    // from the (attacker-controllable) page body and writes fact rows — and,
+    // on a source with a local_path, a `## Facts` fence in the entity's own
+    // .md — keyed to `people/…` / `companies/…` slugs the caller never named.
+    // That is exactly the capability `extract_facts` is denied at dispatch
+    // for, reachable indirectly through a perfectly in-prefix put_page. The
+    // sibling post-hooks above already skip for untrusted callers (auto-link
+    // at `remote !== false && !trustedWorkspace`, chronicle at
+    // `remote !== false`); this one had no gate at all.
+    // Keyed on "the caller is slug-confined at all", not on ctx.auth alone:
+    // the delegated (submit_agent → subagent) context carries
+    // `allowedSlugPrefixes` but NOT `auth`, so an auth-only test would let a
+    // bound client re-open this path simply by delegating the write.
+    if (ctx.auth?.boundSlugPrefixes || ctx.viaSubagent === true) {
+      factsQueued = { skipped: 'slug_bound_client' };
+    } else {
     try {
       const { runFactsBackstop } = await import('./facts/backstop.ts');
       const r = await runFactsBackstop(
@@ -1050,6 +1365,7 @@ const put_page: Operation = {
       }
     } catch {
       factsQueued = { skipped: 'backstop_error' };
+    }
     }
 
     // v0.42.x (#2390): Life Chronicle backstop. ONLY on a real import
@@ -1088,7 +1404,9 @@ const put_page: Operation = {
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
     try {
       const { runPostWriteLint } = await import('./output/post-write.ts');
-      const lint = await runPostWriteLint(ctx.engine, result.slug);
+      const lint = await runPostWriteLint(ctx.engine, result.slug, {
+        sourceId: ctx.sourceId ?? 'default',
+      });
       if (lint.ran) {
         writerLint = {
           error_count: lint.findings.filter(f => f.severity === 'error').length,
@@ -1153,7 +1471,11 @@ async function runAutoLink(
 
   // Live-mode resolver: per-put throwaway cache, pg_trgm + optional search.
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
-  // within this page's source — no cross-source basename edges.
+  // within this page's source — no cross-source basename edges. Also scopes
+  // the fuzzy fallback (findByTitleFuzzy) to the same source the put_page is
+  // targeting — without it, cross-source slug suggestions get silently dropped
+  // at the FK filter and the link looks like it failed to resolve. Twin of
+  // #1436's `tryFuzzyMatch` fix.
   const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
   // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
   const globalBasename = await isGlobalBasenameEnabled(engine);
@@ -1307,6 +1629,7 @@ const delete_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'delete_page');
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
@@ -1340,6 +1663,7 @@ const restore_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'restore_page');
     if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
@@ -1384,7 +1708,11 @@ const list_pages: Operation = {
   params: {
     type: { type: 'string', description: 'Filter by page type' },
     tag: { type: 'string', description: 'Filter by tag' },
-    limit: { type: 'number', description: 'Max results (default 50)' },
+    limit: { type: 'number', description: 'Max results (default 50; remote callers are capped at 100)' },
+    offset: {
+      type: 'number',
+      description: 'Skip first N rows (pagination). Engine-supported since PageFilters gained offset; previously accepted at the CLI and silently dropped.',
+    },
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
@@ -1410,18 +1738,70 @@ const list_pages: Operation = {
     // enumerate src-B pages. Pre-fix, ctx.sourceId / ctx.auth?.allowedSources
     // were ignored at this op handler and the engine returned every source's
     // pages indiscriminately.
-    const scope = sourceScopeOpts(ctx);
-    const pages = await ctx.engine.listPages({
+    // #3242: federatedSearchScope so unqualified listing spans federated
+    // sources (same visibility set as search / get_page). Grants still win.
+    const scope = federatedSearchScope(ctx);
+    // The 100-row cap exists to protect remote MCP/OAuth transports from
+    // unbounded result dumps. Local CLI callers (ctx.remote === false — the
+    // same trust boundary that already bypasses scope enforcement, see the
+    // Operation.scope doc above) own the machine, and a full enumeration is a
+    // legitimate local operation, so an explicit limit above 100 is honored.
+    // Anything that is not strictly `false` stays remote/untrusted (defense
+    // in depth, matching the ctx.remote contract).
+    const requestedLimit = p.limit as number | undefined;
+    const isLocal = ctx.remote === false;
+    const limit = isLocal
+      ? clampSearchLimit(requestedLimit, 50, Number.MAX_SAFE_INTEGER)
+      : clampSearchLimit(requestedLimit, 50, 100);
+    if (!isLocal && requestedLimit !== undefined && Number.isFinite(requestedLimit) && requestedLimit > limit) {
+      // Loud clamp, parity with the three search paths ("search limit clamped
+      // from N to 100"). logger.warn goes to stderr — `list` stdout is
+      // tab-separated and consumed by scripts, so it must stay clean.
+      ctx.logger.warn(`[gbrain] Warning: list limit clamped from ${requestedLimit} to ${limit}; use offset to paginate`);
+    }
+    // Thread offset through — PageFilters has supported it all along; the op
+    // layer just never passed it, so `--offset` was accepted and ignored.
+    const requestedOffset = p.offset as number | undefined;
+    const offset =
+      requestedOffset !== undefined && Number.isFinite(requestedOffset) && requestedOffset > 0
+        ? Math.floor(requestedOffset)
+        : undefined;
+    // Probe one row past the effective limit so truncation is detectable
+    // without a COUNT query. The bug class sealed here is SILENT truncation
+    // — an exhaustive consumer (audit, scan, backfill) gets a full-looking
+    // list and never learns rows were dropped, and with the default
+    // updated_desc sort the dropped rows are always the OLDEST, i.e. exactly
+    // the pages such consumers exist to find.
+    const rows = await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
-      limit: clampSearchLimit(p.limit as number | undefined, 50, 100),
+      limit: limit + 1,
+      offset,
       includeDeleted: (p.include_deleted as boolean) === true,
       updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
       sort,
       ...scope,
     });
+    const truncated = rows.length > limit;
+    const pages = truncated ? rows.slice(0, limit) : rows;
+    // Warn only when the caller's limit was NOT honored (unset → default 50):
+    // an explicit honored limit that happens to land on more rows is ordinary
+    // pagination, not a trap. Local (CLI) only — same operator-facing stderr
+    // channel as the put_page unknown-type hint above — but with no isTTY
+    // gate: scripted callers are precisely the consumers that cannot detect
+    // truncation any other way, and stderr keeps stdout parseable for them.
+    // (Local explicit limits are honored unbounded since #3322, so the
+    // requestedLimit > limit arm is defense in depth only.)
+    if (truncated && isLocal && (requestedLimit === undefined || requestedLimit > limit)) {
+      console.error(
+        `[list_pages] output truncated at ${limit} rows (default 50). ` +
+        `Pass an explicit limit, page through with sort=updated_asc + ` +
+        `updated_after=<last row's updated_at>, or narrow with type/tag.`,
+      );
+    }
     return pages.map(pg => ({
       slug: pg.slug,
+      source_id: pg.source_id,
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
@@ -1448,7 +1828,8 @@ const search: Operation = {
     const queryText = p.query as string;
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
-    const scope = sourceScopeOpts(ctx);
+    // #2561: unqualified trusted-local search spans federated sources.
+    const scope = federatedSearchScope(ctx);
 
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
@@ -1468,6 +1849,10 @@ const search: Operation = {
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
       await stampContentFlags(ctx.engine, results);
+      // #160: same for the unverified auto-extracted stub marker (no boost
+      // to cancel on this path — keyword-only never applies the compiled-
+      // truth boost — but the provenance marker must still surface).
+      await stampUnverifiedExtractions(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       return results;
@@ -1610,7 +1995,9 @@ const query: Operation = {
     // is spread into BOTH the image-similarity searchVector path and the text
     // hybridSearch path below, so both honor the same grant.
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
-    const querySourceScope = resolveRequestedScope(ctx, sourceIdParam);
+    // #2561: unqualified trusted-local query spans federated sources (per-call
+    // source_id / remote grants still resolve through resolveRequestedScope).
+    const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -1920,6 +2307,7 @@ const add_tag: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    enforceClientSlugFence(ctx, p.slug as string, 'add_tag');
     if (ctx.dryRun) return { dry_run: true, action: 'add_tag', slug: p.slug, tag: p.tag };
     // v0.31.8 (D7): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
@@ -1939,6 +2327,7 @@ const remove_tag: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    enforceClientSlugFence(ctx, p.slug as string, 'remove_tag');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_tag', slug: p.slug, tag: p.tag };
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
     await ctx.engine.removeTag(p.slug as string, p.tag as string, sourceOpts);
@@ -1992,6 +2381,10 @@ const add_link: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    // Client fence on the `from` endpoint only: the edge originates from
+    // (and renders on) the from page; linking TO a page outside the
+    // binding is a reference, not a mutation of the target.
+    enforceClientSlugFence(ctx, p.from as string, 'add_link');
     if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to };
     // v114 (#1941): default omitted provenance to 'manual' (NOT the engine's
     // 'markdown' default) so hand/tool-created CLI edges are honestly manual,
@@ -2032,6 +2425,7 @@ const remove_link: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
     const linkOpts = ctx.sourceId
       ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
@@ -2159,6 +2553,7 @@ const add_timeline_entry: Operation = {
     // confined to the same namespace/allow-list as page writes. Runs before
     // the dry-run short-circuit so preview calls surface the same rejection.
     enforceSubagentSlugFence(ctx, p.slug as string, 'add_timeline_entry');
+    enforceClientSlugFence(ctx, p.slug as string, 'add_timeline_entry');
     if (ctx.dryRun) return { dry_run: true, action: 'add_timeline_entry', slug: p.slug };
     const date = p.date as string;
     // Reject anything that isn't a strict YYYY-MM-DD with year 1900-2199 and
@@ -2531,9 +2926,7 @@ const get_versions: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    const versions = await ctx.engine.getVersions(p.slug as string, sourceOpts);
+    const versions = await ctx.engine.getVersions(p.slug as string, sourceScopeOpts(ctx));
     // Same takes-allow-list privacy boundary as get_page. Snapshots persist
     // historical compiled_truth verbatim, including the takes fence, so
     // a remote token bypassing get_page via /history would re-introduce
@@ -2555,6 +2948,7 @@ const revert_version: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    enforceClientSlugFence(ctx, p.slug as string, 'revert_version');
     if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
     // intended page row instead of whichever same-slug row Postgres returns
@@ -2584,12 +2978,18 @@ const sync_brain: Operation = {
   localOnly: true,
   handler: async (ctx, p) => {
     const { performSync } = await import('../commands/sync.ts');
+    // #2830: thread ctx.sourceId (D7 pattern, same as revert_version /
+    // put_page) so a no-`repo` call resolves the CALLER's sync anchor.
+    // Without it, performSync read the default source's repo_path/last_commit
+    // and silently synced against the wrong repo on multi-source brains.
+    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
     return performSync(ctx.engine, {
       repoPath: p.repo as string | undefined,
       dryRun: ctx.dryRun || (p.dry_run as boolean) || false,
       noEmbed: (p.no_embed as boolean) || false,
       noPull: (p.no_pull as boolean) || false,
       full: (p.full as boolean) || false,
+      ...sourceOpts,
     });
   },
   cliHints: { name: 'sync', hidden: true },
@@ -2608,6 +3008,7 @@ const put_raw_data: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    enforceClientSlugFence(ctx, p.slug as string, 'put_raw_data');
     if (ctx.dryRun) return { dry_run: true, action: 'put_raw_data', slug: p.slug, source: p.source };
     // v0.31.8 (D7 + D21): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
@@ -2624,9 +3025,7 @@ const get_raw_data: Operation = {
     source: { type: 'string', description: 'Filter by source' },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20 + D21): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceOpts);
+    return ctx.engine.getRawData(p.slug as string, p.source as string | undefined, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -2640,7 +3039,11 @@ const resolve_slugs: Operation = {
     partial: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.resolveSlugs(p.partial as string);
+    // #3242: was fully UNSCOPED — the one read that leaked every source's
+    // slugs to any caller (the reporter's "resolve_slugs sees them but
+    // get_page doesn't" matrix). Route through the same visibility set as
+    // get_page/search: grant > federated set > scalar source.
+    return ctx.engine.resolveSlugs(p.partial as string, federatedSearchScope(ctx));
   },
   scope: 'read',
 };
@@ -2652,9 +3055,7 @@ const get_chunks: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    return ctx.engine.getChunks(p.slug as string, sourceOpts);
+    return ctx.engine.getChunks(p.slug as string, sourceScopeOpts(ctx));
   },
   scope: 'read',
 };
@@ -2675,6 +3076,11 @@ const log_ingest: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'log_ingest' };
     await ctx.engine.logIngest({
+      // Thread ctx.sourceId (same pattern as get_chunks/get_page above): on a
+      // multi-source brain the ingest event must be attributed to the caller's
+      // source, not the shared 'default' bucket. Absent sourceId still falls to
+      // the engine's 'default' (single-source brains unchanged).
+      ...(ctx.sourceId ? { source_id: ctx.sourceId } : {}),
       source_type: p.source_type as string,
       source_ref: p.source_ref as string,
       pages_updated: p.pages_updated as string[],
@@ -2691,7 +3097,17 @@ const get_ingest_log: Operation = {
     limit: { type: 'number', description: 'Max entries (default 20)' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.getIngestLog({ limit: clampSearchLimit(p.limit as number | undefined, 20, 50) });
+    // Source-scope the log for remote callers (scalar grant → single-element
+    // array; federated grant → the granted array — linkReadScopeOpts collapse
+    // rule). Trusted local callers (remote === false) keep the whole-brain
+    // view, matching every other read op's local posture. Ingest summaries
+    // can carry another source's private context, so an unscoped remote read
+    // is a cross-source leak.
+    const scope = ctx.remote !== false ? linkReadScopeOpts(ctx) : {};
+    return ctx.engine.getIngestLog({
+      limit: clampSearchLimit(p.limit as number | undefined, 20, 50),
+      ...(scope.sourceIds ? { sourceIds: scope.sourceIds } : scope.sourceId ? { sourceIds: [scope.sourceId] } : {}),
+    });
   },
   scope: 'read',
 };
@@ -2993,7 +3409,20 @@ const submit_agent: Operation = {
     }
 
     // Validate each param against the binding.
-    const requestedTools = (p.allowed_tools as string[] | undefined) ?? boundTools;
+    //
+    // An EXPLICIT empty array is not "no restriction" here — downstream the
+    // subagent worker reads empty `allowed_tools` as "the full tool registry"
+    // and empty `allowed_slug_prefixes` as "fall back to the legacy
+    // wiki/agents/<job-id>/ namespace". Both subset loops below pass
+    // vacuously over an empty list, so `{allowed_tools: [], allowed_slug_prefixes: []}`
+    // from a client bound to `['search']` + `['emp-alice/']` would hand its
+    // subagent the whole registry (including put_page) writing outside the
+    // binding. `??` only substitutes null/undefined, so collapse the empty
+    // case to the binding explicitly.
+    const requestedToolsRaw = p.allowed_tools as string[] | undefined;
+    const requestedTools = requestedToolsRaw === undefined || requestedToolsRaw.length === 0
+      ? boundTools
+      : requestedToolsRaw;
     for (const t of requestedTools) {
       if (!boundTools.includes(t)) {
         throw new OperationError(
@@ -3002,10 +3431,35 @@ const submit_agent: Operation = {
         );
       }
     }
-    const requestedSlugPrefixes = (p.allowed_slug_prefixes as string[] | undefined) ?? boundSlugPrefixes ?? [];
+    const requestedSlugPrefixesRaw = p.allowed_slug_prefixes as string[] | undefined;
+    const requestedSlugPrefixes =
+      requestedSlugPrefixesRaw === undefined || requestedSlugPrefixesRaw.length === 0
+        ? (boundSlugPrefixes ?? [])
+        : requestedSlugPrefixesRaw;
+    // A bound client must end up with a non-empty delegated fence: an empty
+    // list reaches the subagent as "use the legacy wiki/agents/<id>/ namespace",
+    // which is outside every bound prefix.
+    if (boundSlugPrefixes !== null && requestedSlugPrefixes.length === 0) {
+      throw new OperationError(
+        'permission_denied',
+        `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`,
+        'Re-scope the client with a non-empty --bound-slug-prefixes.',
+      );
+    }
     if (boundSlugPrefixes !== null) {
       for (const sp of requestedSlugPrefixes) {
-        if (!boundSlugPrefixes.some(bp => sp.startsWith(bp) || bp === sp)) {
+        // Boundary-aware, same rule as the direct fence: a raw `startsWith`
+        // let a boundary-less binding (`emp-alice`) authorize a requested
+        // prefix in a SIBLING namespace (`emp-alice-2/`), which is then handed
+        // to the child as a full glob grant over another employee's pages.
+        if (!boundSlugPrefixes.some(bp => {
+          const base = normalizeSlugPrefix(bp);
+          const req = normalizeSlugPrefix(sp);
+          if (base === '') return false;
+          return base.endsWith('/')
+            ? req.startsWith(base)
+            : req === base || req.startsWith(`${base}/`);
+        })) {
           throw new OperationError(
             'permission_denied',
             `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
@@ -3031,6 +3485,14 @@ const submit_agent: Operation = {
     }
 
     // Dry-run echo.
+    // The subagent fence uses `matchesSlugAllowList`, whose grammar makes a
+    // BARE entry match that one slug exactly — so a plain `emp-alice/` binding
+    // would let the delegated agent write nothing. Normalize the
+    // trailing-slash form into the glob the delegated matcher expects, so one
+    // stored column means the same span of slugs on both paths.
+    const delegatedSlugPrefixes = requestedSlugPrefixes.map(sp =>
+      sp.endsWith('/') ? `${sp}*` : sp);
+
     if (ctx.dryRun) {
       return {
         dry_run: true,
@@ -3039,6 +3501,10 @@ const submit_agent: Operation = {
         bound_tools: boundTools,
         bound_source: boundSource,
         bound_max_concurrent: boundMaxConcurrent,
+        // What the delegated job would ACTUALLY be granted, after the binding
+        // is applied — a preview that hides this can't show a widening bug.
+        resolved_tools: requestedTools,
+        resolved_slug_prefixes: delegatedSlugPrefixes,
       };
     }
 
@@ -3052,11 +3518,24 @@ const submit_agent: Operation = {
       prompt: p.prompt as string,
       max_turns: Math.min((p.max_turns as number) ?? 20, 100),
       allowed_tools: requestedTools,
-      allowed_slug_prefixes: requestedSlugPrefixes,
+      allowed_slug_prefixes: delegatedSlugPrefixes,
       __owner_client_id: clientId,
     };
     if (typeof p.model === 'string') jobData.model = p.model;
-    if (boundSource) jobData.source_id = boundSource;
+    // Write source for the delegated job comes from the AUTHENTICATED client
+    // whenever we have it. `bound_source_id` is an optional, separately-set
+    // column: unset it defaulted the child to 'default', and if it disagreed
+    // with the token's own source the child followed the column — either way
+    // a correctly slug-fenced client could act on the wrong source.
+    const delegatedSource = ctx.auth?.sourceId ?? boundSource;
+    if (boundSource && ctx.auth?.sourceId && boundSource !== ctx.auth.sourceId) {
+      throw new OperationError(
+        'permission_denied',
+        `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`,
+        'Re-scope the client so the two agree: `gbrain auth rescope-client <id> --source <source>`.',
+      );
+    }
+    if (delegatedSource) jobData.source_id = delegatedSource;
     const job = await queue.add(
       'subagent',
       jobData,
@@ -3289,7 +3768,7 @@ const get_calibration_profile: Operation = {
     holder: {
       type: 'string',
       description:
-        "Holder slug, e.g. 'garry' or 'people/charlie-example'. Defaults to 'garry' when omitted.",
+        "Holder slug, e.g. 'self' or 'people/charlie-example'. Defaults to config emotional_weight.user_holder, else 'self', when omitted.",
     },
   },
   handler: async (ctx, p) => {
@@ -3711,11 +4190,12 @@ const whoami: Operation = {
   name: 'whoami',
   description:
     'Introspect the calling identity. Returns one of three transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
+    '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
     '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
-    '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
-    'context is ambiguous (remote=true without auth) — fail-closed posture ' +
-    'mirroring the v0.26.9 trust-boundary contract.',
+    '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
+    'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
+    'context is ambiguous (remote=true without auth and no transport marker) ' +
+    '— fail-closed posture mirroring the v0.26.9 trust-boundary contract.',
   params: {},
   scope: 'read',
   handler: async (ctx) => {
@@ -3726,6 +4206,12 @@ const whoami: Operation = {
     // special-case `transport: 'local'` explicitly.
     if (ctx.remote === false) {
       return { transport: 'local', scopes: [] };
+    }
+    // #1061: stdio MCP is remote/untrusted by design but has no per-token
+    // auth (local pipe) — a known transport, not a bug. Report it instead of
+    // throwing. Empty scopes: nothing here may be used to gate anything.
+    if (!ctx.auth && ctx.transport === 'stdio') {
+      return { transport: 'stdio', scopes: [] };
     }
     if (!ctx.auth) {
       throw new OperationError(
@@ -3746,6 +4232,10 @@ const whoami: Operation = {
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
         scopes: ctx.auth.scopes,
         expires_at: ctx.auth.expiresAt ?? null,
+        // Read-only self-introspection of the token's source grants —
+        // widens nothing; absent grants serialize fail-closed (null / []).
+        source_id: ctx.auth.sourceId ?? null,
+        federated_read: ctx.auth.allowedSources ?? [],
       };
     }
     return {
@@ -4366,6 +4856,90 @@ const code_traversal_cache_clear: Operation = {
   cliHints: { name: 'code_traversal_cache_clear', hidden: true },
 };
 
+// --- #3390: provider-agnostic embedding migration ---
+
+const migrate_embeddings: Operation = {
+  name: 'migrate_embeddings',
+  description: 'Re-embed the brain onto a different embedding provider/model (#3390): schema dimension transition, NULL-signature (#3391) invalidation, query-cache purge, resumable re-embed. Without yes=true returns the plan + cost estimate only. Local-only admin op; the primary surface is `gbrain migrate embeddings`.',
+  params: {
+    to: { type: 'string', required: true, description: 'Target provider:model (e.g. openai:text-embedding-3-small).' },
+    dim: { type: 'number', description: "Target dimensions. Defaults to the provider recipe's declared width; required when the recipe declares none." },
+    dry_run: { type: 'boolean', description: 'Plan + cost estimate only; change nothing.' },
+    yes: { type: 'boolean', description: 'Confirm the re-embed spend + destructive schema change. Required for a live run.' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    // Belt-and-braces on top of localOnly (the get_recent_transcripts
+    // pattern): a schema-rebuilding, money-spending op must never be
+    // reachable from a remote transport even if a future dispatch path
+    // forgets the localOnly filter.
+    if (ctx.remote !== false) {
+      throw new Error('migrate_embeddings is local-only. Run `gbrain migrate embeddings` on the host.');
+    }
+    const {
+      planEmbeddingMigration, applyEmbeddingMigration, completeEmbeddingMigration,
+      reconcilePageSignatures, migrationSignature,
+    } = await import('./embedding-migration.ts');
+    const to = p.to as string;
+    const dim = p.dim as number | undefined;
+    let fromModel: string | undefined;
+    let fromDims: number | undefined;
+    try {
+      const { getEmbeddingModel, getEmbeddingDimensions } = await import('./ai/gateway.ts');
+      fromModel = getEmbeddingModel();
+      fromDims = getEmbeddingDimensions();
+    } catch { /* gateway unconfigured — plan falls back to defaults */ }
+    const plan = await planEmbeddingMigration(ctx.engine, {
+      to,
+      ...(dim !== undefined && { dim }),
+      ...(fromModel !== undefined && { fromModel }),
+      ...(fromDims !== undefined && { fromDims }),
+    });
+    if (ctx.dryRun || p.dry_run === true || p.yes !== true) {
+      return { status: p.yes === true || p.dry_run === true ? 'planned' : 'needs_confirmation', plan };
+    }
+    const { persistEmbeddingFileConfig, probeTargetProvider } = await import('../commands/migrate-embeddings.ts');
+    // Safety parity with the CLI path: probe the target provider BEFORE any
+    // mutation. Without this, `yes:true` would drop the embedding column and
+    // only then discover the key/model/dim is wrong.
+    const probe = await probeTargetProvider(plan.to_model, plan.to_dims);
+    if (!probe.ok) return { status: 'failed', reason: probe.message, plan };
+    const applied = await applyEmbeddingMigration(ctx.engine, plan, {
+      persistConfig: (m, d) => persistEmbeddingFileConfig(m, d),
+    });
+    if (applied.status !== 'applied') return { ...applied, plan };
+    const { runEmbedCore } = await import('../commands/embed.ts');
+    // singleFlight parity with the CLI path: takes the same per-source
+    // embed-backfill lock so this can't race a queued embed-backfill job on
+    // the NULL→non-NULL upsert (the TODOS:2299 class).
+    const embedResult = await runEmbedCore(ctx.engine, {
+      stale: true, catchUp: true, singleFlight: true, includeNullSignature: true, quiet: true,
+    });
+    // Stamp batch-boundary pages before probing for completion (see
+    // reconcilePageSignatures — the embed loop's all-or-nothing stamp rule
+    // skips any page split across two stale batches).
+    const reconciled = await reconcilePageSignatures(ctx.engine, plan);
+    const remaining = await ctx.engine.countStaleChunks({
+      signature: migrationSignature(plan.to_model, plan.to_dims),
+      includeNullSignature: true,
+    });
+    if (remaining === 0) await completeEmbeddingMigration(ctx.engine, plan);
+    return {
+      status: remaining === 0 ? 'completed' : 'incomplete',
+      plan,
+      embedded: embedResult.embedded,
+      remaining,
+      signatures_reconciled: reconciled,
+      invalidated: applied.invalidated,
+      schema_transitioned: applied.schema_transitioned,
+      cache_cleared: applied.cache_cleared,
+    };
+  },
+  cliHints: { name: 'migrate-embeddings', hidden: true },
+};
+
 // --- v0.36 Phase 2: search_by_image (image-as-query) ---
 
 const search_by_image: Operation = {
@@ -4413,14 +4987,10 @@ const search_by_image: Operation = {
       throw new Error('search_by_image accepts only one of: image_path, image_url, image_data');
     }
 
-    // D23-#6 — pre-flight daily-budget check for remote OAuth clients.
-    // Local CLI callers (ctx.remote=false) bypass the cap (clientId="").
+    // D23-#6 — remote OAuth clients are charged through the durable
+    // reserve-then-settle ledger below. Local CLI callers bypass the cap
+    // (clientId="") because they use their own provider credentials.
     const clientId = (ctx.remote === true ? (ctx.auth?.clientId ?? '') : '');
-    if (clientId) {
-      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
-      const { checkBudget } = await import('./spend-log.ts');
-      await checkBudget(ctx.engine, clientId, Math.round(budgetUsd * 100));
-    }
 
     // Resolve image bytes via the SSRF-defended loader. For remote callers,
     // tighter byte cap.
@@ -4440,33 +5010,75 @@ const search_by_image: Operation = {
     // one spread — `__all__` spans the brain only for trusted local callers.
     const imageSourceScope = resolveRequestedScope(ctx, sourceIdParam);
 
-    const { searchByImage } = await import('./search/by-image.ts');
-    const results = await searchByImage(
-      ctx.engine,
-      { base64: loaded.base64, mime: loaded.contentType },
-      {
-        limit: (p.limit as number) || 20,
-        offset: (p.offset as number) || 0,
-        query: queryRefinement,
-        ...imageSourceScope,
-      },
-    );
-
-    // D23-#6 — record successful Voyage call. Best-effort; failures don't
-    // block the response.
+    // Reserve immediately before entering the paid search routine. Validation,
+    // image loading, and scope resolution happen first so known no-charge
+    // failures do not strand reservations. An ambiguous provider failure is
+    // settled at this operation's fixed-price upper bound below; pessimistic
+    // accounting is safer than reopening daily headroom after the TTL.
+    let spendReservationId: string | null = null;
+    let estimatedSpendCents = 0;
     if (clientId) {
-      const { recordSpend, VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
-      // Approximate: 1 image embed + (query ? 1 text embed : 0). Both are
-      // billed at the same per-call rate by Voyage.
+      const { VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
+      const { reserve } = await import('./minions/budget-meter.ts');
       const calls = 1 + (queryRefinement ? 1 : 0);
-      void recordSpend(ctx.engine, {
+      estimatedSpendCents = VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls;
+      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
+      const reservation = await reserve(ctx.engine, {
         clientId,
-        tokenName: ctx.auth?.clientName ?? null,
-        operation: 'search_by_image',
-        spendCents: VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls,
+        estimatedCents: estimatedSpendCents,
+        capCents: budgetUsd * 100,
         provider: 'voyage',
         model: 'voyage-multimodal-3',
       });
+      spendReservationId = reservation.reservationId;
+    }
+
+    const { searchByImage } = await import('./search/by-image.ts');
+    let results: Awaited<ReturnType<typeof searchByImage>>;
+    try {
+      results = await searchByImage(
+        ctx.engine,
+        { base64: loaded.base64, mime: loaded.contentType },
+        {
+          limit: (p.limit as number) || 20,
+          offset: (p.offset as number) || 0,
+          query: queryRefinement,
+          ...imageSourceScope,
+        },
+      );
+    } catch (providerError) {
+      if (spendReservationId) {
+        const { settle } = await import('./minions/budget-meter.ts');
+        try {
+          await settle(
+            ctx.engine,
+            spendReservationId,
+            estimatedSpendCents,
+            'search_by_image_error_pessimistic',
+            ctx.auth?.clientName ?? null,
+          );
+        } catch (accountingError) {
+          throw new AggregateError(
+            [providerError, accountingError],
+            'search_by_image provider call failed and its spend reservation could not be settled',
+          );
+        }
+      }
+      throw providerError;
+    }
+
+    // Settlement and the spend-log mirror commit in one transaction. A
+    // database/accounting failure blocks the response and leaves the pending
+    // reservation holding headroom rather than returning an unmetered success.
+    if (spendReservationId) {
+      const { settle } = await import('./minions/budget-meter.ts');
+      await settle(
+        ctx.engine,
+        spendReservationId,
+        estimatedSpendCents,
+        'search_by_image',
+        ctx.auth?.clientName ?? null,
+      );
     }
 
     return results;
@@ -4562,7 +5174,8 @@ const list_schema_packs: Operation = {
     const { existsSync, readdirSync } = await import('node:fs');
     const { join } = await import('node:path');
     const { gbrainPath } = await import('./config.ts');
-    const bundled = ['gbrain-base', 'gbrain-recommended'];
+    const { BUNDLED_PACK_NAMES } = await import('./schema-pack/bundled.ts');
+    const bundled = [...BUNDLED_PACK_NAMES];
     const installedDir = gbrainPath('schema-packs');
     const installed: string[] = [];
     if (existsSync(installedDir)) {
@@ -4713,7 +5326,7 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: every mutation is validated against an in-memory manifest first, and the pack file is written to disk at most once, after the FULL batch has proven valid — so a failure at any point leaves the pack file byte-identical to its pre-batch state (never a partial write). Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {
@@ -4736,92 +5349,20 @@ const schema_apply_mutations: Operation = {
     const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : 'cli';
     const sourceId = ctx.sourceId;  // codex C5: write-side scoping
-    // Compose every mutation inside ONE withPackLock so the batch is
-    // truly atomic. The withMutation skeleton handles audit / cache
-    // invalidation per operation; we orchestrate the lock + iteration.
-    const { withPackLock } = await import('./schema-pack/pack-lock.ts');
-    const {
-      addTypeToPack, removeTypeFromPack, updateTypeOnPack,
-      addAliasToType, removeAliasFromType, addPrefixToType, removePrefixFromType,
-      addLinkTypeToPack, removeLinkTypeFromPack,
-      setExtractableOnType, setExpertRoutingOnType,
-      SchemaPackMutationError,
-    } = await import('./schema-pack/mutate.ts');
-    const baseMutateOpts = {
-      actor: actor as 'cli' | `mcp:${string}`,
-      batchId,
-      engine: ctx.engine,
-      ...(sourceId ? { sourceId } : {}),
-      ...(force ? { force: true } : {}),
-    };
-    const results: unknown[] = [];
+    // `applyMutationsAtomic` (issue #2581) owns the lock + single read +
+    // single write for the whole batch: every mutation is validated
+    // in-memory first, and the pack file is written at most once, only
+    // after the FULL batch checks out. That is what makes this actually
+    // atomic (a failure at any index can never leave earlier mutations on
+    // disk), vs. the old per-mutation-writes-as-it-goes shape.
+    const { applyMutationsAtomic } = await import('./schema-pack/mutate.ts');
     try {
-      // Outer lock: hold the pack for the whole batch so other writers
-      // can't slip in between mutations.
-      await withPackLock(pack, { force, lockDir: undefined }, async () => {
-        for (let i = 0; i < mutations.length; i++) {
-          const m = mutations[i]!;
-          // Each primitive acquires the lock internally; the outer
-          // withPackLock makes that re-entrant via fast-stale-detect
-          // (--force option for the inner call). To keep semantics
-          // simple, we pass {force:true} to the inner calls because
-          // they're nested inside our outer lock — we already own it.
-          const innerOpts = { ...baseMutateOpts, force: true };
-          let r: unknown;
-          switch (m.op) {
-            case 'add_type':
-              r = await addTypeToPack(pack, {
-                name: m.name as string,
-                primitive: m.primitive as never,
-                prefix: m.prefix as string,
-                extractable: m.extractable as boolean | undefined,
-                expertRouting: m.expert_routing as boolean | undefined,
-                aliases: m.aliases as string[] | undefined,
-              }, innerOpts);
-              break;
-            case 'remove_type':
-              r = await removeTypeFromPack(pack, m.name as string, innerOpts);
-              break;
-            case 'update_type':
-              r = await updateTypeOnPack(pack, { name: m.name as string, patch: (m.patch as object) ?? {} }, innerOpts);
-              break;
-            case 'add_alias':
-              r = await addAliasToType(pack, m.type as string, m.alias as string, innerOpts);
-              break;
-            case 'remove_alias':
-              r = await removeAliasFromType(pack, m.type as string, m.alias as string, innerOpts);
-              break;
-            case 'add_prefix':
-              r = await addPrefixToType(pack, m.type as string, m.prefix as string, innerOpts);
-              break;
-            case 'remove_prefix':
-              r = await removePrefixFromType(pack, m.type as string, m.prefix as string, innerOpts);
-              break;
-            case 'add_link_type':
-              r = await addLinkTypeToPack(pack, {
-                name: m.name as string,
-                inverse: m.inverse as string | undefined,
-                inference: m.inference as { regex?: string; page_type?: string; target_type?: string } | undefined,
-              }, innerOpts);
-              break;
-            case 'remove_link_type':
-              r = await removeLinkTypeFromPack(pack, m.name as string, innerOpts);
-              break;
-            case 'set_extractable':
-              r = await setExtractableOnType(pack, m.type as string, m.value as boolean, innerOpts);
-              break;
-            case 'set_expert_routing':
-              r = await setExpertRoutingOnType(pack, m.type as string, m.value as boolean, innerOpts);
-              break;
-            default:
-              throw new SchemaPackMutationError(
-                'INVALID_RESULT',
-                `unknown mutation op: '${m.op}' at index ${i}`,
-                { index: i, op: m.op },
-              );
-          }
-          results.push({ index: i, op: m.op, ...(r as object) });
-        }
+      const results = await applyMutationsAtomic(pack, mutations, {
+        actor: actor as 'cli' | `mcp:${string}`,
+        batchId,
+        engine: ctx.engine,
+        ...(sourceId ? { sourceId } : {}),
+        ...(force ? { force: true } : {}),
       });
       return {
         schema_version: 1,
@@ -4832,17 +5373,21 @@ const schema_apply_mutations: Operation = {
       };
     } catch (e) {
       const code = (e as { code?: string }).code ?? 'UNKNOWN';
+      const failedAtIndex = (e as { details?: { index?: number } }).details?.index;
       return {
         error: 'mutation_failed',
         code,
         message: (e as Error).message,
         batch_id: batchId,
-        // Partial results recorded so the agent can inspect which
-        // mutations landed before the failure (the atomic guarantee
-        // is at the LOCK level — individual mutations are sequential
-        // and each is atomic; pack state reflects everything up to the
-        // failed mutation).
-        partial_results: results,
+        // Nothing was written to disk — applyMutationsAtomic only writes
+        // once, after every mutation in the batch has validated cleanly.
+        // (Pre-fix, this field was `partial_results` and listed mutations
+        // that HAD already landed on disk, because the old implementation
+        // wrote as it went — that shape is gone; a failed batch can no
+        // longer imply partial application.)
+        mutations_applied: 0,
+        pack_unchanged: true,
+        ...(failedAtIndex !== undefined ? { failed_at_index: failedAtIndex } : {}),
       };
     }
   },
@@ -4957,7 +5502,7 @@ const run_onboard: Operation = {
     // typo, the underlying queue.add would reject. Defense-in-depth.
     const result = await runRemediation(
       ctx.engine,
-      { targetScore, maxUsd },
+      { targetScore, maxUsd, extraRemediations: allowedExtras },
       {},
     );
 
@@ -5359,6 +5904,208 @@ const chronicle_backfill: Operation = {
   cliHints: { name: 'chronicle-backfill' },
 };
 
+// ---------------------------------------------------------------------------
+// Extraction quarantine lane (issue #160)
+//
+// `extractAndEnrich` regex-extracts entity names from arbitrary text and
+// creates people/ + companies/ stub pages. These three ops are its ONLY
+// sanctioned surface:
+//   - extract_entities    — run extraction. Direct authoritative writes need
+//                           BOTH the trusted local CLI (ctx.remote === false)
+//                           AND the explicit --trusted-extraction flag;
+//                           everything else lands in the quarantine lane
+//                           (frontmatter provenance/status markers).
+//   - extraction_pending  — list unverified stubs awaiting review.
+//   - extraction_review   — promote (status → verified) or reject
+//                           (soft-delete) in batch. Owner-only (fail-closed
+//                           on ctx.remote): THIS surface never lets a remote
+//                           caller flip the status markers. Scope note: the
+//                           markers are ordinary frontmatter, so a caller who
+//                           already holds generic remote put_page write scope
+//                           can rewrite the page (markers included) — that
+//                           caller could equally author an unmarked people/
+//                           page directly, so the lane adds no privilege
+//                           there; put_page authz is its own boundary.
+// ---------------------------------------------------------------------------
+
+// Resource guards for extract_entities (#160 hardening): bound the work a
+// single remote write-scope call can trigger. ponytail: flat caps; make them
+// config knobs only if a real workload hits them.
+const MAX_EXTRACT_TEXT_CHARS = 200_000;
+const MAX_EXTRACT_ENTITIES = 200;
+
+const extract_entities: Operation = {
+  name: 'extract_entities',
+  description: 'Extract entity names (people, companies) from text and create/update their brain stub pages. Stubs from untrusted input land in the quarantine lane (frontmatter `provenance: auto-extracted` + `status: unverified`) — excluded from authoritative retrieval boosts until reviewed. Direct authoritative writes require the trusted local CLI AND --trusted-extraction.',
+  params: {
+    text: { type: 'string', required: true, description: 'The text to extract entities from (email, transcript, pasted content, …). Max 200k characters — split larger inputs.' },
+    source_slug: { type: 'string', required: true, description: 'Slug of the source page the text came from (used for backlinks + timeline attribution).' },
+    trusted_extraction: { type: 'boolean', required: false, description: 'Local CLI only: write stubs directly as authoritative pages, skipping the quarantine lane. Ignored (always quarantined) for remote callers.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    // Trust rule (#160, fail-closed like the CV6 provenance gate above):
+    // `ctx.remote === false` is the ONLY truthy condition that can admit a
+    // direct authoritative write, and even then the caller must opt in
+    // explicitly. Remote/unset trust → quarantine lane, flag ignored.
+    const trusted = ctx.remote === false && p.trusted_extraction === true;
+    const text = p.text as string;
+    // Resource guards: the greedy name regex on a huge paste can yield tens
+    // of thousands of "entities", each costing several DB round-trips. Cap
+    // input size loudly and entity count softly (surfaced as `truncated`).
+    if (text.length > MAX_EXTRACT_TEXT_CHARS) {
+      throw new OperationError(
+        'invalid_params',
+        `extract_entities: text is ${text.length} chars (max ${MAX_EXTRACT_TEXT_CHARS}).`,
+        'Split the input and call extract_entities per section.',
+      );
+    }
+    if (ctx.dryRun) return { dry_run: true, action: 'extract_entities', trusted };
+    const { extractEntities, enrichEntities } = await import('./enrichment-service.ts');
+    const found = extractEntities(text);
+    const capped = found.slice(0, MAX_EXTRACT_ENTITIES);
+    const results = await enrichEntities(
+      ctx.engine,
+      capped.map((e) => ({ entityName: e.name, entityType: e.type, context: e.context, sourceSlug: p.source_slug as string })),
+      {
+        trusted,
+        ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+        // Pure local DB writes — no external API call to pace, so the
+        // system-load capacity gate would only stall the caller.
+        throttle: false,
+      },
+    );
+    return {
+      status: 'ok',
+      trusted,
+      quarantined: results.filter((r) => r.quarantined === true).length,
+      count: results.length,
+      entities_found: found.length,
+      truncated: found.length > capped.length,
+      entities: results,
+    };
+  },
+  cliHints: { name: 'extract-entities' },
+};
+
+const extraction_pending: Operation = {
+  name: 'extraction_pending',
+  description: 'List unverified auto-extracted entity stubs awaiting owner review (the quarantine lane from extract_entities). Promote or reject them with extraction_review.',
+  params: {
+    limit: { type: 'number', required: false, description: 'Max rows (default 100, cap 500).' },
+    offset: { type: 'number', required: false, description: 'Pagination offset.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const limit = Math.min(Math.max(Number(p.limit ?? 100) || 100, 1), 500);
+    const offset = Math.max(Number(p.offset ?? 0) || 0, 0);
+    // Read-side source isolation: route through sourceScopeOpts (federated
+    // array > scalar > nothing), applied in SQL below.
+    const scope = sourceScopeOpts(ctx);
+    const params: unknown[] = [];
+    let srcClause = '';
+    if (scope.sourceIds && scope.sourceIds.length > 0) {
+      params.push(scope.sourceIds);
+      srcClause = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (scope.sourceId) {
+      params.push(scope.sourceId);
+      srcClause = `AND p.source_id = $${params.length}`;
+    }
+    params.push(limit, offset);
+    const rows = await ctx.engine.executeRaw<{
+      slug: string; title: string; type: string; source_id: string;
+      extracted_from: string | null; created_at: string;
+    }>(
+      `SELECT p.slug, p.title, p.type, p.source_id,
+              p.frontmatter ->> 'source' AS extracted_from,
+              p.created_at::text AS created_at
+       FROM pages p
+       JOIN sources s ON s.id = p.source_id
+       WHERE ${unverifiedExtractionFragment('p')}
+         ${buildVisibilityClause('p', 's')}
+         ${srcClause}
+       ORDER BY p.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params,
+    );
+    return { count: rows.length, pending: rows };
+  },
+  cliHints: { name: 'extraction-pending' },
+};
+
+const extraction_review: Operation = {
+  name: 'extraction_review',
+  description: 'Promote or reject unverified auto-extracted entity stubs (batch). Promote flips `status` to verified (provenance kept for audit); reject soft-deletes the stub. Owner-only: this op is refused for any non-local caller. (The markers are ordinary frontmatter — the boundary against rewriting them wholesale is put_page write authz, same as for any page.)',
+  params: {
+    action: { type: 'string', required: true, description: "'promote' or 'reject'." },
+    slugs: { type: 'array', required: true, items: { type: 'string' }, description: 'Stub slugs to act on (batch).' },
+  },
+  mutating: true,
+  scope: 'write',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    // The review decision IS the trust gate — if a remote caller could
+    // promote, injected content could self-promote and the quarantine lane
+    // would be decorative. Fail-closed: only strictly-local callers pass.
+    if (ctx.remote !== false) {
+      throw new OperationError(
+        'permission_denied',
+        'extraction_review is owner-only: promote/reject decisions must come from the trusted local CLI.',
+        'Run `gbrain extraction-review <promote|reject> --slugs ...` on the host machine.',
+      );
+    }
+    const action = p.action as string;
+    if (action !== 'promote' && action !== 'reject') {
+      throw new OperationError('invalid_params', `extraction_review: action must be 'promote' or 'reject'; got '${action}'.`);
+    }
+    // CLI passes `--slugs a,b,c` as one string; MCP passes a real array.
+    const slugs = Array.isArray(p.slugs)
+      ? (p.slugs as string[])
+      : typeof p.slugs === 'string'
+        ? p.slugs.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+    if (slugs.length === 0) {
+      throw new OperationError('invalid_params', 'extraction_review: slugs must be a non-empty array (CLI: --slugs slug1,slug2).');
+    }
+    if (ctx.dryRun) return { dry_run: true, action: `extraction_review:${action}`, slugs };
+    const results: Array<{ slug: string; status: string }> = [];
+    for (const slug of slugs) {
+      const page = await ctx.engine.getPage(slug, ctx.sourceId ? { sourceId: ctx.sourceId } : undefined);
+      if (!page) {
+        results.push({ slug, status: 'not_found' });
+        continue;
+      }
+      if (!isUnverifiedExtraction(page.frontmatter)) {
+        results.push({ slug, status: 'not_unverified' });
+        continue;
+      }
+      if (action === 'promote') {
+        // Frontmatter-only flip via a targeted JSONB merge — NOT putPage,
+        // whose upsert would reset non-carried columns (page_kind →
+        // 'markdown', content_hash, …) for a change that only touches one
+        // frontmatter key. provenance stays 'auto-extracted' as the audit
+        // trail of HOW the page came to exist; status → 'verified' records
+        // the owner's call. jsonb_build_object binds as text (no
+        // JSON.stringify-into-::jsonb hazard); identical on both engines.
+        await ctx.engine.executeRaw(
+          `UPDATE pages
+           SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || jsonb_build_object($1::text, $2::text),
+               updated_at = now()
+           WHERE slug = $3 AND source_id = $4`,
+          [EXTRACTION_STATUS_KEY, STATUS_VERIFIED, slug, page.source_id],
+        );
+        results.push({ slug, status: 'promoted' });
+      } else {
+        await ctx.engine.softDeletePage(slug, { sourceId: page.source_id });
+        results.push({ slug, status: 'rejected' });
+      }
+    }
+    return { status: 'ok', action, results };
+  },
+  cliHints: { name: 'extraction-review', positional: ['action'] },
+};
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
@@ -5415,6 +6162,8 @@ export const operations: Operation[] = [
   volunteer_chronicle, chronicle_backfill,
   // v0.43 (#2095): push-based context
   volunteer_context,
+  // Extraction quarantine lane (#160): gated entity extraction + review queue
+  extract_entities, extraction_pending, extraction_review,
   // v0.31: hot memory (facts table)
   extract_facts, recall, forget_fact,
   // v0.32.6: contradiction probe MCP surface (M3)
@@ -5429,6 +6178,8 @@ export const operations: Operation[] = [
   code_blast, code_flow,
   // v0.34 W3b: code_traversal_cache admin clear op
   code_traversal_cache_clear,
+  // #3390: provider-agnostic embedding migration (local-only admin)
+  migrate_embeddings,
   // v0.40.6.0 Schema Cathedral v3: 9 new ops — 7 read + 2 admin (NOT
   // localOnly per D2 so remote agents (your OpenClaw, etc.) can author packs).
   // schema_apply_mutations is batched per D10 — one MCP tool, N

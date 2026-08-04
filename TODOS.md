@@ -1,18 +1,49 @@
 # TODOS
 
+## upstream sync follow-up (396-commit merge, fork branch `feature/pgroonga-chinese-fts`)
+
+- [ ] **P3 — cross-outer-batch restamp tracking misses pages split across `--batch-size`.**
+  `embedStaleForSource` (`src/core/embed-stale.ts`) and `embedAllStale`
+  (`src/commands/embed.ts`) restamp a page's `contextual_retrieval_mode` only
+  when every stale chunk it saw landed cleanly in ONE outer cursor batch
+  (`stale.length === existing.length` after the slice loop). A page whose
+  stale-chunk count exceeds `batchSize` (default 2000) — realistically only
+  `per_chunk_synopsis` pages with very large chunk counts — gets its restamp
+  check evaluated per-batch, so the "did every stale chunk for this page land
+  this pass" condition can be false for a batch that only saw part of the
+  page, even though the full page did eventually complete across batches.
+  Effect: `contextual_retrieval_mode` metadata lags what the vectors actually
+  are (no vector loss, no incorrect restamp — confirmed via codex review
+  2026-08-04). Self-heals on a later reindex sweep. Fix would need tracking
+  "chunks seen this page, this call" across outer-batch boundaries rather
+  than resetting per batch.
+
+## v0.42.67.0 follow-ups (Windows build tooling)
+
+Filed as follow-ups from v0.42.67.0 (`.gitattributes` LF pin for `*.sh` +
+`bash` prefix on the 33 `package.json` check commands). Both items are newly
+observable: before that release these checks never executed on Windows at all,
+so nothing about their runtime was measurable.
+
+- [ ] **P2 — three guard scripts exceed the 120s `run-verify-parallel.sh` cap on Windows.**
+  With the dispatch fixed, `bun run verify` on Windows gets 25 passes and 7 failures, and
+  `check:privacy`, `check:test-names` and `check:test-isolation` are timeouts rather than
+  real failures (they pass on Linux and macOS well inside the cap). They walk the tree with
+  per-file shell loops, which is far slower under Windows process creation. Either raise the
+  cap for these three, or replace the per-file loop with a single `grep -r` pass. Same cap
+  swallows `typecheck`, though standalone `bun run typecheck` exits 0.
+- [ ] **P3 — `check:wasm` cannot create its `node_modules` symlink on Windows.**
+  `scripts/check-wasm-embedded.sh` fails with `ln: failed to create symbolic link
+  '/tmp/gbrain-wasm-check.XXXX/node_modules': No such file or directory`. Unprivileged
+  Windows accounts cannot create symlinks without developer mode. Consider a junction, a
+  copy, or skipping the check with a clear message when symlink creation is unavailable.
+
 ## community fix-wave follow-ups (filed v0.42.60.0)
 
-- [ ] **P1 — take-writes source scoping fails open when source resolution errors (#2684 residual).**
-  `resolveTakesSourceId` (src/commands/takes.ts) swallows resolution errors and returns
-  `undefined`, which falls back to the unscoped slug-only page lookup — so an invalid
-  `GBRAIN_SOURCE` (or a broken dotfile chain) silently restores the pre-#2698 cross-source
-  write behavior on multi-source brains. Decide fail-closed semantics: error out when a
-  source was explicitly requested but doesn't resolve; keep the unscoped fallback only for
-  brains with no source configuration at all. Add a regression test for the invalid-source
-  path. Found by cross-model adversarial review during the v0.42.60.0 release ship.
-- [ ] **P2 — cherry-pick #2112's uncovered doctor.ts hunk.** Fix-wave A (#2820) superseded
+- [x] **P2 — cherry-pick #2112's uncovered doctor.ts hunk.** Fix-wave A (#2820) superseded
   most of #2112 but not its `checkSubagentCapability` fix (check explicit `models.subagent`
-  before `models.tier.subagent`). Refile or cherry-pick; the rest of that PR is covered.
+  before `models.tier.subagent`). Implemented: `checkSubagentCapability` now resolves
+  `models.subagent` before tier/default fallbacks and has regression coverage.
 
 ## v0.42.59.0 follow-ups (five-fix rollup #2735–#2739)
 
@@ -69,17 +100,20 @@ Deferred from the provider-agnostic plumbing wave (#1249/#1250/#1292/#2271/#2209
 Plan + review trail at `~/.claude/plans/system-instruction-you-are-working-keen-newell.md`.
 The eng-review + Codex outside-voice narrowed the wave to these deferrals:
 
-- [ ] **P2 — Capability-aware query expansion on OpenAI-compat providers (#2372).**
+- [x] **P2 — Capability-aware query expansion on OpenAI-compat providers (#2372).**
   Expansion only runs for recipes that declare an `expansion` touchpoint, and only the
   native providers (anthropic/openai/google) do. To make expansion work on
   litellm/openrouter/groq/together/deepseek you must ADD expansion touchpoints to those
   chat-capable recipes AND add a `generateObject`→`generateText` capability fallback for
   backends without strict structured outputs. Feature-shaped; overlaps the general
   OpenAI-compat proxy story (`docs/designs/COMMUNITY_IDEAS.md`). Community PR #2373 is a
-  starting point. Where: `src/core/ai/gateway.ts:expand`, recipe files, `types.ts` (ExpansionTouchpoint).
-- [ ] **P2 — LiteLLM as a chat/expansion backend.** `litellm-proxy` declares ONLY an
+  starting point. Implemented by #2373 plus the DeepSeek/Groq/Together recipe wave,
+  LiteLLM chat/expansion support, and the OpenRouter expansion touchpoint. Where:
+  `src/core/ai/gateway.ts:expand`, recipe files, `types.ts` (ExpansionTouchpoint).
+- [x] **P2 — LiteLLM as a chat/expansion backend.** `litellm-proxy` declares ONLY an
   embedding touchpoint, so `think`/chat on LiteLLM is dead. Add chat (and expansion) so a
-  LiteLLM proxy is a full LLM backend, not embedding-only. The general OpenAI-compat proxy story.
+  LiteLLM proxy is a full LLM backend, not embedding-only. Implemented by #2208.
+  The general OpenAI-compat proxy story.
 - [ ] **P3 — Per-model embedding dims metadata on `EmbeddingTouchpoint`.** `default_dims`
   is recipe-wide, so a recipe (ollama) can't carry different native dims per model. This
   wave added the modern ollama model NAMES + a `trust_custom_dims` passthrough (user supplies
@@ -2287,10 +2321,25 @@ at plan time and got carved out:
   via `buildPerSourceBindings`. Document workaround: register
   source-scoped OAuth clients.
 
-- [ ] **v0.41+: T20 — extends-chain merging in registry.ts.**
-  `registry.ts:167` documents the gap. Implementing full child-wins
-  merge cascades through every consumer of `manifest.page_types`. ~1
-  day CC.
+- [x] **v0.41+: T20 — extends-chain merging in registry.ts.** DONE (#1749).
+  `resolvePack` now merges parent → child (child-wins) for the six
+  ingest/query-shaping fields (`page_types`, `link_types`,
+  `frontmatter_links`, `enrichable_types`, `filing_rules`, `takes_kinds`)
+  plus `borrow_from` materialization, in `src/core/schema-pack/merge.ts`.
+  The cascade was transparent (consumers already read `resolved.manifest`),
+  not per-consumer. `phases`/`calibration_domains` deliberately excluded —
+  see the P3 follow-up below.
+
+- [ ] **P3: explicit opt-in to inherit `phases` / `calibration_domains`.**
+  T20 excludes these two from the child-wins merge because they gate real
+  cycle execution (`cycle.ts` `packDeclaresPhase`) and the manifest
+  contract says each pack declares its own participation explicitly —
+  auto-inheriting would silently make a child run cycle phases it never
+  requested. Multi-level lens packs (`gbrain-everything`) therefore still
+  re-declare them by hand. If that redeclaration becomes painful, add an
+  explicit manifest flag (e.g. `inherit_phases: true`) so a pack author
+  opts in consciously. Depends on: T20 (landed). Start in
+  `src/core/schema-pack/merge.ts` (`mergeInheritedManifest`).
 
 - [ ] **v0.41+: T21 — comment-preserving YAML emitter.**
   v0.40.7.0 emitter does NOT preserve comments. Authors who care
@@ -2549,7 +2598,7 @@ contributor traps.
 
 - [ ] **v0.37.x: Adopt `resolveDefaultHeaders` for Together / Groq / other attribution-bearing recipes.** v0.37.6.0's `default_headers` / `resolveDefaultHeaders` seam is generic — any recipe whose provider benefits from app-attribution headers can opt in. Together and Groq both have rankings/analytics tied to per-app headers. Add their respective attribution headers to each recipe, similar to OR's `HTTP-Referer` + `X-OpenRouter-Title`. No type-system or gateway changes needed; just `default_headers` blocks on the existing recipes plus `<PROVIDER>_REFERER` / `<PROVIDER>_TITLE` env vars in their `auth_env.optional`. Filed during v0.37.6.0 eng review as a D4 generalization opportunity.
 
-- [ ] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
+- [x] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
 
 
 ## v0.37.4.0 pgGraph CI scaffolding follow-ups (v0.37.x+)

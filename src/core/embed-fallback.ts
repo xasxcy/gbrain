@@ -1,4 +1,4 @@
-import { classifyEmbedFailure, isInvalidInputError } from './embed-failure.ts';
+import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from './embed-failure.ts';
 import { isMustAbortError } from './worker-pool.ts';
 
 /**
@@ -25,8 +25,10 @@ export function isOllamaBatchSplitWorthyError(error: unknown): boolean {
  * V4 Ollama predicate and first-failure semantics.
  */
 export function isPartialStaleSplitWorthyError(error: unknown): boolean {
-  // Only explicit configuration faults are run-global. Every other provider
-  // error gets a one-chunk salvage attempt in the stale-only pipeline.
+  // Configuration faults and transient/rate-limit errors (#3037 cost
+  // bounding) are run-global. Every other provider error gets a one-chunk
+  // salvage attempt in the stale-only pipeline.
+  if (isTransientEmbedError(error)) return false;
   return classifyEmbedFailure(error).kind === 'failure';
 }
 

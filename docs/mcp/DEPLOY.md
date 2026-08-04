@@ -250,13 +250,50 @@ All 30 GBrain operations are available remotely, including `sync_brain` and
 directory where `gbrain serve` was launched. Symlinks, `..` traversal, and absolute
 paths outside cwd are rejected. Page slugs and filenames are allowlist-validated
 (alphanumeric + hyphens; no control chars, RTL overrides, or backslashes). Local
-CLI callers (`gbrain file upload ...`) keep unrestricted filesystem access since
+CLI callers (`gbrain files upload ...`) keep unrestricted filesystem access since
 the user owns the machine.
 
 ## Deployment Options
 
 See [ALTERNATIVES.md](ALTERNATIVES.md) for a comparison of ngrok, Tailscale
 Funnel, and cloud hosts (Fly.io, Railway).
+
+### Co-located Docker workloads (self-hosted Postgres)
+
+OAuth scopes and source scoping guard the `gbrain serve --http` path. They do
+NOT guard raw Postgres. If the brain's Postgres runs as a container on the same
+Docker host as other workloads (agent runtimes, n8n, staging fixtures), any
+container sharing Docker's default `bridge` network can open a direct DB
+session — no OAuth token required — and read every source. That silently
+recreates a privileged path underneath the isolation you configured at the MCP
+layer.
+
+Network-zone the host so untrusted containers can never reach Postgres:
+
+```
+Docker host
+├── gbrain-net          ← ONLY the brain's Postgres (+ gbrain serve, if containerized)
+├── agent-<id>-net      ← each untrusted agent runtime, isolated
+└── default bridge      ← no secret-bearing databases
+```
+
+Operator checklist:
+
+```text
+[ ] Postgres is on a user-defined Docker network, not the default bridge
+    (or nothing else runs on that bridge)
+[ ] If Postgres publishes a host port at all, it binds loopback only
+    (`-p 127.0.0.1:5432:5432`, never `0.0.0.0`)
+[ ] Untrusted agent containers have no DATABASE_URL or Postgres password
+[ ] Untrusted agents reach the brain via OAuth/Bearer against serve --http only
+    (host loopback via host.docker.internal / host gateway — never gbrain-net)
+[ ] OAuth clients are least-privilege: scoped --source / --federated-read,
+    pre-minted short-lived tokens preferred over long-lived client secrets
+[ ] Isolation verified: a team-scoped client cannot read internal-only sources
+```
+
+Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
+allowed `source_id`s, so even a leaked connection string can't read everything.
 
 ## Troubleshooting
 

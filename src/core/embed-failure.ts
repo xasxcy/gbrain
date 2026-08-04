@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { AIConfigError } from './ai/errors.ts';
+import { AIConfigError, AITransientError } from './ai/errors.ts';
 
 export type EmbedFailureClass =
   | 'provider_timeout'
@@ -14,6 +14,24 @@ export type EmbedFailureClassification =
 export function isInvalidInputError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /invalid input|input (?:is )?too long|context length|token limit|unprocessable entity/i.test(message);
+}
+
+/**
+ * #3037 cost bounding: rate-limit (429) and transient outage errors must
+ * never be treated as split-worthy — fanning a struggling/rate-limited
+ * provider out into N single-chunk calls makes the outage worse, it doesn't
+ * salvage anything. Mirrors src/commands/embed.ts's isRateLimitError.
+ */
+export function isTransientEmbedError(error: unknown): boolean {
+  if (error instanceof AITransientError) return true;
+  let cur: unknown = error;
+  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
+    const obj = cur as { status?: unknown; statusCode?: unknown; cause?: unknown };
+    if (obj.status === 429 || obj.statusCode === 429) return true;
+    cur = obj.cause;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /rate.?limit|429/i.test(message);
 }
 
 export function classifyEmbedFailure(error: unknown): EmbedFailureClassification {
