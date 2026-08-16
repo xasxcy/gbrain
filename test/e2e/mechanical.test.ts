@@ -737,7 +737,7 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
       await sql`
         INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
         VALUES (${seedSlug}, ${'nf-' + String(i).padStart(3, '0') + '.txt'}, ${seedSlug + '/nf-' + i + '.txt'}, ${'text/plain'}, ${100}, ${'nhash-' + i}, ${'{}'}::jsonb)
-        ON CONFLICT (storage_path) DO NOTHING
+        ON CONFLICT (source_id, storage_path) DO NOTHING
       `;
     }
     const total = await sql`SELECT count(*)::int AS n FROM files`;

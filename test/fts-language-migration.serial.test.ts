@@ -70,15 +70,13 @@ describe('configurable_fts_language migration', () => {
     expect(calls[1]).toContain('SET search_path = pg_catalog, public');
   });
 
-  test('non-english language triggers content_chunks backfill only (pages backfill moved to v128)', async () => {
-    // FORK-FIX (2026-07-22, batch 2, item 2): v127 now installs the FINAL
-    // (no-compiled_truth) pages trigger from the start instead of a
-    // transitional compiled_truth-including one, which removes the
-    // overflow risk that made the old `UPDATE pages SET id = id` backfill
-    // in this migration crash on large pages (#2704 follow-up). Backfilling
-    // EXISTING pages.search_vector rows is now v128's job \u2014 batched, and
-    // for every language, not just non-English (see v128's own tests) \u2014
-    // so v127 no longer touches the pages table at all.
+  test('non-english language backfills both pages and content_chunks (upstream shape)', async () => {
+    // configurable_fts_language is upstream's migration, kept byte-identical
+    // so the automated upstream sync stops conflicting on migrate.ts. Its
+    // non-English path recreates both trigger functions and then backfills
+    // pages (via UPDATE-to-same-value) and content_chunks. The pages trigger
+    // it installs still indexes compiled_truth; the fork narrows that in its
+    // own later migration, asserted separately below.
     const ftsMig = MIGRATIONS.find(m => m.name === 'configurable_fts_language');
     const calls: string[] = [];
 
@@ -94,17 +92,54 @@ describe('configurable_fts_language migration', () => {
 
     await ftsMig?.handler?.(mockEngine);
 
-    // pt_br \u2014 2 CREATE (pages fn, chunk fn) + 1 content_chunks backfill = 3 calls.
-    expect(calls.length).toBe(3);
+    // pt_br \u2014 2 CREATE (pages fn, chunk fn) + pages backfill + chunks backfill.
+    expect(calls.length).toBe(4);
     expect(calls[0]).toContain("to_tsvector('pt_br'");
     expect(calls[0]).toContain('update_page_search_vector');
-    expect(calls[0]).not.toContain('compiled_truth');
     expect(calls[1]).toContain("to_tsvector('pt_br'");
     expect(calls[1]).toContain('update_chunk_search_vector');
-    expect(calls[2]).toContain("to_tsvector('pt_br'");
-    expect(calls[2]).toMatch(/UPDATE content_chunks/);
-    for (const sql of calls) {
-      expect(sql).not.toMatch(/UPDATE pages/);
+    expect(calls[2]).toMatch(/UPDATE pages/);
+    expect(calls[3]).toContain("to_tsvector('pt_br'");
+    expect(calls[3]).toMatch(/UPDATE content_chunks/);
+  });
+
+  test('the fork migration installs a compiled_truth-free pages trigger and backfills in batches', async () => {
+    // The fork's standing repair for upstream's #2704 pair. Upstream's
+    // configurable_fts_language still builds pages.search_vector from
+    // compiled_truth (unbounded whole-page body, overflows Postgres's 1MB
+    // tsvector cap on large pages) and upstream's
+    // page_search_vector_drop_compiled_truth never backfills existing rows.
+    // This migration owns both halves for the fork. Looked up BY NAME: fork
+    // migrations are re-sequenced to max(upstream)+1 on every sync.
+    const forkMig = MIGRATIONS.find(
+      m => m.name === 'fork_page_search_vector_final_trigger_and_batched_backfill',
+    );
+    expect(forkMig).toBeDefined();
+    const calls: string[] = [];
+
+    const mockEngine = {
+      executeRaw: async (sql: string) => {
+        calls.push(sql);
+        return [];
+      },
+    } as unknown as BrainEngine;
+
+    process.env[ENV_KEY] = 'pt_br';
+    resetFtsLanguageCache();
+
+    await forkMig!.handler!(mockEngine);
+
+    // The installed pages trigger must not index compiled_truth.
+    expect(calls[0]).toContain('update_page_search_vector');
+    expect(calls[0]).not.toContain('compiled_truth');
+    expect(calls[0]).toContain('SET search_path = pg_catalog, public');
+    // The backfill must be batched (keyset over the SERIAL PK), never a
+    // single unbounded UPDATE holding a lock over the whole pages table.
+    const backfills = calls.filter(sql => /UPDATE pages/.test(sql));
+    expect(backfills.length).toBeGreaterThan(0);
+    for (const sql of backfills) {
+      expect(sql).toMatch(/WHERE id > \$1 AND search_vector IS NOT NULL/);
+      expect(sql).toMatch(/LIMIT \$2/);
     }
   });
 

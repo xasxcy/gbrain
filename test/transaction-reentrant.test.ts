@@ -13,6 +13,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -91,6 +92,10 @@ d('transaction() re-entrancy (Postgres)', () => {
   let engine: PostgresEngine;
 
   beforeAll(async () => {
+    // Connects directly instead of going through setupDB(), so it owns the
+    // production guard itself: initSchema + the fixture writes below run
+    // against whatever DATABASE_URL points at.
+    assertSafeE2eDatabaseUrl(DATABASE_URL!);
     engine = new PostgresEngine();
     await engine.connect({ database_url: DATABASE_URL! } as never);
     await engine.initSchema();

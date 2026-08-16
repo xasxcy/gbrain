@@ -50,32 +50,36 @@ describe('persistEmbedOutcome', () => {
     expect((await engine.listStaleChunks({ signature: 'sig' })).map(r => r.chunk_index)).toEqual([0, 1]);
   });
 
-  test('v126 itself covers fresh, upgrade, replay, and verify', async () => {
-    const v126 = MIGRATIONS.find((migration) => migration.version === 126);
-    expect(v126).toBeDefined();
+  test('embed_failures_ledger covers fresh, upgrade, replay, and verify', async () => {
+    // Looked up by NAME, not version number. Fork migrations are re-sequenced
+    // to max(upstream)+1 on every upstream sync, so any hardcoded number here
+    // is a merge-time landmine — this entry has already moved 126 -> 134.
+    const ledger = MIGRATIONS.find((migration) => migration.name === 'embed_failures_ledger');
+    expect(ledger).toBeDefined();
+    const priorVersion = String(ledger!.version - 1);
     // Fresh schema includes the canonical objects.
     await engine.initSchema();
     expect(await engine.executeRaw(`SELECT 1 FROM information_schema.tables WHERE table_name = 'embed_failures'`)).toHaveLength(1);
     expect(await engine.executeRaw(`SELECT 1 FROM pg_indexes WHERE indexname = 'embed_failures_active_idx'`)).toHaveLength(1);
-    expect(await v126!.verify!(engine)).toBe(true);
+    expect(await ledger!.verify!(engine)).toBe(true);
 
-    // Upgrade starts at v125 with the v126 objects absent, then executes the
-    // real migration entry and its verify hook. runMigrations always drives
-    // the schema to LATEST_VERSION (not just v126), so the assertion here
-    // targets v126's own behavior — the migration count pending after v125
-    // and v126's verify — instead of hardcoding "latest == 126", which broke
-    // (applied:1,current:126 → applied:3,current:128) the moment v127/v128
-    // were added.
-    const pendingFromV125 = MIGRATIONS.filter((m) => m.version > 125).length;
+    // Upgrade starts one version below the ledger migration with its objects
+    // absent, then executes the real migration entry and its verify hook.
+    // runMigrations always drives the schema to LATEST_VERSION (not just to
+    // this migration), so the assertion targets THIS migration's own behavior
+    // — the pending count from the prior version plus its verify — instead of
+    // hardcoding a latest-version equality, which broke the moment later
+    // migrations were added.
+    const pendingFromPrior = MIGRATIONS.filter((m) => m.version >= ledger!.version).length;
     await engine.executeRaw(`DROP TABLE embed_failures`);
-    await engine.setConfig('version', '125');
-    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromV125, current: LATEST_VERSION });
-    expect(await v126!.verify!(engine)).toBe(true);
+    await engine.setConfig('version', priorVersion);
+    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromPrior, current: LATEST_VERSION });
+    expect(await ledger!.verify!(engine)).toBe(true);
 
     // Replay is the migration body again, not a second fresh-schema init.
-    await engine.setConfig('version', '125');
-    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromV125, current: LATEST_VERSION });
-    expect(await v126!.verify!(engine)).toBe(true);
+    await engine.setConfig('version', priorVersion);
+    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromPrior, current: LATEST_VERSION });
+    expect(await ledger!.verify!(engine)).toBe(true);
   });
 
   test('atomically persists vectors, writes failures, and removes a stale ledger generation', async () => {
