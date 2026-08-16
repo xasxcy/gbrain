@@ -6049,6 +6049,47 @@ export const MIGRATIONS: Migration[] = [
       migrationNotice('  v136: re-applied upstream migrations 126/127/128 masked by the fork renumber\n');
     },
   },
+  {
+    version: 137,
+    name: 'repair_masked_upstream_125',
+    // Fourth masked migration, missed by v136. v136 was derived by diffing
+    // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
+    // (take_proposals_per_claim_idempotency) was masked a different way: the
+    // pre-merge MIGRATIONS array carried v125 TWICE. The fork's
+    // repair_code_edges_... sat at v125 ahead of upstream's entry, so the
+    // runner stamped the high-water at 125 after the first one and upstream's
+    // never became pending. A duplicate version IS a masking instance, not
+    // merely a numbering-hygiene defect.
+    //
+    // Confirmed on the production brain (stamped 136) before writing this:
+    //   take_proposals_idempotency_idx = (source_id, page_slug, content_hash,
+    //   prompt_version) — md5(claim_text) absent, i.e. upstream v125's DDL
+    //   never ran. Effect: every claim after the first on a page is silently
+    //   dropped by ON CONFLICT. (take_proposals was empty, so nothing was lost
+    //   yet — this is a latent defect, repaired here before the feature is used.)
+    //
+    // Same lookup-don't-copy shape as v136. Unlike v136 this one carries a
+    // verify hook: the repair has a cheap, exact server-side postcondition
+    // (the index expression), so there is no reason to accept a silent no-op.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      const masked = MIGRATIONS.find(m => m.version === 125);
+      if (masked) await applyOneMigration(engine, masked);
+      migrationNotice('  v137: re-applied upstream migration 125 masked by the duplicate v125 entry\n');
+    },
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ def: string | null }>(
+        `SELECT pg_get_indexdef(oid) AS def FROM pg_class
+          WHERE relname = 'take_proposals_idempotency_idx'`,
+      );
+      // No index at all means take_proposals predates the idempotency work on
+      // this brain; the repair has nothing to assert. A present index MUST
+      // carry the per-claim term.
+      if (rows.length === 0) return true;
+      return (rows[0]?.def ?? '').includes('md5(claim_text)');
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
