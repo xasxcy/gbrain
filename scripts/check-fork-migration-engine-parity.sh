@@ -30,6 +30,11 @@ import re, sys, os
 
 repo = sys.argv[1]
 migrate_ts = os.path.join(repo, 'src', 'core', 'migrate.ts')
+# The fork's migration bodies live outside upstream's migrate.ts (ADR-087).
+# Both files must be scanned: the composite-unique constraint this checker
+# exists to guard (files -> UNIQUE(source_id, storage_path)) is a FORK
+# migration, so scanning migrate.ts alone would find nothing and pass.
+fork_migrations_ts = os.path.join(repo, 'src', 'core', 'fork-migrations.ts')
 engine_files = [
     os.path.join(repo, 'src', 'core', 'postgres-engine.ts'),
     os.path.join(repo, 'src', 'core', 'pglite-engine.ts'),
@@ -37,6 +42,24 @@ engine_files = [
 
 with open(migrate_ts) as f:
     migrate_src = f.read()
+
+# fork-migrations.ts is fork-owned and its absence is itself the failure this
+# checker has to catch: the upstream sync script rewrites migrate.ts and could
+# drop the wiring, at which point every check below would still pass — on
+# upstream's migrations alone. Fail before parsing, not after.
+if not os.path.exists(fork_migrations_ts):
+    print(
+        '[check-fork-migration-engine-parity] FAILED: src/core/fork-migrations.ts is '
+        'missing. The fork migrations it holds (ADR-087) are what this checker exists '
+        'to guard; without it the checks below would pass on upstream migrations alone.',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+with open(fork_migrations_ts) as f:
+    fork_src = f.read()
+# Newline-joined, not spliced: the scanner is offset-based and each file is
+# independently brace-balanced, so concatenating is safe.
+migrate_src += '\n' + fork_src
 
 # ---------------------------------------------------------------------------
 # Extract sqlFor objects with a small boundary-aware TypeScript scanner.
@@ -258,6 +281,8 @@ UNIQUE_CONSTR_RE = re.compile(
 )
 ON_CONFLICT_RE = re.compile(r'ON\s+CONFLICT\s*\(\s*([^)]+)\s*\)', re.IGNORECASE)
 
+composite_constraints_seen = 0
+
 for mig in all_migrations:
     for engine, sql in mig['sqlFor'].items():
         if not sql.strip():
@@ -266,6 +291,7 @@ for mig in all_migrations:
             cols = [c.strip() for c in cm.group(1).split(',')]
             if len(cols) <= 1:
                 continue  # single-column key — no composite parity issue
+            composite_constraints_seen += 1
             mig_table = preceding_alter_table(sql, cm.start())
             for fname, content in engine_contents.items():
                 for ocm in ON_CONFLICT_RE.finditer(content):
@@ -282,6 +308,33 @@ for mig in all_migrations:
                             f"added by migration '{mig['name']}' [{engine}] on {table_note}.\n"
                             f"    Update to: ON CONFLICT ({', '.join(cols)})"
                         )
+
+# Fail closed on zero FORK coverage.
+#
+# Counting composite constraints across BOTH files is not enough: upstream has
+# composite UNIQUE constraints of its own, so that count stays non-zero even
+# when the fork's migrations have vanished entirely. (Verified — with
+# fork-migrations.ts removed, the earlier version of this guard still exited 0.)
+# The invariant that actually matters is that the FORK file contributed, so
+# assert against it specifically.
+fork_only = extract_sql_for_migrations(fork_src)
+if not fork_only:
+    print(
+        '[check-fork-migration-engine-parity] FAILED: src/core/fork-migrations.ts '
+        'contributed no sqlFor migrations. Either the fork migrations were dropped by '
+        'an upstream sync, or they no longer use sqlFor — in both cases Check A and B '
+        'are running on upstream migrations only and a pass here is green-on-empty.',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if composite_constraints_seen == 0:
+    print(
+        '[check-fork-migration-engine-parity] FAILED: no composite UNIQUE constraint '
+        'found in any sqlFor migration, so Check A had nothing to compare ON CONFLICT '
+        'targets against.',
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Check B: ADD CONSTRAINT <name> without any idempotency guard.
