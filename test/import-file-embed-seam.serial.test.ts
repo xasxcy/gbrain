@@ -3,7 +3,10 @@
  *
  * Hermetic: the embedding module is mocked before importing import-file.ts;
  * the engine is an in-memory Proxy recorder (getPage/config default to
- * "nothing on file"). No gateway, network, or DB is used.
+ * "nothing on file"). No gateway, network, or DB is used. The first case
+ * overrides that default with a minimal write-then-read page store, because
+ * importFromContent's closing verifyPageReadable would otherwise fail before
+ * the embedding assertions are reached — see the comment there.
  *
  * Locks two behaviours production checkpoint-drain evidence showed missing:
  *   1. `importFromContent`'s inline embed call at import-file.ts:707 must
@@ -64,9 +67,20 @@ describe('markdown import inline-embed fallback (import-file.ts:707 seam)', () =
     };
 
     const stored: any[][] = [];
+    // Minimal write-then-read store. importFromContent ends with
+    // verifyPageReadable, which re-reads the page it just wrote and throws if
+    // getPage returns null — a real guard against the silent-desync class, and
+    // unconditional since long before this test existed. The default recorder
+    // ("putPage writes nothing, getPage always null") models a database that
+    // lost the write, so this test could never reach its own assertions.
+    //
+    // That negative case is not this test's job: it is covered explicitly, both
+    // branches, in test/write-verify-guard.test.ts. The SUT here is the inline
+    // embedding seam. Same in-memory-page-store shape as test/import-file.ts.
+    const pages = new Map<string, any>();
     const engine = mockEngine({
-      getPage: async () => null,
-      putPage: async () => {},
+      getPage: async (slug: string) => pages.get(slug) ?? null,
+      putPage: async (slug: string, page: any) => { pages.set(slug, { slug, ...page }); },
       updatePageContextualRetrievalState: async () => {},
       upsertChunks: async (_slug: string, chunks: any[]) => {
         stored.push(chunks);

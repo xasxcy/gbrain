@@ -189,22 +189,42 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
 
-  test('non-OOM error bypasses fallback: only ONE call, chunk stays NULL', async () => {
+  test('sustained 429 is rethrown without per-chunk or truncation fan-out', async () => {
+    // SCOPE. Injecting embedFn bypasses production's first line of defence:
+    // embedBatchWithBackoff (src/commands/embed.ts) recognises a 429 and backs
+    // off up to 5 times before rethrowing. So a 429 arriving HERE means that
+    // backoff is already exhausted — "sustained", not "first sighting". This
+    // case pins the second layer's behaviour, and says nothing about how many
+    // times production retries a 429.
+    //
+    // At this layer the contract is: do NOT fan out. isPartialStaleSplitWorthyError
+    // returns false for transient errors precisely so a rate limit is not
+    // amplified into N single-chunk requests (#3037), and embed-stale.ts:239-244
+    // then rethrows the fatalError unconditionally — "any run-global terminal
+    // error must still propagate and reject the whole embedStaleForSource call".
+    //
+    // The test used to assert the opposite (that the call returns normally with
+    // done: true). It had contradicted the implementation since it was written;
+    // it is not a regression from any particular merge.
     const text = 'z'.repeat(6000);
     await seedChunk('non-oom', text);
 
-    let callCount = 0;
-    const result = await embedStaleForSource(engine, 'default', {
-      embedFn: async () => {
-        callCount++;
-        throw new Error('rate_limit_exceeded: 429'); // NOT an OOM-like error
+    const fatal = new Error('rate_limit_exceeded: 429'); // NOT an OOM-like error
+    const calls: number[][] = [];
+    const promise = embedStaleForSource(engine, 'default', {
+      embedFn: async (texts: string[]) => {
+        calls.push(texts.map((t: string) => t.length));
+        throw fatal;
       },
     });
 
-    // Batch call fails with non-OOM → rethrown immediately, no per-chunk retry
-    expect(callCount).toBe(1);
-    expect(result.embedded).toBe(0);
-    expect(result.done).toBe(true);
+    // Identity, not message: a wrapped-and-rethrown error would still match on
+    // message while having lost the original.
+    await expect(promise).rejects.toBe(fatal);
+    // Exact call shape, not just a count: proves there was neither a per-chunk
+    // split nor a 5500/5000/4500 truncation ladder.
+    expect(calls).toEqual([[6000]]);
+    // And no embedding was fabricated on the way out.
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
 
