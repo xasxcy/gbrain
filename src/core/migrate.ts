@@ -11,6 +11,26 @@ import {
 import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
 
 /**
+ * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
+ * what this migration changed" lines that specific handlers write to stderr)
+ * are suppressed. Set by runMigrations for a FRESH-install full replay — those
+ * notices are useful diagnostics on an UPGRADE but pure noise as a new user's
+ * first-run output. Module-level (not threaded through the Migration type)
+ * because only a couple of handlers emit them. Guarded via `migrationNotice`.
+ * Known limitation: concurrent runMigrations calls in one process (two engines
+ * migrating simultaneously) share this flag — worst case is a suppressed or
+ * extra stderr NOTICE line; migration execution/stamping is unaffected.
+ */
+let quietMigrationNotices = false;
+
+/** Write a per-migration explanatory notice unless fresh-install quiet mode is
+ *  on. Handlers should route their "what changed" lines through this. */
+function migrationNotice(line: string): void {
+  if (quietMigrationNotices) return;
+  process.stderr.write(line);
+}
+
+/**
  * Schema migrations — run automatically on initSchema().
  *
  * Each migration is a version number + idempotent SQL. Migrations are embedded
@@ -180,6 +200,9 @@ export const MIGRATIONS: Migration[] = [
           }
         }
       }
+      // Migration progress goes to stderr — stdout must stay clean for
+      // callers parsing JSON (e.g. `gbrain doctor --json | jq`); migrations
+      // can run lazily inside ANY command's first DB connect.
       if (renamed > 0) process.stderr.write(`  Renamed ${renamed} slugs\n`);
     },
   },
@@ -5441,6 +5464,397 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 123,
+    name: 'configurable_fts_language',
+    // Recreate the two search_vector trigger functions using the language
+    // configured via GBRAIN_FTS_LANGUAGE (default 'english'). Idempotent:
+    // CREATE OR REPLACE swaps the function body atomically; no trigger
+    // recreation needed since the trigger references the function by name.
+    //
+    // Why a handler instead of a static SQL string: Postgres tsvector
+    // functions don't accept parameterized config names — the language
+    // must be a literal in the SQL. getFtsLanguage() validates the value
+    // (lowercase letters/digits/underscores only) before interpolation.
+    //
+    // Function bodies mirror schema.sql / pglite-schema.ts exactly —
+    // INCLUDING the `SET search_path = pg_catalog, public` hardening from
+    // v120/#1647 (CREATE OR REPLACE resets proconfig, so omitting it here
+    // would silently strip the hardening on every upgraded brain). Only
+    // the text-search config name is parameterized. Keep all copies in
+    // sync when the trigger logic changes.
+    //
+    // Backfill: after recreating the functions, re-tokenize existing rows
+    // under the new language. Skipped when the configured language is
+    // 'english' (trigger output identical — re-tokenizing is wasted I/O).
+    // To change language after this migration has run, use
+    // `gbrain reindex-search-vector`.
+    sql: '',
+    handler: async (engine) => {
+      const lang = getFtsLanguage();
+
+      const recreatePagesFn = `
+        CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
+        DECLARE
+          timeline_text TEXT;
+        BEGIN
+          SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+          INTO timeline_text
+          FROM timeline_entries
+          WHERE page_id = NEW.id;
+
+          NEW.search_vector :=
+            setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') ||
+            setweight(to_tsvector('${lang}', coalesce(NEW.compiled_truth, '')), 'B') ||
+            setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') ||
+            setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
+
+          RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql;
+      `;
+
+      const recreateChunksFn = `
+        CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS $fn$
+        BEGIN
+          NEW.search_vector :=
+            setweight(to_tsvector('${lang}', COALESCE(NEW.doc_comment, '')), 'A') ||
+            setweight(to_tsvector('${lang}', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
+            setweight(to_tsvector('${lang}', COALESCE(NEW.chunk_text, '')), 'B');
+          RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql;
+      `;
+
+      await engine.executeRaw(recreatePagesFn);
+      await engine.executeRaw(recreateChunksFn);
+
+      if (lang === 'english') {
+        // stderr, NOT stdout: migrations run lazily inside any command's
+        // first DB connect — a console.log here polluted `doctor --json`
+        // stdout and broke jq consumers (heavy-tests fm_wallclock).
+        migrationNotice(`  v123: trigger functions recreated with language='english' (default — no backfill needed)\n`);
+        return;
+      }
+
+      // Backfill existing rows under the new tokenizer. UPDATE-to-same-value
+      // re-fires the pages trigger; chunks are rewritten directly with the
+      // same expression as the trigger.
+      await engine.executeRaw(`
+        UPDATE pages SET id = id
+        WHERE search_vector IS NOT NULL;
+      `);
+
+      await engine.executeRaw(`
+        UPDATE content_chunks
+        SET search_vector =
+          setweight(to_tsvector('${lang}', COALESCE(doc_comment, '')), 'A') ||
+          setweight(to_tsvector('${lang}', COALESCE(symbol_name_qualified, '')), 'A') ||
+          setweight(to_tsvector('${lang}', COALESCE(chunk_text, '')), 'B')
+        WHERE search_vector IS NOT NULL;
+      `);
+
+      migrationNotice(`  v123: trigger functions recreated with language='${lang}' + backfilled existing rows\n`);
+    },
+  },
+  {
+    version: 124,
+    name: 'page_search_vector_drop_compiled_truth',
+    // #2704: a single markdown page whose compiled_truth exceeds Postgres's
+    // hard 1,048,575-byte tsvector cap made update_page_search_vector()
+    // throw "string is too long for tsvector" INSIDE the pages UPSERT
+    // transaction — not a per-file ledger entry, a transaction abort. The
+    // whole source's sync checkpoint stayed pinned (Sync BLOCKED) until the
+    // oversized file was fixed or manually skipped, even though every
+    // OTHER file in the run imported fine.
+    //
+    // Fix: drop compiled_truth (the unbounded whole-page body) from this
+    // trigger. It was already redundant — content_chunks.search_vector
+    // (Cathedral II Layer 3, v0.20.0) is the ACTUAL keyword-search source:
+    // searchKeyword() in postgres-engine.ts/pglite-engine.ts ranks and
+    // queries `cc.search_vector` exclusively; `pages.search_vector` is
+    // written by this trigger but never read by any query in this
+    // codebase (verified: no `pages.search_vector`/bare `search_vector`
+    // appears on either side of a WHERE/ts_rank anywhere outside this
+    // trigger's own definition and the reindex/backfill machinery that
+    // maintains it). And chunking already bounds each chunk_text well
+    // under the tsvector limit (chunkText() targets embedding-sized
+    // pieces, several orders of magnitude smaller than 1MB) — the overflow
+    // was specific to the whole-page grain this trigger no longer builds.
+    //
+    // title + timeline (both naturally small — a compiled_truth-sized
+    // title or timeline field would be its own bug) stay, so
+    // pages.search_vector keeps carrying SOME signal rather than going
+    // fully inert; a future PR can drop the column outright once its
+    // last non-search consumer (if any turns up) is confirmed gone.
+    //
+    // No backfill: existing rows keep whatever search_vector they already
+    // computed until their next UPDATE (harmless — nothing reads this
+    // column, so staleness has zero behavioral effect). The brains that
+    // actually hit this bug never successfully wrote a value for the
+    // oversized page in the first place, so there's nothing stale to fix
+    // for them specifically — the NEXT sync of that exact file is what
+    // proves the fix, not a backfill of already-working rows.
+    //
+    // Function body mirrors reindex-search-vector.ts's recreatePagesFn
+    // (documented contract there: keep both in lockstep) and the fresh-
+    // install baselines in pglite-schema.ts / schema-embedded.ts — all
+    // four updated in the same commit as this migration.
+    sql: '',
+    handler: async (engine) => {
+      const lang = getFtsLanguage();
+      await engine.executeRaw(`
+        CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
+        DECLARE
+          timeline_text TEXT;
+        BEGIN
+          SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+          INTO timeline_text
+          FROM timeline_entries
+          WHERE page_id = NEW.id;
+
+          NEW.search_vector :=
+            setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') ||
+            setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') ||
+            setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
+
+          RETURN NEW;
+        END;
+        $fn$ LANGUAGE plpgsql;
+      `);
+      migrationNotice(`  v124: update_page_search_vector() no longer indexes compiled_truth (was overflowing tsvector on large pages, #2704)
+`);
+    },
+  },
+  {
+    version: 125,
+    name: 'take_proposals_per_claim_idempotency',
+    // #2138: the original idempotency key was per page, so each INSERT after
+    // the first claim silently conflicted. md5(claim_text) makes it per claim
+    // without adding/backfilling a column. The new key is strictly finer than
+    // the old key and therefore preserves all existing rows.
+    idempotent: true,
+    sql: `
+      DROP INDEX IF EXISTS take_proposals_idempotency_idx;
+      CREATE UNIQUE INDEX IF NOT EXISTS take_proposals_idempotency_idx
+        ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
+    `,
+  },
+  {
+    version: 126,
+    name: 'session_context_state',
+    // v0.45.7 (issue #1) ambient recall — per-session cursor + boundary-tie
+    // dedup for the `delta` verb and the heartbeat runtime. Key is
+    // (source_id, client_id, session_id): client_id defaults to the 'local'
+    // sentinel for the CLI/hook path; REMOTE callers pass their auth client id
+    // so two harnesses in one source can't stomp/read each other's cursor
+    // (eng 1B). ONE key shape — no split key, no NULL branch. surfaced_slugs
+    // holds the boundary set: page slugs delivered AT the cursor timestamp,
+    // REPLACED on every advance (bounded by the delta fetch limit). jsonb
+    // columns default to '[]'::jsonb (a DDL LITERAL default — the ::jsonb
+    // param double-encode trap only bites INSERT/UPDATE binds, not DDL
+    // defaults; writes bind via executeRaw + $N::text::jsonb, guarded by
+    // scripts/check-jsonb-params.mjs). Created empty; plain CREATE INDEX
+    // is instant — no CONCURRENTLY. RLS: covered by the v35
+    // auto_rls_on_create_table event trigger on Postgres. Keep in sync with
+    // src/schema.sql, src/core/pglite-schema.ts, src/core/schema-embedded.ts.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS session_context_state (
+        source_id         TEXT NOT NULL,
+        client_id         TEXT NOT NULL DEFAULT 'local',
+        session_id        TEXT NOT NULL,
+        standing_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+        surfaced_slugs    JSONB NOT NULL DEFAULT '[]'::jsonb,
+        last_wake_at      TIMESTAMPTZ,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, client_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
+        ON session_context_state (updated_at);
+    `,
+  },
+  {
+    version: 127,
+    name: 'oauth_client_surface_and_minion_queue_index',
+    // WP4 (MCP consumer-feedback wave) — two additive pieces:
+    //
+    // 1. oauth_clients.surface + surface_set_by (amendments 17-19): the
+    //    per-client MCP tool surface consumed by the D2 ceiling resolution in
+    //    serve-http (`min(server --surface ceiling, row surface ?? config
+    //    default)`) and written by `gbrain auth rescope-client --surface`
+    //    (surface_set_by='operator', the lock the request_tools persist
+    //    branch cannot override) and the `request_tools` meta-op
+    //    (surface_set_by='self'). TEXT with an OPEN value space (amendment
+    //    18): unrecognized values are ignored at resolution (warn-once per
+    //    client), and future client tiers will write tier names into this
+    //    same column — never a second column. NULL = no per-client surface
+    //    (server/config resolution applies). verifyAccessToken's degrade
+    //    ladder gained a rung above v85's so pre-v127 brains keep
+    //    authenticating (ENG-9: both columns probed by missingOAuthColumn).
+    //
+    // 2. idx_minion_jobs_queue_status_updated (ENG-10, WP5 wedge index):
+    //    btree (queue, status, updated_at) covering all four count FILTERs
+    //    and both max(updated_at) FILTERs in queryWedgeSignals
+    //    (supervisor.ts) — no non-partial queue index existed before this.
+    //    Plain CREATE INDEX (small table; no CONCURRENTLY needed, which also
+    //    keeps this runnable inside the migration transaction on both
+    //    engines).
+    //
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts,
+    // src/core/schema-embedded.ts + the bootstrap probe sets in both engines
+    // (test/schema-bootstrap-coverage.test.ts pins coverage).
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface TEXT;
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface_set_by TEXT;
+      CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated
+        ON minion_jobs (queue, status, updated_at);
+    `,
+  },
+  {
+    version: 128,
+    name: 'minion_jobs_timeout_backfill_and_duplicate_cycle_cleanup',
+    // Jobs fix wave (upstream issues #2/#3) — two one-shot repairs for rows
+    // that predate the fixes shipping alongside this migration:
+    //
+    // 1. HANDLER_DEFAULT_TIMEOUT_MS backfill. Submit-time stamping (#1737)
+    //    never touched already-queued rows, so their timeout_ms = NULL fell
+    //    to the minutes-scale null-default wall-clock sweep and long handlers
+    //    were dead-lettered mid-progress. Values are SNAPSHOTTED at authoring
+    //    time — deliberately NOT generated from the live map, so every brain
+    //    applies identical SQL under this version number; the claim-time
+    //    COALESCE in MinionQueue.claim owns all future drift. Do NOT sync
+    //    this list when handler-timeouts.ts changes. No timeout_at stamp for
+    //    already-active rows: that would arm the tighter 1x handleTimeouts
+    //    kill mid-flight; the 2x wall-clock bound (via non-NULL timeout_ms)
+    //    is the gentler, sufficient repair, and every future claim stamps
+    //    timeout_at correctly.
+    //
+    // 2. Duplicate autopilot-cycle backlog cleanup. The slot-scoped dispatch
+    //    guards accumulated byte-identical waiting cycles when a job stalled
+    //    in 'active' (unbounded — one observed brain held ~111). Cancel all
+    //    but the newest waiting row per (name, queue, source scope),
+    //    restricted to ticker-keyed rows (idempotency-key prefix heuristic:
+    //    manually submitted cycles carry no key unless the operator passes
+    //    one; mimicking the ticker prefix opts into ticker dedup semantics)
+    //    AND to rows without a camelCase data.sourceId — the ticker only
+    //    ever writes snake_case source_id, so a sourceId row is by
+    //    definition not ticker-provenance and must never be swept
+    //    (adversarial-review tightening: prevents distinct sourceId scopes
+    //    collapsing into the empty source_id group).
+    //    Rows are preserved as 'cancelled' for audit; their idempotency keys
+    //    free naturally via the dead/cancelled key-NULLing rule in add().
+    //    Leaves <=1 waiting (+ possibly 1 active) per scope — converges to
+    //    single-flight within one wall-clock window; the maxPending guard
+    //    (shipped with this wave) prevents new accumulation.
+    //
+    // Non-terminal status set + row-lock race-safety per the v15 precedent
+    // (serializes against claim()'s FOR UPDATE SKIP LOCKED). Idempotent:
+    // statement 1 re-runs match zero rows (timeout_ms IS NULL guard);
+    // statement 2 re-runs keep only survivors.
+    idempotent: true,
+    sql: `
+      UPDATE minion_jobs
+         SET timeout_ms = CASE name
+               WHEN 'subagent'                     THEN 1800000
+               WHEN 'subagent_aggregator'          THEN 1800000
+               WHEN 'embed-backfill'               THEN 1800000
+               WHEN 'autopilot-cycle'              THEN 1800000
+               WHEN 'autopilot-global-maintenance' THEN 1800000
+               WHEN 'chronicle_extract'            THEN 600000
+               WHEN 'facts-absorb'                 THEN 600000
+               WHEN 'contextual_reindex_per_chunk' THEN 3600000
+             END,
+             updated_at = now()
+       WHERE timeout_ms IS NULL
+         AND status IN ('waiting','active','delayed','waiting-children','paused')
+         AND name IN ('subagent','subagent_aggregator','embed-backfill',
+                      'autopilot-cycle','autopilot-global-maintenance',
+                      'chronicle_extract','facts-absorb',
+                      'contextual_reindex_per_chunk');
+
+      UPDATE minion_jobs
+         SET status = 'cancelled',
+             finished_at = now(),
+             updated_at = now(),
+             error_text = 'v128: superseded duplicate autopilot cycle'
+       WHERE status = 'waiting' AND parent_job_id IS NULL
+         AND name IN ('autopilot-cycle','autopilot-global-maintenance')
+         AND (idempotency_key LIKE 'autopilot-cycle:%' OR idempotency_key LIKE 'autopilot-global:%')
+         AND data->>'sourceId' IS NULL
+         AND id NOT IN (
+           SELECT id FROM (
+             SELECT DISTINCT ON (name, queue, COALESCE(data->>'source_id','')) id
+             FROM minion_jobs
+             WHERE status = 'waiting' AND parent_job_id IS NULL
+               AND name IN ('autopilot-cycle','autopilot-global-maintenance')
+               AND (idempotency_key LIKE 'autopilot-cycle:%' OR idempotency_key LIKE 'autopilot-global:%')
+               AND data->>'sourceId' IS NULL
+             ORDER BY name, queue, COALESCE(data->>'source_id',''), created_at DESC, id DESC
+           ) keep
+         );
+    `,
+  },
+  {
+    version: 129,
+    name: 'dream_verdicts_triage_v1_columns',
+    // #4152 two-stage cascade: widens the boolean-era verdict cache into a
+    // scored triage record — ordinal salience score in [0,1], content type,
+    // candidate segments (verbatim quotes), entity candidates, plus the
+    // judging model and triage prompt version that make a cached verdict
+    // auditable and version-invalidatable. Legacy rows keep score NULL and
+    // are treated as cache misses by runTriagePass (re-judged once, cheap).
+    // No backfill by design; no index (the table is PK-probed only).
+    //
+    // dream_verdicts is migration-created on PGLite (v30, absent from
+    // PGLITE_SCHEMA_SQL), so these columns take the COLUMN_EXEMPTIONS route
+    // in test/schema-bootstrap-coverage.test.ts rather than bootstrap
+    // probes — there is no schema-blob forward reference to trip on, and
+    // every reader treats NULL as legacy-miss. Keep src/schema.sql (and the
+    // regenerated schema-embedded.ts) in sync for fresh Postgres installs.
+    //
+    // Rollback note: the stored worth_processing boolean derives from the
+    // FIXED 0.5 constant while the new runtime gate uses the configurable
+    // dream.triage.threshold. A binary rollback to pre-#4152 code (which
+    // trusts the boolean as permanent) after retuning the threshold gates
+    // differently until content hashes change — sweep with
+    // `gbrain dream retriage --force` (or clear scored rows) after such a
+    // rollback.
+    idempotent: true,
+    sql: `
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS score DOUBLE PRECISION;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS content_type TEXT;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS segments JSONB;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS entities JSONB;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS model TEXT;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS triage_version INT;
+    `,
+  },
+  {
+    version: 130,
+    name: 'minion_jobs_lock_duration_ms',
+    // #4145: per-job lock lease. A single worker-global 30s lockDuration
+    // cannot serve both 2s shell jobs and 173s-average LLM subagent jobs —
+    // under host CPU saturation the renewal window was missed and healthy
+    // long-running handlers were force-evicted. The column carries an
+    // optional per-job lease; NULL means "worker default" (the pre-#4145
+    // behavior), so NO backfill is needed — the claim-time COALESCE against
+    // HANDLER_DEFAULT_LOCK_DURATION_MS (handler-timeouts.ts) owns all
+    // defaulting from here on. CHECK added via the idempotent drop-then-add
+    // pattern (v7 precedent) so migrated brains carry the same DB bound as
+    // fresh installs; the operative [5s,1h] range clamp lives app-side in
+    // clampLockDurationMs. No index: only per-row reads on already-indexed
+    // access paths (bootstrap-coverage: column-only, no probe needed).
+    // (Authored as v129; renumbered to v130 when #4152's
+    // dream_verdicts_triage_v1_columns landed the number first.)
+    idempotent: true,
+    sql: `
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS lock_duration_ms INTEGER;
+      ALTER TABLE minion_jobs DROP CONSTRAINT IF EXISTS chk_lock_duration_positive;
+      ALTER TABLE minion_jobs ADD CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000));
+    `,
+  },
+  {
+    version: 131,
     name: 'pgroonga_fts_chinese',
     // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
     // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -5458,7 +5872,7 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 124,
+    version: 132,
     name: 'files_source_id_storage_path_unique',
     // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
     // Two sources importing the same relative path would fight over one row,
@@ -5485,7 +5899,7 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 125,
+    version: 133,
     name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
     // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
     // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -5514,7 +5928,7 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 126,
+    version: 134,
     name: 'embed_failures_ledger',
     // Current-state retry ledger for partial stale embedding. The DDL is
     // intentionally identical to the fresh schemas and safe to replay.
@@ -5549,61 +5963,22 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
-    version: 127,
-    name: 'configurable_fts_language',
+    version: 135,
+    name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
     idempotent: true,
     sql: '',
     handler: async (engine) => {
-      const lang = getFtsLanguage();
-      // #2704 fix (batch 2 merge regression): install the FINAL trigger form
-      // right away — compiled_truth is never indexed, even transiently.
-      // Originally this migration still built search_vector from
-      // compiled_truth (an unbounded whole-page body) and then ran a
-      // full-table `UPDATE pages SET id = id` to backfill non-English
-      // languages, which overflows Postgres's 1MB tsvector cap on large
-      // pages (`string is too long for tsvector`) and aborts the whole
-      // migration before v128 ever runs. Dropping compiled_truth here
-      // removes the overflow risk entirely, so the pages backfill is no
-      // longer needed in this step — v128 now owns backfilling *all*
-      // existing rows (any language) in controlled batches.
-      await engine.executeRaw(`
-        CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
-        DECLARE timeline_text TEXT;
-        BEGIN
-          SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '') INTO timeline_text FROM timeline_entries WHERE page_id = NEW.id;
-          NEW.search_vector := setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') || setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') || setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
-          RETURN NEW;
-        END;
-        $fn$ LANGUAGE plpgsql;
-      `);
-      await engine.executeRaw(`
-        CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS $fn$
-        BEGIN
-          NEW.search_vector := setweight(to_tsvector('${lang}', COALESCE(NEW.doc_comment, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(NEW.symbol_name_qualified, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(NEW.chunk_text, '')), 'B');
-          RETURN NEW;
-        END;
-        $fn$ LANGUAGE plpgsql;
-      `);
-      if (lang === 'english') {
-        process.stderr.write(`  v127: trigger functions recreated with language='english', compiled_truth dropped from pages trigger (no chunk backfill needed)\n`);
-        return;
-      }
-      // Non-English: content_chunks rows are chunk-grain (bounded per-chunk
-      // text), so backfilling them here carries none of the pages-table
-      // overflow risk described above.
-      await engine.executeRaw(`UPDATE content_chunks SET search_vector = setweight(to_tsvector('${lang}', COALESCE(doc_comment, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(symbol_name_qualified, '')), 'A') || setweight(to_tsvector('${lang}', COALESCE(chunk_text, '')), 'B') WHERE search_vector IS NOT NULL;`);
-      process.stderr.write(`  v127: trigger functions recreated with language='${lang}', compiled_truth dropped from pages trigger, content_chunks backfilled\n`);
-    },
-  },
-  {
-    version: 128,
-    name: 'page_search_vector_drop_compiled_truth',
-    idempotent: true,
-    sql: '',
-    handler: async (engine) => {
-      // v127 already installs the final (no-compiled_truth) trigger
-      // function; CREATE OR REPLACE here again is a defensive no-op so this
-      // step is still correct standalone (e.g. partial migration history).
+      // Fork-only. Upstream's v123/v124 pair leaves two defects that upstream
+      // has not fixed: v123 still builds search_vector from compiled_truth (an
+      // unbounded whole-page body) and full-table-backfills it for non-English
+      // languages, which overflows Postgres's 1MB tsvector cap on large pages
+      // ('string is too long for tsvector') and aborts the migration; and v124
+      // only does CREATE OR REPLACE, never touching existing rows, so upgraded
+      // brains keep compiled_truth baked into search_vector forever.
+      //
+      // This migration is the fork's standing repair for both. It lives here
+      // rather than as an edit to v123/v124 so the upstream half of this file
+      // stays byte-identical and the automated sync stops conflicting on it.
       const lang = getFtsLanguage();
       await engine.executeRaw(`
         CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
@@ -5643,22 +6018,36 @@ export const MIGRATIONS: Migration[] = [
         lastId = Math.max(...rows.map((r) => r.id));
         if (rows.length < batchSize) break;
       }
-      process.stderr.write(`  v128: update_page_search_vector() no longer indexes compiled_truth (was overflowing tsvector on large pages, #2704); backfilled ${totalBackfilled} existing row(s)\n`);
+      migrationNotice(`  v135: compiled_truth dropped from pages trigger (was overflowing tsvector on large pages, #2704); backfilled ${totalBackfilled} existing row(s)\n`);
     },
   },
   {
-    version: 125,
-    name: 'take_proposals_per_claim_idempotency',
-    // #2138: the original idempotency key was per page, so each INSERT after
-    // the first claim silently conflicted. md5(claim_text) makes it per claim
-    // without adding/backfilling a column. The new key is strictly finer than
-    // the old key and therefore preserves all existing rows.
+    version: 136,
+    name: 'repair_masked_upstream_126_127_128',
+    // One-time repair for the fork-renumber masking class (#2038 in this
+    // file's own history). runMigrations gates on a single high-water
+    // integer (`m.version > current`), not an applied-set. The fork used to
+    // occupy 123-126 with its own migrations and pushed upstream's 123/124
+    // to 127/128, so a brain stamped at 128 skips upstream's REAL 126/127/128
+    // forever once this merge restores upstream numbering. Verified absent on
+    // the production brain at merge time: session_context_state (missing),
+    // oauth_clients.surface/surface_set_by (missing), and
+    // idx_minion_jobs_queue_status_updated (missing).
+    //
+    // Re-applies those three by looking them up in MIGRATIONS rather than
+    // duplicating their DDL, so this can never drift from the definitions it
+    // repairs. All three are declared idempotent upstream, so re-running them
+    // on a brain that already applied them normally is a no-op.
     idempotent: true,
-    sql: `
-      DROP INDEX IF EXISTS take_proposals_idempotency_idx;
-      CREATE UNIQUE INDEX IF NOT EXISTS take_proposals_idempotency_idx
-        ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
-    `,
+    sql: '',
+    handler: async (engine) => {
+      for (const version of [126, 127, 128]) {
+        const masked = MIGRATIONS.find(m => m.version === version);
+        if (!masked) continue;
+        await applyOneMigration(engine, masked);
+      }
+      migrationNotice('  v136: re-applied upstream migrations 126/127/128 masked by the fork renumber\n');
+    },
   },
 ];
 
@@ -6020,17 +6409,64 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     return { applied: 0, current };
   }
 
+  // Fresh install vs upgrade: a never-migrated brain (schema blob seeds
+  // version='1'; every migration is >= 2) replays the FULL history — printing
+  // ~240 lines of internal migration names as the user's first-run experience.
+  // That wall makes a 2-second init read as complex and fragile ("1 → 125"
+  // implies the brand-new install was 124 versions stale). Fresh installs get
+  // one summary line; EXISTING brains keep the full per-migration detail
+  // (upgrades are where the names carry diagnostic value).
+  // GBRAIN_MIGRATE_VERBOSE=1 is the incident escape hatch (env-first, matching
+  // the GBRAIN_SYNC_*/GBRAIN_PACE_* pattern).
+  const freshInstall = current <= 1 && pending.length === sorted.length;
+  const quietReplay = freshInstall && process.env.GBRAIN_MIGRATE_VERBOSE !== '1';
+  // Suppress per-migration explanatory notices during a fresh-install replay
+  // (they are upgrade diagnostics, noise on a new user's first run). Restored
+  // in the finally so an in-process upgrade after a fresh init still narrates.
+  quietMigrationNotices = quietReplay;
+
   // Progress messages route to stderr so callers parsing stdout (e.g.
   // `gbrain jobs submit --json | jq`) aren't polluted by migration noise.
-  process.stderr.write(`  Schema version ${current} → ${LATEST_VERSION} (${pending.length} migration(s) pending)\n`);
-
-  // Pre-flight: warn about connections that might block DDL
-  await checkForBlockingConnections(engine);
+  if (quietReplay) {
+    process.stderr.write(`  Setting up brain schema (v${LATEST_VERSION})...\n`);
+  } else {
+    process.stderr.write(`  Schema version ${current} → ${LATEST_VERSION} (${pending.length} migration(s) pending)\n`);
+  }
 
   let applied = 0;
-  for (const m of pending) {
-    process.stderr.write(`  [${m.version}] ${m.name}...\n`);
+  try {
+    // Pre-flight: warn about connections that might block DDL
+    await checkForBlockingConnections(engine);
 
+    for (const m of pending) {
+      if (!quietReplay) process.stderr.write(`  [${m.version}] ${m.name}...\n`);
+      try {
+        await applyOneMigration(engine, m);
+        // Update version after both SQL and handler succeed. Inside the same
+        // catch so a stamp-write failure is also NAMED in quiet mode.
+        await engine.setConfig('version', String(m.version));
+      } catch (err) {
+        // Quiet fresh-install replay: name the failing migration — without the
+        // per-step lines, the error would otherwise be anonymous.
+        if (quietReplay) process.stderr.write(`  [${m.version}] ${m.name} failed\n`);
+        throw err;
+      }
+
+      if (!quietReplay) process.stderr.write(`  [${m.version}] ✓ ${m.name}\n`);
+      applied++;
+    }
+  } finally {
+    // Never leak the fresh-install quiet flag into a later in-process run —
+    // covers every exit path from here on (incl. the pre-flight probe).
+    quietMigrationNotices = false;
+  }
+
+  return { applied, current: LATEST_VERSION };
+}
+
+/** One migration's full body (SQL + handler + verify), extracted so the
+ *  runMigrations loop can name the failing migration in quiet-replay mode. */
+async function applyOneMigration(engine: BrainEngine, m: Migration): Promise<void> {
     // Pick SQL: engine-specific `sqlFor` wins over engine-agnostic `sql`.
     const sql = m.sqlFor?.[engine.kind] ?? m.sql;
 
@@ -6101,11 +6537,4 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
       }
     }
 
-    // Update version after both SQL and handler succeed
-    await engine.setConfig('version', String(m.version));
-    process.stderr.write(`  [${m.version}] ✓ ${m.name}\n`);
-    applied++;
-  }
-
-  return { applied, current: LATEST_VERSION };
 }

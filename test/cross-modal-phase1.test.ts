@@ -136,7 +136,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 16 (cross-modal still appended; 15→16 reranker document truncation)', () => {
+  test('KNOBS_HASH_VERSION is 18 (cross-modal still appended; 15→16 detail fold #3515; 16→17 degradation-stamp epoch; 17→18 reranker document truncation)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -149,8 +149,11 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // #3430: 13→14 compiled_truth boost no longer applies at detail=medium.
     // 14→15: the resolved FTS configuration name (fts=) — a language switch
     // plus `reindex-search-vector` must not keep serving pre-switch rows.
-    // 15→16: candidate-document truncation (reranker_max_document_chars).
-    expect(KNOBS_HASH_VERSION).toBe(16);
+    // #3515: 15→16 detail fold (det=).
+    // WP2/T3: 16→17 degradation-stamp epoch — pre-stamp cache rows must not
+    // claim a clean (undegraded) run they can't prove.
+    // Fork: 17→18 candidate-document truncation (reranker_max_document_chars).
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

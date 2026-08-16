@@ -20,6 +20,7 @@
 import { createHash } from 'crypto';
 import type { SearchResult } from '../types.ts';
 import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankResult } from '../ai/gateway.ts';
+import { BudgetExhausted } from '../budget/budget-tracker.ts';
 import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
 
 export const DEFAULT_RERANKER_MAX_DOCUMENT_CHARS = 600;
@@ -46,6 +47,17 @@ export interface RerankerOpts {
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
   return createHash('sha256').update(query, 'utf8').digest('hex').slice(0, 8);
+}
+
+function classifyRerankFailure(err: unknown): RerankFailureReason {
+  if (err instanceof RerankError) return err.reason;
+  if (
+    err instanceof BudgetExhausted ||
+    (err && typeof err === 'object' && (err as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED')
+  ) {
+    return 'budget';
+  }
+  return 'unknown';
 }
 
 /**
@@ -96,8 +108,7 @@ export async function applyReranker(
       ...(opts.model ? { model: opts.model } : {}),
     });
   } catch (err) {
-    const reason: RerankFailureReason =
-      err instanceof RerankError ? err.reason : 'unknown';
+    const reason = classifyRerankFailure(err);
     const errorSummary = err instanceof Error ? err.message : String(err);
     try {
       logRerankFailure({

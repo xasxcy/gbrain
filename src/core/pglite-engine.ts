@@ -1,7 +1,15 @@
 import { PGlite } from '@electric-sql/pglite';
-import { vector } from '@electric-sql/pglite/vector';
-import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import type { Transaction } from '@electric-sql/pglite';
+// Engine-live path: static top-level imports (scratch probe, #2674) — the
+// engine-dynamic-import guard forbids lazy `import()` here.
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join as joinPath, resolve as resolvePath, sep as pathSep } from 'node:path';
+// Engine-live path: static top-level import (no lazy `import()`). Supplies
+// PGLite's WASM/fsBundle/extension assets embedded via `with { type: 'file' }`
+// so a `bun build --compile` binary can serve a PGLite brain (Bun vfs #1340).
+// The embedded `extensions` REPLACE the stock `{ vector, pg_trgm }` imports.
+import { getEmbeddedPgliteOptions } from './pglite-embedded-assets.ts';
 import type {
   BrainEngine,
   BatchOpts,
@@ -47,10 +55,13 @@ import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
+// Engine-live path (#3596): static import, never a lazy `import()` in the
+// connect() catch. No cycle: pglite-repair.ts imports nothing from this file.
+import { attemptWalRepairAndRetry, closeRepairEpisodeIfOpen, type WalRepairReceipt } from './pglite-repair.ts';
 import { getFtsLanguage } from './fts-language.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
-  Chunk, ChunkInput, StaleChunkRow, StalePageRow,
+  Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
@@ -82,6 +93,8 @@ import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, b
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
+import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -93,50 +106,138 @@ import { hasCJK, escapeLikePattern } from './cjk.ts';
 
 type PGLiteDB = PGlite;
 
+// PGLite's parameter bridge corrupts the current engine session when a single
+// statement crosses the signed-int16 bind ceiling (32,767 parameters). Keep
+// bulk code-edge writes comfortably below it; the two edge shapes use 7 and 6
+// binds per row respectively.
+const PGLITE_EDGE_BATCH_MAX_BIND_PARAMS = 30_000;
+
 // Tier 3 snapshot fast-restore. Reads a tar dump produced by
 // `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
 // the current MIGRATIONS hash via a sidecar `.version` file; on mismatch we
 // silently fall through to a normal initSchema (snapshot is just an
 // optimization, never authoritative).
 let _snapshotWarnLogged = false;
-function tryLoadSnapshot(snapshotPath: string): Blob | null {
-  try {
-    // Lazy require so production builds without these imports don't crash.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
-    const crypto = require('node:crypto') as typeof import('node:crypto');
-    const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts');
-    const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts');
 
-    if (!fs.existsSync(snapshotPath)) {
+// Per-process memo. MIGRATIONS + PGLITE_SCHEMA_SQL are static for the life of
+// the process, so the schema hash is too; the version file and the ~42MB tar
+// are read once per (path, process) instead of once per engine construction
+// (a full suite constructs 600+ engines — the un-memoized loader re-read the
+// tar and re-hashed 131 migration handler sources every time, ~84MB of
+// transient allocation per call). A null entry means the path is terminally
+// unusable this process (missing/stale/torn) — no retry per construction.
+// The dims/model shape gate is deliberately NOT memoized: tests reconfigure
+// the gateway mid-process (zembed/1280) and a mismatched engine must fall
+// back to cold init even when an earlier engine loaded this same snapshot.
+// Accepted limitation: a snapshot file rewritten mid-process is not observed;
+// the only writer (build-pglite-snapshot.ts) runs before test fan-out.
+let _snapshotSchemaHashMemo: string | null = null;
+// blob stays null until the FIRST caller whose shape gate passes — a process
+// whose gateway shape never matches the snapshot (the zembed/1280 test
+// files) never pays the 42MB tar read at all.
+const _snapshotFileMemo = new Map<string, { versionLines: string[]; blob: Blob | null } | null>();
+let _snapshotTarReads = 0;
+
+export function __snapshotMemoStatsForTests(): { tarReads: number; memoEntries: number } {
+  return { tarReads: _snapshotTarReads, memoEntries: _snapshotFileMemo.size };
+}
+
+export function __resetSnapshotMemoForTests(): void {
+  _snapshotSchemaHashMemo = null;
+  _snapshotFileMemo.clear();
+  _snapshotTarReads = 0;
+  _snapshotWarnLogged = false;
+}
+
+export function tryLoadSnapshot(snapshotPath: string): Blob | null {
+  try {
+    let entry = _snapshotFileMemo.get(snapshotPath);
+    if (entry === null) return null; // terminally unusable this process
+    if (entry === undefined) {
+      // First touch of this path in this process — do the file work once.
+      // Lazy require so production builds without these imports don't crash.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require('node:fs') as typeof import('node:fs'); // engine-dynamic-import-ok
+      const crypto = require('node:crypto') as typeof import('node:crypto'); // engine-dynamic-import-ok
+      const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts'); // engine-dynamic-import-ok
+      const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts'); // engine-dynamic-import-ok
+
+      if (!fs.existsSync(snapshotPath)) {
+        if (!_snapshotWarnLogged) {
+          // eslint-disable-next-line no-console
+          console.warn(`[pglite] GBRAIN_PGLITE_SNAPSHOT set but file missing: ${snapshotPath} — using normal init.`);
+          _snapshotWarnLogged = true;
+        }
+        _snapshotFileMemo.set(snapshotPath, null);
+        return null;
+      }
+      const versionPath = snapshotPath.replace(/\.tar(?:\.gz)?$/, '.version');
+      if (!fs.existsSync(versionPath)) {
+        if (!_snapshotWarnLogged) {
+          // eslint-disable-next-line no-console
+          console.warn(`[pglite] snapshot version file missing: ${versionPath} — using normal init.`);
+          _snapshotWarnLogged = true;
+        }
+        _snapshotFileMemo.set(snapshotPath, null);
+        return null;
+      }
+      if (_snapshotSchemaHashMemo === null) {
+        _snapshotSchemaHashMemo = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
+      }
+      const versionLines = fs.readFileSync(versionPath, 'utf8').trim().split('\n');
+      if (_snapshotSchemaHashMemo !== (versionLines[0] ?? '')) {
+        if (!_snapshotWarnLogged) {
+          // eslint-disable-next-line no-console
+          console.warn(`[pglite] snapshot stale (schema hash mismatch) — using normal init. Rebuild with: bun run build:pglite-snapshot`);
+          _snapshotWarnLogged = true;
+        }
+        _snapshotFileMemo.set(snapshotPath, null);
+        return null;
+      }
+      entry = { versionLines, blob: null };
+      _snapshotFileMemo.set(snapshotPath, entry);
+    }
+
+    // W0 fix-wave: the version file's dims=/model= lines record the embedding
+    // shape the snapshot was BAKED with. A snapshot whose vector(dims) columns
+    // differ from what THIS process would create poisons every embedding
+    // write ("expected 1280 dimensions, not 1536" — the W0 incident when the
+    // fixture went default-on). Resolve our would-be shape through the same
+    // gateway-with-default fallback initSchema uses and refuse a mismatch.
+    // Version files without the shape lines (pre-W0) are treated as stale.
+    // Re-evaluated on EVERY call against the CURRENT gateway config — never
+    // memoized (see memo comment above).
+    let wantDims: number | string = DEFAULT_EMBEDDING_DIMENSIONS;
+    let wantModel: string = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const gw = require('./ai/gateway.ts') as typeof import('./ai/gateway.ts'); // engine-dynamic-import-ok
+      wantDims = gw.getEmbeddingDimensions();
+      wantModel = gw.getEmbeddingModel();
+    } catch { /* gateway not configured — defaults, same as initSchema */ }
+    const shapeOk = entry.versionLines[1] === `dims=${wantDims}` && entry.versionLines[2] === `model=${wantModel}`;
+    if (!shapeOk) {
       if (!_snapshotWarnLogged) {
         // eslint-disable-next-line no-console
-        console.warn(`[pglite] GBRAIN_PGLITE_SNAPSHOT set but file missing: ${snapshotPath} — using normal init.`);
+        console.warn(`[pglite] snapshot embedding shape mismatch (want dims=${wantDims} model=${wantModel}, have ${entry.versionLines[1] ?? 'none'} ${entry.versionLines[2] ?? ''}) — using normal init. Rebuild with: bun run build:pglite-snapshot`);
         _snapshotWarnLogged = true;
       }
       return null;
     }
-    const versionPath = snapshotPath.replace(/\.tar(?:\.gz)?$/, '.version');
-    if (!fs.existsSync(versionPath)) {
-      if (!_snapshotWarnLogged) {
-        // eslint-disable-next-line no-console
-        console.warn(`[pglite] snapshot version file missing: ${versionPath} — using normal init.`);
-        _snapshotWarnLogged = true;
+    if (entry.blob === null) {
+      // Tar read deferred until the first shape-matching caller (see memo
+      // comment above). A torn/unreadable tar is terminal for the process.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fs = require('node:fs') as typeof import('node:fs'); // engine-dynamic-import-ok
+        const buf = fs.readFileSync(snapshotPath);
+        _snapshotTarReads += 1;
+        entry.blob = new Blob([new Uint8Array(buf.buffer as ArrayBuffer, buf.byteOffset, buf.byteLength)]);
+      } catch {
+        _snapshotFileMemo.set(snapshotPath, null);
+        return null;
       }
-      return null;
     }
-    const expectedHash = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
-    const actualHash = fs.readFileSync(versionPath, 'utf8').trim();
-    if (expectedHash !== actualHash) {
-      if (!_snapshotWarnLogged) {
-        // eslint-disable-next-line no-console
-        console.warn(`[pglite] snapshot stale (schema hash mismatch) — using normal init. Rebuild with: bun run build:pglite-snapshot`);
-        _snapshotWarnLogged = true;
-      }
-      return null;
-    }
-    const buf = fs.readFileSync(snapshotPath);
-    return new Blob([buf]);
+    return entry.blob;
   } catch {
     // Any failure -> fall through to normal init. Never block tests.
     return null;
@@ -144,7 +245,7 @@ function tryLoadSnapshot(snapshotPath: string): Blob | null {
 }
 
 export function computeSnapshotSchemaHash(
-  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string } }>,
+  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string }; handler?: unknown }>,
   schemaSQL: string,
   crypto: typeof import('node:crypto'),
 ): string {
@@ -160,6 +261,13 @@ export function computeSnapshotSchemaHash(
     hash.update(m.sql ?? '');
     hash.update('\t');
     hash.update(m.sqlFor?.pglite ?? '');
+    hash.update('\t');
+    // W0 fix-wave (D5.13, Codex #4): 19+ migrations carry executable
+    // `handler` code with empty/absent sql — invisible to the sql-only hash,
+    // so editing a handler reused a stale snapshot. Function.prototype
+    // .toString folds the handler SOURCE into the hash (deterministic within
+    // a checkout; this is a dev/test fixture, not a shipped artifact).
+    hash.update(typeof m.handler === 'function' ? String(m.handler) : '');
     hash.update('\n');
   }
   return hash.digest('hex');
@@ -174,23 +282,49 @@ export function computeSnapshotSchemaHash(
  *   payload. Fix: `bun upgrade` (newer Bun versions mount the vfs
  *   writable) or run via Node.
  *
- * `macos-26-3` — the pre-existing #223 hint signature (early macOS
- *   26.3 builds shipped a broken WASM runtime).
+ * `corrupt` — catalog/pgvector corruption (#2348): 58P01 /
+ *   internal_load_library / missing vector type or core relation.
+ *   WAL reset cannot fix this class; routes to `gbrain reinit-pglite`.
+ *   MUST stay matched BEFORE the wasm arm — a `58P01 … Aborted()`
+ *   message is catalog corruption, not a WAL tear.
+ *
+ * `wasm-abort` — the Emscripten runtime abort (`Aborted(). Build with
+ *   -sASSERTIONS…`, `RuntimeError: unreachable`, and the legacy #223
+ *   signatures). Root cause is almost always corrupt WAL/checkpoint
+ *   state after an unclean shutdown (historically misdiagnosed as a
+ *   "macOS 26.3 WASM bug" — see #223); this verdict is the trigger
+ *   for the in-place WAL auto-repair (`pglite-repair.ts`).
  *
  * `unknown` — falls through to a generic hint that names the doctor
- *   command; the macOS 26.3 link is offered only on darwin (#2674).
+ *   command; the #223 pointer is offered only on darwin (#2674).
  *
  * Regex tightened per Codex eng-review finding #9: don't match
  * generic `pglite.data` substring (could fire on unrelated PGLite
  * errors). Match the literal `$$bunfs` marker OR ENOENT+pglite.data
  * co-occurrence.
  */
-export type PgliteInitFailure = 'bunfs' | 'macos-26-3' | 'corrupt' | 'unknown';
+export type PgliteInitFailure = 'bunfs' | 'wasm-abort' | 'corrupt' | 'unknown';
 
 // #2674: non-Error rejections (Emscripten aborts can throw plain objects)
 // used to stringify as "[object Object]" — prefer .message when present.
+// WAL-repair wave: Emscripten's FS layer also throws message-LESS objects
+// (e.g. `ErrnoError { name: 'ErrnoError', errno: 20 }` when the data dir is a
+// symlink NODEFS refuses to mount) — surface name+errno / JSON instead of the
+// useless "[object Object]".
 export function stringifyPgliteInitError(err: unknown): string {
-  return String((err as { message?: unknown })?.message ?? err);
+  const message = (err as { message?: unknown })?.message;
+  if (message != null) return String(message);
+  if (typeof err === 'object' && err !== null) {
+    const name = (err as { name?: unknown }).name;
+    const errno = (err as { errno?: unknown }).errno;
+    if (typeof name === 'string' && errno != null) return `${name} (errno ${errno})`;
+    try {
+      const json = JSON.stringify(err);
+      if (json && json !== '{}') return typeof name === 'string' ? `${name}: ${json}` : json;
+    } catch { /* circular — fall through */ }
+    if (typeof name === 'string') return name;
+  }
+  return String(err);
 }
 
 export function classifyPgliteInitError(message: string): PgliteInitFailure {
@@ -203,10 +337,68 @@ export function classifyPgliteInitError(message: string): PgliteInitFailure {
   if (/58P01|internal_load_library|type "?vector"? does not exist|relation "?content_chunks"? does not exist/i.test(message)) {
     return 'corrupt';
   }
-  if (/abort.*runtime|macos.*26\.3|wasm.*runtime/i.test(message)) {
-    return 'macos-26-3';
+  // Broadened (v0.42.x WAL-repair wave): the REAL production message is
+  // `Aborted(). Build with -sASSERTIONS for more info.` — no "runtime" in it,
+  // so the legacy arms alone let the primary crash fall through to 'unknown'.
+  // Deliberately over-matches (RuntimeError/unreachable are generic WASM
+  // traps); the repair path downstream is bounded by layout validation, the
+  // reaped-lock gate, and restore-on-failure.
+  if (/aborted\s*\(\)|RuntimeError|unreachable|abort.*runtime|macos.*26\.3|wasm.*runtime/i.test(message)) {
+    return 'wasm-abort';
   }
   return 'unknown';
+}
+
+/**
+ * What the auto-repair path did (or why it didn't run) for a `wasm-abort`
+ * failure — folded into the user-facing error so the message never lies about
+ * the state of the data dir. `'failed-not-restored'` is the arm that matters
+ * most: repair ran, PGLite still failed, AND the automatic restore failed —
+ * the dir is in a reset state and the user must restore from the backup.
+ */
+export interface PgliteInitRepairContext {
+  repair:
+    | 'not-attempted'
+    | 'in-memory'
+    | 'disabled'
+    | 'skipped-validation'
+    | 'skipped-live-writer'
+    | 'skipped-cooldown'
+    | 'failed-restored'
+    | 'failed-not-restored';
+  backupPath?: string;
+  detail?: string;
+}
+
+function repairContextLine(ctx: PgliteInitRepairContext): string {
+  switch (ctx.repair) {
+    case 'in-memory':
+      return '  This engine is in-memory (no data dir), so there is no stored state to\n' +
+        '  repair — this is an environment/runtime failure, not data corruption.';
+    case 'disabled':
+      return '  Auto-repair is disabled (GBRAIN_PGLITE_WAL_REPAIR=off). Run\n' +
+        '  `gbrain pglite-repair` to repair manually.';
+    case 'skipped-validation':
+      return `  Auto-repair skipped: ${ctx.detail ?? 'the data dir did not validate as a PG17 pglite layout'}.`;
+    case 'skipped-live-writer':
+      return `  Auto-repair skipped: ${ctx.detail ?? 'the data-dir lock was acquired by reaping a prior holder'}`;
+    case 'skipped-cooldown':
+      return `  Auto-repair skipped: ${ctx.detail ?? 'a recent attempt failed (cooldown active)'}`;
+    case 'failed-restored':
+      return '  Auto-repair ran but PGLite still failed to start. The data dir was\n' +
+        `  RESTORED to its pre-repair state (backup kept at ${ctx.backupPath ?? '<dataDir>.wal-repair-backup-*'}).` +
+        (ctx.detail ? `\n  Detail: ${ctx.detail}` : '');
+    case 'failed-not-restored':
+      return '  Auto-repair ran, PGLite still failed to start, AND the automatic restore\n' +
+        '  itself failed — the data dir is currently in a RESET state. Your\n' +
+        `  pre-repair files are intact in the backup at ${ctx.backupPath ?? '<dataDir>.wal-repair-backup-*'};\n` +
+        '  restore manually: move the backup\'s `pg_wal` dir back to `<dataDir>/pg_wal`\n' +
+        '  and its `pg_control` file back to `<dataDir>/global/pg_control`.' +
+        (ctx.detail ? `\n  Detail: ${ctx.detail}` : '');
+    case 'not-attempted':
+    default:
+      return '  Auto-repair was not attempted.';
+  }
 }
 
 export function buildPgliteInitErrorMessage(
@@ -215,6 +407,9 @@ export function buildPgliteInitErrorMessage(
   // #2674: threaded (defaulted) so tests can exercise both branches without
   // monkey-patching process.platform.
   platform: NodeJS.Platform = process.platform,
+  // WAL-repair wave: what auto-repair did for a wasm-abort, so the hint tells
+  // the truth about the current state of the data dir.
+  ctx?: PgliteInitRepairContext,
 ): string {
   const header = 'PGLite failed to initialize its WASM runtime.';
   let hint: string;
@@ -227,17 +422,31 @@ export function buildPgliteInitErrorMessage(
         '  does not help, run via Node: `node src/cli.ts` or install gbrain\n' +
         '  using the Node-based path. See #1340 for details.';
       break;
-    case 'macos-26-3':
+    case 'wasm-abort':
       hint =
-        '  This is most commonly the macOS 26.3 WASM bug:\n' +
-        '  https://github.com/garrytan/gbrain/issues/223';
+        '  Most common cause: corrupt WAL/checkpoint state after an unclean\n' +
+        '  shutdown (often a macOS-upgrade reboot killing gbrain mid-write) —\n' +
+        '  NOT a macOS WASM bug, despite the historical diagnosis in\n' +
+        '  https://github.com/garrytan/gbrain/issues/223.\n' +
+        repairContextLine(ctx ?? { repair: 'not-attempted' }) + '\n' +
+        '  Recovery ladder:\n' +
+        '    1. gbrain pglite-repair --dry-run   (diagnose, mutates nothing)\n' +
+        '       gbrain pglite-repair --yes       (in-place WAL repair, data preserved)\n' +
+        '    2. Rebuild from your brain repo: `gbrain reinit-pglite` (or manually:\n' +
+        '       back up ~/.gbrain, move brain.pglite aside, `gbrain init --pglite`,\n' +
+        '       re-add sources + `gbrain sync` + `gbrain embed`).\n' +
+        '    3. Switch engines (docs/ENGINES.md): `gbrain init --supabase` or\n' +
+        '       native Postgres.\n' +
+        '  Run `gbrain doctor` for a full diagnosis.';
       break;
     case 'corrupt':
       hint =
         '  Your PGLite store looks corrupted (the catalog or the pgvector\n' +
         '  extension cannot load). This happens when two processes opened the\n' +
         '  same brain at once — now prevented (#2348), but an already-damaged\n' +
-        '  store cannot be repaired in place. Recover:\n' +
+        '  store cannot be repaired in place (WAL repair does not fix catalog\n' +
+        '  corruption; `gbrain pglite-repair --dry-run` can still report the\n' +
+        '  state of the data dir). Recover:\n' +
         '    1. Restore a backup of the brain.pglite directory if you have one, OR\n' +
         '    2. Rebuild from your brain repo:\n' +
         '       gbrain reinit-pglite --embedding-model <id> --embedding-dimensions <N>\n' +
@@ -246,19 +455,40 @@ export function buildPgliteInitErrorMessage(
       break;
     case 'unknown':
     default:
-      // #2674: only blame the macOS 26.3 WASM bug on macOS. On other
-      // platforms, point at the causes that are actually plausible there.
+      // #2674: name the plausible causes per platform. The darwin branch keeps
+      // the #223 pointer (readers arrive from that issue), reframed to the
+      // real root cause behind those reports: torn WAL from unclean shutdown.
       hint = platform === 'darwin'
-        ? '  Possible cause: the macOS 26.3 WASM bug\n' +
-          '  (https://github.com/garrytan/gbrain/issues/223).\n' +
-          '  Run `gbrain doctor` for a full diagnosis.'
+        ? '  Possible cause: corrupt WAL/checkpoint state after an unclean\n' +
+          '  shutdown — the failure class behind\n' +
+          '  https://github.com/garrytan/gbrain/issues/223.\n' +
+          '  Try `gbrain pglite-repair --dry-run` to diagnose the data dir, and\n' +
+          '  run `gbrain doctor` for a full diagnosis.'
         : '  Possible causes: another gbrain process holding the database\n' +
           '  (lock contention), or a damaged PGLite data directory.\n' +
-          '  Run `gbrain doctor` for a full diagnosis; if the data dir is\n' +
+          '  Try `gbrain pglite-repair --dry-run` to diagnose the data dir, and\n' +
+          '  run `gbrain doctor` for a full diagnosis; if the data dir is\n' +
           '  damaged, `gbrain reinit-pglite` rebuilds it from your brain repo.';
       break;
   }
   return `${header}\n${hint}\n  Original error: ${original}`;
+}
+
+/**
+ * The loud stderr notice printed when connect() auto-repaired the data dir in
+ * place. Exported for the serial regression test.
+ */
+export function buildWalRepairNotice(receipt: WalRepairReceipt): string {
+  return [
+    '⚠️  gbrain repaired this brain\'s PGLite WAL in place.',
+    `    Data dir: ${receipt.dataDir}`,
+    `    Cause: torn WAL/checkpoint state from an unclean shutdown (issue #223 class).`,
+    `    Data files were preserved; transactions not checkpointed before the`,
+    `    corruption may be lost (the standard pg_resetwal caveat).`,
+    `    Pre-repair backup: ${receipt.backupPath}`,
+    `    Recommended: run \`gbrain doctor\` to verify brain integrity.`,
+    `    Disable auto-repair with GBRAIN_PGLITE_WAL_REPAIR=off.`,
+  ].join('\n');
 }
 
 /**
@@ -287,6 +517,95 @@ async function preservingProcessExitCode<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * #2674 — the scratch-store probe, the diagnostic half of the issue.
+ *
+ * PGLite reports only `Aborted()` to JS and prints the real PANIC (e.g.
+ * `could not locate a valid checkpoint record`) to its own stderr, so from
+ * the JS-visible error alone a damaged store is indistinguishable from a
+ * broken WASM runtime. The one thing that CAN tell them apart is opening a
+ * throwaway store on the same machine:
+ *
+ *   - scratch store works → the runtime is healthy; the REAL store is damaged.
+ *   - scratch store fails too → the runtime cannot start here at all.
+ *
+ * Stderr capture: PGLite 0.4.3 exposes no print/printErr hook on
+ * `PGliteOptions` (checked: only `debug`, which still writes to the
+ * process's own stderr), so we deliberately do NOT try to intercept the
+ * PANIC text — monkey-patching process.stderr.write around an async WASM
+ * init is exactly the hack the classifier comments warn against. The
+ * probe's ok/fail outcome carries the diagnosis instead; `verdict` is
+ * populated from the JS-visible error for callers that want it.
+ *
+ * Runs the SAME code path as the real engine (PGlite.create with the
+ * embedded WASM/extension assets) but deliberately NOT PGLiteEngine.connect():
+ * connect wraps failures in buildPgliteInitErrorMessage, whose hint text
+ * would then pollute re-classification of the probe error.
+ *
+ * Safety: the scratch dir comes from mkdtemp under os.tmpdir() and is
+ * additionally checked against `realStorePath` (refuses any overlap in
+ * either direction) — a bug here must never touch the brain being
+ * diagnosed. The dir is removed in a finally, success or failure.
+ */
+export interface PgliteScratchProbeResult {
+  ok: boolean;
+  duration_ms: number;
+  /** JS-visible error when ok=false (the PANIC itself lands on stderr, not here). */
+  error?: string;
+  verdict?: PgliteInitFailure;
+}
+
+export async function probePgliteScratchStore(
+  realStorePath?: string,
+): Promise<PgliteScratchProbeResult> {
+  const scratchDir = await mkdtemp(joinPath(tmpdir(), 'gbrain-pglite-probe-'));
+  if (realStorePath) {
+    const real = resolvePath(realStorePath);
+    const scratch = resolvePath(scratchDir);
+    if (scratch === real || scratch.startsWith(real + pathSep) || real.startsWith(scratch + pathSep)) {
+      await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+      throw new Error(
+        `refusing to probe: scratch dir ${scratch} overlaps the real store ${real}`,
+      );
+    }
+  }
+
+  const started = Date.now();
+  let db: PGlite | null = null;
+  try {
+    // Same assets as the real engine's connect(): the embedded WASM/fsBundle/
+    // extension options (Bun vfs #1340) — a compiled binary's probe must
+    // exercise the same runtime path the real store open uses.
+    const embedded = await getEmbeddedPgliteOptions();
+    db = await preservingProcessExitCode(() =>
+      PGlite.create({
+        dataDir: joinPath(scratchDir, 'store'),
+        ...embedded,
+      }),
+    );
+    await db.query(`CREATE TABLE scratch_probe (id int PRIMARY KEY, note text)`);
+    await db.query(`INSERT INTO scratch_probe VALUES (1, 'ok')`);
+    const res = await db.query<{ note: string }>(`SELECT note FROM scratch_probe WHERE id = 1`);
+    if (res.rows[0]?.note !== 'ok') {
+      throw new Error(`scratch store read-back mismatch: ${JSON.stringify(res.rows)}`);
+    }
+    return { ok: true, duration_ms: Date.now() - started };
+  } catch (err) {
+    const message = stringifyPgliteInitError(err);
+    return {
+      ok: false,
+      duration_ms: Date.now() - started,
+      error: message,
+      verdict: classifyPgliteInitError(message),
+    };
+  } finally {
+    if (db) {
+      try { await db.close(); } catch { /* probe store — nothing to save */ }
+    }
+    await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
@@ -305,6 +624,12 @@ export class PGLiteEngine implements BrainEngine {
    * and true inside a nested transaction() call on the same tx scope.
    */
   private readonly _inTransaction?: boolean;
+  /**
+   * Set when connect() auto-repaired the data dir's WAL in place (mirrors
+   * upstream PR #994's `repairedDataDir`). Null on every non-repaired connect.
+   * Test seam + programmatic callers can surface the receipt.
+   */
+  walRepairReceipt: WalRepairReceipt | null = null;
 
   get db(): PGLiteDB {
     if (!this._db) throw new Error('PGLite not connected. Call connect() first.');
@@ -314,6 +639,7 @@ export class PGLiteEngine implements BrainEngine {
   // Lifecycle
   async connect(config: EngineConfig): Promise<void> {
     this._savedConfig = config; // #2034: remember for reconnect()
+    this.walRepairReceipt = null; // per-connect: stale receipts must not survive reconnect()
     const dataDir = config.database_path || undefined; // undefined = in-memory
 
     // Acquire file lock to prevent concurrent PGLite access (crashes with Aborted())
@@ -343,14 +669,35 @@ export class PGLiteEngine implements BrainEngine {
     // a snapshot/restore around these awaits does NOT contain them. That is
     // why the CLI's exit paths read gbrain's own verdict
     // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
+    // Embedded WASM/fsBundle/extension assets (Bun vfs #1340). Resolved once
+    // here so both the initial create and the WAL-repair retry below share the
+    // same compiled modules. Its `extensions` replaces the stock vector/pg_trgm.
+    const embedded = await getEmbeddedPgliteOptions();
     try {
       this._db = await preservingProcessExitCode(() =>
         PGlite.create({
           dataDir,
           loadDataDir,
-          extensions: { vector, pg_trgm },
+          ...embedded,
         }),
       );
+      // Snapshot-timezone parity: dumpDataDir bakes the BUILD process's
+      // TimeZone into the restored cluster's defaults, so a snapshot-loaded
+      // engine would run sessions in the build machine's zone while a
+      // cold-init engine follows this process (bun test pins TZ=UTC; bun run
+      // follows the host). That divergence shifted every naive-timestamp
+      // day-boundary comparison by the offset — date-dependent tests failed
+      // only in the evening, only under the snapshot. Pin the session to the
+      // RUNTIME zone so restored engines behave exactly like cold ones.
+      if (this._snapshotLoaded && this._db) {
+        const runtimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        await this._db.query(`SELECT set_config('TimeZone', $1, false)`, [runtimeZone]);
+      }
+      // Healthy open: close any repair episode left open by a prior failed
+      // attempt (red-team: episodes otherwise stayed open forever — doctor
+      // kept reporting corruption-likely and a weeks-stale episode backup
+      // could be reused over much newer data). Cheap no-op without a sidecar.
+      if (dataDir) closeRepairEpisodeIfOpen(dataDir);
     } catch (err) {
       // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.8.0
       // (#1340): the previous error hint hardcoded the macOS 26.3 link, but
@@ -360,7 +707,54 @@ export class PGLiteEngine implements BrainEngine {
       // users get the right next step.
       const original = stringifyPgliteInitError(err); // #2674
       const verdict = classifyPgliteInitError(original);
-      const wrapped = new Error(buildPgliteInitErrorMessage(verdict, original));
+      let ctx: PgliteInitRepairContext = { repair: 'not-attempted' };
+
+      // WAL-repair wave (#223/#1670/#2575): a wasm-abort on a PERSISTENT data
+      // dir is almost always torn WAL/checkpoint state from an unclean
+      // shutdown — repairable in place. The seam NEVER throws (its failure
+      // modes fold into `ctx`), so every non-repaired path still funnels
+      // through the single lock-release-then-throw site below.
+      if (verdict === 'wasm-abort') {
+        if (!dataDir) {
+          ctx = { repair: 'in-memory' };
+        } else {
+          const attempt = await attemptWalRepairAndRetry(
+            dataDir,
+            () => preservingProcessExitCode(() =>
+              // No loadDataDir on the retry: the snapshot path is
+              // in-memory-only (see above), and dataDir is persistent here.
+              PGlite.create({
+                dataDir,
+                ...embedded,
+              }),
+            ),
+            { reaped: this._lock?.reaped },
+          );
+          if (attempt.status === 'repaired') {
+            this._db = attempt.db;
+            this.walRepairReceipt = attempt.receipt;
+            console.warn(buildWalRepairNotice(attempt.receipt));
+            return; // success: lock stays held, normal connect contract
+          }
+          if (attempt.status === 'skipped') {
+            const reasonToCtx = {
+              'disabled': 'disabled',
+              'validation-failed': 'skipped-validation',
+              'possibly-live-writer': 'skipped-live-writer',
+              'recently-failed': 'skipped-cooldown',
+            } as const;
+            ctx = { repair: reasonToCtx[attempt.reason], detail: attempt.detail };
+          } else {
+            ctx = {
+              repair: attempt.restored ? 'failed-restored' : 'failed-not-restored',
+              backupPath: attempt.receipt?.backupPath,
+              detail: attempt.repairError,
+            };
+          }
+        }
+      }
+
+      const wrapped = new Error(buildPgliteInitErrorMessage(verdict, original, process.platform, ctx));
       // Release the lock so a fresh process can try again; leaking the lock
       // here turns a recoverable init error into a stuck-brain state.
       if (this._lock?.acquired) {
@@ -540,6 +934,10 @@ export class PGLiteEngine implements BrainEngine {
                 WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='source_id') AS oauth_clients_source_id_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='federated_read') AS oauth_clients_federated_read_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='surface') AS oauth_clients_surface_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='surface_set_by') AS oauth_clients_surface_set_by_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='sources') AS sources_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
@@ -575,7 +973,13 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='timeline_entries') AS timeline_entries_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='timeline_entries' AND column_name='event_page_id') AS timeline_event_page_id_exists
+                WHERE table_schema='public' AND table_name='timeline_entries' AND column_name='event_page_id') AS timeline_event_page_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='minion_jobs') AS minion_jobs_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='timeout_at') AS minion_jobs_timeout_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='minion_jobs' AND column_name='idempotency_key') AS minion_jobs_idempotency_key_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -602,6 +1006,8 @@ export class PGLiteEngine implements BrainEngine {
       oauth_clients_exists: boolean;
       oauth_clients_source_id_exists: boolean;
       oauth_clients_federated_read_exists: boolean;
+      oauth_clients_surface_exists: boolean;
+      oauth_clients_surface_set_by_exists: boolean;
       sources_exists: boolean;
       sources_archived_exists: boolean;
       sources_archived_at_exists: boolean;
@@ -620,6 +1026,9 @@ export class PGLiteEngine implements BrainEngine {
       pages_links_extracted_at_exists: boolean;
       timeline_entries_exists: boolean;
       timeline_event_page_id_exists: boolean;
+      minion_jobs_exists: boolean;
+      minion_jobs_timeout_at_exists: boolean;
+      minion_jobs_idempotency_key_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -652,6 +1061,13 @@ export class PGLiteEngine implements BrainEngine {
     // PGLITE_SCHEMA_SQL crash without them.
     const needsOauthClientsBootstrap = probe.oauth_clients_exists
       && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
+    // WP4 (v127): oauth_clients.surface + surface_set_by. No PGLITE_SCHEMA_SQL
+    // index references them, but the columns are migration-added AND in the
+    // blob's CREATE TABLE — the exact v121 mask class — so the bootstrap adds
+    // them defense-in-depth (and satisfies the MIGRATIONS ADD COLUMN
+    // coverage gate). They ship in one migration and go missing together.
+    const needsOauthClientsSurface = probe.oauth_clients_exists
+      && (!probe.oauth_clients_surface_exists || !probe.oauth_clients_surface_set_by_exists);
     // v0.26.5 (v34): sources.archived + archived_at + archive_expires_at added
     // for soft-delete lifecycle. Not directly referenced by indexes BUT
     // PGLITE_SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS sources` is a no-op on
@@ -698,6 +1114,12 @@ export class PGLiteEngine implements BrainEngine {
     const needsPagesLinksExtractedAt = probe.pages_exists && !probe.pages_links_extracted_at_exists;
     // v121: schema-blob indexes reference event_page_id before migrations run.
     const needsTimelineEventPageId = probe.timeline_entries_exists && !probe.timeline_event_page_id_exists;
+    // v7-era (#2626 class sweep): minion_jobs.timeout_at + idempotency_key are
+    // migration-added AND referenced by blob indexes (idx_minion_jobs_timeout,
+    // uniq_minion_jobs_idempotency) — a pre-v7 minion_jobs wedges blob replay
+    // exactly like the v121 incident.
+    const needsMinionJobsTimeoutAt = probe.minion_jobs_exists && !probe.minion_jobs_timeout_at_exists;
+    const needsMinionJobsIdempotencyKey = probe.minion_jobs_exists && !probe.minion_jobs_idempotency_key_exists;
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -705,12 +1127,14 @@ export class PGLiteEngine implements BrainEngine {
         && !needsMcpLogBootstrap && !needsSubagentProviderId
         && !needsPagesRecency && !needsIngestLogSourceId
         && !needsFilesBootstrap && !needsOauthClientsBootstrap
+        && !needsOauthClientsSurface
         && !needsSourcesArchive && !needsPagesLastRetrievedAt
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
-        && !needsTimelineEventPageId) return;
+        && !needsTimelineEventPageId
+        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -874,6 +1298,18 @@ export class PGLiteEngine implements BrainEngine {
       `);
     }
 
+    if (needsOauthClientsSurface) {
+      // WP4 (v127): per-client MCP tool surface + operator-lock marker.
+      // Nullable TEXT, no index — bootstrap mirrors the v127 column shape so
+      // the blob's CREATE TABLE presence can't mask the forward reference on
+      // pre-v127 brains (the v121 wedge class). v127 runs later via
+      // runMigrations and is idempotent.
+      await this.db.exec(`
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface TEXT;
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface_set_by TEXT;
+      `);
+    }
+
     if (needsSourcesArchive) {
       // v34 (destructive_guard_columns) promotes archive lifecycle from JSONB
       // config to real columns on sources. PGLITE_SCHEMA_SQL's
@@ -963,6 +1399,20 @@ export class PGLiteEngine implements BrainEngine {
       // source of truth for the FK and indexes and runs idempotently afterward.
       await this.db.exec(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+      `);
+    }
+
+    if (needsMinionJobsTimeoutAt) {
+      // v7: blob index idx_minion_jobs_timeout references timeout_at; a
+      // pre-v7 minion_jobs wedges blob replay without it (same class as v121).
+      await this.db.exec(`
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS timeout_at TIMESTAMPTZ;
+      `);
+    }
+    if (needsMinionJobsIdempotencyKey) {
+      // v7: blob index uniq_minion_jobs_idempotency references idempotency_key.
+      await this.db.exec(`
+        ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
       `);
     }
   }
@@ -1303,7 +1753,16 @@ export class PGLiteEngine implements BrainEngine {
       params.push(filters.tag);
       where.push(`t.tag = $${params.length}`);
     }
-    if (filters?.updated_after) {
+    if (filters?.updatedAfterKeyset) {
+      // v0.45.7 keyset: (updated_at, slug) strict-greater — supersedes updated_after.
+      params.push(filters.updatedAfterKeyset.updatedAt);
+      const tsIdx = params.length;
+      params.push(filters.updatedAfterKeyset.slug);
+      const slugIdx = params.length;
+      where.push(
+        `(p.updated_at > $${tsIdx}::timestamptz OR (p.updated_at = $${tsIdx}::timestamptz AND p.slug > $${slugIdx}))`,
+      );
+    } else if (filters?.updated_after) {
       params.push(filters.updated_after);
       where.push(`p.updated_at > $${params.length}::timestamptz`);
     }
@@ -2738,8 +3197,14 @@ export class PGLiteEngine implements BrainEngine {
   async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]> {
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const source = sourceIds ?? opts?.sourceId ?? 'default';
+    // #2544: explicit non-vector column list — rowToChunk discards embeddings
+    // at this call site, so `cc.*` shipped every vector only to be thrown away.
     const { rows } = await this.db.query(
-      `SELECT cc.* FROM content_chunks cc
+      `SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+              cc.model, cc.token_count, cc.embedded_at, cc.language,
+              cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line,
+              cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality
+       FROM content_chunks cc
        JOIN pages p ON p.id = cc.page_id
        WHERE p.slug = $1 AND ${sourceIds ? 'p.source_id = ANY($2::text[])' : 'p.source_id = $2'}
        ORDER BY cc.chunk_index`,
@@ -3053,6 +3518,73 @@ export class PGLiteEngine implements BrainEngine {
       [opts.sourceId, afterPid, afterIdx, limit],
     );
     return rows as unknown as StaleChunkRow[];
+  }
+
+  /**
+   * Shared chunkless-page-with-content predicate (mirrors PostgresEngine).
+   * Excludes quarantined + embed_skip pages — both are intentionally
+   * chunkless by design, not drift the safety net should repair.
+   */
+  private buildChunklessPagesWhere(opts?: { sourceId?: string }): { where: string; params: unknown[] } {
+    const conds: string[] = [
+      'p.deleted_at IS NULL',
+      // healChunklessPages chunks BOTH compiled_truth and timeline (mirrors
+      // embedPage) — a timeline-only page (rare but schema-legal) has
+      // something to heal even with compiled_truth = ''.
+      `(p.compiled_truth <> '' OR p.timeline <> '')`,
+      EMBED_SKIP_FILTER_FRAGMENT,
+      QUARANTINE_FILTER_FRAGMENT,
+      'NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)',
+    ];
+    const params: unknown[] = [];
+    if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      conds.push(`p.source_id = $${params.length}`);
+    }
+    return { where: conds.join(' AND '), params };
+  }
+
+  async countChunklessPagesWithContent(opts?: { sourceId?: string }): Promise<number> {
+    const { where, params } = this.buildChunklessPagesWhere(opts);
+    const { rows } = await this.db.query(
+      `SELECT count(*)::int AS count FROM pages p WHERE ${where}`,
+      params,
+    );
+    const count = (rows[0] as { count: number } | undefined)?.count ?? 0;
+    return Number(count);
+  }
+
+  async listChunklessPagesWithContent(opts?: {
+    batchSize?: number;
+    afterPageId?: number;
+    sourceId?: string;
+  }): Promise<ChunklessPageRow[]> {
+    const { where, params } = this.buildChunklessPagesWhere(opts);
+    let afterClause = '';
+    if (opts?.afterPageId != null) {
+      params.push(opts.afterPageId);
+      afterClause = ` AND p.id > $${params.length}`;
+    }
+    // Small default (unlike the 2000-row chunk-metadata cursors elsewhere):
+    // each row here carries a FULL page body. See engine.ts docstring.
+    const limit = opts?.batchSize ?? 50;
+    params.push(limit);
+    const limitIdx = params.length;
+    const { rows } = await this.db.query(
+      `SELECT p.id, p.slug, p.source_id, p.compiled_truth, p.timeline
+         FROM pages p
+        WHERE ${where}${afterClause}
+        ORDER BY p.id
+        LIMIT $${limitIdx}`,
+      params,
+    );
+    return (rows as Record<string, unknown>[]).map(r => ({
+      id: r.id as number,
+      slug: r.slug as string,
+      source_id: (r.source_id as string | undefined) ?? 'default',
+      compiled_truth: (r.compiled_truth as string | null) ?? '',
+      timeline: (r.timeline as string | null) ?? '',
+    }));
   }
 
   async deleteChunks(slug: string, opts?: { sourceId?: string }): Promise<void> {
@@ -3733,8 +4265,14 @@ export class PGLiteEngine implements BrainEngine {
              COUNT(DISTINCT n.last_link_type) AS edge_count,
              array_agg(DISTINCT n.last_link_type)
                FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
+             -- Final path tie-break (lexicographic) makes the pick deterministic
+             -- when a node is reachable at the same depth from multiple seeds;
+             -- without it the winner is plan/heap-order dependent and the two
+             -- engines (or two runs) can disagree. Relational retrieval is
+             -- documented deterministic; keep in lockstep with postgres-engine.ts.
              (array_agg(array_to_string(n.path, chr(9))
-               ORDER BY n.depth ASC, array_length(n.path, 1) ASC))[1] AS path_str,
+               ORDER BY n.depth ASC, array_length(n.path, 1) ASC,
+                        array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
              (SELECT cc.id FROM content_chunks cc
                WHERE cc.page_id = n.id ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
       FROM walk n
@@ -4379,27 +4917,38 @@ export class PGLiteEngine implements BrainEngine {
     // still trip Postgres 21000 on multi-source brains — caller's choice).
     // With opts.sourceId, the lookup is source-scoped so the right row
     // gets the raw_data attached.
+    // cathedral-4 parity: RETURNING id + zero-row check, matching the
+    // Postgres engine — a missing page must THROW, never silently no-op
+    // (callers treat a raw-data miss as an integrity failure).
     if (opts?.sourceId) {
-      await this.db.query(
+      const r = await this.db.query(
         `INSERT INTO raw_data (page_id, source, data)
          SELECT id, $2, $3::jsonb
          FROM pages WHERE slug = $1 AND source_id = $4
          ON CONFLICT (page_id, source) DO UPDATE SET
            data = EXCLUDED.data,
-           fetched_at = now()`,
+           fetched_at = now()
+         RETURNING id`,
         [slug, source, JSON.stringify(data), opts.sourceId]
       );
+      if (r.rows.length === 0) {
+        throw new Error(`putRawData failed: page "${slug}" (source=${opts.sourceId}) not found`);
+      }
       return;
     }
-    await this.db.query(
+    const r = await this.db.query(
       `INSERT INTO raw_data (page_id, source, data)
        SELECT id, $2, $3::jsonb
        FROM pages WHERE slug = $1
        ON CONFLICT (page_id, source) DO UPDATE SET
          data = EXCLUDED.data,
-         fetched_at = now()`,
+         fetched_at = now()
+       RETURNING id`,
       [slug, source, JSON.stringify(data)]
     );
+    if (r.rows.length === 0) {
+      throw new Error(`putRawData failed: page "${slug}" not found`);
+    }
   }
 
   async getRawData(
@@ -4486,14 +5035,21 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows as FileRow[];
   }
 
-  // Dream-cycle significance verdict cache (v0.23).
+  // Dream-cycle triage verdict cache (v0.23 boolean era; widened by #4152 triage-v1).
   async getDreamVerdict(filePath: string, contentHash: string): Promise<DreamVerdict | null> {
     const result = await this.db.query<{
       worth_processing: boolean;
       reasons: string[] | null;
       judged_at: Date | string;
+      score: number | null;
+      content_type: string | null;
+      segments: Array<{ quote: string; note?: string }> | null;
+      entities: string[] | null;
+      model: string | null;
+      triage_version: number | null;
     }>(
-      `SELECT worth_processing, reasons, judged_at
+      `SELECT worth_processing, reasons, judged_at,
+              score, content_type, segments, entities, model, triage_version
        FROM dream_verdicts
        WHERE file_path = $1 AND content_hash = $2`,
       [filePath, contentHash]
@@ -4504,18 +5060,35 @@ export class PGLiteEngine implements BrainEngine {
       worth_processing: r.worth_processing,
       reasons: r.reasons ?? [],
       judged_at: r.judged_at instanceof Date ? r.judged_at.toISOString() : String(r.judged_at),
+      score: r.score ?? null,
+      content_type: r.content_type ?? null,
+      segments: r.segments ?? [],
+      entities: r.entities ?? [],
+      model: r.model ?? null,
+      triage_version: r.triage_version ?? null,
     };
   }
 
   async putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void> {
+    // $N::jsonb + JSON.stringify is legal ONLY on PGLite (its db.query parses
+    // text→jsonb natively); the postgres.js twin must use sql.json().
     await this.db.query(
-      `INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons)
-       VALUES ($1, $2, $3, $4::jsonb)
+      `INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons,
+                                   score, content_type, segments, entities, model, triage_version)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8::jsonb, $9, $10)
        ON CONFLICT (file_path, content_hash) DO UPDATE SET
          worth_processing = EXCLUDED.worth_processing,
          reasons = EXCLUDED.reasons,
+         score = EXCLUDED.score,
+         content_type = EXCLUDED.content_type,
+         segments = EXCLUDED.segments,
+         entities = EXCLUDED.entities,
+         model = EXCLUDED.model,
+         triage_version = EXCLUDED.triage_version,
          judged_at = now()`,
-      [filePath, contentHash, verdict.worth_processing, JSON.stringify(verdict.reasons)]
+      [filePath, contentHash, verdict.worth_processing, JSON.stringify(verdict.reasons),
+       verdict.score, verdict.content_type, JSON.stringify(verdict.segments),
+       JSON.stringify(verdict.entities), verdict.model, verdict.triage_version]
     );
   }
 
@@ -6119,11 +6692,13 @@ export class PGLiteEngine implements BrainEngine {
     const resolved = edges.filter(e => e.to_chunk_id != null);
     const unresolved = edges.filter(e => e.to_chunk_id == null);
 
-    if (resolved.length > 0) {
+    const resolvedBatchSize = Math.floor(PGLITE_EDGE_BATCH_MAX_BIND_PARAMS / 7);
+    for (let offset = 0; offset < resolved.length; offset += resolvedBatchSize) {
+      const batch = resolved.slice(offset, offset + resolvedBatchSize);
       const rowParts: string[] = [];
       const params: unknown[] = [];
       let p = 1;
-      for (const e of resolved) {
+      for (const e of batch) {
         rowParts.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}, $${p++}::jsonb, $${p++})`);
         params.push(
           e.from_chunk_id, e.to_chunk_id, e.from_symbol_qualified,
@@ -6141,11 +6716,14 @@ export class PGLiteEngine implements BrainEngine {
       );
       inserted += res.affectedRows ?? 0;
     }
-    if (unresolved.length > 0) {
+
+    const unresolvedBatchSize = Math.floor(PGLITE_EDGE_BATCH_MAX_BIND_PARAMS / 6);
+    for (let offset = 0; offset < unresolved.length; offset += unresolvedBatchSize) {
+      const batch = unresolved.slice(offset, offset + unresolvedBatchSize);
       const rowParts: string[] = [];
       const params: unknown[] = [];
       let p = 1;
-      for (const e of unresolved) {
+      for (const e of batch) {
         rowParts.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++}::jsonb, $${p++})`);
         params.push(
           e.from_chunk_id, e.from_symbol_qualified, e.to_symbol_qualified, e.edge_type,

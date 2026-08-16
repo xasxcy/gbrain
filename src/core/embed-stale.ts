@@ -12,6 +12,7 @@
  * `embed.ts`.
  */
 import type { BrainEngine } from './engine.ts';
+import type { Chunk, ChunkInput } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from '../commands/embed.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
@@ -19,6 +20,39 @@ import { AbortError } from './abort-check.ts';
 import { persistStaleSlice } from './embed-slice-persist.ts';
 import { resolveEmbedSubBatchSize } from './embed-slices.ts';
 
+/**
+ * W0 fix-wave (Tier-1 #3, CONFIRMED): the ONE carry-through field list for
+ * re-embed upserts. upsertChunks writes these columns as EXCLUDED.<col>
+ * (overwrite, not COALESCE), so any re-embed path that omits a field resets
+ * it — omitting `modality` flipped every image chunk to modality='text',
+ * silently zeroing the image search arm (filter `cc.modality = 'image'`).
+ * Pre-fix this list existed twice: here (correct, with modality) and in
+ * commands/embed.ts preserveCodeMetadata (missing modality — the bug). Both
+ * consumers now share THIS list; embedding_image is deliberately NOT carried
+ * (the upsert COALESCEs it, and getChunks returns the pgvector as a string
+ * which upsertChunks would mis-serialize).
+ */
+export function carryChunkMetadata(
+  loaded: Pick<Partial<Chunk>,
+    'modality' | 'language' | 'symbol_name' | 'symbol_type' | 'start_line'
+    | 'end_line' | 'parent_symbol_path' | 'doc_comment' | 'symbol_name_qualified'>,
+  base: ChunkInput,
+): ChunkInput {
+  return {
+    ...base,
+    modality: loaded.modality ?? undefined,
+    language: loaded.language ?? undefined,
+    symbol_name: loaded.symbol_name ?? undefined,
+    symbol_type: loaded.symbol_type ?? undefined,
+    start_line: loaded.start_line ?? undefined,
+    end_line: loaded.end_line ?? undefined,
+    parent_symbol_path: loaded.parent_symbol_path ?? undefined,
+    doc_comment: loaded.doc_comment ?? undefined,
+    symbol_name_qualified: loaded.symbol_name_qualified ?? undefined,
+  };
+}
+
+/** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
   afterPageId: number;
   afterChunkIndex: number;

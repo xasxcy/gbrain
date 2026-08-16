@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 16 (14→15 folds the resolved FTS configuration name; 15→16 reranker document truncation invalidates prior rankings)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(16);
+  it('is 18 (15→16 detail fold #3515; 16→17 degradation-stamp epoch: pre-stamp cache rows become unreachable; 17→18 reranker document truncation invalidates prior rankings)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 });

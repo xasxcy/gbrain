@@ -355,6 +355,28 @@ CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
+-- Per-chunk retry state for partial stale embedding. Current state only:
+-- successful checkpoints and content/signature generation changes delete it.
+CREATE TABLE IF NOT EXISTS embed_failures (
+  source_id           TEXT NOT NULL,
+  page_id             BIGINT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  slug                TEXT NOT NULL,
+  chunk_index         INT NOT NULL,
+  embedding_signature TEXT NOT NULL,
+  chunk_hash          TEXT NOT NULL,
+  error_class         TEXT NOT NULL,
+  error_fingerprint   TEXT NOT NULL,
+  attempt_count       INT NOT NULL DEFAULT 1,
+  first_seen          TIMESTAMPTZ NOT NULL,
+  last_seen           TIMESTAMPTZ NOT NULL,
+  next_retry_at       TIMESTAMPTZ NOT NULL,
+  quarantined_at      TIMESTAMPTZ,
+  quarantine_reason   TEXT,
+  PRIMARY KEY (source_id, page_id, chunk_index, embedding_signature, chunk_hash)
+);
+CREATE INDEX IF NOT EXISTS embed_failures_active_idx
+  ON embed_failures (page_id, chunk_index, embedding_signature, chunk_hash);
+
 -- v0.20.0 Cathedral II: chunk-grain FTS trigger.
 -- Weight 'A' on doc_comment + symbol_name_qualified; weight 'B' on chunk_text.
 -- NL queries ("how do we handle errors") rank doc-comment hits above body text.
@@ -428,12 +450,24 @@ CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_to
 -- ============================================================
 -- links: cross-references between pages
 -- ============================================================
--- Provenance model (v0.13, extended issue #972):
---   link_source       — 'markdown' | 'frontmatter' | 'manual' | 'wikilink-resolved' | NULL
---                       'wikilink-resolved' is the opt-in
---                       (link_resolution.global_basename) basename-match
---                       provenance — see issue #972 / migration v113.
---                       (NULL = legacy row written before v0.13; unknown source)
+-- Provenance model (v0.13; opened to kebab provenance in v114 / issue #1941):
+--   link_source       — open kebab-case provenance tag, NOT a closed allowlist.
+--                       Format gate (CHECK): ^[a-z][a-z0-9]*(-[a-z0-9]+)*\$ and
+--                       char_length <= 64. NULL = legacy row (pre-v0.13).
+--                       Reconciliation-managed built-ins written internally:
+--                         'markdown'         — body markdown links
+--                         'frontmatter'      — YAML frontmatter edges (see origin_*)
+--                         'mentions'         — auto-linked body-text mentions
+--                         'wikilink-resolved'— opt-in global-basename [[name]] (#972)
+--                       User/tool-facing:
+--                         'manual'           — hand- or tool-created edges (the
+--                                              add_link op default + CLI link-add)
+--                         '<your-tag>'       — external derivers, e.g. 'citation-graph',
+--                                              stamp their own kebab tag (no migration).
+--                       The add_link OP forbids callers from passing the four
+--                       managed built-ins (they imply reconciliation semantics a
+--                       hand-created row can't honor); the DB CHECK still admits
+--                       them because internal writers use them. See operations.ts.
 --   origin_page_id    — for link_source='frontmatter', the page whose YAML
 --                       frontmatter created this edge; scopes reconciliation
 --   origin_field      — the frontmatter field name (e.g. 'key_people')
@@ -441,21 +475,21 @@ CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_to
 -- The unique constraint includes link_source + origin_page_id so a manual edge
 -- and a frontmatter-derived edge with the same (from, to, type) tuple coexist.
 -- Reconciliation on put_page filters by (link_source='frontmatter' AND
--- origin_page_id = written_page) — never touches other pages' edges.
+-- origin_page_id = written_page) — never touches other pages' edges. (This is
+-- exactly why a CLI-forged 'frontmatter' row with NULL origin would be a phantom
+-- edge reconciliation never cleans — hence the op-layer guard.)
 CREATE TABLE IF NOT EXISTS links (
   id             SERIAL PRIMARY KEY,
   from_page_id   INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   to_page_id     INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   link_type      TEXT    NOT NULL DEFAULT '',
   context        TEXT    NOT NULL DEFAULT '',
-  -- v114 (#1941): link_source is an open kebab-case provenance, not a closed
-  -- allowlist — external derivers (e.g. 'citation-graph') stamp their own tag
-  -- without a gbrain migration. Format gate only: lowercase kebab, <=64 chars.
-  -- The reconciliation-managed built-ins ('markdown','frontmatter','mentions',
-  -- 'wikilink-resolved') still satisfy this and are written internally; the
-  -- add_link op forbids CALLERS from forging them (see operations.ts). 'manual'
-  -- is the user-facing default for hand/tool-created edges.
-  link_source    TEXT    CHECK (link_source IS NULL OR (link_source ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*$' AND char_length(link_source) <= 64)),
+  -- v0.41.18.0: 'mentions' added for auto-linked body-text mentions
+  -- (gbrain extract links --by-mention). Filtered OUT of backlink-count
+  -- for search ranking; only counts toward orphan-ratio + graph traversal.
+  -- v0.40.8.2 (#972): 'wikilink-resolved' added for opt-in global-basename
+  -- wikilink resolution (bare [[name]] resolved by slug tail).
+  link_source    TEXT    CHECK (link_source IS NULL OR (link_source ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*\$' AND char_length(link_source) <= 64)),
   -- v0.41.18.0: nullable link_kind distinguishes "plain body mention" from
   -- "verb-pattern-derived typed link" within link_source='mentions'.
   -- Codex finding #12 design: keep link_source stable; add link_kind
@@ -643,6 +677,11 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   bound_brain_id          TEXT NULL,
   bound_slug_prefixes     TEXT[] NULL,
   bound_max_concurrent    INTEGER NOT NULL DEFAULT 1,
+  -- WP4 (v127): per-client MCP tool surface + who set it ('operator' |
+  -- 'self' | 'dcr_default'). Value space is OPEN (future client tiers write
+  -- tier names into surface); NULL = server/config surface resolution.
+  surface                 TEXT NULL,
+  surface_set_by          TEXT NULL,
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;
@@ -707,8 +746,11 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
 
--- #1794: append-only delta storage (one row per completed path). FK cascade
--- drops children with the parent. Mirrors migration v115 + src/schema.sql.
+-- #1794: append-only delta storage. One row per completed path; sync's
+-- appendCompleted INSERTs only the delta instead of rewriting the whole
+-- completed_keys JSONB array each flush (O(N^2) -> O(delta)). FK cascade drops
+-- children with the parent (clearOpCheckpoint + 7-day purge). PK prefix
+-- (op,fingerprint) serves all reads; no separate index. Mirrors migration v115.
 CREATE TABLE IF NOT EXISTS op_checkpoint_paths (
   op          TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
@@ -718,6 +760,45 @@ CREATE TABLE IF NOT EXISTS op_checkpoint_paths (
   CONSTRAINT op_checkpoint_paths_parent_fk
     FOREIGN KEY (op, fingerprint) REFERENCES op_checkpoints (op, fingerprint) ON DELETE CASCADE
 );
+
+-- #2095 push-based context: feedback-loop log of volunteered pages
+-- (volunteer_context op / retrieval-reflex pointers / gbrain watch).
+-- "Used" derives from pages.last_retrieved_at > volunteered_at; rationale is
+-- a deterministic template string, never raw conversation text. 90-day prune
+-- in the dream cycle's purge phase. Mirrors migration v117.
+CREATE TABLE IF NOT EXISTS context_volunteer_events (
+  id             BIGSERIAL PRIMARY KEY,
+  source_id      TEXT NOT NULL,
+  slug           TEXT NOT NULL,
+  confidence     DOUBLE PRECISION NOT NULL,
+  match_arm      TEXT NOT NULL,
+  rationale      TEXT NOT NULL DEFAULT '',
+  channel        TEXT NOT NULL DEFAULT 'op',
+  session_id     TEXT,
+  turn           INTEGER,
+  volunteered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS context_volunteer_events_src_time_idx
+  ON context_volunteer_events (source_id, volunteered_at DESC);
+CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
+  ON context_volunteer_events (source_id, slug);
+
+-- session_context_state (v0.45.7 / migration v126 — ambient recall issue #1):
+-- per-session cursor + boundary-tie dedup for the \`delta\` verb + heartbeat
+-- runtime. Key (source_id, client_id, session_id); client_id 'local' sentinel
+-- for CLI/hook, remote auth client id otherwise. jsonb DDL-literal defaults.
+CREATE TABLE IF NOT EXISTS session_context_state (
+  source_id         TEXT NOT NULL,
+  client_id         TEXT NOT NULL DEFAULT 'local',
+  session_id        TEXT NOT NULL,
+  standing_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+  surfaced_slugs    JSONB NOT NULL DEFAULT '[]'::jsonb,
+  last_wake_at      TIMESTAMPTZ,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, client_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
+  ON session_context_state (updated_at);
 
 -- migration_impact_log moved BELOW minion_jobs (was here, lines 645-676)
 -- because its \`job_id BIGINT REFERENCES minion_jobs(id)\` FK requires
@@ -858,6 +939,7 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   depth            INTEGER     NOT NULL DEFAULT 0,
   max_children     INTEGER,
   timeout_ms       INTEGER,
+  lock_duration_ms INTEGER,
   timeout_at       TIMESTAMPTZ,
   remove_on_complete BOOLEAN   NOT NULL DEFAULT FALSE,
   remove_on_fail   BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -874,7 +956,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   CONSTRAINT chk_nonnegative CHECK (attempts_made >= 0 AND attempts_started >= 0 AND stalled_counter >= 0 AND max_attempts >= 1 AND max_stalled >= 0),
   CONSTRAINT chk_depth_nonnegative CHECK (depth >= 0),
   CONSTRAINT chk_max_children_positive CHECK (max_children IS NULL OR max_children > 0),
-  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0)
+  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0),
+  CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000))
 );
 
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_claim ON minion_jobs (queue, priority ASC, created_at ASC) WHERE status = 'waiting';
@@ -885,6 +968,9 @@ CREATE INDEX IF NOT EXISTS idx_minion_jobs_parent ON minion_jobs(parent_job_id);
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_timeout ON minion_jobs (timeout_at) WHERE status = 'active' AND timeout_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_parent_status ON minion_jobs (parent_job_id, status) WHERE parent_job_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_minion_jobs_idempotency ON minion_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- WP4/WP5 (v127, ENG-10): wedge-signal index — covers the queue-health count
+-- FILTERs and max(updated_at) reads in queryWedgeSignals (supervisor.ts).
+CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated ON minion_jobs (queue, status, updated_at);
 
 -- Inbox table for sidechannel messaging
 CREATE TABLE IF NOT EXISTS minion_inbox (
@@ -1047,6 +1133,15 @@ CREATE TABLE IF NOT EXISTS dream_verdicts (
   worth_processing BOOLEAN     NOT NULL,
   reasons          JSONB,
   judged_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #4152 triage-v1 (migration v129): ordinal salience score in [0,1],
+  -- content type, candidate segments/entities, judging model + prompt
+  -- version. NULL on boolean-era rows — readers treat those as cache misses.
+  score            DOUBLE PRECISION,
+  content_type     TEXT,
+  segments         JSONB,
+  entities         JSONB,
+  model            TEXT,
+  triage_version   INT,
   PRIMARY KEY (file_path, content_hash)
 );
 
