@@ -9,9 +9,13 @@ carry an explicit **trigger condition**: the criterion under which it stops bein
 "latent" and becomes work. A backlog entry without a trigger is a note nobody
 re-evaluates.
 
-Architectural decisions are NOT recorded here — the ADR single source of truth is
-`DECISIONS.md` in the operator's vault (`01-raw/PARA/1. 项目/PKM-OB_Hermes秘书系统/`).
-This file only tracks deferred fork defects.
+Scope, so the three places don't drift into each other:
+
+- **this file** — deferred fork *defects*, each with a trigger condition
+- **`FORK_RUNTIME.md`** — runtime topology and environment traps (which host serves
+  what, Surge Ponte behaviour, cron guards, how to tell a real outage from a fake one)
+- **`DECISIONS.md`** in the operator's vault (`01-raw/PARA/1. 项目/PKM-OB_Hermes秘书系统/`)
+  — the ADR single source of truth. Architectural decisions go there, not here.
 
 ---
 
