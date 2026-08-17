@@ -3228,8 +3228,9 @@ export class PGLiteEngine implements BrainEngine {
     conds: string[],
     params: unknown[],
     signature: string | undefined,
+    ignoreBackoff?: boolean,
   ): void {
-    if (signature === undefined) return;
+    if (signature === undefined || ignoreBackoff) return;
     params.push(signature);
     const signatureParam = params.length;
     conds.push(`NOT EXISTS (
@@ -3242,7 +3243,7 @@ export class PGLiteEngine implements BrainEngine {
     )`);
   }
 
-  private buildStaleChunkWhere(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): { where: string; params: unknown[] } {
+  private buildStaleChunkWhere(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
     const params: unknown[] = [];
     const conds: string[] = [];
     if (opts?.signature !== undefined) {
@@ -3256,7 +3257,7 @@ export class PGLiteEngine implements BrainEngine {
       conds.push(`cc.embedding IS NULL`);
     }
     conds.push(`NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`);
-    this.appendEmbedFailureEligibility(conds, params, opts?.signature);
+    this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
     if (opts?.sourceId !== undefined) {
       params.push(opts.sourceId);
       conds.push(`p.source_id = $${params.length}`);
@@ -3264,13 +3265,13 @@ export class PGLiteEngine implements BrainEngine {
     return { where: conds.join(' AND '), params };
   }
 
-  private buildListStaleChunkWhere(opts?: { sourceId?: string; signature?: string }): { where: string; params: unknown[] } {
+  private buildListStaleChunkWhere(opts?: { sourceId?: string; signature?: string; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
     const params: unknown[] = [];
     const conds = [
       'cc.embedding IS NULL',
       `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
     ];
-    this.appendEmbedFailureEligibility(conds, params, opts?.signature);
+    this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
     if (opts?.sourceId !== undefined) {
       params.push(opts.sourceId);
       conds.push(`p.source_id = $${params.length}`);
@@ -3278,7 +3279,7 @@ export class PGLiteEngine implements BrainEngine {
     return { where: conds.join(' AND '), params };
   }
 
-  async countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number> {
+  async countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number> {
     // D7: source-scoped count for `gbrain embed --stale --source X`. Always
     // JOIN pages so embed-skip + signature predicates apply. PGLite is
     // PostgreSQL 17.5 in WASM and supports the full JSONB operator set.
@@ -3360,6 +3361,7 @@ export class PGLiteEngine implements BrainEngine {
     signature: string;
     orderBy?: 'page_id' | 'updated_desc';
     afterUpdatedAt?: string | null;
+    ignoreBackoff?: boolean;
   }): Promise<StaleChunkRow[]> {
     const limit = opts.batchSize ?? 2000;
     const afterPid = opts.afterPageId ?? 0;
@@ -3411,6 +3413,7 @@ export class PGLiteEngine implements BrainEngine {
     signature?: string;
     orderBy?: 'page_id' | 'updated_desc';
     afterUpdatedAt?: string | null;
+    ignoreBackoff?: boolean;
   }): Promise<StaleChunkRow[]> {
     if (opts?.signature !== undefined) return this.listSignatureEligibleStaleChunks(opts as typeof opts & { signature: string });
     const limit = opts?.batchSize ?? 2000;

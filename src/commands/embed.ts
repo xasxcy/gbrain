@@ -168,6 +168,17 @@ export interface EmbedOpts {
    */
   includeNullSignature?: boolean;
   /**
+   * ADR-090: bypass the retry-ledger's backoff/quarantine eligibility gate
+   * (embed_failures.next_retry_at / quarantined_at). That gate exists to
+   * stop the routine `embed --stale` drain from hammering a degraded
+   * provider; `gbrain migrate embeddings` is a deliberate, explicit,
+   * one-time action whose "resume finishes the job" contract must not be
+   * silently satisfied by a chunk sitting in its backoff window (that
+   * reports the migration complete while the chunk is still on the OLD
+   * embedding model/dimension). Set by `migrate-embeddings.ts` only.
+   */
+  ignoreBackoff?: boolean;
+  /**
    * Migration-hardening: locks the CALLER already holds (the migration
    * orchestrator acquires the per-source embed-backfill locks up front, before
    * the schema transition, and holds them through the drain). When set with
@@ -565,6 +576,7 @@ async function runEmbedCoreInner(engine: BrainEngine, opts: EmbedOpts): Promise<
         paceMaxConcurrency,
         quiet: opts.quiet,
         includeNullSignature: opts.includeNullSignature,
+        ignoreBackoff: opts.ignoreBackoff,
       }, drainSignal);
     } catch (e) {
       // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
@@ -975,6 +987,8 @@ async function embedAll(
     quiet?: boolean;
     /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
     includeNullSignature?: boolean;
+    /** ADR-090: bypass retry-ledger backoff/quarantine eligibility (see EmbedOpts). */
+    ignoreBackoff?: boolean;
   },
   signal?: AbortSignal,
 ) {
@@ -1391,6 +1405,8 @@ async function embedAllStale(
     quiet?: boolean;
     /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
     includeNullSignature?: boolean;
+    /** ADR-090: bypass retry-ledger backoff/quarantine eligibility (see EmbedOpts). */
+    ignoreBackoff?: boolean;
   },
   signature?: string,
   externalSignal?: AbortSignal,
@@ -1406,6 +1422,7 @@ async function embedAllStale(
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
   const includeNullSig = !!staleOpts?.includeNullSignature;
+  const ignoreBackoff = !!staleOpts?.ignoreBackoff;
 
   // Chunkless-page safety net: pre-flight count mirrors the countStaleChunks
   // short-circuit just below — a healthy brain pays one extra SELECT
@@ -1473,7 +1490,7 @@ async function embedAllStale(
   // The same current signature also excludes ledger-deferred/quarantined rows.
   const staleCount = await engine.countStaleChunks(
     signature
-      ? { ...sourceOpt, signature, ...(includeNullSig && { includeNullSignature: true }) }
+      ? { ...sourceOpt, signature, ...(includeNullSig && { includeNullSignature: true }), ...(ignoreBackoff && { ignoreBackoff: true }) }
       : sourceOpt,
   );
   let totalProcessedPages = 0;
@@ -1633,7 +1650,7 @@ async function embedAllStale(
     if (!pacer.snapshot().enabled) return false;
     if (effectiveSignal.aborted) return false;
     if (reentries >= MAX_REENTRIES) return false;
-    const remaining = await engine.countStaleChunks(signature ? { ...sourceOpt, signature } : sourceOpt);
+    const remaining = await engine.countStaleChunks(signature ? { ...sourceOpt, signature, ...(ignoreBackoff && { ignoreBackoff: true }) } : sourceOpt);
     if (remaining === 0) return false;
     if (result.embedded === lastReentryEmbedded) return false; // no forward progress
     lastReentryEmbedded = result.embedded;
@@ -1670,6 +1687,7 @@ async function embedAllStale(
           }),
           ...(sourceId && { sourceId }),
           ...(signature && { signature }),
+          ...(ignoreBackoff && { ignoreBackoff: true }),
         }),
       );
       if (batch.length === 0) {

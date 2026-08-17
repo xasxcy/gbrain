@@ -1122,8 +1122,19 @@ export interface BrainEngine {
    * count embedded chunks whose page has NO recorded signature (v108
    * grandfathered). Provider-migration paths set this so pre-stamp pages
    * aren't silently left in the old embedding space.
+   *
+   * `ignoreBackoff` (2026-08-17, ADR-090): skip the retry-ledger's
+   * `next_retry_at`/`quarantined_at` exclusion. The eligibility filter
+   * exists to stop the background `embed --stale` drain from hammering a
+   * degraded provider; `migrate embeddings` is a deliberate, explicit,
+   * one-time user action whose completion contract ("resume finishes the
+   * job") must not be silently satisfied by a chunk sitting in its backoff
+   * window — that reports "complete" while the chunk is still on the OLD
+   * embedding model/dimension, a real data-integrity gap. Quarantined
+   * chunks (permanently failing) are still counted as stale rather than
+   * silently dropped.
    */
-  countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number>;
+  countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number>;
   /**
    * Sum of LENGTH(chunk_text) over stale chunks — the character-count
    * backlog the embed phase / embed-backfill will process. Sibling of
@@ -1197,6 +1208,8 @@ export interface BrainEngine {
     // both round-trip TIMESTAMPTZ as Date | string; ISO string is the
     // common denominator on the wire).
     afterUpdatedAt?: string | null;
+    /** ADR-090: see countStaleChunks — bypass retry-ledger backoff/quarantine for an explicit one-time migration. */
+    ignoreBackoff?: boolean;
   }): Promise<StaleChunkRow[]>;
   /**
    * Pre-flight count for the chunkless-page safety net: pages with

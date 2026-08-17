@@ -3118,8 +3118,9 @@ export class PostgresEngine implements BrainEngine {
     conds: string[],
     params: unknown[],
     signature: string | undefined,
+    ignoreBackoff?: boolean,
   ): void {
-    if (signature === undefined) return;
+    if (signature === undefined || ignoreBackoff) return;
     params.push(signature);
     const signatureParam = params.length;
     conds.push(`NOT EXISTS (
@@ -3132,7 +3133,7 @@ export class PostgresEngine implements BrainEngine {
     )`);
   }
 
-  private buildStaleChunkWhere(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): { where: string; params: unknown[] } {
+  private buildStaleChunkWhere(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
     const params: unknown[] = [];
     const conds: string[] = [];
     if (opts?.signature !== undefined) {
@@ -3146,7 +3147,7 @@ export class PostgresEngine implements BrainEngine {
       conds.push(`cc.embedding IS NULL`);
     }
     conds.push(`NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`);
-    this.appendEmbedFailureEligibility(conds, params, opts?.signature);
+    this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
     if (opts?.sourceId !== undefined) {
       params.push(opts.sourceId);
       conds.push(`p.source_id = $${params.length}`);
@@ -3154,13 +3155,13 @@ export class PostgresEngine implements BrainEngine {
     return { where: conds.join(' AND '), params };
   }
 
-  private buildListStaleChunkWhere(opts?: { sourceId?: string; signature?: string }): { where: string; params: unknown[] } {
+  private buildListStaleChunkWhere(opts?: { sourceId?: string; signature?: string; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
     const params: unknown[] = [];
     const conds = [
       'cc.embedding IS NULL',
       `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
     ];
-    this.appendEmbedFailureEligibility(conds, params, opts?.signature);
+    this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
     if (opts?.sourceId !== undefined) {
       params.push(opts.sourceId);
       conds.push(`p.source_id = $${params.length}`);
@@ -3168,7 +3169,7 @@ export class PostgresEngine implements BrainEngine {
     return { where: conds.join(' AND '), params };
   }
 
-  async countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number> {
+  async countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number> {
     // Always JOIN pages so the embed_skip + signature predicates apply.
     // D7: source_id scoping. v0.41.31: optional signature widens staleness
     // to embedding_signature drift (NULL grandfathered unless
@@ -3258,6 +3259,7 @@ export class PostgresEngine implements BrainEngine {
       signature: string;
       orderBy?: 'page_id' | 'updated_desc';
       afterUpdatedAt?: string | null;
+      ignoreBackoff?: boolean;
     },
   ): Promise<StaleChunkRow[]> {
     const limit = opts.batchSize ?? 2000;
@@ -3310,6 +3312,7 @@ export class PostgresEngine implements BrainEngine {
     signature?: string;
     orderBy?: 'page_id' | 'updated_desc';
     afterUpdatedAt?: string | null;
+    ignoreBackoff?: boolean;
   }): Promise<StaleChunkRow[]> {
     const limit = opts?.batchSize ?? 2000;
     const afterPid = opts?.afterPageId ?? 0;

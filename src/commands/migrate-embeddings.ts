@@ -723,6 +723,7 @@ export async function executeMigrationFlow(
       catchUp: true,
       singleFlight: true,
       includeNullSignature: true,
+      ignoreBackoff: true,
       quiet: opts.quiet,
       heldLocks,
       ...(opts.batchSize !== undefined && { batchSize: opts.batchSize }),
@@ -734,6 +735,7 @@ export async function executeMigrationFlow(
     const remaining = await engine.countStaleChunks({
       signature: migrationSignature(plan.to_model, plan.to_dims),
       includeNullSignature: true,
+      ignoreBackoff: true,
     });
 
     const base = {
