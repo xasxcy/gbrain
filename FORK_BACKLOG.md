@@ -85,8 +85,10 @@ Any fix must add a genuinely two-source case.
 ## FB-002 · The `embed_failures` retry ledger is unreachable for transient provider failures
 
 - **Recorded**: 2026-08-17, after an overnight incident
-- **Status**: confirmed defect, unfixed. Fork-only — `embed-slice-persist.ts`,
-  `embed-failure.ts` and `embed-fallback.ts` are all absent upstream.
+- **Status**: **fixed in `64fea146`** (2026-08-17). Diagnosis kept below for the
+  next time a related failure-accounting bug needs this context. Fork-only —
+  `embed-slice-persist.ts`, `embed-failure.ts` and `embed-fallback.ts` are all
+  absent upstream.
 - **Severity**: this is an unbounded retry loop that leaves no trace. It burned a
   GPU all night for zero embedded chunks and nothing in the database recorded it.
 
@@ -146,6 +148,44 @@ transient error leaves N ledger rows rather than zero.
 Note the endpoint itself was healthy when checked the next morning: a 32-chunk
 batch of ~2700-char texts returned HTTP 200 in 11.6s against a 180s timeout. So the
 outage was real but transient — the defect is that nothing bounded the retrying.
+
+### Fixed in `64fea146`
+
+`persistStaleSlice` now also walks `partial.fatalIndexes` (when `fatalError` is
+set) and pushes a ledger entry per index, classified via `classifyEmbedFailure`
+— `AIConfigError` still excluded (`kind === 'fatal'`), matching the pre-existing
+skip for the normal `failures` loop. No extra provider calls: this only records
+what already happened, exactly as the original shape-of-the-fix note specified.
+
+Verified two ways:
+1. **Negative control**: `test/embed-fatal-error-ledger.test.ts` fails without
+   the fix (`embed_failures` empty) and passes with it (N rows, correct
+   `error_class`, valid `next_retry_at`, not quarantined) — confirmed by
+   actually reverting the fix and re-running before committing.
+2. **Real production entry point**: pointed `provider_base_urls.ollama` at an
+   unreachable port on the same real host (config backed up first, restored
+   after), ran `embed --stale --source lifeos-vault` against the live 366-chunk
+   stuck page. Before the fix this page produced the exact incident behaviour
+   (`backoff_deferred=0` every round). After: `embed_failures` held 366 rows,
+   all with `next_retry_at > now()`, zero quarantined. A same-round rerun before
+   the retry window opened showed `eligible_now=0` (backoff correctly blocking
+   premature retry) — the ledger is not just written, it's read.
+
+FB-002's fix does not by itself make the 366 stuck chunks embeddable — that
+was a distinct root cause. See **ADR-089** in the vault's `DECISIONS.md` (the
+batch was too large to fit `GBRAIN_AI_EMBED_TIMEOUT_MS` no matter how many
+times it retried) and the T1b real-content verification below.
+
+### T1b real-content verification (2026-08-17, same session)
+
+After ADR-089's two changes (`GBRAIN_EMBED_SUBBATCH_SIZE` 32→8,
+`isPartialStaleSplitWorthyError` now splits `provider_timeout`), the same
+366-chunk page was re-run to convergence: 224/366 committed with **zero new
+failures** (`backoff_deferred=0` throughout) before this session's reporting
+cutoff; the remainder is the original FB-002 incident's ledger rows draining
+normally through cron as their retry windows come due — not a new failure
+class. Confirms both fixes work together as designed: FB-002 makes failure
+observable, ADR-089 makes the underlying batch actually embeddable.
 
 ---
 
