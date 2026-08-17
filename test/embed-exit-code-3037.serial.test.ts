@@ -18,6 +18,7 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const DIMS = 16;
@@ -113,8 +114,26 @@ describe('gbrain embed exit code on failures (#3037)', () => {
       expect(failing.exitCode).not.toBe(0);
       expect(failing.stderr).toMatch(/failed to embed/i);
 
-      // Same brain, healthy provider: converges and exits 0 (failure exit is
-      // not sticky; the failed chunks stayed NULL so --stale picks them up).
+      // ADR-090 (2026-08-17): the failing run above now lands a real
+      // embed_failures ledger row for the chunk (FB-002 fatalIndexes fix,
+      // 64fea146) with a 15-minute initial backoff (c052e015, production-
+      // verified — deliberately not shortened). A same-second retry is
+      // correctly DEFERRED, not retried — that's the ledger doing its job of
+      // not hammering a provider that just failed. Clear the backoff
+      // directly (mirrors the pattern in test/embed-stale.serial.test.ts)
+      // to prove the chunk still converges once eligible, without touching
+      // the production-tested backoff duration itself.
+      const engine = new PGLiteEngine();
+      await engine.connect({ database_path: join(home, '.gbrain', 'brain.pglite') } as never);
+      try {
+        await engine.executeRaw(`UPDATE embed_failures SET next_retry_at = now() - INTERVAL '1 second'`);
+      } finally {
+        await engine.disconnect();
+      }
+
+      // Same brain, healthy provider + backoff cleared: converges and exits
+      // 0 (failure exit is not sticky; the failed chunks stayed NULL so
+      // --stale picks them up once they're eligible again).
       mode = 'ok';
       const healthy = await runCli(['embed', '--stale'], env, 90_000);
       if (healthy.exitCode !== 0) {
