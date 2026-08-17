@@ -23,13 +23,25 @@ export function isOllamaBatchSplitWorthyError(error: unknown): boolean {
  * Batch-1 policy for the stale-only partial pipeline. It deliberately widens
  * only that caller's salvage set; legacy inline/single-page callers retain the
  * V4 Ollama predicate and first-failure semantics.
+ *
+ * T1b (2026-08-17, ADR — see DECISIONS.md): a batch that fails because it
+ * genuinely timed out (content volume exceeds GBRAIN_AI_EMBED_TIMEOUT_MS, not
+ * because the provider is degraded) is split-worthy even though it is an
+ * AITransientError. A page with N chunks that all individually embed in
+ * seconds but never fit inside the timeout as one batch has no other
+ * self-healing path — #3037's blast-radius argument against fanning out
+ * (rate-limit/outage amplification) does not apply to a wall-clock budget
+ * problem. Rate-limit (429) and non-timeout transient/outage errors keep the
+ * #3037 no-fan-out property.
  */
 export function isPartialStaleSplitWorthyError(error: unknown): boolean {
+  const classified = classifyEmbedFailure(error);
+  if (classified.kind === 'failure' && classified.errorClass === 'provider_timeout') return true;
   // Configuration faults and transient/rate-limit errors (#3037 cost
   // bounding) are run-global. Every other provider error gets a one-chunk
   // salvage attempt in the stale-only pipeline.
   if (isTransientEmbedError(error)) return false;
-  return classifyEmbedFailure(error).kind === 'failure';
+  return classified.kind === 'failure';
 }
 
 /** Ladder layer: failures for which shorter text can plausibly succeed. */

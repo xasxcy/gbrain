@@ -21,6 +21,7 @@ import {
   embedWithTruncationFallbackPartial,
 } from '../src/core/embed-fallback.ts';
 import type { ChunkInput } from '../src/core/types.ts';
+import { AITransientError } from '../src/core/ai/errors.ts';
 
 let engine: PGLiteEngine;
 
@@ -322,6 +323,46 @@ describe('SPEC V4 fallback contracts', () => {
     } catch (error) {
       expect(error).toBe(reset);
     }
+  });
+
+  // T1b (2026-08-17): a whole-batch AITransientError timeout used to be
+  // treated like any other transient/outage error and short-circuit to
+  // fatalError with zero per-chunk salvage — even though, per FB-002's
+  // measurement, individual chunks embed in seconds and only the BATCH
+  // exceeds GBRAIN_AI_EMBED_TIMEOUT_MS. isPartialStaleSplitWorthyError now
+  // carves timeout out of the #3037 no-fan-out rule so oversized batches
+  // self-heal via per-chunk retry instead of piling up as a permanently
+  // unembeddable page.
+  test('partial-stale policy splits a batch-wide timeout into per-chunk salvage (T1b)', async () => {
+    const timeout = new AITransientError('[embed(ollama:qwen3-embedding:4b)] The operation timed out');
+    const calls: number[] = [];
+    const partial = await embedWithTruncationFallbackPartial(['a', 'b', 'c'], async (texts) => {
+      calls.push(texts.length);
+      if (texts.length > 1) throw timeout;
+      return texts.map((_, index) => makeVec(index));
+    }, { policy: 'partial-stale' });
+
+    // One failed batch call, then one call per chunk — no fatalError.
+    expect(calls).toEqual([3, 1, 1, 1]);
+    expect(partial.vectors.every((vector) => vector !== null)).toBe(true);
+    expect(partial.fatalError).toBeUndefined();
+    expect(partial.failures).toEqual([]);
+  });
+
+  // Companion negative case: a 429/rate-limit AITransientError must keep the
+  // #3037 no-fan-out property even after the T1b timeout carve-out — this is
+  // the design line T1b is not allowed to erase.
+  test('partial-stale policy still refuses to split a batch-wide 429 (#3037 preserved)', async () => {
+    const rateLimited = new AITransientError('rate_limit_exceeded: 429');
+    const calls: number[] = [];
+    const partial = await embedWithTruncationFallbackPartial(['a', 'b', 'c'], async (texts) => {
+      calls.push(texts.length);
+      throw rateLimited;
+    }, { policy: 'partial-stale' });
+
+    expect(calls).toEqual([3]);
+    expect(partial.fatalError).toBe(rateLimited);
+    expect(partial.fatalIndexes).toEqual([0, 1, 2]);
   });
 
   test('single timeout calls once; partial records it and legacy throws the same object', async () => {

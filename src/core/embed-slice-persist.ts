@@ -94,6 +94,34 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
   if (partial.fatalError !== undefined) {
     const indexes = (partial.fatalIndexes ?? []).map((index) => rows[index]?.chunk_index).filter((index): index is number => index !== undefined);
     write(`[embed-stale] error slug=${first.slug} chunk_index=[${indexes.join(',')}] err=${partial.fatalError instanceof Error ? partial.fatalError.message : String(partial.fatalError)}`);
+
+    // FB-002: a run-global fatalError (e.g. a whole-batch timeout that
+    // #3037 correctly refuses to fan out into per-chunk retries) previously
+    // left `entries` untouched for these chunks, so persistEmbedOutcome was
+    // never called with them and embed_failures stayed at zero rows forever
+    // — the retry/backoff ledger this table exists for was unreachable for
+    // the single most likely reason to need it. Record them here; this does
+    // NOT retry anything (zero extra provider calls), it only makes the
+    // failure observable so the next round's backoff/quarantine machinery
+    // can see it.
+    const classified = classifyEmbedFailure(partial.fatalError);
+    if (classified.kind !== 'fatal') {
+      for (const index of partial.fatalIndexes ?? []) {
+        const row = rows[index];
+        if (!row) continue;
+        entries.push({
+          chunkIndex: row.chunk_index,
+          chunkHash: hashChunk(row.chunk_text),
+          outcome: {
+            failure: {
+              errorClass: classified.errorClass,
+              errorFingerprint: fingerprintEmbedFailure(partial.fatalError),
+            },
+          },
+        });
+        write(`[embed-fail] slug=${first.slug} chunk_index=${row.chunk_index} class=${classified.errorClass}`);
+      }
+    }
   }
 
   let outcome: PersistEmbedOutcomeResult | undefined;
