@@ -52,9 +52,9 @@ Surge **代替目标主机接下了 TCP 握手**,之后才在隧道里失败。�
 | launchd 标签 | 干什么 | 现状 |
 |---|---|---|
 | cron 包装脚本 `~/.local/bin/gbrain-cron-sync.sh` | 每 30 分钟 `bun src/cli.ts sync` | **在跑** |
-| `com.xasxcy.gbrain-upstream-sync` | 每天 10:30 跑上游同步脚本 | **已 bootout + disable**(2026-08-17) |
+| `com.xasxcy.gbrain-upstream-sync` | 每天 10:30 跑上游同步脚本 | **已恢复 enabled**(2026-08-17，批4工单收尾):T2 端到端验证通过(注入器重写后完整链路，含 FORK_INVARIANTS 检查/parity lint/提交推送)后按工单要求重新启用 |
 
-上游同步代理停用的原因见 `FORK_BACKLOG.md` 与 vault ADR-087:注入器重写后**完整链路尚未端到端验证过**,在验证之前不能让它无人值守地跑。plist 保留在 `~/Library/LaunchAgents/`,恢复用 `launchctl enable` + `bootstrap`。
+停用期间的背景见 `FORK_BACKLOG.md` 与 vault ADR-087（注入器重写后完整链路曾未端到端验证）；本轮 T2 已验证通过，代理已重新纳入无人值守调度。
 
 **这个仓库没有 build 步骤(ADR-070):工作区就是生产代码。** 存盘即上线,下一轮 cron 直接执行。所以改到一半的树 = 线上跑着改到一半的代码。
 
