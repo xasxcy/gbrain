@@ -150,10 +150,18 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
  */
 function processStartMs(pid: number): number | null {
   try {
+    // `ps lstart` prints LOCAL time with no timezone suffix (ctime format:
+    // "Mon Aug 17 20:06:28 2026"). Date.parse() on a naive string like that
+    // assumes UTC, so on any non-UTC host the result is off by exactly the
+    // local UTC offset (~8h on a UTC+8 machine) — enough to blow through
+    // PID_REUSE_TOLERANCE_MS and make every live worker look "reused",
+    // silently emptying readWorkers(). Force TZ=UTC on the `ps` child so
+    // its output IS UTC, matching Date.parse()'s assumption.
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, TZ: 'UTC' },
     }).trim();
     if (!out) return null;
     const t = Date.parse(out);
