@@ -135,6 +135,14 @@ describePty('gbrain init interactive pickers under a real PTY (keyless)', () => 
         HOME: homeDir,
         GBRAIN_HOME: homeDir,
         TMPDIR: process.env.TMPDIR,
+        // NODE_ENV=test must propagate to this hand-built env (unlike
+        // launchTty above, this spawnSync does NOT go through
+        // hermeticChildEnv). Without it, loadRepoDotenv()'s `NODE_ENV ===
+        // 'test'` guard doesn't fire, and the child loads the developer's
+        // real repo-root .env (PG_APP_PWD et al) — silently redirecting
+        // this "isolated" readback to a real remote Postgres database
+        // instead of the test's own tmpdir PGLite brain.
+        NODE_ENV: 'test',
       },
       cwd: REPO_ROOT,
       encoding: 'utf-8',

@@ -94,6 +94,12 @@ describe.skipIf(SKIP)('agent-scheduler shell-chain contract', () => {
       // Repo paths cross the shell boundary via env, never string interpolation.
       SCHED_REPO: repoDir,
       SCHED_CLONE: cloneDir,
+      // Without this, loadRepoDotenv()'s `NODE_ENV === 'test'` guard doesn't
+      // fire in these hand-built child envs, and every `gbrain` shim
+      // invocation silently loads the developer's real repo-root .env
+      // (PG_APP_PWD et al) — redirecting the "keyless PGLite brain" this
+      // suite is pinned against to a real remote Postgres database instead.
+      NODE_ENV: 'test',
     };
 
     // Keyless brain — the install shape whose chain used to exit 1.
