@@ -3188,7 +3188,7 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
-  async sumStaleChunkChars(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number> {
+  async sumStaleChunkChars(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number> {
     // Sibling of countStaleChunks: same stale predicate, summing chunk_text
     // length for the sync cost preview. ::bigint guards int4 overflow.
     const { where, params } = this.buildStaleChunkWhere(opts);

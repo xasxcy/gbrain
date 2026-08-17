@@ -608,9 +608,14 @@ export async function planEmbeddingMigration(
   let narrow: number;
   let totalChars: number;
   if (col.exists) {
-    wide = await engine.countStaleChunks({ signature: sig, includeNullSignature: true });
-    narrow = await engine.countStaleChunks({ signature: sig });
-    totalChars = await engine.sumStaleChunkChars({ signature: sig, includeNullSignature: true });
+    // ADR-090: same reasoning as verifyMigrationComplete above — this quote
+    // (chunks_to_embed / est_cost_usd) must not under-report a chunk sitting
+    // in its retry-ledger backoff window. `wide` and `narrow` share the
+    // ignoreBackoff base so `null_signature_chunks = wide - narrow` stays a
+    // meaningful subtraction (both sides use the same eligibility set).
+    wide = await engine.countStaleChunks({ signature: sig, includeNullSignature: true, ignoreBackoff: true });
+    narrow = await engine.countStaleChunks({ signature: sig, ignoreBackoff: true });
+    totalChars = await engine.sumStaleChunkChars({ signature: sig, includeNullSignature: true, ignoreBackoff: true });
   } else {
     // Column ABSENT: the stale predicates reference cc.embedding and would
     // throw. Every chunk needs embedding once the column is (re)built.

@@ -1151,7 +1151,7 @@ export interface BrainEngine {
    * `includeNullSignature` lifts the grandfather clause (#3391) — see
    * countStaleChunks.
    */
-  sumStaleChunkChars(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number>;
+  sumStaleChunkChars(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number>;
   /**
    * Stamp `pages.embedding_signature = signature` for one page. Called after
    * a page's chunks are (re)embedded so a later model swap can detect it as
