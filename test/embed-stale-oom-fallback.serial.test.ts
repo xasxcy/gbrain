@@ -272,6 +272,20 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     //   shortText (500): effectiveLevels=[500], call len=500 → success.
     //   longText (6000): effectiveLevels=[6000, 5500, 5000, 4500]:
     //     len=6000 → OOM, len=5500 → OOM, len=5000 → success (≤5000).
+    //
+    // That ladder is the whole point of this case, so assert it. It was
+    // described in the comment above but never checked: callLog was collected
+    // and then dropped, leaving `countStaleChunks === 0` as the only
+    // assertion — which an implementation taking a completely different path
+    // (no truncation at all, or per-chunk fan-out from the start) would still
+    // satisfy, as long as the vectors eventually landed.
+    expect(callLog).toEqual([
+      { length: 2, count: 500 },   // batch of both chunks → OOM
+      { length: 1, count: 500 },   // short chunk retried alone → success
+      { length: 1, count: 6000 },  // long chunk at full length → OOM
+      { length: 1, count: 5500 },  // truncated one level → still OOM
+      { length: 1, count: 5000 },  // truncated again → success
+    ]);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
   });
 });

@@ -37,10 +37,21 @@ export interface SkillsManifestDrift {
  * manifest file itself is excluded from its own hash set. Symlinks and other
  * non-regular entries are skipped.
  */
+/** FORK-FIX: OS-generated files that appear in local checkouts but never in git. */
+const OS_JUNK_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+
 export function computeSkillsManifest(dir: string): SkillsManifest {
   const files: string[] = [];
   const walk = (rel: string): void => {
     for (const entry of readdirSync(join(dir, rel), { withFileTypes: true })) {
+      // FORK-FIX: skip OS junk files. macOS drops a .DS_Store into any
+      // directory Finder has visited; it is gitignored, so it exists in local
+      // working copies and never in CI. Hashing it made `check:skills-manifest`
+      // fail on every macOS checkout with a diff the developer cannot commit
+      // away — committing the hash would then fail in CI, where the file is
+      // absent. Named explicitly rather than skipping all dotfiles, because
+      // migrations/.gitkeep is a real tracked manifest entry. Worth upstreaming.
+      if (OS_JUNK_FILES.has(entry.name)) continue;
       const relPath = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) walk(relPath);
       else if (entry.isFile() && relPath !== SKILLS_MANIFEST_FILENAME) files.push(relPath);
