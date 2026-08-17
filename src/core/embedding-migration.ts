@@ -967,7 +967,15 @@ export async function verifyMigrationComplete(
   const sig = migrationSignature(target.toModel, target.toDims);
   let staleWide = 0;
   if (col.exists) {
-    staleWide = await engine.countStaleChunks({ signature: sig, includeNullSignature: true });
+    // ADR-090: this is the DB-reality gate migrate-embeddings.ts uses to
+    // decide "nothing to migrate, exit 0" BEFORE any drain even starts.
+    // Without ignoreBackoff, a chunk sitting in its post-failure retry-ledger
+    // backoff window is invisible to this count, so a fresh `migrate
+    // embeddings` invocation could short-circuit to "verified on target"
+    // while that chunk is still on the OLD model/dimension — worse than the
+    // post-drain "remaining" miscount this ADR was written for, since here
+    // the migration never even attempts the chunk.
+    staleWide = await engine.countStaleChunks({ signature: sig, includeNullSignature: true, ignoreBackoff: true });
   } else {
     // Absent column: the stale predicate would throw; every chunk is pending.
     const rows = await engine.executeRaw<{ n: number }>(
