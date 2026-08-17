@@ -94,6 +94,7 @@ CHECKS=(
   "check:doc-history"
   "check:fixture-privacy"
   "check:source-scope-onboard"
+  "check:getpage-scope"
   "check:no-double-retry"
   "check:batch-audit-site"
   "check:engine-dynamic-import"
@@ -103,6 +104,7 @@ CHECKS=(
   "check:worker-lock-renewal-shape"
   "check:fork-migration-parity"
   "check:bootstrap-tag"
+  "check:plugin-tree"
   "check:skill-refs"
   # Previously reachable ONLY from the deleted check:all (i.e. never run):
   "check:newlines"
@@ -111,6 +113,9 @@ CHECKS=(
   # Revived registered-but-never-executed guards (this pass):
   "check:pagetype-exhaustive"
   "check:pg-url-redaction"
+  # Containment sprint: module-size ratchet + structural-suite freshness.
+  "check:module-size"
+  "check:structural-manifest"
 )
 
 if [ "${#CHECKS[@]}" -eq 0 ]; then
