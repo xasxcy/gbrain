@@ -61,6 +61,14 @@ export interface EmbedBackfillResult {
   embedded: number;
   chunksProcessed: number;
   pagesProcessed: number;
+  /**
+   * #4283: chunks whose embeddings this run NULLed (signature/content drift).
+   * The zero-embed honesty gate below keys on it; surfacing it in the result
+   * row lets external samplers audit null-vs-write balance per run.
+   */
+  invalidated: number;
+  /** #4283: set when drifted chunks existed but the embedder probe failed. */
+  invalidationSkipped?: 'embedder_probe_failed';
   /** $USD spent inside this job (from BudgetTracker.totalSpent). */
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
@@ -133,8 +141,19 @@ function parseParams(data: Record<string, unknown>): EmbedBackfillJobData {
 
 export function makeEmbedBackfillHandler(
   engine: BrainEngine,
-  testOpts?: { embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]> },
+  // Test seams. Production callers leave this unset.
+  //   runStale — upstream's seam: replace the stale-drain wholesale so the
+  //     honesty gates below are unit-testable without a fake gateway.
+  //   embedFn  — the fork's seam: inject a fake embedder into the REAL drain,
+  //     so slice-checkpoint / cooperative-shutdown behaviour is exercised end
+  //     to end. Merged onto one options object (2026-08-25 upstream merge);
+  //     both sides' call shape `(engine, { … })` is unchanged.
+  testOpts: {
+    runStale?: typeof embedStaleForSource;
+    embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+  } = {},
 ) {
+  const runStale = testOpts.runStale ?? embedStaleForSource;
   return async function embedBackfillHandler(
     job: MinionJobContext,
   ): Promise<EmbedBackfillResult> {
@@ -151,6 +170,7 @@ export function makeEmbedBackfillHandler(
         embedded: 0,
         chunksProcessed: 0,
         pagesProcessed: 0,
+        invalidated: 0,
         spentUsd: 0,
       };
     }
@@ -179,7 +199,7 @@ export function makeEmbedBackfillHandler(
 
     try {
       const result = await withBudgetTracker(tracker, async () =>
-        embedStaleForSource(engine, sourceId, {
+        runStale(engine, sourceId, {
           batchSize,
           signal,
           pacer,
@@ -210,8 +230,23 @@ export function makeEmbedBackfillHandler(
           embedded: result.embedded,
           chunksProcessed: result.chunksProcessed,
           pagesProcessed: result.pagesProcessed,
+          invalidated: result.invalidated,
+          ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
           spentUsd: tracker.totalSpent,
         };
+      }
+      // #4283 honesty gate: a completed drain that embedded NOTHING while
+      // having work to do (it NULLed vectors, or it pulled stale chunks) is a
+      // broken-embedder run, not a success. Throw so the queue marks the job
+      // failed — pre-fix this shape reported `status: "success"` twelve runs
+      // in a row while an entire corpus sat stripped. NULLed chunks stay NULL
+      // for the next (fixed-config) run to pick up.
+      if (result.embedded === 0 && (result.invalidated > 0 || result.chunksProcessed > 0)) {
+        throw new Error(
+          `embed-backfill: embedded 0 of ${result.chunksProcessed} processed chunk(s) ` +
+          `(${result.invalidated} invalidated) for source "${sourceId}" — refusing to report success. ` +
+          `Check embedding provider config/credentials on the worker.`,
+        );
       }
       return {
         status: 'success',
@@ -219,6 +254,8 @@ export function makeEmbedBackfillHandler(
         embedded: result.embedded,
         chunksProcessed: result.chunksProcessed,
         pagesProcessed: result.pagesProcessed,
+        invalidated: result.invalidated,
+        ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
         spentUsd: tracker.totalSpent,
       };
     } catch (err) {
@@ -231,6 +268,7 @@ export function makeEmbedBackfillHandler(
           embedded: 0, // Tracker doesn't track per-chunk count
           chunksProcessed: 0,
           pagesProcessed: 0,
+          invalidated: 0, // Unknown — the drain's counters are lost with the throw
           spentUsd: tracker.totalSpent,
           budgetCapUsd: capUsd,
         };

@@ -22,6 +22,7 @@ import {
   checkPgliteScratchProbe,
   computeQueueHealthCheck,
   computeWedgedQueueCheck,
+  computeOrphanedPrivateQueueCheck,
   computeAutopilotFanoutConcurrencyCheck,
   checkSubagentHealth,
   checkBatchRetryHealth,
@@ -33,6 +34,7 @@ import {
   checkSyncConsolidation,
   checkPoolBudget,
   checkLinksExtractionLag,
+  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkRerankerHealth,
@@ -137,7 +139,9 @@ export async function doctorReportRemote(
       checks.push({
         name: 'timeline_dedup_index',
         status: 'ok',
-        message: idx.tablePresent ? 'idx_timeline_dedup has the 4-column shape' : 'no timeline_entries table yet',
+        // #3737: canonical shape keys md5(summary) so long summaries can't
+        // overflow the btree row cap.
+        message: idx.tablePresent ? 'idx_timeline_dedup has the md5-keyed 4-column shape' : 'no timeline_entries table yet',
       });
     } else {
       checks.push({
@@ -145,12 +149,20 @@ export async function doctorReportRemote(
         status: 'fail',
         message:
           `idx_timeline_dedup is ${idx.indexPresent ? `(${idx.columns.join(', ')})` : 'absent'}, ` +
-          `expected (page_id, date, summary, source) — timeline writes are failing (#2038). ` +
+          `expected (page_id, date, md5(summary), source) — timeline writes are failing (#2038/#3737). ` +
           `Run \`gbrain apply-migrations --force-schema\` to heal it.`,
       });
     }
   } catch {
     checks.push({ name: 'timeline_dedup_index', status: 'warn', message: 'Could not check idx_timeline_dedup shape' });
+  }
+
+  // 2c. #550: pages(source_id, slug) upsert arbiter — same drift class as 2b.
+  // When the arbiter is missing, EVERY putPage fails with "no unique or
+  // exclusion constraint" and the version counter can't see it.
+  {
+    const { pagesUpsertArbiterCheck } = await import('./checks/core-health.ts');
+    checks.push(await pagesUpsertArbiterCheck(engine));
   }
 
   // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
@@ -312,6 +324,7 @@ export async function doctorReportRemote(
 
   // issue #1801 — wedged_queue (cross-surface parity with buildChecks).
   checks.push(await computeWedgedQueueCheck(engine));
+  checks.push(await computeOrphanedPrivateQueueCheck(engine));
 
   // #2194 fix #5 — warn when autopilot fan-out exceeds worker concurrency.
   checks.push(await computeAutopilotFanoutConcurrencyCheck(engine));
@@ -372,6 +385,8 @@ export async function doctorReportRemote(
   checks.push(await checkSchemaPackSourceDrift(engine));
 
   // 7. v0.32.3 search-lite mode + per-key drift surface.
+  const inertFallbackChain = await checkChatFallbackChainInert(engine);
+  if (inertFallbackChain) checks.push(inertFallbackChain);
   checks.push(await checkSearchMode(engine));
 
   // 8. v0.32.3 eval_drift: retrieval-affecting files changed since last

@@ -23,7 +23,7 @@ import type {
 import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidTokenError, InvalidClientMetadataError, InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
@@ -682,14 +682,20 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         AND client_id = ${client.client_id}
       RETURNING client_id, scopes, expires_at
     `;
-    if (rows.length === 0) throw new Error('Refresh token not found');
+    // #4532: InvalidGrantError (not bare Error) — the SDK's token handler maps
+    // OAuthError subclasses to their RFC 6749 wire shape (400 invalid_grant)
+    // and everything else to a 500 Internal Server Error. A refresh with a
+    // rotated/expired token is a routine client condition (RFC 6749 §5.2
+    // invalid_grant), and the 500 made well-behaved MCP clients treat it as a
+    // server outage instead of re-running the authorization flow.
+    if (rows.length === 0) throw new InvalidGrantError('Refresh token not found');
 
     const row = rows[0];
     // NULL expires_at is treated as expired (fail-closed). Schema permits NULL
     // even though issueTokens always sets it, so a corrupt or hand-modified row
     // can't ride past validation.
     const expiresAt = coerceTimestamp(row.expires_at);
-    if (expiresAt === undefined || expiresAt < now) throw new Error('Refresh token expired');
+    if (expiresAt === undefined || expiresAt < now) throw new InvalidGrantError('Refresh token expired');
 
     // F3 hardening: requested scopes on refresh MUST be a subset of the
     // original grant on this refresh token's row. RFC 6749 §6: "the scope of
@@ -934,10 +940,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     if (legacyRows.length > 0) {
       // For legacy tokens, name = clientId = clientName (single identifier).
-      // Update last_used_at
-      await this.sql`
-        UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
-      `;
+      // #2833: debounced fire-and-forget last_used_at update — only writes
+      // once per token per 60s, and NEVER blocks or fails verification (a
+      // slow/broken UPDATE used to hang or 401 every legacy-token request).
+      // Mirrors src/mcp/http-transport.ts validateToken; the SQL-level WHERE
+      // keeps the debounce race-tolerant under concurrent requests.
+      this.sql`
+        UPDATE access_tokens
+        SET last_used_at = now()
+        WHERE token_hash = ${tokenHash}
+          AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
+      `.catch(() => { /* fire-and-forget */ });
       const name = legacyRows[0].name as string;
       const permissions = coerceLegacyPermissions(legacyRows[0].permissions);
       const { sourceId, allowedSources } = parseLegacyTokenScope(permissions?.source_id);
@@ -964,6 +977,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // allowedSources for federated reads, matching legacy HTTP transport.
         sourceId,
         allowedSources,
+        // #3242 parity with src/mcp/http-transport.ts: only the historical
+        // no-grant floor may widen unqualified reads to the federated set.
+        hasSourceGrant: permissions?.source_id != null,
         takesHoldersAllowList,
       } as CoreAuthInfo as SdkAuthInfo;
     }

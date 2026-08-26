@@ -54,6 +54,11 @@ fi
 # bare `bun test` runs while DATABASE_URL/GBRAIN_DATABASE_URL is ambient; the
 # per-file name floor (test/helpers/db-guard.ts) still applies after this.
 export GBRAIN_TEST_ALLOW_DATABASE_URL=1
+# Provider keys: the unit-lane preload (provider-keys-preload.ts) strips
+# ambient ANTHROPIC/OPENAI keys for keyless-CI parity; e2e is the lane where
+# real keys are deliberate (live embed/parity tests skip-gate on them), so
+# opt back in at this boundary.
+export GBRAIN_TEST_KEEP_PROVIDER_KEYS=1
 # The e2e suite runs on DATABASE_URL only; an ambient GBRAIN_DATABASE_URL
 # would pass the opt-in yet reach CLI-subprocess paths with no name floor —
 # drop it here so only the floored variable crosses the boundary.
@@ -111,6 +116,7 @@ for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPEN
     GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
     GBRAIN_PGLITE_SNAPSHOT) ;;  # snapshot fast-path fixture (exported by ci-local.sh / runners) — keep
     GBRAIN_TEST_ALLOW_DATABASE_URL) ;;  # #3485 preload opt-in (set above) — keep
+    GBRAIN_TEST_KEEP_PROVIDER_KEYS) ;;  # provider-keys preload opt-in (set above) — keep
     GBRAIN_E2E_FILE_TIMEOUT) ;;  # per-file cap override — read AFTER this scrub, so it must survive it
     GBRAIN_E2E_ALLOW_DB) ;;  # #3485 name-floor opt-in — the guard's own error
                              # message tells operators to set it; stripping it
@@ -227,13 +233,17 @@ for f in "${files[@]}"; do
   # assertion output, which reads like a mystery failure. CI runs those
   # files in their own job WITHOUT this wrapper (see .github/workflows/
   # e2e.yml tier2), so the cap only ever bit local runs: give them 4x.
+  # serve-http-multi-agent rides the same carve-out for a different reason:
+  # it spawns TWO `gbrain serve --http` subprocesses (19133 + a chaos serve
+  # on 19134) plus several CLI register subprocesses, so its wall clock is
+  # process-spawn-bound, not test-bound.
   file_timeout="${GBRAIN_E2E_FILE_TIMEOUT:-${E2E_FILE_TIMEOUT_SECS:-180}}"
   # Digits-only validation (same strict positive-int posture as the TS env
   # knobs): a malformed value falls back to the default instead of
   # word-splitting into extra gtimeout arguments or breaking the 4x math.
   case "$file_timeout" in ''|*[!0-9]*) file_timeout=180 ;; esac
   case "$f" in
-    */skills.test.ts|*/zeroentropy-live.test.ts) file_timeout=$((file_timeout * 4)) ;;
+    */skills.test.ts|*/zeroentropy-live.test.ts|*/serve-http-multi-agent.test.ts) file_timeout=$((file_timeout * 4)) ;;
   esac
   if command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT_CMD="gtimeout $file_timeout"

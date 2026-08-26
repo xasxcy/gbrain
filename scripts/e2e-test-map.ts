@@ -15,6 +15,15 @@
 // No brace expansion, no ?, no [ ].
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
+  // Serve-delegated sync: wire types, job runner, CLI ladder, and the IPC
+  // plumbing all feed the delegation-under-serve E2E.
+  "src/core/context/sync-ipc.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/core/serve-sync-runner.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/commands/sync-delegate.ts": ["test/e2e/sync-delegation-under-serve.serial.test.ts"],
+  "src/core/context/resolve-ipc.ts": [
+    "test/e2e/bootstrap-hook-under-serve.serial.test.ts",
+    "test/e2e/sync-delegation-under-serve.serial.test.ts",
+  ],
   // Source-aware ranking, hybrid search, intent classification.
   "src/core/search/**": [
     "test/e2e/search-quality.test.ts",
@@ -51,6 +60,18 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/cycle/synthesize.ts": [
     "test/e2e/multi-source-bug-class.test.ts",
     "test/e2e/synthesize-bigint-job-id-postgres.test.ts",
+    "test/e2e/dream-synthesize-pglite.test.ts",
+  ],
+  // The inline drain claims from MinionQueue, so its entry must be a SUPERSET:
+  // the drain suite plus the full minions e2e set — a narrower list would
+  // reduce coverage vs the fail-closed run-everything default for unmapped paths.
+  "src/core/cycle/inline-drain.ts": [
+    "test/e2e/dream-synthesize-pglite.test.ts",
+    "test/e2e/minions-concurrency.test.ts",
+    "test/e2e/minions-resilience.test.ts",
+    "test/e2e/minions-shell.test.ts",
+    "test/e2e/minions-shell-pglite.test.ts",
+    "test/e2e/worker-abort-recovery.test.ts",
   ],
   "src/commands/embed.ts": [
     "test/e2e/multi-source-bug-class.test.ts",

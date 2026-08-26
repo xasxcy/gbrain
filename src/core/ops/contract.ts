@@ -166,6 +166,15 @@ export interface AuthInfo {
    */
   sourceId?: string;
   /**
+   * #3242 (serve --http parity): distinguishes an operator-set source scope
+   * from the historical no-grant 'default' floor. `false` ONLY for a legacy
+   * bearer token whose `access_tokens.permissions.source_id` is absent —
+   * the one case whose unqualified reads may widen to the federated set.
+   * `true` (or undefined, e.g. OAuth clients) never widens. Mirrors
+   * `AuthResult.hasSourceGrant` in `src/mcp/http-transport.ts`.
+   */
+  hasSourceGrant?: boolean;
+  /**
    * v0.34.1 (#876): array of source ids this OAuth client may READ
    * from (federation). Sourced from `oauth_clients.federated_read`.
    * Independent of `sourceId` (write authority): a "WeCare L3 dept"
@@ -323,6 +332,17 @@ export interface OperationContext {
    * v0.15 behavior; pure addition, no regression).
    */
   allowedSlugPrefixes?: string[];
+  /**
+   * #4216 — defer chunk embeddings on put_page writes: importFromContent runs
+   * noEmbed and the standing embed machinery (embed phase / phase-end
+   * backfill / the stale-embed sweep) picks the chunks up via the
+   * `embedding IS NULL` partial index. Set ONLY by server-side dispatchers
+   * (the oneshot runner's programmatic writes); never hydrated from any wire
+   * payload, so remote callers cannot toggle it. (Flag spelled without dashes
+   * here on purpose — the flag-registry generator harvests bare dash-dash
+   * tokens from comments.)
+   */
+  deferEmbeds?: boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers

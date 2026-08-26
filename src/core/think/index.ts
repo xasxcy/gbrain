@@ -20,16 +20,18 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import type { BrainEngine, SynthesisEvidenceInput } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
-import { runGather, renderPagesBlock, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
+import { runGather, renderPagesBlock, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
 import { renderTakesBlock } from './sanitize.ts';
 import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
-import { chat as gatewayChat, probeChatModel, type ChatResult } from '../ai/gateway.ts';
+import { chat as gatewayChat, probeChatModel, isThinkingByDefaultModel, type ChatResult } from '../ai/gateway.ts';
+import { getProviderCapabilities } from '../ai/capabilities.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
+import { parseTemporalWindow } from './temporal-window.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -208,13 +210,14 @@ export interface ThinkResult {
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4000;
 
-// Thinking-by-default Claude 5 models (`anthropic:claude-*-5`) spend a large
-// share of the output budget on internal reasoning before emitting any answer,
-// so the 4000 default leaves `think` with empty or truncated text. Give those
-// models headroom; providers bill actual tokens, not the cap. Everything else
-// keeps 4000.
+// Thinking-by-default Claude 5 models spend a large share of the output budget
+// on internal reasoning before emitting any answer, so the 4000 default leaves
+// `think` with empty or truncated text. Give those models headroom; providers
+// bill actual tokens, not the cap. Everything else keeps 4000. Detection is
+// shared with the gateway (`isThinkingByDefaultModel`) so provider-prefixed
+// spellings (openrouter:anthropic/claude-*-5, claude-cli:*) get the same
+// treatment; think keeps its own smaller 16000 cap.
 const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
-const THINKING_BY_DEFAULT_MODEL_RE = /^anthropic[:/]claude-[a-z0-9]+-5(?:[.-]|$)/i;
 // OpenAI reasoning models spend output budget on internal reasoning tokens
 // the same way — reasoning tokens are billed as output and count against
 // `max_tokens` — so they get the same headroom. Deliberately scoped to the
@@ -227,9 +230,24 @@ const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-c
 export function maxOutputTokensFor(modelStr: string): number {
   const openaiReasoning =
     OPENAI_REASONING_MODEL_RE.test(modelStr) && !OPENAI_CHAT_SNAPSHOT_RE.test(modelStr);
-  return THINKING_BY_DEFAULT_MODEL_RE.test(modelStr) || openaiReasoning
-    ? THINKING_DEFAULT_MAX_OUTPUT_TOKENS
-    : DEFAULT_MAX_OUTPUT_TOKENS;
+  // Shared name-based predicate (#4087: one source of truth in gateway.ts —
+  // provider-prefixed + bare Claude 5 spellings, never 3.5-era models).
+  if (isThinkingByDefaultModel(modelStr) || openaiReasoning) {
+    return THINKING_DEFAULT_MAX_OUTPUT_TOKENS;
+  }
+  // Recipe-declared thinking-by-default (gbrain#4172, e.g. DeepSeek v4):
+  // keyed on the capability, not a model-name regex, so a provider's model
+  // renames don't silently drop the headroom. Reasoning bills as output and
+  // counts against max_tokens; without headroom the 4000 cap is spent on
+  // reasoning and think returns truncated/empty JSON.
+  try {
+    if (getProviderCapabilities(modelStr).supportsThinking) {
+      return THINKING_DEFAULT_MAX_OUTPUT_TOKENS;
+    }
+  } catch {
+    // Unknown provider / chat-less recipe — keep the conservative default.
+  }
+  return DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 function inferIntent(question: string, anchor?: string): string {
@@ -240,9 +258,14 @@ function inferIntent(question: string, anchor?: string): string {
   return 'general';
 }
 
+/** Strip a wrapping code fence, if present (shared by parse + salvage). */
+function stripEnvelopeFences(text: string): string {
+  return text.trim().replace(/^```(?:json)?\s*\n?/, '').replace(/```\s*$/, '');
+}
+
 function tryParseJSON(text: string): unknown {
   // The model may wrap JSON in code fences. Strip if present.
-  const stripped = text.trim().replace(/^```(?:json)?\s*\n?/, '').replace(/```\s*$/, '');
+  const stripped = stripEnvelopeFences(text);
   try {
     return JSON.parse(stripped);
   } catch {
@@ -253,6 +276,104 @@ function tryParseJSON(text: string): unknown {
     }
     return null;
   }
+}
+
+/** #4509 — is this model output SHAPED like a JSON envelope (as opposed to
+ * refusal prose / the graceful sentinel, whose raw text is meaningful)? */
+export function looksLikeJsonEnvelope(text: string): boolean {
+  return stripEnvelopeFences(text).startsWith('{');
+}
+
+/**
+ * #4509 — best-effort field salvage from a MALFORMED ThinkResponse envelope
+ * (the common cause is max-token truncation cutting the JSON mid-string).
+ * Pre-fix, the raw envelope text shipped as the user-facing `answer` with
+ * `citations: []`. Tolerant by construction: the answer string is recovered
+ * up to the cut (dangling escapes trimmed), citations/gaps only when their
+ * arrays survived whole. Returns null when no non-empty answer is present —
+ * the caller then suppresses the raw JSON entirely.
+ */
+export function salvageThinkEnvelope(
+  text: string,
+): Pick<ThinkResponse, 'answer' | 'citations' | 'gaps'> | null {
+  const stripped = stripEnvelopeFences(text);
+  if (!stripped.startsWith('{')) return null;
+  const answer = salvageStringField(stripped, 'answer');
+  if (answer === null || answer.trim().length === 0) return null;
+  const citations = (salvageArrayField(stripped, 'citations') ?? []).filter(
+    (c): c is ThinkResponse['citations'][number] =>
+      typeof c === 'object' && c !== null && typeof (c as { page_slug?: unknown }).page_slug === 'string',
+  );
+  const gaps = (salvageArrayField(stripped, 'gaps') ?? []).filter(
+    (g): g is string => typeof g === 'string',
+  );
+  return { answer, citations, gaps };
+}
+
+/** Recover `"key": "…"` even when the closing quote never arrives (truncation). */
+function salvageStringField(src: string, key: string): string | null {
+  const keyIdx = src.indexOf(`"${key}"`);
+  if (keyIdx === -1) return null;
+  let i = keyIdx + key.length + 2;
+  while (i < src.length && /\s/.test(src[i]!)) i++;
+  if (src[i] !== ':') return null;
+  i++;
+  while (i < src.length && /\s/.test(src[i]!)) i++;
+  if (src[i] !== '"') return null;
+  i++;
+  let raw = '';
+  for (; i < src.length; i++) {
+    const c = src[i]!;
+    if (c === '\\') {
+      raw += c + (src[i + 1] ?? '');
+      i++;
+      continue;
+    }
+    if (c === '"') break; // properly terminated
+    raw += c;
+  }
+  // Truncation can leave a dangling escape — trim a lone trailing backslash
+  // and an incomplete \uXXXX so the re-parse below can't fail on them.
+  if (/(?:^|[^\\])(?:\\\\)*\\$/.test(raw)) raw = raw.slice(0, -1);
+  raw = raw.replace(/\\u[0-9a-fA-F]{0,3}$/, '');
+  try {
+    return JSON.parse(`"${raw}"`) as string;
+  } catch {
+    // Last resort: the escaped text beats the whole raw envelope.
+    return raw;
+  }
+}
+
+/** Parse `"key": [...]` when the array survived whole; null when cut mid-array. */
+function salvageArrayField(src: string, key: string): unknown[] | null {
+  const keyIdx = src.indexOf(`"${key}"`);
+  if (keyIdx === -1) return null;
+  const open = src.indexOf('[', keyIdx);
+  if (open === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i]!;
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[') depth++;
+    else if (c === ']') {
+      depth--;
+      if (depth === 0) {
+        try {
+          const v = JSON.parse(src.slice(open, i + 1));
+          return Array.isArray(v) ? v : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null; // truncated mid-array
 }
 
 // ─── Extractive fallback [WP2/E2] ────────────────────────────────────────────
@@ -357,6 +478,7 @@ export async function runThink(
 ): Promise<ThinkResult> {
   const rounds = Math.max(1, opts.rounds ?? 1);
   const warnings: string[] = [];
+  const window = parseTemporalWindow(opts.since, opts.until);
 
   // Resolve the model through the 6-tier chain.
   const modelUsed = await resolveModel(engine, {
@@ -399,6 +521,7 @@ export async function runThink(
     question: opts.question,
     anchor: opts.anchor,
     questionEmbedding,
+    ...(window ? { window } : {}),
     takesHoldersAllowList: opts.takesHoldersAllowList,
     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
     ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
@@ -407,9 +530,15 @@ export async function runThink(
   // raw error text stays on stderr. Distinguishes an errored stream from a
   // legitimately-empty one for MCP/remote callers.
   for (const w of gather.warnings) warnings.push(w);
+  if (gather.diagnostics.window?.dropped) {
+    warnings.push(`WINDOW_EXCLUDED_${gather.diagnostics.window.dropped}_PAGES`);
+  }
 
-  // Render evidence blocks for the prompt
-  const pagesBlock = renderPagesBlock(gather.pages, 600, opts.question);
+  // Render evidence blocks for the prompt. #4510: the per-page excerpt is
+  // budget-aware — 600 chars is the FLOOR (a big gather never collapses each
+  // page below it) and a small gather spreads the block budget into much
+  // larger, often complete, per-page windows.
+  const pagesBlock = renderPagesBlock(gather.pages, pagesBlockExcerptLen(gather.pages.length), opts.question);
   const takesForPrompt = gather.takes.map(takesHitToTakeForPrompt);
   const { rendered: takesBlock, sanitizedCount } = renderTakesBlock(takesForPrompt);
   if (sanitizedCount > 0) {
@@ -457,6 +586,7 @@ export async function runThink(
   // `other` intent short-circuits before any SQL fires.
   let trajectoryBlock = '';
   let trajectoryPointsCount = 0;
+  let trajectoryExcludedCount = 0;
   const trajectoryEnabledConfig = await readThinkTrajectoryEnabled(engine);
   const trajectoryEnabledOpt = opts.withTrajectory !== false; // default true
   if (trajectoryEnabledConfig && trajectoryEnabledOpt) {
@@ -503,8 +633,15 @@ export async function runThink(
                     setTimeout(() => resolve([]), 5000);
                   }),
                 ]);
-                if (points.length === 0) return null;
-                const fmt = formatTrajectoryBlock(points, resolved.slug, {
+                const boundedPoints = window ? points.filter(point => {
+                  const ms = point.valid_from.getTime();
+                  const outside = (window.startMs !== null && ms < window.startMs)
+                    || (window.endMs !== null && ms > window.endMs);
+                  if (outside) trajectoryExcludedCount++;
+                  return !outside;
+                }) : points;
+                if (boundedPoints.length === 0) return null;
+                const fmt = formatTrajectoryBlock(boundedPoints, resolved.slug, {
                   intent: trajIntent,
                 });
                 if (fmt.rendered.length === 0) return null;
@@ -535,6 +672,7 @@ export async function runThink(
   if (trajectoryPointsCount > 0) {
     warnings.push(`TRAJECTORY_INJECTED_${trajectoryPointsCount}_POINTS`);
   }
+  if (trajectoryExcludedCount > 0) warnings.push(`WINDOW_EXCLUDED_${trajectoryExcludedCount}_TRAJECTORY_POINTS`);
 
   // SYNTHESIZE
   const intent = inferIntent(opts.question, opts.anchor);
@@ -680,9 +818,24 @@ export async function runThink(
         warnings.push('LLM_OUTPUT_NOT_JSON');
         synthesisOk = false;  // #1698: malformed output (and the non-JSON graceful sentinel)
         // Refusals + the graceful sentinel land here too — coarse on purpose
-        // (no dedicated status; the raw text stays in `answer` for consumers).
+        // (no dedicated status; for PROSE the raw text stays in `answer`).
         synthesisStatus = 'not_json';
-        response = { answer: text, citations: [], gaps: [] };
+        // #4509: a malformed JSON envelope (max-token truncation is the
+        // common cause) previously shipped VERBATIM as the user-facing
+        // answer. Salvage the answer/citations/gaps fields tolerantly; when
+        // the text is JSON-shaped but unsalvageable, emit no answer at all
+        // (the extractive fallback below carries the content) — never raw
+        // JSON to the user.
+        const salvaged = salvageThinkEnvelope(text);
+        if (salvaged) {
+          warnings.push('SALVAGED_ANSWER_FROM_MALFORMED_JSON');
+          response = salvaged;
+        } else if (looksLikeJsonEnvelope(text)) {
+          warnings.push('MALFORMED_JSON_ANSWER_SUPPRESSED');
+          response = { answer: '', citations: [], gaps: [] };
+        } else {
+          response = { answer: text, citations: [], gaps: [] };
+        }
       } else {
         const r = parsed as Partial<ThinkResponse>;
         response = {

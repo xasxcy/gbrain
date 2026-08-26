@@ -65,11 +65,16 @@ function flagsInText(text: string): Set<string> {
   return out;
 }
 
-/** One level of ./relative imports (static or dynamic) from a module's source. */
+/** One level of ./relative imports (static or dynamic) from a module's source.
+ *  TYPE-ONLY imports are skipped: they carry no runtime behavior the command
+ *  can consume, so their doc-comment prose must not register flags (observed:
+ *  `import type { BrainEngine } from engine.ts` handed skillpack 10 phantom
+ *  flags from engine.ts's comments — the 4th prose-bleed incident). */
 function relativeImports(src: string, fromDir: string): string[] {
+  const scanSrc = src.replace(/import\s+type\s+[^;]+;/g, '');
   const paths = new Set<string>();
-  for (const m of src.matchAll(/from\s+'(\.\.?\/[^']+\.ts)'/g)) paths.add(m[1]);
-  for (const m of src.matchAll(/import\('(\.\.?\/[^']+\.ts)'\)/g)) paths.add(m[1]);
+  for (const m of scanSrc.matchAll(/from\s+'(\.\.?\/[^']+\.ts)'/g)) paths.add(m[1]);
+  for (const m of scanSrc.matchAll(/import\('(\.\.?\/[^']+\.ts)'\)/g)) paths.add(m[1]);
   return [...paths]
     .map(p => resolvePath(fromDir, p))
     .filter(p => existsSync(p) && !isExcludedModule(p))
@@ -96,6 +101,7 @@ function facadeExpansion(p: string): string[] {
   };
   if (rel === 'src/core/operations.ts') return collect(join(ROOT, 'src/core/ops'));
   if (rel === 'src/commands/doctor.ts') return collect(join(ROOT, 'src/commands/doctor'));
+  if (rel === 'src/commands/skillpack.ts') return collect(join(ROOT, 'src/commands/skillpack'));
   if (rel === 'src/commands/sync.ts') {
     // Only the modules PEELED OUT of sync.ts (their text used to live inside
     // it). Pre-existing sync-* siblings were always ordinary deps — sweeping
@@ -163,7 +169,15 @@ export function buildFlagRegistry(): Record<string, string[]> {
   // standalone literal (`includes('--dry-run')`, `has('--dry-run')`,
   // `=== '--dry-run'`). Prose bleed embeds the flag inside a longer string, so
   // it never has quotes on both sides of the bare flag.
-  const SAFETY_FLAGS = new Set(['--dry-run']);
+  const SAFETY_FLAGS = new Set(['--dry-run', '--allow-noncanonical-root']);
+  // Reindex scope/mode flags can bleed through upgrade's imported modules even
+  // though upgrade does not forward them. Require direct consumption on the
+  // affected dispatch surfaces so callers never get silently ignored selectors.
+  const SCOPING_FLAGS_BY_COMMAND: Record<string, string[]> = {
+    reindex: ['--type'],
+    upgrade: ['--type', '--aliases'],
+    'post-upgrade': ['--type', '--aliases'],
+  };
   const consumes = (text: string, flag: string): boolean =>
     new RegExp(`['"\`]${flag}['"\`]`).test(text);
 
@@ -197,6 +211,9 @@ export function buildFlagRegistry(): Record<string, string[]> {
 
     for (const f of EXTRA_FLAGS[command] ?? []) { flags.add(f); depthZero.add(f); }
     for (const f of SAFETY_FLAGS) {
+      if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
+    }
+    for (const f of SCOPING_FLAGS_BY_COMMAND[command] ?? []) {
       if (flags.has(f) && !consumes(depthZeroText, f)) flags.delete(f);
     }
     registry[command] = [...flags].sort();

@@ -39,6 +39,10 @@ mock.module('../src/core/embedding.ts', () => ({
   // setPageEmbeddingSignature / invalidateStaleSignatureEmbeddings resolve to
   // null via the Proxy default, so the signature value is inert here.
   currentEmbeddingSignature: () => 'test:model:1536',
+  // #3374: import-file.ts (imported by the routing test below) also pulls
+  // embedMultimodal from this module; the mock must export it or the import
+  // itself throws. Inert — no test here exercises the multimodal path.
+  embedMultimodal: async (inputs: unknown[]) => inputs.map(() => new Float32Array(512)),
 }));
 
 // Import AFTER mocking.
@@ -623,7 +627,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
     }
   });
 
-  test('case 4: non-rate-limit error rethrows immediately without retry', async () => {
+  test('case 4: non-retriable error rethrows immediately without retry', async () => {
     const { embedBatchWithBackoff } = await import('../src/commands/embed.ts');
     let calls = 0;
     embedBatchBehavior = async () => {
@@ -631,8 +635,31 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
       throw new Error('500 internal server error');
     };
     await expect(embedBatchWithBackoff(['x'])).rejects.toThrow('500 internal server error');
-    // Single attempt — no retries on non-429.
+    // Single attempt — no retries on non-gateway 5xx (#3966 keeps 500 fatal).
     expect(calls).toBe(1);
+  });
+
+  test('case 4b: 502 Bad Gateway retries then succeeds (#3966)', async () => {
+    const { embedBatchWithBackoff, detectGatewayErrorFromCause } = await import('../src/commands/embed.ts');
+    expect(detectGatewayErrorFromCause({ cause: { status: 502 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 503 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 504 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 500 } })).toBe(false);
+
+    let calls = 0;
+    embedBatchBehavior = async () => {
+      calls++;
+      if (calls === 1) {
+        // NIM-style wrap: status on cause; parseable delay keeps the test fast.
+        const err = new Error('[embed(nvidia:nvidia/nv-embed-v1)] Bad Gateway — try again in 10ms');
+        (err as any).cause = { status: 502 };
+        throw err;
+      }
+      return [new Float32Array(1536)];
+    };
+    const result = await embedBatchWithBackoff(['x']);
+    expect(calls).toBe(2);
+    expect(result).toHaveLength(1);
   });
 
   test('case 5: jitter range — same parsed delay produces non-identical sleeps across runs', async () => {
@@ -671,7 +698,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
   });
 
   test('case 7: AITransientError-shaped wrap with 429 cause triggers retry; 500 cause does not', async () => {
-    const { embedBatchWithBackoff, detect429FromCause } = await import('../src/commands/embed.ts');
+    const { embedBatchWithBackoff, detect429FromCause, detectGatewayErrorFromCause } = await import('../src/commands/embed.ts');
 
     // Pure helper checks first.
     expect(detect429FromCause({ cause: { status: 429 } })).toBe(true);
@@ -680,6 +707,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
     expect(detect429FromCause({ status: 500 })).toBe(false);
     expect(detect429FromCause(undefined)).toBe(false);
     expect(detect429FromCause(null)).toBe(false);
+    expect(detectGatewayErrorFromCause({ cause: { cause: { status: 502 } } })).toBe(true);
     // Deep wrap (defensive — current normalizeAIError wraps once).
     expect(detect429FromCause({ cause: { cause: { status: 429 } } })).toBe(true);
 
@@ -719,6 +747,123 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
     expect(lastEmbedBatchOpts).toBeDefined();
     expect((lastEmbedBatchOpts as { maxRetries?: number }).maxRetries).toBe(0);
   });
+});
+
+// ────────────────────────────────────────────────────────────────
+// #3374: transient network retry branch (timeout / conn-reset)
+// beside the 429 path, plain bounded backoff, never caller aborts.
+// ────────────────────────────────────────────────────────────────
+
+describe('#3374 — transient network retry branch', () => {
+  test('classifier: structured codes, TimeoutError name, message fallback', async () => {
+    const { isTransientNetworkEmbedError } = await import('../src/commands/embed.ts');
+    // Structured code on the error itself and through the cause chain.
+    const reset = new Error('request failed');
+    (reset as any).code = 'ECONNRESET';
+    expect(isTransientNetworkEmbedError(reset)).toBe(true);
+    expect(isTransientNetworkEmbedError({ cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } })).toBe(true);
+    expect(isTransientNetworkEmbedError({ cause: { cause: { code: 'ETIMEDOUT' } } })).toBe(true);
+    expect(isTransientNetworkEmbedError({ name: 'TimeoutError' })).toBe(true);
+    // Message fallback for wrappers that strip the code.
+    expect(isTransientNetworkEmbedError(new Error('socket hang up'))).toBe(true);
+    expect(isTransientNetworkEmbedError(new Error('fetch failed'))).toBe(true);
+    expect(isTransientNetworkEmbedError(new Error('request timed out'))).toBe(true);
+    // NOT transient: plain 500, permanent 4xx, caller aborts.
+    expect(isTransientNetworkEmbedError(new Error('500 internal server error'))).toBe(false);
+    expect(isTransientNetworkEmbedError(new Error('400 invalid input'))).toBe(false);
+    expect(isTransientNetworkEmbedError(new Error('The operation was aborted.'))).toBe(false);
+    expect(isTransientNetworkEmbedError(new Error('embed budget aborted'))).toBe(false);
+  });
+
+  test('backoff: plain bounded exponential with jitter, capped', async () => {
+    const { transientBackoffMs, TRANSIENT_NET_BASE_MS, TRANSIENT_NET_MAX_MS, RATE_LIMIT_JITTER } =
+      await import('../src/commands/embed.ts');
+    const mid = () => 0.5; // jitter multiplier = 1.0
+    expect(transientBackoffMs(0, mid)).toBe(TRANSIENT_NET_BASE_MS);
+    expect(transientBackoffMs(1, mid)).toBe(TRANSIENT_NET_BASE_MS * 2);
+    expect(transientBackoffMs(2, mid)).toBe(TRANSIENT_NET_BASE_MS * 4);
+    // Cap: attempt 10 would be 1024s uncapped.
+    expect(transientBackoffMs(10, mid)).toBe(TRANSIENT_NET_MAX_MS);
+    // Jitter bounds at the cap.
+    expect(transientBackoffMs(10, () => 0)).toBe(Math.floor(TRANSIENT_NET_MAX_MS * (1 - RATE_LIMIT_JITTER)));
+    expect(transientBackoffMs(10, () => 1)).toBe(Math.floor(TRANSIENT_NET_MAX_MS * (1 + RATE_LIMIT_JITTER)));
+  });
+
+  test('conn-reset retries then succeeds (no retry-after to parse)', async () => {
+    const { embedBatchWithBackoff } = await import('../src/commands/embed.ts');
+    let calls = 0;
+    embedBatchBehavior = async () => {
+      calls++;
+      if (calls === 1) {
+        const err = new Error('socket hang up');
+        (err as any).code = 'ECONNRESET';
+        throw err;
+      }
+      return [new Float32Array(1536)];
+    };
+    const result = await embedBatchWithBackoff(['x']);
+    expect(calls).toBe(2);
+    expect(result).toHaveLength(1);
+  }, 10_000);
+
+  test('caller-initiated abort during the transient sleep bubbles out (never retried)', async () => {
+    const { embedBatchWithBackoff } = await import('../src/commands/embed.ts');
+    const controller = new AbortController();
+    let calls = 0;
+    embedBatchBehavior = async () => {
+      calls++;
+      const err = new Error('connect timeout');
+      (err as any).code = 'UND_ERR_CONNECT_TIMEOUT';
+      throw err;
+    };
+    setTimeout(() => controller.abort(), 50);
+    const t0 = Date.now();
+    await expect(embedBatchWithBackoff(['x'], { abortSignal: controller.signal })).rejects.toThrow();
+    // One attempt, abort wakes the ~1s backoff sleep early, loop exits.
+    expect(calls).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(600);
+  });
+
+  test('import-file path (#3374): a one-off conn reset no longer aborts the import', async () => {
+    const { importFromContent } = await import('../src/core/import-file.ts');
+    let calls = 0;
+    embedBatchBehavior = async (texts) => {
+      calls++;
+      if (calls === 1) {
+        const err = new Error('read ECONNRESET');
+        (err as any).code = 'ECONNRESET';
+        throw err;
+      }
+      return texts.map(() => new Float32Array(1536));
+    };
+    // Minimal working-DB mock: tx.putPage lands in a store the read-back
+    // guard can see; everything else resolves null via the Proxy default.
+    const pageStore = new Map<string, any>();
+    const tx = new Proxy({} as any, {
+      get(_, prop: string) {
+        if (prop === 'putPage') {
+          return async (slug: string, page: any) => { pageStore.set(slug, page); };
+        }
+        return () => Promise.resolve(null);
+      },
+    });
+    const engine = mockEngine({
+      getPage: async (slug: string) =>
+        pageStore.has(slug) ? { slug, ...pageStore.get(slug) } : null,
+      transaction: async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+    });
+    const res = await importFromContent(
+      engine,
+      'notes/transient-net-test',
+      '# Transient\n\nSome body text long enough to produce a chunk for embedding.',
+      {},
+    );
+    // Pre-fix: bare embedBatch → the first ECONNRESET propagated and the
+    // import aborted. Post-fix: one retry, then the page lands.
+    expect(calls).toBe(2);
+    expect(pageStore.has('notes/transient-net-test')).toBe(true);
+    expect(res).toBeDefined();
+  }, 10_000);
 });
 
 // ────────────────────────────────────────────────────────────────
@@ -878,7 +1023,13 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     });
     embedBatchBehavior = async (texts) => {
       if (texts.length > 1) throw new Error('EOF');
-      if (texts[0] === 'bad') throw new Error('The operation timed out');
+      if (texts[0] === 'bad') throw new Error('provider rejected the request'  // 2026-08-25 merge: upstream #3374 made
+        // timeouts retriable, so the previous 'The operation timed out' now
+        // burns 5 real backoff sleeps before reaching the ledger and blows the
+        // test budget. A non-retriable provider error exercises the same
+        // property this test guards — good chunk's vector commits, bad chunk
+        // lands in the failure ledger — without asserting on retry timing.
+        );
       return [new Float32Array(1536)];
     };
 
@@ -886,7 +1037,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     expect(result.embedded).toBe(1);
     expect(result.pages_processed).toBe(1);
     expect(persisted.entries[0]?.outcome.vector).toBeInstanceOf(Float32Array);
-    expect(persisted.entries[1]?.outcome.failure.errorClass).toBe('provider_timeout');
+    expect(persisted.entries[1]?.outcome.failure.errorClass).toBe('provider_other');
   });
 
   test('fatal after a prefix logs the actual foreground chunk_index', async () => {
@@ -931,7 +1082,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     });
     embedBatchBehavior = async (texts) => {
       if (texts.length > 1) throw new Error('EOF');
-      if (texts[0] === 'bad') throw new Error('The operation timed out');
+      if (texts[0] === 'bad') throw new Error('provider rejected the request'); // see note above (#3374)
       return [new Float32Array(1536)];
     };
     const originalError = console.error;
@@ -958,7 +1109,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
       getChunks: async () => stale.map((row) => ({ ...row, embedded_at: null })),
       invalidateStaleSignatureEmbeddings: async () => 0,
     });
-    embedBatchBehavior = async () => { throw new Error('The operation timed out'); };
+    embedBatchBehavior = async () => { throw new Error('provider rejected the request'); }; // see note above (#3374)
     const originalError = console.error;
     let stderr = '';
     (console.error as any) = (chunk: string) => { stderr += chunk; };
@@ -1303,5 +1454,46 @@ describe('embed --stale contextual-retrieval wrapping (#3507)', () => {
     expect(seen).toContain('prose chunk');
     expect(seen.some((t) => t.startsWith('<context>'))).toBe(false);
     expect(restamps).toHaveLength(0);
+  });
+});
+
+describe('#3796 — attempt-scaled 429 wait floors (rolling TPM window)', () => {
+  const mid = () => 0.5; // jitterFactor = 1 → deterministic
+
+  test('tiny provider hints get floored, and the floor escalates per attempt', async () => {
+    const { rateLimitDelayMs, RATE_LIMIT_ATTEMPT_FLOOR_MS } = await import('../src/commands/embed.ts');
+    // 'try again in 100ms' → hint = 600ms at mid jitter; every attempt floors above it.
+    const waits = [0, 1, 2, 3, 4].map((attempt) => rateLimitDelayMs('try again in 100ms', attempt, mid));
+    expect(waits).toEqual([...RATE_LIMIT_ATTEMPT_FLOOR_MS]);
+    // Strictly escalating ladder.
+    for (let i = 1; i < waits.length; i++) expect(waits[i]).toBeGreaterThan(waits[i - 1]);
+  });
+
+  test('a larger provider hint wins over the floor (Retry-After must be honored)', async () => {
+    const { rateLimitDelayMs, RATE_LIMIT_PAD_MS } = await import('../src/commands/embed.ts');
+    const hinted = 240_000 + RATE_LIMIT_PAD_MS;
+    for (const attempt of [0, 2, 4]) {
+      expect(rateLimitDelayMs('try again in 240s', attempt, mid)).toBe(hinted);
+    }
+  });
+
+  test('cumulative floored wait spans the rolling TPM minute even at worst-case jitter', async () => {
+    const { rateLimitDelayMs } = await import('../src/commands/embed.ts');
+    const low = () => 0; // jitterFactor = 1 - RATE_LIMIT_JITTER (worst case)
+    let total = 0;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      total += rateLimitDelayMs('try again in 132ms', attempt, low);
+    }
+    // Pre-fix: 5 × ~442ms ≈ 2.2s — every retry burned inside the same TPM
+    // minute. Post-fix the ladder must span it.
+    expect(total).toBeGreaterThan(60_000);
+  });
+
+  test('attempts past the ladder clamp to the last floor', async () => {
+    const { rateLimitDelayMs, RATE_LIMIT_ATTEMPT_FLOOR_MS } = await import('../src/commands/embed.ts');
+    const last = RATE_LIMIT_ATTEMPT_FLOOR_MS[RATE_LIMIT_ATTEMPT_FLOOR_MS.length - 1];
+    expect(rateLimitDelayMs('429 slow down', 10, mid)).toBe(Math.max(last, rateLimitDelayMs('429 slow down', 4, mid)));
+    // Negative attempt (defensive) clamps to the first rung.
+    expect(rateLimitDelayMs('try again in 1ms', -1, mid)).toBe(RATE_LIMIT_ATTEMPT_FLOOR_MS[0]);
   });
 });

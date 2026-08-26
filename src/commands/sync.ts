@@ -1,9 +1,9 @@
 import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 'fs';
-import { join, relative } from 'path';
+import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
-import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
-import { collectSyncableFiles } from './import.ts';
+import { importFile, importImageFile, isImageFilePath as isImageImportPath } from '../core/import-file.ts';
+import { collectSyncableFiles, shouldLogIngest } from './import.ts';
 import {
   isSyncable,
   isPoisonedPath,
@@ -14,10 +14,12 @@ import {
   unacknowledgedSyncFailures,
   acknowledgeFailures,
   loadSyncFailures,
-  formatCodeBreakdown,
+  formatCodeBreakdown, formatFailedFileList,
   applySyncFailureGate,
   isSkippablePath,
   resolveAutoSkipThreshold,
+  summarizeFailuresByCode,
+  isEmbeddingInfraCode,
   DEFAULT_SOURCE_ID,
 } from '../core/sync.ts';
 import {
@@ -25,7 +27,6 @@ import {
   buildDetachedWorkingTreeManifest,
 } from '../core/sync-delta.ts';
 import { CHUNKER_VERSION } from '../core/chunkers/code.ts';
-import { willEmbedSynchronously } from '../core/embedding.ts';
 import type { SyncManifest } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -70,6 +71,7 @@ import {
   type OpCheckpointKey,
 } from '../core/op-checkpoint.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
+import { msysToNativePath } from '../core/path-confine.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
 import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../core/pace-mode.ts';
 import { AbortError } from '../core/abort-check.ts';
@@ -77,7 +79,14 @@ import { AbortError } from '../core/abort-check.ts';
 // below also has a re-export block at its original site in this file so
 // existing importers keep working; these imports are the symbols the code
 // remaining here still uses directly.
-import { runInlineCostGate } from '../core/sync-cost-gate.ts';
+import {
+  buildSingleSyncJsonEnvelope,
+  formatSyncEmbedBackfillOutcome,
+  resolveSingleSyncEmbedPlan,
+  resolveSyncAllEmbedPlan,
+  resolveSyncEmbedBackfill,
+  type SyncEmbedBackfillOutcome,
+} from '../core/sync-embed-backfill.ts';
 import {
   git,
   isPathSafe,
@@ -85,6 +94,9 @@ import {
   isDetachedHead,
   unique,
   resolveSlugByPathOrSourcePath,
+  resolveSlugsForRemovedPaths,
+  resolveRemovedPathSlug,
+  refusedRemovedPathMessage,
   createSyncBaselineCommit,
   isWithinRoot,
   resolveNoEmbed,
@@ -96,6 +108,8 @@ import {
   writeSyncAnchor,
   readChunkerVersion,
   writeChunkerVersion,
+  resolveSlugRootMode,
+  type SlugRootMode,
 } from '../core/sync-anchor.ts';
 import {
   SyncLockBusyError,
@@ -220,8 +234,17 @@ export interface SyncResult {
   chunksCreated: number;
   /** Pages re-embedded during this sync's auto-embed step. 0 if --no-embed or skipped. */
   embedded: number;
+  embedDeferralReason?: 'large_sync';
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
+  /**
+   * #3875: code breakdown of the blocking failures (set on
+   * `blocked_by_failures` only). Lets printSyncResult (and --json consumers)
+   * distinguish provider-infra failures (EMBEDDING_TIMEOUT / RATE_LIMIT /
+   * QUOTA — retry after fixing the provider) from genuine file poison
+   * (--skip-failed territory).
+   */
+  failureCodes?: Array<{ code: string; count: number }>;
   /**
    * Files skipped because their FILENAME contains bracket/control characters
    * (SyncableReason 'malformed-path'). Informational — these never gate
@@ -235,6 +258,14 @@ export interface SyncResult {
    * in job results where daemon stderr is invisible.
    */
   type_warnings?: Array<{ kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string; count: number }>;
+  /**
+   * Working-tree files invisible to commit-driven sync (attached HEAD without
+   * --working-tree): untracked/added, modified, and deleted counts AFTER the
+   * same scope/exclude/isSyncable filters imports use. Uncommitted renames are
+   * decomposed as add(new path) + delete(old path). Absent when zero, or when
+   * the working tree was imported (detached HEAD or --working-tree).
+   */
+  uncommitted?: { added: number; modified: number; deleted: number };
   /**
    * v0.41.13.0 partial-sync fields (only set when status === 'partial').
    *
@@ -279,6 +310,12 @@ export interface SyncOpts {
   noPull?: boolean;
   noEmbed?: boolean;
   noExtract?: boolean;
+  /**
+   * #3969: opt back into per-poll ingest_log rows. By default a sync that
+   * landed nothing (no pages written, no chunks, no failures acknowledged)
+   * skips the ingest_log write — mirrors runImport's shouldLogIngest gate.
+   */
+  logNoop?: boolean;
   /** Bug 9 — acknowledge + skip past current failure set (CLI --skip-failed). */
   skipFailed?: boolean;
   /** Bug 9 — re-attempt unacknowledged failures explicitly (CLI --retry-failed). */
@@ -300,6 +337,11 @@ export interface SyncOpts {
    * pre-v0.17 global-config path unchanged.
    */
   sourceId?: string;
+  /**
+   * github source kind: refresh exactly one item (webhook path).
+   * When set, sync skips the sweep and re-fetches this single issue/PR.
+   */
+  githubItem?: { repo: string; number: number; kind: 'issue' | 'pr'; deleted?: boolean };
   /** Multi-repo: sync strategy override (markdown, code, auto). */
   strategy?: 'markdown' | 'code' | 'auto';
   /**
@@ -328,6 +370,17 @@ export interface SyncOpts {
    * changes in diffs, so sync uses the full filesystem walker when this is set.
    */
   includeGitignored?: boolean;
+  /**
+   * Import uncommitted working-tree state (untracked files + uncommitted
+   * tracked edits/deletes) on an ATTACHED HEAD, via the same manifest-merge
+   * path detached-HEAD syncs have always used. Off by default: commit-driven
+   * sync stays the contract, and uncommitted drift is counted + reported
+   * either way (see SyncResult.uncommitted). CLI `--working-tree`; persist
+   * with config `sync.include_working_tree=true`. NOTE: the inline cost
+   * estimator does not price working-tree files on attached repos, so the
+   * gate can underestimate an explicit --working-tree run.
+   */
+  workingTree?: boolean;
   /**
    * Number of parallel workers for the import phase. When > 1, each worker
    * gets its own small Postgres connection pool and files are dispatched via
@@ -407,6 +460,14 @@ export interface SyncOpts {
    * Precedent: CycleOpts.signal at src/core/cycle.ts (v0.22.1 #403).
    */
   signal?: AbortSignal;
+  /**
+   * Serve-delegated sync progress seam: fired at phase boundaries and on every
+   * durable checkpoint flush (cumulative bankedFiles). Sync-fire, never
+   * awaited — the delegated-job runner mirrors these into the record that
+   * `sync_status` IPC polls read. Absent for direct CLI runs (stderr
+   * breadcrumbs already cover that surface).
+   */
+  onProgress?: (p: { phase: string; bankedFiles?: number }) => void;
 }
 
 // The git-plumbing cluster (git(), discoverGitRoot, createSyncBaselineCommit,
@@ -558,14 +619,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // report names WHICH phase spun. Doesn't fix #1342 but converts
   // "hung with no output" into actionable diagnostic data.
   serr(`[gbrain phase] sync.resolve_repo`);
+  opts.onProgress?.({ phase: 'resolve_repo' });
   // Resolve repo path
-  const repoPath = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
-  if (!repoPath) {
+  const rawRepoPath = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
+  if (!rawRepoPath) {
     const hint = opts.sourceId
       ? `Source "${opts.sourceId}" has no local_path. Run: gbrain sources add ${opts.sourceId} --path <path>`
       : `No repo path specified. Use --repo or run gbrain init with --repo first.`;
     throw new Error(hint);
   }
+  // #3696: resolve to ABSOLUTE at entry. A relative path (legacy relative
+  // sources.local_path row, or a caller-passed `--repo .`) breaks the moment
+  // any consumer runs from a different cwd (launchd daemon at cwd=/). Since
+  // writeSyncAnchor('repo_path', anchorPath) re-persists this value below,
+  // one successful sync from the right cwd self-heals a legacy relative row
+  // to absolute.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rawRepoPath is the local operator's --repo CLI arg or the operator-written sync anchor (sync.repo_path / sources.local_path); the sync_brain op is localOnly:true so no remote caller reaches this path, and absolutizing it here IS the #3696 fix
+  const repoPath = pathResolve(rawRepoPath);
 
   serr(`[gbrain phase] sync.load_active_pack`);
   // v0.39 T1.5: load active pack ONCE at sync entry; pass to every per-file
@@ -591,6 +661,40 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     syncActivePack = { page_types: resolved.manifest.page_types };
   } catch {
     syncActivePack = undefined;
+  }
+
+  // v0.46: github source kind. A source registered with kind=github is
+  // API-backed, not git-backed: the sync engine materializes issues/PRs
+  // into the managed dir and hands off to the standard import pipeline.
+  // Everything below (git anchors, diff, reconcile) is git-specific and
+  // does not apply. Also handles opts.githubItem (webhook single-item
+  // refresh) when the source is github-kind.
+  if (opts.sourceId || opts.githubItem) {
+    const srcId = opts.sourceId ?? 'default';
+    const cfgRows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+      `SELECT local_path, config FROM sources WHERE id = $1`,
+      [srcId],
+    );
+    if (cfgRows.length > 0) {
+      const rawCfg = typeof cfgRows[0].config === 'string'
+        ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
+        : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+      if (rawCfg.kind === 'github') {
+        serr(`[gbrain phase] sync.github_materialize`);
+        const { parseGitHubSourceConfig, runGitHubSync } = await import('../core/github-source.ts');
+        const { defaultCloneDir } = await import('../core/sources-ops.ts');
+        const fallbackDir = cfgRows[0].local_path ?? defaultCloneDir(`${srcId}-github`);
+        const cfg = parseGitHubSourceConfig(rawCfg, fallbackDir);
+        return await runGitHubSync(engine, srcId, cfg, opts);
+      }
+      if (opts.githubItem) {
+        throw new Error(
+          `github_item refresh requires a github-kind source, but "${srcId}" is not github-kind.`,
+        );
+      }
+    } else if (opts.githubItem) {
+      throw new Error(`github_item refresh requires a github-kind source; source "${srcId}" not found.`);
+    }
   }
 
   // v0.28: source-aware re-clone branch. When the source has a remote_url
@@ -748,7 +852,31 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // the SCOPE path, so a follow-up bare `gbrain sync` auto-discovers the same
   // scope. Unchanged (the caller's repoPath spelling) when no --src-subpath.
   const anchorPath = opts.srcSubpath ? rawScopeRoot : repoPath;
-  const fullSyncRoots = { gitContextRoot, syncScopeRoot, anchorPath };
+  // #4342 — explicit + STICKY slug namespace for scoped syncs. Pre-fix the
+  // namespace was implicit: a local_path that happened to sit inside a bigger
+  // git repo silently produced git-root-PREFIXED slugs (`notes/foo` instead
+  // of `foo`), diverging from what `gbrain import <dir>` of the same tree
+  // creates. The mode is decided once (resolveSlugRootMode: stored pin >
+  // explicit --src-subpath > auto-pin when existing pages already carry the
+  // prefix > local_path-relative) and persisted, so a live install never
+  // re-slugs and every later sync agrees.
+  let slugRootMode: SlugRootMode = 'git-root';
+  if (scoped) {
+    // Probe prefix in SLUG spelling (resolveSlugForPath), not raw path
+    // spelling — the auto-pin LIKE must match how slugs were actually minted.
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- syncScopeRelPath is relative() of the realpath'd scope already proven inside the realpath'd git root by the isWithinRoot guard above (so it carries no ..); the join output only mints an in-memory slug probe string, no fs operation
+    const probeSlug = resolveSlugForPath(join(syncScopeRelPath, 'x.md'));
+    const slugPrefix = probeSlug.slice(0, probeSlug.length - '/x'.length);
+    slugRootMode = await resolveSlugRootMode(engine, {
+      sourceId: opts.sourceId,
+      explicitGitRoot: opts.srcSubpath !== undefined,
+      slugPrefix,
+      // #4342 review fix: a --dry-run must not persist the sticky pin —
+      // resolve in-memory only; the first real sync writes it.
+      dryRun: opts.dryRun === true,
+    });
+  }
+  const fullSyncRoots = { gitContextRoot, syncScopeRoot, anchorPath, slugRootMode };
 
   serr(`[gbrain phase] sync.detect_head`);
   // Detect detached HEAD up front so the working-tree fallback fires for both
@@ -808,6 +936,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!opts.dryRun && !opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     serr(`[gbrain phase] sync.git_pull start`);
+    opts.onProgress?.({ phase: 'git_pull' });
     try {
       const { pullRepo } = await import('../core/git-remote.ts');
       // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
@@ -821,7 +950,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
+      serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 200)})`);
       // v0.41.13.0 (T3 / D-V4-mech-7): pullRepo wraps execFileSync errors
       // in GitOperationError, so `error.code === 'ETIMEDOUT'` and
       // `error.signal === 'SIGTERM'` live on `.cause`, NOT on the top-
@@ -851,7 +980,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
         serr(`Warning: git pull failed (remote diverged). Syncing from local state.`);
       } else {
-        serr(`Warning: git pull failed: ${msg.slice(0, 100)}`);
+        serr(`Warning: git pull failed: ${msg.slice(0, 200)}`); // #1315 stderr-first
       }
     }
   }
@@ -1022,14 +1151,100 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const currentVersion = String(CHUNKER_VERSION);
   const versionMismatch = storedVersion !== null && storedVersion !== currentVersion;
   const versionNeverSet = storedVersion === null && opts.sourceId !== undefined;
-  const detachedWorkingTreeManifest = detachedHead ? buildDetachedWorkingTreeManifest(gitContextRoot) : null;
-  const hasDetachedWorkingTreeChanges = detachedWorkingTreeManifest !== null &&
-    (detachedWorkingTreeManifest.added.length > 0 ||
-      detachedWorkingTreeManifest.modified.length > 0 ||
-      detachedWorkingTreeManifest.deleted.length > 0 ||
-      detachedWorkingTreeManifest.renamed.length > 0);
+  // Untracked-gap fix: the working-tree manifest is now built for attached
+  // HEADs too, not just detached ones. Detached HEAD (pre-existing semantics)
+  // or a resolved workingTree opt-in → the manifest merges into the delta
+  // below and uncommitted state IMPORTS. Attached without the opt-in → NOT
+  // imported, but counted through the same scope/exclude/isSyncable filters
+  // imports use and reported as `uncommitted` drift + a stderr warning.
+  // Before this, "Already up to date." printed while untracked files sat
+  // invisible — sync reported convergence it had not achieved.
+  //
+  // The config fallback resolves HERE (not the CLI layer) so EVERY caller —
+  // dream cycle, minion sync jobs, sync_brain — honors the persisted
+  // `sync.include_working_tree` the warnings recommend. Per-call flag wins;
+  // the config read is best-effort (a config error never breaks a sync).
+  let workingTreeResolved = opts.workingTree;
+  if (workingTreeResolved === undefined) {
+    try {
+      workingTreeResolved = (await engine.getConfig('sync.include_working_tree')) === 'true';
+    } catch { workingTreeResolved = false; }
+  }
+  const importWorkingTree = detachedHead || workingTreeResolved === true;
+  // Fail-open guard: the manifest builder shells out under a 30s/100MiB git
+  // budget and THROWS on breach; a monster untracked dir must not convert
+  // every previously-working up-to-date sync into a hard error. Drift
+  // counting degrades to empty with a stderr note; an EXPLICIT working-tree
+  // import request fails closed with the reason (importing without the
+  // manifest would silently skip the very files the caller asked for).
+  let workingTreeManifest: SyncManifest;
+  try {
+    workingTreeManifest = buildDetachedWorkingTreeManifest(gitContextRoot);
+  } catch (e) {
+    if (importWorkingTree) {
+      throw new Error(
+        `working-tree manifest unavailable (${e instanceof Error ? e.message.slice(0, 160) : String(e)}) — ` +
+        `cannot import uncommitted state; re-run without --working-tree or fix the repo state`,
+      );
+    }
+    serr('[sync] working-tree drift probe failed — drift counting skipped this run.');
+    workingTreeManifest = { added: [], modified: [], deleted: [], renamed: [] };
+  }
 
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+  // #753/#774 scope filter (hoisted above the up_to_date gate so the drift
+  // counter here and the delta filter below apply IDENTICAL predicates):
+  // git-diff paths are git-root-relative; when a subpath scope is active, only
+  // paths under it participate. Back-compat: syncScopeRelPath is '' when
+  // scope == root, so inScope is always true and the filters reduce to the
+  // pre-#774 behavior exactly.
+  const inScope = (p: string): boolean =>
+    !scoped || p === syncScopeRelPath || p.startsWith(syncScopeRelPath + '/');
+  // --exclude patterns match the SCOPE-relative path (what the user of a
+  // scoped source thinks in), same form runImport matches on full sync.
+  const scopeRel = (p: string): string =>
+    scoped && p.startsWith(syncScopeRelPath + '/') ? p.slice(syncScopeRelPath.length + 1) : p;
+  // FORK: source-config `exclude_paths` participates in the same predicate as
+  // --exclude. Moved up with upstream's hoist (2026-08-25 merge) so the
+  // untracked-gap drift counter and the delta filter still agree.
+  const sourceExcludePaths: string[] = Array.isArray(sourceCfg.exclude_paths) ? (sourceCfg.exclude_paths as string[]) : [];
+  const excluded = (p: string): boolean =>
+    (opts.exclude !== undefined && opts.exclude.length > 0 && matchesAnyGlob(scopeRel(p), opts.exclude)) ||
+    sourceExcludePaths.some(pattern => matchesAnyGlob(scopeRel(p), [pattern, `${pattern.replace(/\/$/, '')}/**`]));
+  const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+
+  // Filtered working-tree counts. Renames decompose as add(to) + delete(from)
+  // — the same decomposition the import path applies — so a rename-only dirty
+  // tree still reports drift instead of reproducing the silent gap this
+  // counter exists to close (a staged `git mv` populates only `renamed`).
+  const wtCounts = {
+    added: workingTreeManifest.added.filter(p => inScope(p) && !excluded(p) && isSyncable(p, syncOpts)).length +
+      workingTreeManifest.renamed.filter(r => inScope(r.to) && !excluded(r.to) && isSyncable(r.to, syncOpts)).length,
+    modified: workingTreeManifest.modified.filter(p => inScope(p) && !excluded(p) && isSyncable(p, syncOpts)).length,
+    deleted: workingTreeManifest.deleted.filter(p => inScope(p) && isSyncable(p, syncOpts)).length +
+      workingTreeManifest.renamed.filter(r => inScope(r.from) && isSyncable(r.from, syncOpts)).length,
+  };
+  const wtSyncableTotal = wtCounts.added + wtCounts.modified + wtCounts.deleted;
+  // Fast-path gate: detached HEADs keep the pre-existing RAW-manifest gate;
+  // attached repos gate on SYNCABLE changes so a stray unsyncable scratch
+  // file can't defeat the up_to_date fast path on every scheduled run.
+  const hasWorkingTreeChanges = detachedHead
+    ? (workingTreeManifest.added.length > 0 ||
+        workingTreeManifest.modified.length > 0 ||
+        workingTreeManifest.deleted.length > 0 ||
+        workingTreeManifest.renamed.length > 0)
+    : wtSyncableTotal > 0;
+
+  let uncommittedDrift: { added: number; modified: number; deleted: number } | undefined;
+  if (!importWorkingTree && wtSyncableTotal > 0) {
+    uncommittedDrift = wtCounts;
+    serr(
+      `[sync] ${wtSyncableTotal} uncommitted file(s) are invisible to ` +
+      `commit-driven sync (${wtCounts.added} untracked/added, ${wtCounts.modified} modified, ${wtCounts.deleted} deleted). ` +
+      `Commit them, or run 'gbrain sync --working-tree' to import uncommitted state.`,
+    );
+  }
+
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !(importWorkingTree && hasWorkingTreeChanges)) {
     // #3068: the pull failed and nothing local advanced — this run imported
     // NOTHING and the remote may hold commits we could not fetch. Reporting
     // `up_to_date` here (and bumping the heartbeat below) is exactly the
@@ -1073,6 +1288,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       chunksCreated: 0,
       embedded: 0,
       pagesAffected: [],
+      ...(uncommittedDrift ? { uncommitted: uncommittedDrift } : {}),
     };
   }
 
@@ -1103,7 +1319,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // `unavailable`, fall back to the authoritative full reconcile instead of
   // throwing — a slow correct reconcile beats a hard error or a silent walk.
   const delta = computeSyncDelta(gitContextRoot, lastCommit, pin, {
-    detachedManifest: detachedWorkingTreeManifest,
+    detachedManifest: importWorkingTree ? workingTreeManifest : null,
   });
   if (delta.status === 'unavailable') {
     serr(
@@ -1114,23 +1330,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   }
   const manifest = delta.manifest;
 
-  // #753/#774 scope filter: git-diff paths are git-root-relative; when a
-  // subpath scope is active, only paths under it participate. Back-compat:
-  // syncScopeRelPath is '' when scope == root, so inScope is always true and
-  // the filters below reduce to the pre-#774 behavior exactly.
-  const inScope = (p: string): boolean =>
-    !scoped || p === syncScopeRelPath || p.startsWith(syncScopeRelPath + '/');
-  // --exclude patterns match the SCOPE-relative path (what the user of a
-  // scoped source thinks in), same form runImport matches on full sync.
-  const scopeRel = (p: string): string =>
-    scoped && p.startsWith(syncScopeRelPath + '/') ? p.slice(syncScopeRelPath.length + 1) : p;
-  const sourceExcludePaths: string[] = Array.isArray(sourceCfg.exclude_paths) ? (sourceCfg.exclude_paths as string[]) : [];
-  const excluded = (p: string): boolean =>
-    (opts.exclude !== undefined && opts.exclude.length > 0 && matchesAnyGlob(scopeRel(p), opts.exclude)) ||
-    sourceExcludePaths.some(pattern => matchesAnyGlob(scopeRel(p), [pattern, `${pattern.replace(/\/$/, '')}/**`]));
-
-  // Filter to syncable files (strategy-aware + scope-aware + exclude-aware)
-  const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+  // Scope/exclude/isSyncable filter lambdas (`inScope`/`scopeRel`/`excluded`/
+  // `syncOpts`) are hoisted above the up_to_date gate — the untracked-gap
+  // drift counter shares them so both apply identical predicates.
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
   // `renamed` (only `r.to` is kept below) AND `deleted` (git emits it as `R`,
   // not `D`), leaving the OLD page stale. Fold the source side into the delete
@@ -1176,6 +1378,52 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       .filter(r => inScope(r.to) && unsyncableReason(r.to, syncOpts) === 'malformed-path')
       .map(r => r.to),
   ]);
+
+  // #4342 'source-root' mode: translate the (git-root-relative) manifest to
+  // SOURCE-relative paths so every downstream consumer — slugs, source_path,
+  // deletes, renames, checkpoints — names pages the way `gbrain import
+  // <local_path>` would. Under 'git-root' (or an unscoped sync) this is a
+  // no-op and the pre-#4342 behavior is byte-for-byte. The file-join base
+  // below (`syncImportRoot`) moves with it so `join(base, path)` still lands
+  // on the same file.
+  const sourceRootMode = scoped && slugRootMode === 'source-root';
+  const syncImportRoot = sourceRootMode ? syncScopeRoot : gitContextRoot;
+  /** Manifest path → the mode's canonical page path (slug/source_path base). */
+  const modePath = (p: string): string => (sourceRootMode ? scopeRel(p) : p);
+  if (sourceRootMode) {
+    filtered.added = filtered.added.map(scopeRel);
+    filtered.modified = filtered.modified.map(scopeRel);
+    filtered.deleted = filtered.deleted.map(scopeRel);
+    filtered.renamed = filtered.renamed.map(r => ({ from: scopeRel(r.from), to: scopeRel(r.to) }));
+  }
+
+  // Working-tree mass-delete valve: merged working-tree deletes bypass the
+  // full-reconcile valve (#2828), but the hazard is the same — a transient
+  // uncommitted tree state (mid-rebase checkout, accidental rm -rf) hit by a
+  // scheduled --working-tree/config sync must not sweep the source. Same
+  // ratio + same env escape hatch. Deletes are skipped loudly; adds and
+  // modifies still import, and committing the deletions (or
+  // GBRAIN_ALLOW_MASS_RECONCILE=1) re-enables them.
+  if (importWorkingTree && !detachedHead && filtered.deleted.length >= 10 && !massReconcileAllowed()) {
+    try {
+      const rows = await engine.executeRaw<{ count: number }>(
+        opts.sourceId
+          ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1`
+          : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL`,
+        opts.sourceId ? [opts.sourceId] : [],
+      );
+      const pageCount = Number(rows[0]?.count ?? 0);
+      if (pageCount > 0 && filtered.deleted.length > pageCount * MASS_RECONCILE_RATIO) {
+        serr(
+          `\n  WARNING: refusing to delete ${filtered.deleted.length} page(s) from a working-tree ` +
+          `sync (> ${Math.round(MASS_RECONCILE_RATIO * 100)}% of ${pageCount} page(s)). An uncommitted ` +
+          `tree deleting this much is almost always transient (mid-rebase, accidental rm) — commit the ` +
+          `deletions to apply them, or re-run with GBRAIN_ALLOW_MASS_RECONCILE=1. Adds/modifies still import.\n`,
+        );
+        filtered.deleted = [];
+      }
+    } catch { /* valve is best-effort — a count failure must not block the sync */ }
+  }
 
   // NAV-4: warn when --exclude filtered out every candidate change — almost
   // always a mistyped pattern, and otherwise indistinguishable from
@@ -1261,7 +1509,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // its row — only the poison signature (`](`/control chars) is sweepable.
     // Deleting a legit page's row while its file sits on disk is data loss.
     if (reason === 'malformed-path' && !isPoisonedPath(path)) continue;
-    const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId);
+    // #3942: guarded resolver — never delete a page whose recorded origin is
+    // a DIFFERENT file just because this path re-slugifies onto its slug.
+    // #4342: resolve in the mode's namespace (source-relative under
+    // 'source-root'; git-root-relative otherwise).
+    const slug = await resolveRemovedPathSlug(engine, modePath(path), opts.sourceId, serr);
+    if (slug === undefined) continue;
     try {
       const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
@@ -1374,6 +1627,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       if (ok) {
         consecutiveFlushFailures = 0;
         bankedFiles += batch.length;
+        opts.onProgress?.({ phase: 'import', bankedFiles });
       } else {
         // Not durably banked — re-merge so the next flush retries this batch.
         for (const p of batch) pendingCheckpointPaths.add(p);
@@ -1531,13 +1785,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //   abort-check ──► partial('timeout')
   //       │
   //       ▼
-  //   engine.resolveSlugsByPaths(batch, {sourceId})  ◀── 1 SQL round-trip
+  //   resolveSlugsForRemovedPaths(batch)             ◀── exact source_path,
+  //       │                                              then VERIFIED fallback;
+  //       ▼                                              foreign-origin refusals
+  //   slugs = deletable.map(...)                         (#3942) warned + skipped
   //       │
   //       ▼
-  //   slugs = batch.map(path => map.get(path)
-  //                  ?? resolveSlugForPath(path))    ◀── pure-JS fallback for
-  //       │                                              frontmatter-fallback
-  //       ▼                                              + missing-source-path
   //   try {
   //     deleted = engine.deletePages(slugs, opts)    ◀── 1 SQL round-trip
   //     pagesAffected.push(...deleted)               ◀── D6: only confirmed
@@ -1576,18 +1829,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
         const batch = deletesToDo.slice(i, i + DELETE_BATCH_SIZE);
 
-        // Phase A: batch slug resolution (1 round-trip per batch).
-        let pathSlugMap: Map<string, string>;
-        try {
-          pathSlugMap = await engine.resolveSlugsByPaths(batch, deleteScopedOpts);
-        } catch {
-          // Resolve failure: fall back to empty map; per-path fallback
-          // below will use resolveSlugForPath. Best-effort, matches the
-          // existing resolveSlugByPathOrSourcePath swallow-and-fallback
-          // semantics.
-          pathSlugMap = new Map();
+        // Phase A: guarded batch slug resolution (#3942 — a re-slugified
+        // fallback can name a DIFFERENT page; refusals are logged + skipped).
+        const resolution = await resolveSlugsForRemovedPaths(engine, batch, sid);
+        for (const r of resolution.refused) {
+          serr(refusedRemovedPathMessage(r));
+          // Deliberately handled — checkpoint so a resume doesn't re-refuse.
+          await markCompleted(r.path);
         }
-        const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p));
+        const deletable = batch.filter(p => resolution.slugs.has(p));
+        const slugs = deletable.map(p => resolution.slugs.get(p) as string);
 
         // Phase B: batch delete (1 round-trip per batch).
         try {
@@ -1597,9 +1848,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // downstream extract/embed don't waste lookups.
           pagesAffected.push(...deleted);
           for (const s of deleted) deletedSlugs.add(s);
-          // v0.42.x (#1794): the whole batch is handled (deleted or already
-          // gone); checkpoint every path so a resume skips it.
-          for (const p of batch) await markCompleted(p);
+          // v0.42.x (#1794): the whole batch is handled (deleted, already
+          // gone, or refused above); checkpoint every path so a resume skips it.
+          for (const p of deletable) await markCompleted(p);
         } catch (err) {
           // D7 decompose: a transient blip on this batch shouldn't lose all
           // 500 deletes. Fall back to per-slug deletePage for THIS batch
@@ -1610,10 +1861,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
               await engine.deletePage(slugs[j], deleteScopedOpts);
               pagesAffected.push(slugs[j]);
               deletedSlugs.add(slugs[j]);
-              await markCompleted(batch[j]);
+              await markCompleted(deletable[j]);
             } catch (perSlugErr) {
               failedFiles.push({
-                path: batch[j],
+                path: deletable[j],
                 error: `delete failed: ${perSlugErr instanceof Error ? perSlugErr.message : String(perSlugErr)} (batch error: ${err instanceof Error ? err.message : String(err)})`,
               });
             }
@@ -1633,7 +1884,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           progress.finish();
           return await partial('timeout');
         }
-        const slug = await resolveSlugByPathOrSourcePath(engine, path, undefined);
+        // #3942: same guarded resolver as the batched lane (single-path call).
+        const slug = await resolveRemovedPathSlug(engine, path, undefined, serr);
+        if (slug === undefined) {
+          await markCompleted(path);
+          progress.tick(1, path);
+          continue;
+        }
         try {
           await engine.deletePage(slug, deleteOpts);
           pagesAffected.push(slug);
@@ -1685,15 +1942,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           return await partial('timeout');
         }
         const batch = fromPaths.slice(i, i + DELETE_BATCH_SIZE);
-        let m: Map<string, string>;
-        try {
-          m = await engine.resolveSlugsByPaths(batch, { sourceId: sid });
-        } catch {
-          m = new Map();
-        }
-        for (const p of batch) {
-          fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p));
-        }
+        // #3942: guarded resolver — a refused from-path gets NO entry, so the
+        // rename below skips updateSlug and falls back to add + reconcile.
+        const res = await resolveSlugsForRemovedPaths(engine, batch, sid);
+        for (const r of res.refused) serr(refusedRemovedPathMessage(r));
+        for (const [p, s] of res.slugs) fromSlugByPath.set(p, s);
       }
     }
 
@@ -1705,9 +1958,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         progress.finish();
         return await partial('timeout');
       }
+      // #3942: a refused (foreign-origin) from-path resolves to undefined —
+      // never rename a page whose recorded origin is a different file.
       const oldSlug = opts.sourceId
-        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
-        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
+        ? fromSlugByPath.get(from)
+        : await resolveRemovedPathSlug(engine, from, undefined, serr);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
@@ -1717,7 +1972,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // shapes now fall through to the reconcile below.
       let renameApplied = false;
       try {
-        renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
+        if (oldSlug !== undefined) renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
       } catch {
         // Destination slug occupied or invalid — treat as add; the reconcile
         // below removes the stale old row once the destination materialized.
@@ -1729,9 +1984,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // throw here crashes the whole sync mid-run and freezes the checkpoint,
       // defeating --skip-failed. A `skipped` result carrying an error is also
       // captured so the failure is recorded rather than silently dropped.
-      // Paths from git diff are relative to gitContextRoot; the completion
-      // checkpoint advances only after a safe destination was reimported.
-      const filePath = join(gitContextRoot, to);
+      // Paths from git diff are relative to gitContextRoot — except under
+      // #4342's 'source-root' mode, where the filtered manifest (this loop's
+      // source) was remapped scope-relative; the join base moves with it.
+      // NAV-1 TOCTOU: refuse a destination that realpath-resolves outside the
+      // repo (committed symlink pointing out).
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `to` is a git-diff rename path from the synced repo (repo content can be hostile), but the joined path is used ONLY inside the isPathSafe(filePath, gitContextRoot) realpath containment check on the next line — a path escaping the repo root (dot-dot or committed symlink) is refused before any read
+      const filePath = join(syncImportRoot, to);
       // FORK-FIX (2026-07-22): the completion checkpoint must not be written
       // when the reimport failed. updateSlug already ran (and swallows its own
       // error), so a failed importFile leaves the page renamed but its body,
@@ -1756,7 +2015,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         failedFiles.push({ path: to, error: 'path resolves outside git repo (symlink escape)' });
       } else {
         try {
-          const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+          // #2683: dispatch renamed images to importImageFile (binary bytes
+          // through importFile threw UTF-8 errors). Same gate as import.ts.
+          const result = isImageImportPath(to) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+            ? await importImageFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId })
+            : await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
           importResult = result;
           noteTypeWarning(result.type_warning);
           if (result.status === 'imported') {
@@ -1772,12 +2035,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             renameImportOk = true;
           } else if (result.status === 'skipped' && (result as { error?: string }).error) {
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
+          } else if (result.status === 'error') {
+            // importImageFile (and importFile's frontmatter gate) report
+            // failures as status 'error', which no branch above recorded —
+            // the rename silently succeeded with a dead target.
+            failedFiles.push({ path: to, error: String((result as { error?: string }).error ?? 'import error') });
           } else {
             // status 'skipped' with no error == content_hash short-circuit
             // (already imported, unchanged) — done for checkpoint purposes.
             renameImportOk = true;
           }
         } catch (e: unknown) {
+          // (2026-08-25 merge) upstream's `importErrored` flag is folded into
+          // the fork's `renameImportOk`, which defaults to false — a throw
+          // here leaves it false, blocking both the sentinel clear and the
+          // completion checkpoint exactly as upstream's flag did.
           failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
         }
       }
@@ -1852,7 +2124,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       const renameConverged = renameApplied || (destMaterialized && !reconcileFailed);
       // Converged (cheap rename, clean reconcile, or nothing to reconcile):
       // clear any `<rename:…>` sentinel a previous failing run recorded.
-      if (renameConverged) succeededPaths.push(`<rename:${to}>`);
+      if (renameConverged && renameImportOk) succeededPaths.push(`<rename:${to}>`);
       pagesAffected.push(newSlug);
       deletedSlugs.delete(newSlug); // #1284: rename landed on a previously-deleted slug → embeddable again
       // A failed reconcile must NOT checkpoint: banking `to` would make the
@@ -1932,9 +2204,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     progress.start('sync.imports', importsToDo.length);
 
     // Core import logic shared by serial and parallel paths.
-    // Paths from git diff are relative to gitContextRoot; join from there.
-    const syncRepoPath = gitContextRoot;
-    const multimodalEnabled = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+    // Paths from git diff are relative to gitContextRoot; under #4342's
+    // 'source-root' mode the filtered manifest was remapped scope-relative,
+    // so the join base moves to syncScopeRoot with it.
+    const syncRepoPath = syncImportRoot;
     // paced-backfill (T3 / C9 / CX4): ONE shared pacer across all worker
     // engines. This is the multi-pool permit case — each parallel worker owns a
     // separate PostgresEngine, so a single worker count can't bound TOTAL
@@ -2055,10 +2328,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
-        const result = multimodalEnabled && isImageFilePath(path)
-          ? await importImageFile(eng, filePath, path, { noEmbed: noEmbed || undefined, sourceId: opts.sourceId })
-          : await observed(pacer, () =>
-              importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+        // #2683: incremental adds/modifies dispatch images to importImageFile
+        // when multimodal is on (same gate as import.ts's full-sync walker).
+        // Pre-fix, a committed .png went through importFile's UTF-8 text read
+        // and failed — images only ever landed via `sync --full`.
+        const result = await observed(pacer, () =>
+          isImageImportPath(path) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+            ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
+            : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
         noteTypeWarning(result.type_warning);
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
@@ -2081,6 +2358,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           await markCompleted(path);
         } else if (result.status === 'skipped' && (result as any).error) {
           failedFiles.push({ path, error: String((result as any).error) });
+        } else if (result.status === 'error') {
+          // status 'error' (frontmatter validation, importImageFile OCR/read
+          // failures) must feed the failure ledger like a thrown error — the
+          // fall-through below would checkpoint the path as DONE and the file
+          // would never be re-attempted.
+          failedFiles.push({ path, error: String((result as any).error ?? 'import error') });
         } else {
           // status 'skipped' with no error == content_hash short-circuit
           // (already imported, unchanged). It IS done for checkpoint purposes,
@@ -2347,13 +2630,30 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       );
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
-      serr(
-        `\nSync blocked: ${fileFailCount} file(s) failed to parse:\n` +
-        `${codeBreakdown}\n\n` +
-        `Fix the frontmatter and re-run, or use 'gbrain sync --skip-failed' to ` +
-        `acknowledge and move on. A file that keeps failing auto-skips after ` +
-        `${resolveAutoSkipThreshold()} consecutive syncs.`,
-      );
+      // #3875: code-aware copy. Provider-infra failures (embed timeout /
+      // rate limit / quota) are NOT bad files — suggesting --skip-failed for
+      // them acknowledges away perfectly good content. Point at provider
+      // health + a plain re-run (or --full to rebuild) instead.
+      const infraCodes = summarizeFailuresByCode(failedFiles).filter(c => isEmbeddingInfraCode(c.code));
+      if (infraCodes.length > 0) {
+        serr(
+          `\nSync blocked: ${fileFailCount} file(s) failed — embedding provider errors:\n` +
+          `${codeBreakdown}\n\n` +
+          `These are provider-health failures (timeout / rate limit / quota), not bad ` +
+          `files — do NOT use --skip-failed for them. Check the embedding provider ` +
+          `(is it running? out of quota?), then re-run 'gbrain sync' (only the failed ` +
+          `files are re-attempted), or 'gbrain sync --full' to rebuild.`,
+        );
+      } else {
+        serr(
+          `\nSync blocked: ${fileFailCount} file(s) failed to parse:\n` +
+          `${codeBreakdown}\n${formatFailedFileList(failedFiles)}\n\n` +
+          `Pinpoint a file with 'gbrain frontmatter validate <path>' (--fix auto-repairs), ` +
+          `fix the frontmatter and re-run, or use 'gbrain sync --skip-failed' to ` +
+          `acknowledge and move on. A file that keeps failing auto-skips after ` +
+          `${resolveAutoSkipThreshold()} consecutive syncs.`,
+        );
+      }
     }
     // Update last_run + repo_path (progress on infra) but NOT last_commit. The
     // checkpoint is INTENTIONALLY left in place — the banked completed set lets
@@ -2378,6 +2678,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       embedded: 0,
       pagesAffected,
       failedFiles: failedFiles.length,
+      failureCodes: summarizeFailuresByCode(failedFiles),
       bankedFiles,
     };
   }
@@ -2396,16 +2697,28 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     );
   }
 
-  // Log ingest
-  await engine.logIngest({
-    // #3242 (attribution sub-bug): credit the sync to the source it wrote
-    // to, not the shared 'default' bucket.
-    ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
-    source_type: 'git_sync',
-    source_ref: `${repoPath} @ ${headCommit.slice(0, 8)}`,
-    pages_updated: pagesAffected,
-    summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
-  });
+  // Log ingest. #3969: mirror runImport's shouldLogIngest gate — a run that
+  // landed nothing (no pages written, no chunks, no failures acknowledged or
+  // auto-skipped) is a poll, not an ingest event; skip the row unless
+  // opts.logNoop opts back in.
+  if (shouldLogIngest(
+    {
+      imported: pagesAffected.length,
+      errors: gate.acknowledged + gate.autoSkipped.length,
+      chunksCreated,
+    },
+    opts.logNoop === true,
+  )) {
+    await engine.logIngest({
+      // #3242 (attribution sub-bug): credit the sync to the source it wrote
+      // to, not the shared 'default' bucket.
+      ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
+      source_type: 'git_sync',
+      source_ref: `${repoPath} @ ${headCommit.slice(0, 8)}`,
+      pages_updated: pagesAffected,
+      summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
+    });
+  }
 
   // Auto-extract links + timeline (cheap CPU, but skip-inline for LARGE syncs).
   // Thread opts.sourceId so the extract phase reconciles edges + timeline
@@ -2613,8 +2926,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
+    ...(totalChanges > 100 && embedSlugs.length > 0 ? { embedDeferralReason: 'large_sync' as const } : {}),
     malformedSkipped: malformedSkipped.length,
     ...(typeWarningsEnabled && typeWarnings.length > 0 ? { type_warnings: typeWarnings } : {}),
+    ...(uncommittedDrift ? { uncommitted: uncommittedDrift } : {}),
   };
 }
 
@@ -2625,15 +2940,17 @@ async function performFullSync(
   //   syncScopeRoot  — where files are walked/imported (== gitContextRoot
   //                    when no subpath scope is active)
   //   anchorPath     — what gets written back to sync.repo_path/local_path
-  roots: { gitContextRoot: string; syncScopeRoot: string; anchorPath: string },
+  //   slugRootMode   — #4342 sticky namespace anchor (git-root|source-root)
+  roots: { gitContextRoot: string; syncScopeRoot: string; anchorPath: string; slugRootMode: SlugRootMode },
   headCommit: string,
   opts: SyncOpts,
 ): Promise<SyncResult> {
-  const { gitContextRoot, syncScopeRoot, anchorPath } = roots;
-  // Scoped sync → slugs/source_path are git-root-relative (matches the
-  // incremental path's git-diff paths). Unscoped → undefined (dir-relative,
-  // the pre-#774 behavior, byte-for-byte).
-  const slugRoot = syncScopeRoot !== gitContextRoot ? gitContextRoot : undefined;
+  const { gitContextRoot, syncScopeRoot, anchorPath, slugRootMode } = roots;
+  // Scoped 'git-root' sync → slugs/source_path are git-root-relative (matches
+  // the incremental path's git-diff paths). Unscoped OR pinned 'source-root'
+  // (#4342) → undefined (dir-relative — local_path IS the slug base).
+  const slugRoot =
+    syncScopeRoot !== gitContextRoot && slugRootMode === 'git-root' ? gitContextRoot : undefined;
   // Dry-run: walk the scope, count syncable files, return without writing.
   // Fixes the silent-write-on-dry-run bug where performFullSync called
   // runImport unconditionally regardless of opts.dryRun.
@@ -2717,6 +3034,7 @@ async function performFullSync(
   // #753/#774: thread exclude (--exclude CLI) + slugRoot (monorepo subdir).
   const _fullImportT0 = Date.now();
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
+  opts.onProgress?.({ phase: 'full_import' });
   const result = await runImport(engine, importArgs, {
     commit: headCommit,
     strategy: opts.strategy,
@@ -2768,12 +3086,26 @@ async function performFullSync(
       serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
     } else {
       const fileFailCount = result.failures.filter(f => isSkippablePath(f.path)).length;
-      serr(
-        `\nFull sync blocked: ${fileFailCount} file(s) failed:\n` +
-        `${codeBreakdown}\n\n` +
-        `Fix the YAML in those files and re-run, or use '--skip-failed'. A file ` +
-        `that keeps failing auto-skips after ${resolveAutoSkipThreshold()} consecutive syncs.`,
-      );
+      // #3875: code-aware copy — provider-infra failures must not be routed
+      // to --skip-failed (same rationale as the incremental gate above).
+      const infraCodes = summarizeFailuresByCode(result.failures).filter(c => isEmbeddingInfraCode(c.code));
+      if (infraCodes.length > 0) {
+        serr(
+          `\nFull sync blocked: ${fileFailCount} file(s) failed — embedding provider errors:\n` +
+          `${codeBreakdown}\n\n` +
+          `These are provider-health failures (timeout / rate limit / quota), not bad ` +
+          `files — do NOT use --skip-failed for them. Check the embedding provider, ` +
+          `then re-run 'gbrain sync --full'.`,
+        );
+      } else {
+        serr(
+          `\nFull sync blocked: ${fileFailCount} file(s) failed:\n` +
+          `${codeBreakdown}\n${formatFailedFileList(result.failures)}\n\n` +
+          `Pinpoint a file with 'gbrain frontmatter validate <path>' (--fix auto-repairs), ` +
+          `fix the YAML and re-run, or use '--skip-failed'. A file ` +
+          `that keeps failing auto-skips after ${resolveAutoSkipThreshold()} consecutive syncs.`,
+        );
+      }
     }
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
@@ -2786,6 +3118,7 @@ async function performFullSync(
       embedded: 0,
       pagesAffected: [],
       failedFiles: result.failures.length,
+      failureCodes: summarizeFailuresByCode(result.failures),
     };
   }
   if (fullGate.acknowledged > 0) {
@@ -3071,6 +3404,14 @@ Options:
   --include-gitignored Include otherwise-syncable files matched by .gitignore.
                        Forces a full filesystem walk so periodic syncs see
                        ignored untracked content.
+  --working-tree       Also import uncommitted working-tree state (untracked
+                       files + uncommitted edits/deletes). Default: committed
+                       changes only — uncommitted drift is counted and warned,
+                       never silently ignored. Persist with
+                       'gbrain config set sync.include_working_tree true'.
+                       Caution: imports untracked files as-is — unignored
+                       scratch files and secrets included; review 'git status'
+                       before enabling, especially as persisted config.
   --dry-run            Show what would be synced without writing.
   --skip-failed        Acknowledge previously-recorded sync failures so
                        the bookmark can advance past unparseable files.
@@ -3078,11 +3419,15 @@ Options:
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
   --no-pull            Skip 'git pull' before the sync (useful for tests).
+  --no-delegate        On a PGLite brain with a live 'gbrain serve', sync
+                       normally delegates the run to the serve process over
+                       its IPC socket (the lock owner does the work; embeds
+                       defer to serve's background sweep). This flag (or
+                       GBRAIN_SYNC_NO_DELEGATE=1) opts out — sync then fails
+                       fast if a live serve holds the brain.
   --no-schema-pack     Skip loading the active schema pack (no per-file pack
                        regex runs; pages use legacy prefix typing). Escape
                        hatch if a suspect pack regex is wedging sync.
-                       PGLite is single-writer: stop 'gbrain serve' before a
-                       large sync (see docs/architecture/serve-sync-concurrency.md).
                        GBRAIN_SYNC_TRACE=1 names the file being imported (hang triage).
   --all                Sync every registered source instead of just the
                        default (multi-source brains).
@@ -3132,6 +3477,11 @@ See also:
   const retryFailed = args.includes('--retry-failed');
   const noSchemaPack = args.includes('--no-schema-pack'); // v0.41.37.0 #1569
   const includeGitignored = args.includes('--include-gitignored');
+  // Untracked-gap fix: --working-tree imports uncommitted working-tree state.
+  // The config fallback (sync.include_working_tree) resolves inside
+  // performSync so every caller honors it; the CLI passes undefined when the
+  // flag is absent.
+  const workingTree = args.includes('--working-tree') ? true : undefined;
   const syncAll = args.includes('--all');
   let missingPathMode: MissingPathMode = 'fail';
   try {
@@ -3209,7 +3559,16 @@ See also:
       process.exit(worstExit);
     }
     const sourceArg = args.find((a, i) => args[i - 1] === '--source');
-    const sourceId = sourceArg ?? 'default';
+    // #4412: this branch used to hardcode `sourceArg ?? 'default'` while the
+    // sync itself resolves through the full ambient chain (--source >
+    // GBRAIN_SOURCE > dotfile > cwd > sole-non-default). Under
+    // GBRAIN_SOURCE=<src>, `sync --force-break-lock` inspected
+    // gbrain-sync:default — absent — printed "nothing to break", exit 0, and
+    // left the dead holder's row on gbrain-sync:<src>; the follow-up sync
+    // then refused for the 60s takeover grace. Resolve the SAME source the
+    // sync would lock.
+    const { resolveSourceWithTier: resolveBreakSource } = await import('../core/source-resolver.ts');
+    const sourceId = (await resolveBreakSource(engine, sourceArg || null)).source_id;
     const lockKey = `gbrain-sync:${sourceId}`;
     const exit = await runBreakLock(engine, lockKey, sourceId, {
       force: forceBreakLock,
@@ -3337,8 +3696,33 @@ See also:
   // surfaces the auto-route to stderr so the user knows what happened
   // and can pass --source to override if needed.
   const explicitSource = args.find((a, i) => args[i - 1] === '--source') || null;
-  const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
-  const resolved = await resolveSourceWithTier(engine, explicitSource);
+  const { resolveSourceWithTier, resolveSourceForRepoPath, formatSoleNonDefaultNudge } =
+    await import('../core/source-resolver.ts');
+  // #3765: an explicit --repo anchors source resolution at the REPO dir, not
+  // the caller's cwd. Pre-fix, `gbrain sync --repo ~/other-vault` parsed the
+  // path but resolved the source from cwd — anchors, page writes, and the
+  // per-source lock (`syncLockId(sourceId)`) all followed the WRONG source.
+  // Precedence: --source flag > repo-derived (dotfile/local_path at the repo
+  // dir) > the ambient chain. A conflicting GBRAIN_SOURCE refuses loudly.
+  let resolved: { source_id: string; tier: string; detail?: string } | null = null;
+  if (!explicitSource && repoPath) {
+    const derived = await resolveSourceForRepoPath(engine, repoPath);
+    if (derived) {
+      const envSource = process.env.GBRAIN_SOURCE;
+      if (envSource && envSource !== derived.source_id) {
+        console.error(
+          `--repo resolves to source '${derived.source_id}' (via ${derived.tier}) but ` +
+          `GBRAIN_SOURCE='${envSource}' is set. Pass --source <id> to disambiguate.`,
+        );
+        process.exit(1);
+      }
+      resolved = derived;
+      process.stderr.write(
+        `[gbrain] routing sync to source '${derived.source_id}' (resolved from --repo via ${derived.tier}).\n`,
+      );
+    }
+  }
+  if (!resolved) resolved = await resolveSourceWithTier(engine, explicitSource);
   const sourceId: string = resolved.source_id;
   if (resolved.tier === 'sole_non_default') {
     const nudge = formatSoleNonDefaultNudge(sourceId);
@@ -3377,9 +3761,20 @@ See also:
     // own "do work?" gate (sync.ts:1057+1075) + doctor's sync_freshness.
     // Both columns predate v0.41 (writeSyncAnchor / writeChunkerVersion); no
     // schema migration needed.
-    const sources = await engine.executeRaw<{ id: string; name: string; local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null }>(
-      `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL`,
-    );
+    // #3880: archived sources must not re-enter `sync --all`. The archived
+    // column is v34+ — fall back to the unfiltered query on older brains
+    // (house style per pickSoleNonDefaultSource).
+    type SyncAllSourceRow = { id: string; name: string; local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null };
+    let sources: SyncAllSourceRow[];
+    try {
+      sources = await engine.executeRaw<SyncAllSourceRow>(
+        `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+      );
+    } catch {
+      sources = await engine.executeRaw<SyncAllSourceRow>(
+        `SELECT id, name, local_path, config, last_commit, chunker_version FROM sources WHERE local_path IS NOT NULL`,
+      );
+    }
     if (!sources || sources.length === 0) {
       console.log('No sources with local_path configured. Use `gbrain sources add <id> --path <path>` first.');
       return;
@@ -3389,23 +3784,6 @@ See also:
     // the gate (below) and the fan-out (further down) share it.
     const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
     const v2Enabled = await isFederatedV2Enabled(engine);
-
-    // v0.42.42.0 (#2139) cost gate — shared `runInlineCostGate`. Under
-    // federated_v2 + parallel, embedding is DEFERRED to per-source backfill
-    // jobs (own spend cap) so the gate is FYI-only. Inline mode (v2 off, or
-    // --serial without --no-embed) gates on the DELTA estimate: below floor
-    // proceeds; above floor in a non-TTY/--json session AUTO-DEFERS embeds
-    // (exit 0, never exit 2 — the wedged-cron fix); a TTY prompts. Skipped
-    // entirely when --no-embed is set.
-    let autoDeferEmbeds = false;
-    if (!noEmbed) {
-      const mode = willEmbedSynchronously({ v2Enabled, serialFlag, noEmbed });
-      const gate = await runInlineCostGate(engine, {
-        sources, mode, dryRun, jsonOut, yesFlag, full, includeGitignored, label: 'sync --all',
-      });
-      if (gate.action === 'stop') return;
-      autoDeferEmbeds = gate.autoDeferEmbeds;
-    }
 
     // v0.40.5.0 Federated Sync v2 (master) + v0.40.6.0 layering (this branch):
     // master added parallel fan-out via pMapAllSettled, embed-backfill auto-
@@ -3471,6 +3849,20 @@ See also:
       return;
     }
 
+    // v0.42.42.0 (#2139) cost gate — shared with single-source sync. Above
+    // the floor, non-interactive runs keep importing (never exit 2), but the
+    // delivery statement is capability-aware: background queue only when a
+    // worker can drain it, otherwise an exact manual command.
+    const embedPlan = await resolveSyncAllEmbedPlan(engine, runnableSources, {
+      v2Enabled, serialFlag, noEmbed, noAutoEmbed, dryRun, jsonOut, yesFlag, full, includeGitignored,
+    });
+    if (embedPlan.stop) return;
+    const {
+      workerSurface: backfillSurface, fanOutEligible, effectiveNoEmbed, shouldBackfill,
+    } = embedPlan;
+
+    const embedBackfillBySource = new Map<string, SyncEmbedBackfillOutcome>();
+
     // Per-source result accumulator for the optional --json envelope.
     type PerSourceResult = {
       sourceId: string;
@@ -3499,13 +3891,8 @@ See also:
 
     const runOne = async (src: typeof sources[number]): Promise<SyncResult> => {
       const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
-      // D18: parallel path defers embed; auto-enqueue embed-backfill after.
-      // v0.42.42.0 (#2139): `autoDeferEmbeds` (the inline gate tripped in a
-      // non-TTY session) ALSO forces deferral — global by design (the gate's
-      // decision unit is the aggregate estimate; deferral strictly dominates
-      // the exit-2 it replaced for every source).
-      const effectiveNoEmbed =
-        (v2Enabled && !serialFlag && !noEmbed ? true : noEmbed) || autoDeferEmbeds;
+      // D18/#2139: planned fan-out or a cost-gate auto-defer skips inline
+      // embedding; the post-run delivery below reports/queues each source.
       // v0.41.13.0 (T6 / D-V3-3 / D-V4-mech-6) — per-source AbortController.
       //
       // When the user passes --timeout, each source gets its OWN
@@ -3529,12 +3916,13 @@ See also:
         : undefined;
       timer?.unref?.();
       const repoOpts: SyncOpts = {
-        repoPath: src.local_path!,
+        repoPath: msysToNativePath(src.local_path!), // #2955: heal MSYS /c/... before joins
         dryRun, full, noPull,
         noEmbed: effectiveNoEmbed,
         noExtract,
         skipFailed, retryFailed, noSchemaPack,
         includeGitignored,
+        workingTree,
         sourceId: src.id,
         strategy: cfg.strategy,
         concurrency,
@@ -3565,40 +3953,31 @@ See also:
       ) {
         manageGitignoreAtGitRoot(src.local_path!, engine.kind);
       }
-      // D18: auto-enqueue embed-backfill per source (unless opted out).
-      // v0.41.13.0 (T7 / D-V3-5): partial excluded — the next clean sync
-      // re-walks the diff and re-decides whether to enqueue embed for
-      // pages whose content actually changed.
-      // v0.42.42.0 (#2139): `autoDeferEmbeds` enqueues even on the v2-OFF
-      // legacy path — otherwise the gate's auto-defer would strand
-      // NULL-embedded chunks with no queued job to embed them.
+      // Deliver planned or intrinsic >100-file deferrals. Intrinsic delivery
+      // is v2-only on worker-backed engines; no-worker engines still need a
+      // manual outcome. This preserves the worker-backed v2-off rollback.
       if (
-        (v2Enabled || autoDeferEmbeds) &&
-        !noAutoEmbed &&
+        (shouldBackfill || (
+          result.embedDeferralReason === 'large_sync' &&
+          (v2Enabled || backfillSurface.status === 'no_worker_surface')
+        )) &&
         !dryRun &&
         result.status !== 'dry_run' &&
         result.status !== 'up_to_date' &&
         result.status !== 'partial'
       ) {
         try {
-          const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
-          const sub = await submitEmbedBackfill(engine, src.id, { reason: 'sync_all' });
-          if (sub.status === 'submitted') {
-            writeHuman(`  → embed-backfill job ${sub.jobId} queued for ${src.name}`);
-          } else if (sub.status === 'cooldown') {
-            writeHuman(`  → embed-backfill skipped (cooldown) for ${src.name}`);
-          } else if (sub.status === 'spend_capped') {
-            writeHuman(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd}) for ${src.name}`);
-          }
+          const outcome = await resolveSyncEmbedBackfill(engine, src.id, {
+            reason: 'sync_all', autoSubmitDisabled: noAutoEmbed,
+          });
+          embedBackfillBySource.set(src.id, outcome);
+          writeHuman(`  → ${formatSyncEmbedBackfillOutcome(outcome, src.name)}`);
         } catch (e) {
           process.stderr.write(`  → embed-backfill submission failed for ${src.name}: ${e instanceof Error ? e.message : String(e)}\n`);
         }
       }
       return result;
     };
-
-    const parallelEligible =
-      v2Enabled && !serialFlag && engine.kind !== 'pglite' && runnableSources.length > 1;
 
     // v0.42.42.0 (#2139, D13C): the v0.40.6.0 (D15) refusal of --skip-failed /
     // --retry-failed under parallel sync is LIFTED. It existed because the
@@ -3611,13 +3990,13 @@ See also:
     // Effective parallelism — surfaced in the --json envelope so consumers
     // know how the run was actually dispatched. 1 in the serial fallback,
     // capped at min(sourceCount, --max-sources, 8) in the parallel path.
-    const effectiveParallel = parallelEligible
+    const effectiveParallel = fanOutEligible
       ? Math.min(runnableSources.length, maxSources ?? 8)
       : 1;
 
     process.on('SIGINT', onAllSigint);
     try {
-    if (parallelEligible) {
+    if (fanOutEligible) {
       const { pMapAllSettled } = await import('../core/parallel.ts');
       const cap = effectiveParallel;
 
@@ -3724,6 +4103,9 @@ See also:
             ...(r.result.type_warnings ? { type_warnings: r.result.type_warnings } : {}),
           } : {}),
           ...(r.error ? { error: r.error } : {}),
+          ...(embedBackfillBySource.has(r.sourceId)
+            ? { embed_backfill: embedBackfillBySource.get(r.sourceId) }
+            : {}),
         }));
       console.log(JSON.stringify({
         schema_version: 1,
@@ -3766,7 +4148,7 @@ See also:
   const singleSourceInterrupt = new AbortController();
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
   const opts: SyncOpts = {
-    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, includeGitignored, sourceId,
+    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, includeGitignored, workingTree, sourceId,
     strategy: strategyArg, concurrency,
     srcSubpath,
     exclude: excludePatterns.length > 0 ? excludePatterns : undefined,
@@ -3782,22 +4164,25 @@ See also:
   // the gate can never wedge an existing cron; it converts silent ungated
   // inline spend into informed inline-or-deferred spend.
   let singleSourceAutoDefer = false;
+  let singleSourceNoWorkerSurface = false;
   if (!noEmbed && !dryRun && !watch) {
     const gateRows = await engine.executeRaw<{ local_path: string | null; config: Record<string, unknown>; last_commit: string | null; chunker_version: string | null }>(
       `SELECT local_path, config, last_commit, chunker_version FROM sources WHERE id = $1`,
       [sourceId],
     );
     if (gateRows.length > 0) {
-      const gateSources = [{
+      const gate = await resolveSingleSyncEmbedPlan(engine, {
+        sourceId,
         local_path: gateRows[0].local_path ?? repoPath ?? null,
         config: gateRows[0].config ?? {},
         last_commit: gateRows[0].last_commit,
         chunker_version: gateRows[0].chunker_version,
-      }];
-      const gate = await runInlineCostGate(engine, {
-        sources: gateSources, mode: 'inline', dryRun: false, jsonOut, yesFlag, full, includeGitignored, label: 'sync',
+      }, {
+        dryRun: false,
+        jsonOut, yesFlag, full, includeGitignored, noAutoEmbed,
       });
-      if (gate.action === 'stop') return;
+      singleSourceNoWorkerSurface = gate.workerSurface.status === 'no_worker_surface';
+      if (gate.stop) return;
       if (gate.autoDeferEmbeds) {
         opts.noEmbed = true;
         singleSourceAutoDefer = true;
@@ -3833,7 +4218,7 @@ See also:
       if (singleSourceTimer !== undefined) clearTimeout(singleSourceTimer);
       process.off('SIGINT', onSingleSourceSigint);
     }
-    printSyncResult(result);
+    printSyncResult(result, jsonOut ? process.stderr : process.stdout);
     // #3068: a pull_failed partial is NOT a success — unlike timeout-class
     // partials (which converge on retry), a failing pull will not self-heal.
     // Exit non-zero so cron/monitoring sees the wedge instead of a green run.
@@ -3869,23 +4254,26 @@ See also:
     // v0.42.42.0 (#2139, Step 4b): the inline gate auto-deferred this run's
     // embeds (non-TTY, above floor) — enqueue a capped backfill job so the
     // NULL-embedded chunks get embedded out of band instead of being stranded.
+    let singleEmbedBackfill: SyncEmbedBackfillOutcome | undefined;
     if (
-      singleSourceAutoDefer &&
+      (singleSourceAutoDefer || (
+        singleSourceNoWorkerSurface && result.embedDeferralReason === 'large_sync'
+      )) &&
       result.status !== 'dry_run' &&
       result.status !== 'up_to_date' &&
       result.status !== 'partial'
     ) {
       try {
-        const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
-        const sub = await submitEmbedBackfill(engine, sourceId, { reason: 'sync_autodefer' });
-        if (sub.status === 'submitted') {
-          process.stderr.write(`  → embed-backfill job ${sub.jobId} queued (deferred inline embed).\n`);
-        } else if (sub.status === 'cooldown') {
-          process.stderr.write(`  → embed-backfill skipped (cooldown); run \`gbrain embed --stale\` to drain now.\n`);
-        }
+        singleEmbedBackfill = await resolveSyncEmbedBackfill(engine, sourceId, {
+          reason: 'sync_autodefer', autoSubmitDisabled: noAutoEmbed,
+        });
+        process.stderr.write(`  → ${formatSyncEmbedBackfillOutcome(singleEmbedBackfill)}.\n`);
       } catch (e) {
         process.stderr.write(`  → embed-backfill submission failed: ${e instanceof Error ? e.message : String(e)}\n`);
       }
+    }
+    if (jsonOut) {
+      console.log(JSON.stringify(buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill)));
     }
     return;
   }
@@ -4063,12 +4451,14 @@ export async function syncOneSource(
     /** v0.42.7 #1696: propagate --no-extract into every per-source sync. */
     noExtract?: boolean;
     includeGitignored?: boolean;
+    /** Untracked-gap fix: propagate --working-tree into every per-source sync. */
+    workingTree?: boolean;
   },
 ): Promise<{ result: SyncResult; log: string }> {
   const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
   const log = `\n--- Syncing source: ${src.name} ---\n`;
   const repoOpts: SyncOpts = {
-    repoPath: src.local_path!,
+    repoPath: msysToNativePath(src.local_path!), // #2955: heal MSYS /c/... before joins
     dryRun: shared.dryRun,
     full: shared.full,
     noPull: shared.noPull,
@@ -4078,11 +4468,11 @@ export async function syncOneSource(
     retryFailed: shared.retryFailed,
     noSchemaPack: shared.noSchemaPack,
     includeGitignored: shared.includeGitignored,
+    workingTree: shared.workingTree,
     sourceId: src.id,
     strategy: cfg.strategy,
     concurrency: shared.concurrency,
-    // lockId defaults to `gbrain-sync:${src.id}` via the invariant in
-    // performSync (no explicit override needed — sourceId triggers it).
+    // lockId defaults to `gbrain-sync:${src.id}` via the performSync invariant (sourceId triggers it).
   };
   const result = await withSourcePrefix(src.id, () => performSync(engine, repoOpts));
   return { result, log };
@@ -4291,20 +4681,28 @@ async function maybeExtractionNudge(engine: BrainEngine, sourceId?: string): Pro
  * Render a SyncResult to a Writable sink.
  *
  * `sink` defaults to `process.stdout` so existing single-source callers
- * see identical output. The `--all` parallel path passes `process.stderr`
- * when `--json` is set, so banners stay off stdout and the JSON envelope
- * pipes cleanly through `jq` (D4).
+ * see identical output. The `--all` and single-source paths pass
+ * `process.stderr` when `--json` is set, so banners stay off stdout and the
+ * JSON envelope pipes cleanly through `jq` (D4).
  */
-function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
+export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
   const write = (line: string) => sink.write(line + '\n');
+  const writeUncommittedNote = (u: NonNullable<SyncResult['uncommitted']>) =>
+    write(
+      `  NOTE: ${u.added + u.modified + u.deleted} uncommitted file(s) not synced ` +
+      `(${u.added} untracked/added, ${u.modified} modified, ${u.deleted} deleted) — ` +
+      `commit them or run 'gbrain sync --working-tree'.`,
+    );
   switch (result.status) {
     case 'up_to_date':
       write('Already up to date.');
+      if (result.uncommitted) writeUncommittedNote(result.uncommitted);
       break;
     case 'synced':
       write(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
       write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} deleted, R${result.renamed} renamed`);
       write(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
+      if (result.uncommitted) writeUncommittedNote(result.uncommitted);
       break;
     case 'first_sync':
       write(`First sync complete. Checkpoint: ${result.toCommit.slice(0, 8)}`);
@@ -4312,11 +4710,23 @@ function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.
       break;
     case 'dry_run':
       break; // already printed in performSync
-    case 'blocked_by_failures':
-      write(`Sync BLOCKED at ${result.toCommit.slice(0, 8)}: ${result.failedFiles ?? 0} file(s) failed to parse.`);
+    case 'blocked_by_failures': {
+      write(`Sync BLOCKED at ${result.toCommit.slice(0, 8)}: ${result.failedFiles ?? 0} file(s) failed.`);
       write(`  See ~/.gbrain/sync-failures.jsonl for details, or run 'gbrain doctor'.`);
-      write(`  Fix the files then re-run 'gbrain sync', or 'gbrain sync --skip-failed' to move on.`);
+      // #3875: code-aware recovery hint — provider-infra failures are not
+      // fixed by --skip-failed (that would silently unindex good files).
+      const infraCodes = (result.failureCodes ?? []).filter(c => isEmbeddingInfraCode(c.code));
+      if (infraCodes.length > 0) {
+        write(
+          `  Embedding provider errors (${infraCodes.map(c => `${c.code} x${c.count}`).join(', ')}): ` +
+          `check provider health, then re-run 'gbrain sync' (or 'gbrain sync --full'). ` +
+          `Do NOT use --skip-failed for provider errors.`,
+        );
+      } else {
+        write(`  Pinpoint with 'gbrain frontmatter validate <path>', fix, then re-run 'gbrain sync', or 'gbrain sync --skip-failed' to move on.`);
+      }
       break;
+    }
     case 'partial':
       // #3068: a failed (non-timeout) pull with zero imports gets its own
       // message — "imported 0 of 0" reads like success, but the local

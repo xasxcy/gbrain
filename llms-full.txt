@@ -272,7 +272,8 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   same commit as any peel. migrate.ts is `region-exempt` (the MIGRATIONS array grows freely;
   the runner logic around it is ratcheted).
 - **Peeled façades keep their surface.** operations.ts (`src/core/ops/*`), doctor.ts
-  (`src/commands/doctor/*`), sync.ts (`src/core/sync-*`), and both engines
+  (`src/commands/doctor/*`), sync.ts (`src/core/sync-*`), skillpack.ts
+  (`src/commands/skillpack/*`), and both engines
   (`src/core/{postgres,pglite}-engine/*`) are façades re-exporting everything they always
   exported — import sites and published package exports never chase the peel. New code goes
   in the module dirs, not back into the façades. Engine modules take narrow explicit deps
@@ -301,6 +302,7 @@ detail on demand.)
 | search modes / cost knobs | `docs/guides/search-modes.md` |
 | embedding spend gates / cost gate / `spend.posture` / off switches | `docs/operations/spend-controls.md` |
 | push-based context (volunteer/watch/reflex window) | `docs/guides/push-context.md` |
+| checkpoint compaction / compiled context files (`gbrain compile-context`) | `docs/guides/checkpoint-compaction.md` + `docs/guides/ambient-recall.md` |
 | schema packs / page types / extraction | `docs/architecture/schema-packs.md`, `type-taxonomy.md`, `lens-packs.md` |
 | thin-client / remote MCP / cross-modal | `docs/architecture/thin-client.md` |
 | memory verbs / MCP tool surface (`--surface`) / conformance | `docs/protocol/MEMORY_VERBS_v1.md` + the `verbs*`/`surface.ts`/`protocol.ts` entries in `KEY_FILES.md` |
@@ -665,8 +667,8 @@ ms, max waiters) for `--json`; a one-line summary prints to stderr.
 
 ## Version locations (single source of truth: `VERSION` file)
 
-Every release advances the version in **seven files at once**. Keep these in
-sync. `/ship` enforces this via Step 12's idempotency check (VERSION vs
+Every release advances the version in **every file in the table below at
+once**. Keep these in sync. `/ship` enforces this via Step 12's idempotency check (VERSION vs
 package.json drift), but the canonical list lives here so future runs and
 the auto-update agent know where to look.
 
@@ -681,7 +683,7 @@ four numeric segments are required first. Historical 3-segment versions
 (`0.31.3`, `0.22.1`) remain valid in `git log` and migration filenames
 (`skills/migrations/v0.21.0.md`); do NOT rewrite them. Going forward only.
 
-**Required (every release must update all seven):**
+**Required (every release must update every row):**
 
 | File | What lives there | Format |
 |---|---|---|
@@ -697,10 +699,12 @@ four numeric segments are required first. Historical 3-segment versions
 
 **Auto-derived (no manual edit; refreshed by their own commands):**
 
-- `plugin/` — the committed codex/claude plugin skill tree embeds a
-  `gbrain-plugin-tree-stamp: X.Y.Z.W` in its generated README, so every
-  version bump drifts it. Regenerate after the bump: `bun run
-  scripts/generate-plugin-tree.ts --out plugin` (guarded by
+- `plugin/` + `plugin-variants/` — the committed codex/claude plugin skill
+  tree AND the persona variant trees (gbrain-coding, gbrain-daily) embed a
+  `gbrain-plugin-tree-stamp: X.Y.Z.W` (the variants' generated plugin
+  manifests carry the version too), so every version bump drifts them.
+  Regenerate after the bump: `bun run scripts/generate-plugin-tree.ts --out
+  plugin --variants-out plugin-variants` (guarded by
   `scripts/check-plugin-tree.sh` in `bun run verify`; the release
   `publish-codex-plugin` job also drift-gates it before publishing).
 - `bun.lock` — root-package version is auto-pinned from `package.json`. After
@@ -1128,14 +1132,23 @@ the playbook at `skills/migrations/v0.46.3.0.md` — one command migrates both.
 
 ```bash
 export VOYAGE_API_KEY=pa-...          # default embedding + reranker (one key covers both)
-export OPENAI_API_KEY=sk-...          # alternative for vector search; also used for chat models
-export ANTHROPIC_API_KEY=sk-ant-...   # optional, improves search quality via query expansion
+export OPENAI_API_KEY=sk-...          # alternative for vector search; also powers automatic fact extraction + chat models
+export ANTHROPIC_API_KEY=sk-ant-...   # automatic fact extraction + chat models; also improves search via query expansion
 ```
 
 Save to shell profile or `.env`, or store in `~/.gbrain/config.json` (file plane). Do
-NOT use `gbrain config set` for API keys — it writes the DB plane, which the embedding
-pipeline never reads. Without any embedding provider, keyword search still works.
-Without Anthropic, search works but skips query expansion.
+NOT use `gbrain config set` for API keys — it writes the DB plane, which the provider
+pipeline never reads. For the autopilot daemon, put keys AND process-level env
+(`NODE_EXTRA_CA_CERTS`, proxy vars, custom base URLs) in `~/.gbrain/env` — a 0600
+file created by `gbrain autopilot --install` and sourced by the daemon wrapper;
+interactive shell rc files never reach daemon shells, and the path honors
+`GBRAIN_HOME`. Re-run `gbrain autopilot --install` after editing it so the daemon
+reloads. Without any embedding provider, keyword search still works.
+Chat-shaped features (automatic fact extraction, enrichment, synthesis, query
+expansion) route to whichever supported chat key is present (Anthropic or OpenAI) —
+Anthropic when both are set, OpenAI when it is the only one; other chat providers
+need an explicit `models.*` pin. With neither key, extraction stays off and memory
+comes from agent-authored `## Facts` fences and the `remember` verb.
 
 ## Step 3: Create the Brain
 
@@ -1284,6 +1297,17 @@ refuses to overwrite anything that exists. Use `gbrain skillpack reference <name
 diff against gbrain's bundle when you want upstream improvements. (The legacy
 `gbrain skillpack install` managed-block model was removed in v0.33 — run
 `gbrain skillpack migrate-fence` once if upgrading from an older release.)
+
+> **PGLite brains are single-process (applies to every MCP registration
+> below).** PGLite is a single-writer embedded Postgres: the first running
+> `gbrain serve` owns the brain's data directory via the data-dir lock. A
+> second `serve` (gbrain registered in two harnesses on the same machine) —
+> or any CLI command that opens the DB — fails on the lock while that serve
+> is live (`gbrain sync` is the one exception: it delegates to the live
+> serve). If multiple processes need the brain at once, run ONE shared
+> `gbrain serve --http` and point every client at it, or migrate to the
+> Postgres/Supabase engine, which tolerates concurrent connections. Details:
+> [docs/architecture/serve-sync-concurrency.md](docs/architecture/serve-sync-concurrency.md).
 
 **If you are Hermes:** register gbrain as your MCP server:
 
@@ -1823,6 +1847,8 @@ gbrain connect https://your-host/mcp --token gbrain_xxx --install               
 gbrain connect https://your-host/mcp --token gbrain_xxx --agent codex --install # Codex
 ```
 
+Onboarding a whole agent harness onto a shared brain? On the brain host, `gbrain agent register <name> --harness claude-code` mints a scoped OAuth client plus a 30-day token and prints the paste-ready wiring block — presets for daily-driver and write-isolated coding agents. The [onboarding decision table](docs/guides/agent-to-gbrain.md#onboarding-paths--the-decision-table) says which path fits.
+
 **Brain-only install into another coding agent** (Cursor, Claude Cowork, or anything that can fetch a URL and run shell commands) — paste the OpenClaw/Hermes block above (`INSTALL_FOR_AGENTS.md`); it installs the brain, skills, and dream cycle without the personal-agent identity layer. Tested with Codex, Claude Code, Claude Cowork, Cursor, and AlphaClaw.
 
 **[→ Full walkthrough: give your coding agent a memory](docs/tutorials/connect-coding-agent.md)** — the memory-only paths end to end, plus the brain-first protocol you paste into `CLAUDE.md` / `AGENTS.md` and the four habits that make it actually change how you work.
@@ -1843,7 +1869,7 @@ Postgres-at-scale, Supabase, and thin-client setup paths live in [`docs/INSTALL.
 
 GBrain exposes nearly all of its 100+ operations as MCP tools (stdio and HTTP; a handful of local-only ops stay CLI-side) — or exactly the seven memory verbs with `--surface verbs`. The specific snippet depends on which client you use:
 
-- **[Claude Code](docs/mcp/CLAUDE_CODE.md)** — plugin: `/plugin marketplace add garrytan/gbrain` + `/plugin install gbrain@gbrain` (MCP + skills). Or local one-liner: `claude mcp add gbrain -- gbrain serve` (zero server, zero tunnel). Remote with just a bearer token: `gbrain connect https://your-host/mcp --token gbrain_xxx` prints a paste-ready block (or `--install` wires it up and smoke-tests the token).
+- **[Claude Code](docs/mcp/CLAUDE_CODE.md)** — plugin: `/plugin marketplace add garrytan/gbrain` + `/plugin install gbrain@gbrain` (MCP + skills; persona variants `gbrain-coding` / `gbrain-daily` install curated subsets — pick exactly one gbrain plugin). Marketplace-free skills: `gbrain skillpack scaffold --harness claude-code` copies a persona-curated skill set into your user-scope skills dir with a local-edit-respecting update lens. Or local one-liner: `claude mcp add gbrain -- gbrain serve` (zero server, zero tunnel). Remote with just a bearer token: `gbrain connect https://your-host/mcp --token gbrain_xxx` prints a paste-ready block (or `--install` wires it up and smoke-tests the token).
 - **[Codex](docs/mcp/CODEX.md)** — plugin (recommended): `codex plugin marketplace add garrytan/gbrain@codex-plugin` + `codex plugin add gbrain@gbrain` installs the MCP server AND the curated skill set. Or connect-only: `gbrain connect https://your-host/mcp --token gbrain_xxx --agent codex` (or `--install`); Codex reads the bearer from `$GBRAIN_REMOTE_TOKEN` at runtime, so the token never lands in Codex config.
 - **[Cursor / Windsurf / any stdio MCP client](docs/mcp/CLAUDE_CODE.md)** — same shape, add `{"command": "gbrain", "args": ["serve"]}` to your MCP config.
 - **[Hermes](docs/mcp/HERMES.md)** — `printf 'Y\n' | hermes mcp add gbrain --env GBRAIN_HOME=$HOME --connect-timeout 60 --command $(which gbrain) --args serve`. Keep `--args` last, and verify with `hermes mcp test gbrain` (the add exits 0 even on failure).
@@ -1922,6 +1948,7 @@ re-runs are free — unchanged sessions skip on content hash:
 gbrain transcripts ingest                    # discover importable session logs
 gbrain transcripts ingest --all              # import everything discovered
 gbrain transcripts ingest ~/Downloads/conversations.json  # consumer export (unzip first)
+gbrain transcripts ingest --max-bytes 4gb <store>          # oversized store; omit to keep per-format caps
 gbrain transcripts status                    # found vs imported, per harness
 ```
 
@@ -2139,10 +2166,13 @@ gbrain sync --no-schema-pack --no-pull --no-embed --yes
 `gbrain schema lint` warns on the classic nested-quantifier ReDoS
 shapes (`(a+)+`, `(a*)*`, …) in pack regexes, and the runtime caps
 inference-regex input length (override via `GBRAIN_MAX_REGEX_INPUT_CHARS`).
-Third, on a PGLite brain, stop `gbrain serve` before a large sync —
-PGLite is single-writer and a live MCP server contends for the write
-lock. See [`docs/architecture/serve-sync-concurrency.md`](docs/architecture/serve-sync-concurrency.md)
-for the full triage.
+Third, on a PGLite brain with a live `gbrain serve` (your agent's MCP
+server), `gbrain sync` delegates the run to the serve process over its
+local IPC socket — the lock owner does the work, your agent stays up,
+and Ctrl-C aborts to a checkpoint the next sync resumes from. Embeds
+defer to the serve's background sweep. See
+[`docs/architecture/serve-sync-concurrency.md`](docs/architecture/serve-sync-concurrency.md)
+for the limits (unsupported flags, `serve --http`) and the full triage.
 
 **`gbrain init --migrate-only` / a schema migration fails on Windows
 with `getaddrinfo ENOTFOUND`?** Upgrade — schema bring-up now runs its
@@ -2372,7 +2402,7 @@ live in `test/postgres-engine-rls-scope.test.ts`.
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
 
-**Migration:** `gbrain migrate --to supabase` exports everything (pages, chunks, embeddings, links, tags, timeline) and imports into Supabase. `gbrain migrate --to pglite` goes the other direction. Bidirectional, lossless.
+**Migration:** `gbrain migrate --to supabase` exports everything (pages, chunks, embeddings, links, tags, timeline, facts) and imports into Supabase. Config rows copy in full minus the engine-local denylist (`MIGRATE_CONFIG_ENGINE_LOCAL_KEYS`: the target-owned `engine`/`version` connection + schema ledger and the physical embedding-column registry keys); skipped keys are printed, never silent, and the run ends with a per-table copied-count summary. `gbrain migrate --to pglite` goes the other direction. Bidirectional, lossless.
 
 The migration and the autopilot daemon do not race: `migrate --to` claims a
 cooperative pause marker before touching the target. The marker doubles as a
@@ -2758,22 +2788,21 @@ That's it. No API keys required for this tutorial — every step works against t
 ## Step 1: See what pack is active today
 
 ```bash
-gbrain schema active --json
+gbrain schema active
 ```
 
 You'll see something like:
 
-```json
-{
-  "pack_name": "gbrain-base",
-  "version": "1.0.0",
-  "sha8": "...",
-  "page_types_count": 22,
-  "source_tier": "default"
-}
+```text
+Active pack: gbrain-base v1.0.0
+Source: default
+Pack identity: ...
+Page types: 22
+Link verbs: 12
+Takes kinds: hot, warm, cold
 ```
 
-`source_tier: "default"` means you haven't customized anything — you're on the bundled pack. `page_types_count: 22` is the universal starter (person, company, meeting, note, etc.).
+`Source: default` means you haven't customized anything — you're on the bundled pack. `Page types: 22` is the universal starter (person, company, meeting, note, etc.). (Agents needing this as JSON use the MCP op `get_active_schema_pack` — the CLI subcommand prints human output only.)
 
 **You can't mutate bundled packs directly.** Step 2 forks it so you have something writable.
 
@@ -2795,7 +2824,7 @@ gbrain schema use mine
 
 Output: `Pack: mine (json) ... Active.`
 
-Run `gbrain schema active --json` again to confirm `pack_name` is now `mine` and `source_tier` is `home-config` (read from `~/.gbrain/config.json`).
+Run `gbrain schema active` again to confirm `Active pack:` now says `mine` and `Source:` is `home-config` (read from `~/.gbrain/config.json`).
 
 **You've already accomplished something visible** — the active pack changed, and any future query will route through your fork. The next four steps add a custom type and prove it works.
 
@@ -2955,7 +2984,7 @@ gbrain schema lint --with-db
 
 **For agents (MCP):** the same operations are reachable over HTTPS MCP as schema ops. Register an admin-scope OAuth client and `schema_apply_mutations` lets a remote agent compose multi-step refactors as one atomic batch. The batched MCP op + per-pack lock + audit log are the load-bearing primitives that make remote schema authoring safe. See [`skills/schema-author/SKILL.md`](../skills/schema-author/SKILL.md) for the agent dispatcher.
 
-**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade` restores the previous active pack from `~/.gbrain/schema-pack-history.jsonl`.
+**Undo a mistake.** Every mutation primitive has an inverse (`remove-type`, `remove-alias`, `remove-prefix`, `remove-link-type`, `set-extractable false`, etc.). If you fork twice and want to revert, `gbrain schema downgrade --to <pack>` re-activates the pack you name (e.g. `--to gbrain-base`). The bare history-based form depends on `~/.gbrain/schema-pack-history.jsonl`, which nothing writes today — always pass `--to`.
 
 ## Related docs
 
@@ -3013,13 +3042,15 @@ gbrain sync --repo /path/to/brain && gbrain embed --stale
 ```
 
 - `gbrain sync --repo <path>` -- one-shot incremental sync. Detects changes via
-  `git diff`, imports only what changed. For small changesets (<= 100 files),
-  embeddings are generated inline during import — unless the inline cost gate
-  intervenes: when the estimated embedding spend crosses the configured floor
-  in a non-interactive session (cron, `--json`), sync auto-defers embeds to a
-  capped `embed-backfill` job instead of spending silently. Either way the
-  chunks get embedded; a deferred run just finishes asynchronously. See
-  [spend controls](../operations/spend-controls.md).
+  `git diff`, imports only what changed. **Commit-driven:** it imports
+  *committed* changes; uncommitted edits and untracked files are counted and
+  reported as drift, not silently ignored (see Tricky Spot 6). For small
+  changesets (<= 100 files), embeddings are generated inline during import —
+  unless the inline cost gate intervenes: when the estimated embedding spend
+  crosses the configured floor in a non-interactive session (cron, `--json`),
+  sync auto-defers embeds to a capped `embed-backfill` job instead of spending
+  silently. Either way the chunks get embedded; a deferred run just finishes
+  asynchronously. See [spend controls](../operations/spend-controls.md).
 - `gbrain embed --stale` -- backfill embeddings for any chunks that don't have
   them. Safety net for large syncs (>100 files) or prior `--no-embed` runs.
   On a keyless brain (installed with `--no-embedding`), a bare stale embed
@@ -3145,6 +3176,22 @@ vars — incident-time escape hatches, not everyday knobs.
    gbrain include `schema_version: 1`, `owner: "gbrain"`, and
    `kind: "import"` so downstream tools can validate the contract before
    deciding whether to resume.
+
+6. **Sync imports commits, not your working tree.** Files written into the
+   brain repo but never committed are invisible to incremental sync. Sync
+   won't stay silent about them: it prints a NOTE with the drift counts
+   (`N uncommitted file(s) not synced`), the sync result object carries an
+   `uncommitted` summary (surfaced via `sync_brain` over MCP and in
+   `gbrain dream --json` phase details), and the nightly dream cycle reports
+   the sync phase as `warn` instead of a clean run. The fix is to commit the files. If your
+   workflow legitimately writes without committing, opt in to importing
+   uncommitted state with `gbrain sync --working-tree` (one run) or
+   `gbrain config set sync.include_working_tree true` (standing config,
+   honored by every caller including the dream cycle). Caution before making
+   it standing config: untracked means everything `git status` lists as
+   untracked — unignored scratch files and secrets included — so review
+   `git status` first. Gitignored files stay excluded either way (use
+   `--include-gitignored` for those).
 
 ## How to Verify
 
@@ -3316,7 +3363,9 @@ per-transcript synthesis subagents. The dials:
 - `dream.triage.max_tokens` (default 2048, floor 256) — judge output budget.
 - `dream.triage.concurrency` (default 4, clamped 1–16) — concurrent judge
   calls.
-- `dream.synthesize.max_turns` (default 16) — synthesis turn budget. The
+- `dream.synthesize.max_turns` (default 16) — synthesis turn budget for
+  agentic children and oneshot fallbacks (the default oneshot path — see
+  the next section — is a single completion and never spends turns). The
   triage map hands the subagent pre-extracted segments, so the mid-tier
   default model (`models.dream.synthesize`, tier `reasoning`) with a 16-turn
   budget is the intended pairing — frontier-model overrides are unnecessary
@@ -3341,6 +3390,44 @@ gbrain dream retriage --dry-run          # what would change (zero LLM calls)
 gbrain dream retriage --reconcile-queue  # re-score + cancel below-threshold queued jobs
 gbrain dream retriage --audit-rejects 20 # synthesis-model second opinion on 20 rejects
 ```
+
+### Synthesis speed: oneshot mode + the drain pool
+
+Above the triage cascade sit the execution dials (#4216/#4194):
+
+- `dream.synthesize.mode` (default `oneshot`) — how each synthesis child
+  runs. `oneshot` makes ONE tool-less completion against a prompt that
+  already carries a pre-retrieved **LINK CANDIDATES** manifest and the write
+  allow-list, then validates and writes the pages programmatically (slug
+  grammar, allow-list, transcript hash suffix, exact-match wikilinks — all
+  checked before any write; embeds deferred out of the model path and
+  backfilled at phase end by a bounded pass over just the pages the phase
+  wrote — never a source-wide sweep). A response that fails any check automatically
+  falls back to the classic agentic loop **in the same job** — no lost work,
+  no resubmission. Typical effect: 10+ provider round-trips per transcript
+  (up to the 16-turn default cap, more on raised `max_turns`) → 1. Revert
+  dial: `gbrain config set dream.synthesize.mode agentic`.
+- `dream.synthesize.link_manifest` (default on) — the zero-embed
+  pre-retrieval manifest (built from the triage verdict's cached entities +
+  segment notes). Benefits BOTH modes: agentic children stop burning turns
+  on low-yield searches; oneshot children get their link targets up front.
+- `dream.synthesize.inline_concurrency` (default 1, clamp 1–8) — concurrent
+  drain loops for the per-run child queue on Postgres (PGLite always drains
+  serially). Provider ceilings stay with the rate leases (every provider
+  round-trip on every path holds a lease slot), so this dial only removes
+  queue-wait, never over-drives the API.
+
+Reading the phase report (`details.synthesis`): `mode`, `oneshot_jobs` /
+`fallback_jobs` / `agentic_jobs` + a `fallback_reasons` histogram (a rising
+fallback rate means the model is failing the output contract — check the
+top reason before considering the agentic revert), `queue_wait_ms_p50/p95`
+and `child_runtime_ms_p50/p95` (a slow-but-healthy drain is visible instead
+of indistinguishable from a stuck one), and `dead_jobs`/`degraded`. A run
+with any non-completed child does NOT stamp the cooldown, so the next
+nightly retries exactly the failed transcripts; a run whose EVERY child
+died fails the phase loudly. Synthesis children also fail (dead-letter)
+when every attempted page write failed — `completed` can no longer mean
+"zero pages written".
 
 ### What It Does
 
@@ -3521,12 +3608,23 @@ the agent's operational state:
 
 ```json
 {
+  "userAwake": true,
   "currentLocation": {
-    "timezone": "US/Pacific",
-    "city": "San Francisco"
+    "timezone": "Europe/Zurich",
+    "city": "Basel",
+    "source": "user-confirmed"
+  },
+  "homeLocation": {
+    "timezone": "Europe/Zurich",
+    "city": "Basel"
   }
 }
 ```
+
+`homeLocation` is optional. The context engine shows a separate home clock only
+when an explicit home timezone differs from the current timezone. It never
+guesses a home city or timezone. Existing `garryAwake` state remains readable
+for migration compatibility; new producers should write `userAwake`.
 
 **Update the timezone when:**
 - Calendar shows the user flying somewhere (check for airline/hotel events)
@@ -4016,9 +4114,15 @@ The push channels share one zero-LLM core (`src/core/context/volunteer.ts`):
    merged with recency / frequency / user-role salience. Assistant-introduced
    entities and "what did she invest in?" follow-ups whose antecedent was named
    in the window now resolve.
-2. **Resolve** through the alias table, exact titles, and slug suffixes — each
-   arm carries an honest confidence: alias 0.9, exact title 0.8, slug-suffix 0.6,
-   +0.05 when mentioned in ≥2 turns or the newest turn.
+2. **Resolve** through the alias table, exact titles, surnames, and slug
+   suffixes — each arm carries an honest confidence: alias 0.9, exact title
+   0.8, surname 0.72, slug-suffix 0.6, +0.05 when mentioned in ≥2 turns or the
+   newest turn. Lowercase mentions ("remind me what alice said") probe the
+   alias table only, and only when the alias is unique across every source in
+   play; a surname-only reference ("Did Galewright follow up?") resolves when
+   exactly one person page carries that surname. Ambiguity in either arm
+   injects nothing — silence beats a wrong pointer. Kill switch for both:
+   `retrieval_reflex_lexical_arms` (default on).
 3. **Gate** at `min_confidence` (default 0.7 — slug-suffix matches need an
    explicit lower gate), suppress pages already surfaced (slug-presence only),
    cap at 3 pages (hard cap 5).
@@ -4093,6 +4197,7 @@ Kill switch: `GBRAIN_HOOKS=0`. Install/uninstall: `docs/guides/bootstrap.md`.
 | `retrieval_reflex_window_turns` | 4 | turns the ambient reflex extracts from; 1 = legacy current-turn-only (file/env plane: `GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS`) |
 | `retrieval_reflex` | true | the ambient channel's master switch |
 | `retrieval_reflex_max_pointers` | 3 | pointer cap per turn |
+| `retrieval_reflex_lexical_arms` | true | the lowercase-alias + surname recall arms (env: `GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS`); off = pre-v0.46.15 arm set |
 
 Per-call knobs: `max_pages` + `min_confidence` on both the op and `gbrain watch`
 (`--max-pages` / `--min-confidence`, plus `--window-turns` / `--source` on watch);
@@ -4110,6 +4215,172 @@ not an audit trail. Rows are pruned after 90 days by the dream cycle's purge
 phase. Synopses always strip the takes/facts fences — the same strip `get_page`
 applies to untrusted callers, applied unconditionally here so private fence rows
 never reach a prompt regardless of caller trust.
+
+---
+
+## docs/guides/github-source.md
+
+Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/github-source.md
+
+# GitHub source kind: issues and PRs live in the brain
+
+The `github` source kind mirrors issues, pull requests, comments, reviews,
+review comments, labels, assignees, milestones and open-PR CI checks into
+brain pages. One page per item, state in frontmatter, the full thread in the
+body, wikilinks between linked items and every `#<n>` mention. Closed items
+feed the existing dream-cycle atom extraction, so lessons and takes come from
+machinery you already run.
+
+The feature is opt-in and dormant until you register a github-kind source.
+
+## Setup
+
+### 1. Create a fine-grained token
+
+A fine-grained PAT with read permission on `Issues` and `Pull requests`
+(plus `Metadata`, which is mandatory) for the repos you want to track. The
+token must be reachable via an environment variable, by default `GH_TOKEN`.
+It is never stored in the brain; set it in the environment that runs
+`gbrain sync` (and `gbrain serve --http` if you use the webhook).
+
+### 2. Register the source
+
+```bash
+export GH_TOKEN=github_pat_...
+gbrain sources add gh \
+  --kind github \
+  --scope auto
+```
+
+`--scope auto` discovers every repo you own, collaborate on, or belong to as
+an org member. Pin an explicit list instead:
+
+```bash
+gbrain sources add gh \
+  --kind github \
+  --scope repos \
+  --repos owner/one,owner/two
+```
+
+Options:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--token-env <var>` | env var holding the token | `GH_TOKEN` |
+| `--scope auto\|repos` | auto-discover vs explicit list | `auto` |
+| `--repos a/b,c/d` | repos when `--scope repos` | none |
+| `--dir <path>` | managed page directory | `$GBRAIN_HOME/clones/<id>-github` |
+
+Repo names are matched case-insensitively everywhere (GitHub treats them
+that way); pages and state always use the lowercase form. The `gh_handle`
+and `gh_involvement` config keys are reserved: tolerated when present,
+ignored by the sync.
+
+### 3. Sync
+
+```bash
+gbrain sync --source gh          # delta sweep since the last run
+gbrain sync --source gh --full   # full reconcile incl. deletions
+```
+
+The first sync is a full bootstrap and may take a while on large histories
+(the API rate bucket throttles it; every item is written atomically, so
+interruptions resume on the next run). Subsequent sweeps use the `since`
+filter and only touch changed items.
+
+Dream cycle and autopilot pick the source up automatically: the cycle's
+`sync` phase runs every registered source, and the `extract` / `patterns` /
+`consolidate` phases turn resolved items into atoms, lessons and takes.
+
+## Freshness model
+
+Three layers, fastest to cheapest:
+
+1. **Webhook (recommended)**: event-driven, sub-second item refreshes.
+   GitHub pushes the change to you the moment it happens; no polling, no
+   standing API traffic. See below.
+2. **Poll sweeps** (fallback): `gbrain sync --source gh` on your own cron or
+   via autopilot. Zero standing infrastructure. A sweep is one list call per
+   repo plus detail calls for changed items. Use it where a webhook cannot
+   reach the brain (no public URL, locked-down network).
+3. **Full reconcile** (daily recommended): `gbrain sync --source gh --full`
+   re-enumerates everything, refreshes strays and deletes pages for items
+   that vanished. Backed by the same mass-delete guard as git sources.
+   It is the audit that catches anything the webhook or sweeps missed.
+
+Every page carries `synced_at` and the API `updated_at` in frontmatter, so
+staleness is measurable and the next sweep skips fresh pages.
+
+## Webhook (recommended: instant sync)
+
+Point GitHub webhooks at your `gbrain serve --http` instance:
+
+```bash
+gbrain sources webhook set gh --secret <your-secret>
+```
+
+The command prints the payload URL, secret and the exact event list to
+select. Register the webhook on each repo you track, with events: issues,
+pull requests, issue comments, PR reviews, PR review comments, labels,
+milestones, assignees, check runs, check suites, workflow runs. Each event
+submits a targeted `sync` job that refreshes exactly the item that changed
+(check events resolve the linked PR from the payload; events without an
+item reference are acknowledged and skipped). Push events keep their
+existing git-source behavior.
+
+Without a public URL, use a tunnel (Tailscale Funnel, ngrok, or any HTTPS
+host). The webhook is HMAC-signed per source with the same
+`X-Hub-Signature-256` verification as the existing push webhook. Out-of-scope
+repos are acknowledged but never materialized.
+
+## Pages
+
+- Item: `gh/<owner>/<repo>/<number>.md` (numbers are unique per repo across
+  issues and PRs, so one namespace is correct).
+- Repo card: `gh/<owner>/<repo>/index.md`.
+- Frontmatter: kind, repo, number, title, state, status (merged/draft/
+  open/closed), review decision, checks pass/fail/pending counts, labels,
+  assignees, milestone, URL, `updated_at`, `synced_at`, linked items.
+- Body: description, every comment, reviews, review comments with file and
+  line references. `#<n>` mentions and Closes/Fixes/Resolves references
+  become wikilinks, so graph traversal works across the whole history.
+
+## Retrieval
+
+Mirrored items are fully searchable through the normal `gbrain query` /
+`gbrain search` paths (hybrid keyword + vector over title, description,
+comments, reviews and checks). Two behaviors worth knowing:
+
+- **Empty-body items** (an issue or PR with no description) render a
+  `## Context` block with labels, milestone, assignees and repo, so they
+  stay recallable by those facets. Without a body, the chunk would hold
+  only the title, and compound titles tokenize poorly.
+- **Near-identical pages** (the same PR merged across several mirrored
+  repos) are de-duplicated at search time by upstream gbrain (Jaccard
+  similarity, `src/core/search/dedup.ts`). Content recall is unaffected:
+  the surviving copy carries the same text, and the hidden copy is still
+  reachable via a repo-scoped query or direct slug lookup. If you need
+  the per-repo copy to win, include the repo name in the query.
+
+A feature-scoped retrieval bench (brain-bench style, hit@K against a live
+mirror) ships with the QA notes; see `QA-REPORT.md` for the summary.
+
+## Rate limits
+
+The client honors `x-ratelimit` headers, backs off on 403/429 and pauses
+when the bucket runs low. Pagination follows GitHub's Link header, so large
+repositories are never truncated; an enumeration that hits the safety cap
+is treated as failed and never reconciled against the brain. A large
+bootstrap (tens of thousands of items) runs throttled over a few hours and
+resumes where it left off. The sweep cursor only advances after a fully
+successful run, so failed items are retried on the next sweep. Steady-state
+sweeps use a few dozen calls per hour.
+
+## Removing the source
+
+```bash
+gbrain sources remove gh --confirm-destructive
+```
 
 ---
 
@@ -4452,6 +4723,29 @@ Operator checklist:
 
 Optional defense-in-depth: a dedicated Postgres role (or RLS) limited to the
 allowed `source_id`s, so even a leaked connection string can't read everything.
+
+### Run gbrain under a real init (tini / `--init`)
+
+If `gbrain serve` is your container's entrypoint, it runs as PID 1 and
+inherits every orphaned process in the container. Prefer a real init so
+orphan exits are reaped by something built for the job:
+
+```dockerfile
+# Dockerfile: wrap the entrypoint with tini
+ENTRYPOINT ["/usr/bin/tini", "--", "gbrain", "serve", "--http"]
+```
+
+or at run time:
+
+```bash
+docker run --init ... gbrain serve --http
+```
+
+Without an init, gbrain installs its own PID-1 orphan reaper (Linux only):
+a low-frequency `/proc` scan that `waitpid()`s zombies re-parented to it,
+so long-lived containers don't accumulate defunct entries in the PID table.
+It is fail-open and can be disabled with `GBRAIN_PID1_REAP=0` — but tini /
+`--init` remains the recommended setup.
 
 ## Troubleshooting
 

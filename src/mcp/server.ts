@@ -12,17 +12,8 @@ import { disabledOpsForPublishGates } from './publish-gates.ts';
 import type { Operation } from '../core/operations.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
-import {
-  resolveSocketPath,
-  startResolveIpcServer,
-  cleanupStaleSocket,
-  ensureIpcSecret,
-} from '../core/context/resolve-ipc.ts';
-import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
-import { assembleTurnContext } from '../core/context/turn-context.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
-import { makeContextPackIpcHandler } from './context-pack-handler.ts';
-import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
 
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
@@ -83,6 +74,31 @@ export async function stdioVisibleTools(
   return surfacedOps.filter(op => !gateDisabled.has(op.name));
 }
 
+// ─── #4409: in-flight stdio RPC tracking ────────────────────────────────
+// A one-shot MCP client can write a batch of frames and close stdin
+// immediately; the SDK parses every frame during the 'data' events (handler
+// start is queued as a microtask), so at stdin-'end' time requests can be
+// in flight with no response written yet. serve.ts's EOF path consults this
+// counter and drains before its graceful exit instead of dropping the
+// response on the floor. Module-level because one process runs one stdio
+// server (matches the serve-sync-runner singleton posture).
+let _stdioRpcsInFlight = 0;
+
+/** Live count of stdio JSON-RPC requests whose handlers have not settled. */
+export function stdioRpcsInFlightCount(): number {
+  return _stdioRpcsInFlight;
+}
+
+/** Wrap one request handler invocation in the in-flight counter. @internal */
+export async function trackStdioRpc<T>(work: () => Promise<T>): Promise<T> {
+  _stdioRpcsInFlight++;
+  try {
+    return await work();
+  } finally {
+    _stdioRpcsInFlight--;
+  }
+}
+
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
@@ -114,16 +130,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // subtraction happens per request (stdioVisibleTools) — no caching, so a
   // `gbrain config set mcp.publish_skills true` takes effect on the next
   // tools/list without a serve restart (matches the HTTP transports).
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler(ListToolsRequestSchema, async () => trackStdioRpc(async () => ({
     tools: buildToolDefs(await stdioVisibleTools(engine, surfacedOps), { strictParams }),
-  }));
+  })));
 
   // Dispatch tool calls via shared dispatch.ts (parity with HTTP transport).
   // MCP stdio callers are remote/untrusted; dispatch defaults remote=true.
   // The MCP SDK's response type widened in 1.29 to allow a managed-task wrapper;
   // gbrain ops are synchronous, so we return the legacy `{ content, isError? }`
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
-  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => trackStdioRpc(async () => {
     const { name, arguments: params } = request.params;
     // #3242 / #3906: stdio resolves its source through the same ambient chain
     // as local CLI dispatch: GBRAIN_SOURCE, then .gbrain-source, then the
@@ -170,89 +186,19 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       // request_tools bounds its catalog by (persist no-ops without auth).
       surfaceCeiling: surface,
     });
-  });
+  }));
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Retrieval Reflex (#1981, D9=C): on a PGLite brain, serve owns the single
-  // connection, so the context engine (and the per-prompt hook command)
-  // resolve salient entities THROUGH us over a local unix socket rather than
-  // opening a second (impossible) connection.
-  // Best-effort; failure to bind never blocks the MCP server.
-  let resolveServer: import('node:net').Server | null = null;
-  let resolveSocket: string | null = null;
-  try {
-    const cfg = loadConfig();
-    if (cfg?.engine === 'pglite' && cfg.database_path) {
-      resolveSocket = resolveSocketPath(cfg.database_path);
-      const { sourceId: defaultSource } = await resolveMcpStdioSourceScope(engine);
-      // [S3#6] turn_context requires the shared secret from the data dir
-      // (created 0600 here if absent). If the secret can't be provisioned,
-      // turn_context stays fail-closed ('unauthorized') while the secret-free
-      // resolve kind keeps working.
-      let ipcSecret: string | undefined;
-      try {
-        ipcSecret = ensureIpcSecret(cfg.database_path);
-      } catch { /* turn_context disabled; resolve unaffected */ }
-      resolveServer = await startResolveIpcServer(
-        resolveSocket,
-        {
-          // [CX2-10] Bound-source posture for BOTH kinds: the IPC layer
-          // rejects any resolve/turn_context request naming a source other
-          // than boundSourceId ('source_mismatch'), so the only sourceId that
-          // reaches this handler is the bound one or absent — and the handler
-          // resolves against the server's OWN registered source regardless.
-          resolve: (req) =>
-            resolveEntitiesToPointers(
-              engine,
-              defaultSource,
-              req.candidates ?? [],
-              {
-                priorContextText: req.priorContextText,
-                maxPointers: req.maxPointers,
-                suppression: req.suppression,
-              },
-            ),
-          // IPC v2 [ENG-3]: per-turn context assembly for the hook command.
-          // [CX2-10] Always assembles against the server's OWN registered
-          // source — cross-source requests are rejected in the IPC layer via
-          // boundSourceId below, and the handler never honors a caller source.
-          turn_context: (req) =>
-            assembleTurnContext(engine, {
-              sourceId: defaultSource,
-              window: req.window ?? [],
-              priorContextText: req.priorContextText,
-              sessionId: req.sessionId,
-              maxBytes: req.maxBytes,
-            }),
-          // v0.45.7 ambient recall: boundary context pack. Extracted to
-          // context-pack-handler.ts (directly testable against a real engine);
-          // the runtime owns entity merge, banking, the since-cursor, and the
-          // complete-pack-only monotonic cursor advance.
-          context_pack: makeContextPackIpcHandler(engine, defaultSource),
-        },
-        {
-          // The IPC resolve path IS the ambient reflex channel. Logging happens
-          // at DELIVERY (post-write), not inside the resolver — a block the
-          // client's 250ms budget abandoned was never injected, and counting it
-          // would corrupt the volunteered-vs-used precision stats (red-team).
-          onDelivered: (block) => logDeliveredReflexPointers(engine, block.pointers),
-          // The hook lane's feedback loop (#2095 closed over turn_context):
-          // the delivered block's post-trim volunteered pages + pointers land
-          // in context_volunteer_events under the request's channel. Body
-          // lives in volunteer-events.ts (logTurnContextDeliveryFireAndForget)
-          // so the shipped wiring is unit-testable.
-          onTurnContextDelivered: (result, req) =>
-            logTurnContextDeliveryFireAndForget(engine, result, req),
-          boundSourceId: defaultSource,
-          secret: ipcSecret,
-        },
-      );
-    }
-  } catch {
-    /* resolve IPC is best-effort; never block serve */
-  }
+  // Retrieval Reflex (#1981, D9=C): the resolve/turn_context/context_pack
+  // (+ delegated sync/sweep) IPC listener. Wiring shared with `serve --http`
+  // via bindResolveIpcForServe (#4474) — best-effort; failure to bind never
+  // blocks the MCP server.
+  const ipcBinding = await bindResolveIpcForServe(
+    engine,
+    (await resolveMcpStdioSourceScope(engine)).sourceId,
+  );
 
   // v0.45.7 ambient recall: age out stale session cursors once per serve boot
   // (7-day TTL, indexed DELETE). Best-effort — GC failure never blocks serve.
@@ -285,9 +231,20 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
     try { startupSweep?.cancel(); } catch { /* noop */ }
-    try { resolveServer?.close(); } catch { /* noop */ }
-    if (resolveSocket) cleanupStaleSocket(resolveSocket);
-    Promise.resolve(engine.disconnect?.())
+    ipcBinding.close();
+    // Cathedral 5: abort the in-flight checkpoint harvest + drop its queue
+    // BEFORE engine.disconnect — the background-work registry's drain is
+    // CLI-exit-only by contract, and a fire-and-forget DB writer surviving
+    // disconnect busy-loops the single-writer lock (the #1762 hazard class).
+    import('../core/context/checkpoint-harvest.ts')
+      .then((m) => m.shutdownCheckpointHarvest())
+      .catch(() => {})
+      // Delegated-sync settle BEFORE disconnect (idempotent shared promise —
+      // serve.ts's beginShutdown races here on the same signals): the job's
+      // final checkpoint flush and row-lock release need the live engine.
+      .then(() => import('../core/serve-sync-runner.ts').then((m) => m.shutdownDelegatedSync()))
+      .catch(() => {})
+      .then(() => Promise.resolve(engine.disconnect?.()))
       .catch(() => {})
       .finally(() => process.exit(code));
   };
@@ -309,13 +266,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
 
 // Backward compat: used by `gbrain call` command (trusted local path).
 // v0.31.8 (D22): accept opts.sourceId so `gbrain call --source X <op> <json>`
-// can scope the op handler to that source. resolveSourceId() in call.ts is
-// the upstream resolver; this layer just passes the resolved id through.
+// can scope the op handler to that source. resolveSourceWithTier() in call.ts
+// is the upstream resolver; this layer just passes the resolved id through.
+// #3874: also accept opts.localFederatedSourceIds so an ambient-tier
+// resolution widens unqualified reads across federated sources exactly like
+// the direct CLI path (cli.ts makeContext) does.
 export async function handleToolCall(
   engine: BrainEngine,
   tool: string,
   params: Record<string, unknown>,
-  opts?: { sourceId?: string },
+  opts?: { sourceId?: string; localFederatedSourceIds?: string[] },
 ): Promise<unknown> {
   const op = operations.find(o => o.name === tool);
   if (!op) throw new Error(`Unknown tool: ${tool}`);
@@ -327,6 +287,9 @@ export async function handleToolCall(
     remote: false,
     logger: { info: console.log, warn: console.warn, error: console.error },
     ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
+    ...(opts?.localFederatedSourceIds
+      ? { localFederatedSourceIds: opts.localFederatedSourceIds }
+      : {}),
   });
 
   return op.handler(ctx, params);

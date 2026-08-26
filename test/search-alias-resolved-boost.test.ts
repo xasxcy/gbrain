@@ -89,7 +89,14 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 18 (15→16 detail fold #3515; 16→17 degradation-stamp epoch: pre-stamp cache rows become unreachable; 17→18 reranker document truncation invalidates prior rankings)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(18);
+  it('is 27 (20→21 recency fallback re-key #895; 21→22 result-stamp/injection epoch #1663 #3995 #3783 #4220; 22→23 excludePrivate posture fold #4352; 23→24 negative-offset cache-skip gap #4358 residual; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 reranker document truncation, fork)', () => {
+    // mw2: 21→22 result-stamp/injection epoch (#1663 #3995 #3783 #4220).
+    // #4352 follow-up: 22→23 private-visibility posture fold (xp=).
+    // #4358 residual: 23→24 negative-offset cache-skip gap.
+    // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
+    // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
+    // fork: 26→27 — reranker_max_document_chars (rrc=) changes the text the
+    // cross-encoder scores.
+    expect(KNOBS_HASH_VERSION).toBe(27);
   });
 });

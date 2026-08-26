@@ -117,7 +117,8 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   same commit as any peel. migrate.ts is `region-exempt` (the MIGRATIONS array grows freely;
   the runner logic around it is ratcheted).
 - **Peeled façades keep their surface.** operations.ts (`src/core/ops/*`), doctor.ts
-  (`src/commands/doctor/*`), sync.ts (`src/core/sync-*`), and both engines
+  (`src/commands/doctor/*`), sync.ts (`src/core/sync-*`), skillpack.ts
+  (`src/commands/skillpack/*`), and both engines
   (`src/core/{postgres,pglite}-engine/*`) are façades re-exporting everything they always
   exported — import sites and published package exports never chase the peel. New code goes
   in the module dirs, not back into the façades. Engine modules take narrow explicit deps
@@ -146,6 +147,7 @@ detail on demand.)
 | search modes / cost knobs | `docs/guides/search-modes.md` |
 | embedding spend gates / cost gate / `spend.posture` / off switches | `docs/operations/spend-controls.md` |
 | push-based context (volunteer/watch/reflex window) | `docs/guides/push-context.md` |
+| checkpoint compaction / compiled context files (`gbrain compile-context`) | `docs/guides/checkpoint-compaction.md` + `docs/guides/ambient-recall.md` |
 | schema packs / page types / extraction | `docs/architecture/schema-packs.md`, `type-taxonomy.md`, `lens-packs.md` |
 | thin-client / remote MCP / cross-modal | `docs/architecture/thin-client.md` |
 | memory verbs / MCP tool surface (`--surface`) / conformance | `docs/protocol/MEMORY_VERBS_v1.md` + the `verbs*`/`surface.ts`/`protocol.ts` entries in `KEY_FILES.md` |
@@ -510,8 +512,8 @@ ms, max waiters) for `--json`; a one-line summary prints to stderr.
 
 ## Version locations (single source of truth: `VERSION` file)
 
-Every release advances the version in **seven files at once**. Keep these in
-sync. `/ship` enforces this via Step 12's idempotency check (VERSION vs
+Every release advances the version in **every file in the table below at
+once**. Keep these in sync. `/ship` enforces this via Step 12's idempotency check (VERSION vs
 package.json drift), but the canonical list lives here so future runs and
 the auto-update agent know where to look.
 
@@ -526,7 +528,7 @@ four numeric segments are required first. Historical 3-segment versions
 (`0.31.3`, `0.22.1`) remain valid in `git log` and migration filenames
 (`skills/migrations/v0.21.0.md`); do NOT rewrite them. Going forward only.
 
-**Required (every release must update all seven):**
+**Required (every release must update every row):**
 
 | File | What lives there | Format |
 |---|---|---|
@@ -542,10 +544,12 @@ four numeric segments are required first. Historical 3-segment versions
 
 **Auto-derived (no manual edit; refreshed by their own commands):**
 
-- `plugin/` — the committed codex/claude plugin skill tree embeds a
-  `gbrain-plugin-tree-stamp: X.Y.Z.W` in its generated README, so every
-  version bump drifts it. Regenerate after the bump: `bun run
-  scripts/generate-plugin-tree.ts --out plugin` (guarded by
+- `plugin/` + `plugin-variants/` — the committed codex/claude plugin skill
+  tree AND the persona variant trees (gbrain-coding, gbrain-daily) embed a
+  `gbrain-plugin-tree-stamp: X.Y.Z.W` (the variants' generated plugin
+  manifests carry the version too), so every version bump drifts them.
+  Regenerate after the bump: `bun run scripts/generate-plugin-tree.ts --out
+  plugin --variants-out plugin-variants` (guarded by
   `scripts/check-plugin-tree.sh` in `bun run verify`; the release
   `publish-codex-plugin` job also drift-gates it before publishing).
 - `bun.lock` — root-package version is auto-pinned from `package.json`. After

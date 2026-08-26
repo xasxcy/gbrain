@@ -49,12 +49,12 @@ export interface ForkMigrationDeps {
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 131;
+export const FORK_MIGRATION_FLOOR = 142;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 131,
+      version: 142,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +72,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 132,
+      version: 143,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +99,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 133,
+      version: 144,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +128,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 134,
+      version: 145,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +163,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 135,
+      version: 146,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -222,7 +222,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 136,
+      version: 147,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -250,7 +250,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 137,
+      version: 148,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -288,6 +288,72 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         // carry the per-claim term.
         if (rows.length === 0) return true;
         return (rows[0]?.def ?? '').includes('md5(claim_text)');
+      },
+    },
+    {
+      version: 149,
+      name: 'repair_masked_upstream_131_137',
+      // Third instance of the masking class this file's header describes, from
+      // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
+      //
+      // Before that merge upstream's high-water was 130 and the fork occupied
+      // 131-137. Upstream then claimed 131-141 for its own migrations, so the
+      // fork renumbered to 142-148 per ADR-087 — but renumbering only moves the
+      // fork's DEFINITIONS. runMigrations gates on a single high-water integer,
+      // and this brain's counter was already stamped 137 by the FORK's old
+      // 131-137. Upstream's real 131-137 are therefore `m.version > current`
+      // false forever: skipped silently, exactly as v147/v148 above describe.
+      //
+      // Verified on the production brain before writing this (2026-08-26,
+      // counter at 140, i.e. upstream's 138/139/140 had already run):
+      //   131 subagent_tool_use_id unique index ... absent (drop-only; no-op)
+      //   132 session_context_state.checkpoint_manifest .. MISSING
+      //   133 content_chunks.embedded_text_hash ......... MISSING
+      //   135 facts event_time index .................... MISSING
+      //   136 minion_jobs private-queue columns ......... unverified at probe
+      //       time (the pre-check queried the wrong column names; the real
+      //       ones are private_queue_owner_job_id / _token / _lease_until).
+      //       Confirmed PRESENT after this repair ran — it is declared
+      //       idempotent, so re-applying it was a no-op either way.
+      //   137 entity_identities table ................... MISSING
+      //
+      // 133 is load-bearing for this merge: the fork's persistEmbedOutcome now
+      // stamps embedded_text_hash (upstream #4246 adds the stamp inside
+      // _upsertChunksOnce, which that path bypasses), so the merged code cannot
+      // commit a vector on a brain missing the column.
+      //
+      // 134 is deliberately EXCLUDED. It is the one migration in the range
+      // upstream does not declare `idempotent: true`, and it is provably
+      // already satisfied here: both partial indexes it restores
+      // (idx_chunks_embedding_null, content_chunks_stale_idx) were present at
+      // probe time. Re-applying an undeclared migration to reach a state the
+      // brain is already in buys nothing and costs the ADR-087 guarantee.
+      //
+      // Same lookup-don't-copy shape as v147/v148: the DDL is read out of the
+      // live MIGRATIONS registry, so this can never drift from what it repairs.
+      idempotent: true,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [131, 132, 133, 135, 136, 137]) {
+          const masked = deps.allMigrations().find(m => m.version === version);
+          if (!masked) continue;
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 131/132/133/135/136/137 masked by the 2026-08-25 fork renumber\n',
+        );
+      },
+      // The repair has a cheap, exact postcondition and one of its targets is a
+      // hard dependency of the merged embed path, so assert rather than accept
+      // a silent no-op. Postgres-only shape check; PGLite reports its own
+      // catalog, so gate on the engine kind.
+      verify: async (engine) => {
+        if (engine.kind !== 'postgres') return true;
+        const rows = await engine.executeRaw<{ n: number }>(
+          `SELECT count(*)::int AS n FROM information_schema.columns
+            WHERE table_name = 'content_chunks' AND column_name = 'embedded_text_hash'`,
+        );
+        return (rows[0]?.n ?? 0) > 0;
       },
     },
   ];

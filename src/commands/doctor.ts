@@ -1,4 +1,8 @@
 import type { BrainEngine } from '../core/engine.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT } from '../core/embed-skip.ts';
+// Leaf module (no flag surface of its own) — see that file for why this
+// isn't imported from extract-conversation-facts.ts directly (#4135).
+import { ALLOWED_TYPES } from '../core/facts/conversation-types.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -17,8 +21,11 @@ import { dirname, join } from 'path';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { resolveEnvNumber, resolveHoursEnv } from '../core/env-number.ts';
 import { currentEmbeddingSignature } from '../core/embedding.ts';
+import { computeEffectiveDate } from '../core/effective-date.ts';
+import { parseFrontmatter } from '../core/backfill-effective-date.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
+import { zeroTotalContradictionsCheck } from '../core/eval-contradictions/run-health.ts';
 // Peeled doctor modules (containment sprint): each is a verbatim move out of
 // this file. doctor.ts re-exports every moved public symbol under its
 // original name so existing importers (tests, scripts/live-brain-first-check.ts,
@@ -53,6 +60,7 @@ export {
   resolveWhoknowsFixturePath,
   whoknowsHealthCheck,
   pgvectorCheck,
+  pagesUpsertArbiterCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -75,6 +83,7 @@ export {
 export {
   computeQueueHealthCheck,
   computeWedgedQueueCheck,
+  computeOrphanedPrivateQueueCheck,
   computeAutopilotFanoutConcurrencyCheck,
   checkBatchRetryHealth,
 } from './doctor/checks/queue-jobs.ts';
@@ -86,16 +95,21 @@ export {
   checkEmbeddingWidthConsistency,
   checkEmbedFailuresHealth,
   checkFactsEmbeddingWidthConsistency,
+  checkJunkEntityHubs,
+  JUNK_HUB_EDGE_THRESHOLD,
+  JUNK_HUB_MAX_CHUNKS,
 } from './doctor/checks/graph-embedding.ts';
 export {
   checkSourceRoutingHealth,
   checkFederationHealth,
   checkOauthConfidentialHealth,
+  checkOauthClientScopeHealth,
   checkAutopilotLockScope,
   checkStaleLocks,
   checkCyclePhaseScope,
 } from './doctor/checks/routing-federation.ts';
 export {
+  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkEmbeddingEnvOverride,
@@ -111,6 +125,7 @@ export {
   checkLinksExtractionLag,
   checkUnverifiedExtractions,
   checkContentHashDuplicates,
+  checkCodeChunkMetadata,
   checkUndeclaredDbOnlyPages,
   checkDbOnlyCollectorCollision,
   computeExtractAtomsBacklogCheck,
@@ -138,6 +153,7 @@ export {
 import {
   whoknowsHealthCheck,
   pgvectorCheck,
+  pagesUpsertArbiterCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -154,6 +170,7 @@ import {
 import {
   computeQueueHealthCheck,
   computeWedgedQueueCheck,
+  computeOrphanedPrivateQueueCheck,
   computeAutopilotFanoutConcurrencyCheck,
   checkBatchRetryHealth,
 } from './doctor/checks/queue-jobs.ts';
@@ -165,15 +182,18 @@ import {
   checkEmbeddingWidthConsistency,
   checkEmbedFailuresHealth,
   checkFactsEmbeddingWidthConsistency,
+  checkJunkEntityHubs,
 } from './doctor/checks/graph-embedding.ts';
 import {
   checkSourceRoutingHealth,
   checkOauthConfidentialHealth,
+  checkOauthClientScopeHealth,
   checkAutopilotLockScope,
   checkStaleLocks,
   checkCyclePhaseScope,
 } from './doctor/checks/routing-federation.ts';
 import {
+  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkEmbeddingEnvOverride,
@@ -187,6 +207,7 @@ import {
   checkLinksExtractionLag,
   checkUnverifiedExtractions,
   checkContentHashDuplicates,
+  checkCodeChunkMetadata,
   checkUndeclaredDbOnlyPages,
   checkDbOnlyCollectorCollision,
   computeExtractAtomsBacklogCheck,
@@ -366,6 +387,36 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
  */
 
 /**
+ * #4517: is the latest upgrade-errors.jsonl record superseded? True when the
+ * running binary version is at/past the version the failed upgrade was moving
+ * to AND the schema ledger is current (no pending migrations) — i.e. a later
+ * (or retried) upgrade demonstrably finished the job. Pure + exported for
+ * tests. Compares ALL dot-segments (the canonical `compareVersions` stops at
+ * 3, which would treat 0.31.4.1 == 0.31.4.0); a malformed version fails
+ * closed (keeps warning).
+ */
+export function upgradeErrorResolved(
+  failedToVersion: string,
+  binaryVersion: string,
+  schemaCurrent: boolean,
+): boolean {
+  if (!schemaCurrent) return false;
+  if (typeof failedToVersion !== 'string' || typeof binaryVersion !== 'string') return false;
+  const a = binaryVersion.replace(/^v/, '').split('.');
+  const b = failedToVersion.replace(/^v/, '').split('.');
+  if (a.length === 0 || b.length === 0) return false;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const da = parseInt(a[i] ?? '0', 10);
+    const db = parseInt(b[i] ?? '0', 10);
+    if (!Number.isFinite(da) || !Number.isFinite(db) || Number.isNaN(da) || Number.isNaN(db)) return false;
+    if (da > db) return true;
+    if (da < db) return false;
+  }
+  return true; // equal → the failed target version is now running
+}
+
+/**
  * v0.42 self_upgrade_health. Surfaces the self-upgrade mode, whether an update
  * is pending (from the cache), and any recent failed auto-upgrade attempts.
  * File-plane only (no DB) so it runs on thin clients. Three-state: warn on
@@ -423,6 +474,64 @@ export function checkSelfUpgradeHealth(): Check {
       status: 'ok',
       message: `Self-upgrade status unavailable (${e instanceof Error ? e.message : String(e)})`,
     };
+  }
+}
+
+/**
+ * Upgrade-error trail (v0.13+). `gbrain upgrade` silently swallows
+ * best-effort failures in `gbrain post-upgrade`; the failure record is
+ * appended to `~/.gbrain/upgrade-errors.jsonl` so we can surface it here
+ * with a paste-ready recovery hint. Without this, users end up with
+ * half-upgraded brains and no signal.
+ *
+ * #4517: a failure record on its own doesn't mean the brain is STILL
+ * broken — the recovery hint (e.g. `apply-migrations --yes`) may have
+ * already fixed it. Suppression requires BOTH proofs: the installed
+ * binary's own version is at/past the record's `to_version` (the failed
+ * upgrade demonstrably completed filesystem-side) AND the schema ledger is
+ * current (`config.version >= LATEST_VERSION` — the DB half of the upgrade
+ * also finished). A binary alone can lie: `self-upgrade` swaps the binary
+ * before `post-upgrade` runs migrations, which is exactly the failure this
+ * trail records. When the schema can't be verified (no engine, unreadable
+ * version), the warn stays — fail-closed. A superseded record downgrades to
+ * an explicit status:'ok' line (rather than silence) so the operator sees
+ * the past failure was resolved, not swallowed.
+ * `upgradeErrorResolved` above is the pure decision fn.
+ */
+export async function checkUpgradeErrors(
+  engine: Pick<BrainEngine, 'getConfig'> | null,
+): Promise<Check | null> {
+  try {
+    const errPath = gbrainPath('upgrade-errors.jsonl');
+    if (!existsSync(errPath)) return null;
+    const lines = readFileSync(errPath, 'utf-8').split('\n').filter(l => l.trim());
+    if (lines.length === 0) return null;
+    const latest = JSON.parse(lines[lines.length - 1]) as {
+      ts: string; phase: string; from_version: string; to_version: string; hint: string;
+    };
+    const date = latest.ts.slice(0, 10);
+    let schemaCurrent = false;
+    if (engine) {
+      try {
+        const v = parseInt((await engine.getConfig('version')) || '0', 10);
+        schemaCurrent = v >= LATEST_VERSION;
+      } catch { /* unverifiable → keep warning */ }
+    }
+    if (upgradeErrorResolved(latest.to_version, GBRAIN_BINARY_VERSION, schemaCurrent)) {
+      return {
+        name: 'upgrade_errors',
+        status: 'ok',
+        message: `Past post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}) superseded: binary now ${GBRAIN_BINARY_VERSION}, schema current.`,
+      };
+    }
+    return {
+      name: 'upgrade_errors',
+      status: 'warn',
+      message: `Post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}, phase: ${latest.phase}). Recovery: ${latest.hint}`,
+    };
+  } catch {
+    // Read/parse failure is itself best-effort; skip silently.
+    return null;
   }
 }
 
@@ -735,31 +844,18 @@ export async function buildChecks(
     // handles the "schema v7+ but no prefs" case.
   }
 
-  // 3b. Upgrade-error trail (v0.13+). `gbrain upgrade` silently swallows
-  // best-effort failures in `gbrain post-upgrade`; the failure record is
-  // appended to ~/.gbrain/upgrade-errors.jsonl so we can surface it here
-  // with a paste-ready recovery hint. Without this, users end up with
-  // half-upgraded brains and no signal.
-  try {
-    const home = process.env.HOME || '';
-    const errPath = join(home, '.gbrain', 'upgrade-errors.jsonl');
-    if (existsSync(errPath)) {
-      const lines = readFileSync(errPath, 'utf-8').split('\n').filter(l => l.trim());
-      if (lines.length > 0) {
-        const latest = JSON.parse(lines[lines.length - 1]) as {
-          ts: string; phase: string; from_version: string; to_version: string; hint: string;
-        };
-        const date = latest.ts.slice(0, 10);
-        checks.push({
-          name: 'upgrade_errors',
-          status: 'warn',
-          message: `Post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}, phase: ${latest.phase}). Recovery: ${latest.hint}`,
-        });
-      }
-    }
-  } catch {
-    // Read/parse failure is itself best-effort; skip silently.
-  }
+  // 3b. Upgrade-error trail (v0.13+). See checkUpgradeErrors for the #4517
+  // staleness re-verification semantics (binary version + schema ledger).
+  const upgradeErrorsCheck = await checkUpgradeErrors(engine);
+  if (upgradeErrorsCheck) checks.push(upgradeErrorsCheck);
+
+  // 3b-ter. Self-upgrade health (#3747). Pure local-file check (config +
+  // upgrade cache + audit trail; no DB) that was only ever pushed by the
+  // REMOTE report (doctor/report-remote.ts) — the local `gbrain doctor`,
+  // the surface an operator actually runs on the host, never emitted it,
+  // so a wedged auto-upgrade loop was invisible exactly where it would be
+  // diagnosed. Sits beside the upgrade_errors trail it complements.
+  checks.push(checkSelfUpgradeHealth());
 
   // 3b-bis. Supervisor health (filesystem-only: PID liveness + audit log).
   // Reads the default PID file (`~/.gbrain/supervisor.pid` unless the user
@@ -790,6 +886,16 @@ export async function buildChecks(
       } catch { /* pre-migration / transient: pidfile-only */ }
     }
     const running = pidfileRunning || detectedViaDbLock;
+    // #4518: under --fast, `engine` is null (the CLI dispatcher never
+    // connects — see cli.ts's `if (args.includes('--fast'))` branch), so the
+    // #1849 DB-lock fallback above is structurally unreachable. A supervisor
+    // running the documented multi-queue pattern (distinct --pid-file per
+    // named queue, e.g. `supervisor-cron.pid` + `supervisor-default.pid`)
+    // never writes DEFAULT_PID_FILE either, so `running` is always false for
+    // that install shape under --fast — not because it's actually down, but
+    // because the ONE check that could prove otherwise was never attempted.
+    // Don't assert "not running" on a check we know is inconclusive here.
+    const dbLockCheckSkippedUnderFast = fastMode && !pidfileRunning && !engine;
 
     const events = readSupervisorEvents({ sinceMs: 24 * 60 * 60 * 1000 });
     const lastStart = events.filter(e => e.event === 'started').pop()?.ts ?? null;
@@ -817,6 +923,17 @@ export async function buildChecks(
           name: 'supervisor',
           status: 'fail',
           message: `Supervisor gave up at ${maxCrashesEvent.ts} (max_crashes_exceeded). Restart with: gbrain jobs supervisor start --detach`,
+        });
+      } else if (!running && dbLockCheckSkippedUnderFast && events.length > 0) {
+        // #4518: pidfile check found nothing at the HOME-derived default
+        // path, but under --fast we never got to try the #1849 DB-lock
+        // fallback that would prove a per-queue --pid-file supervisor is
+        // actually alive. Say so instead of asserting a liveness verdict
+        // this run structurally couldn't determine.
+        checks.push({
+          name: 'supervisor',
+          status: 'ok',
+          message: `Not found at the default pidfile path (last_start=${lastStart ?? 'unknown'}) — inconclusive under --fast (DB-lock fallback needs a connection). Run \`gbrain doctor\` without --fast to verify a per-queue --pid-file supervisor.`,
         });
       } else if (!running && events.length > 0) {
         checks.push({
@@ -1269,7 +1386,8 @@ export async function buildChecks(
     try {
       const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
       const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      const allowedTypes = ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'] as const;
+      // Single source of truth for the conversation-facts type allowlist (#4135).
+      const allowedTypes = ALLOWED_TYPES;
       // PageFilters supports singular `type` only; iterate the allowed types
       // and cap at ~50/each to land at ~200 total max.
       const sample: import('../core/types.ts').Page[] = [];
@@ -1733,6 +1851,11 @@ export async function buildChecks(
   progress.heartbeat('pgvector');
   checks.push(await pgvectorCheck(engine));
 
+  // 4a-bis. #550: pages(source_id, slug) upsert arbiter — when missing, every
+  // page write fails brain-wide and the version counter can't see the drift.
+  progress.heartbeat('pages_upsert_arbiter');
+  checks.push(await pagesUpsertArbiterCheck(engine));
+
   // 4b. PgBouncer / prepared-statement compatibility.
   // URL-only inspection — no DB roundtrip — so this is cheap and works
   // regardless of whether the caller is the module singleton or a
@@ -1871,8 +1994,54 @@ export async function buildChecks(
   try {
     const version = await engine.getConfig('version');
     schemaVersion = parseInt(version || '0', 10);
-    if (schemaVersion >= LATEST_VERSION) {
-      checks.push({ name: 'schema_version', status: 'ok', message: `Version ${schemaVersion} (latest: ${LATEST_VERSION})` });
+    if (schemaVersion > LATEST_VERSION) {
+      // Forward skew: another node migrated the shared DB past what this
+      // client knows (multi-node brain, hub + spokes on one Postgres). This
+      // client will read/write tables, columns, and indexes it doesn't know
+      // about — more dangerous than backward skew, which at least blocks on
+      // the next `apply-migrations`. See #2036. Takes precedence over the
+      // column diff below: an ahead DB is a superset of this client's
+      // expected columns, and "upgrade this client" is the real fix.
+      checks.push({
+        name: 'schema_version',
+        status: 'warn',
+        message: `Version ${schemaVersion} is AHEAD of this client's latest known version (${LATEST_VERSION}). ` +
+                 `Another node migrated this DB past what this client knows — upgrade this client before writing.`,
+      });
+    } else if (schemaVersion >= LATEST_VERSION) {
+      // #4421: the ledger counter alone can lie — a PgBouncer transaction-
+      // mode pooler can swallow an ALTER TABLE while the migration runner
+      // still advances config.version, leaving the ledger "current" over a
+      // physically narrower table. Add a READ-ONLY column diff via
+      // detectMissingColumns (#4425 — the detection half of
+      // schema-verify.ts's verifySchema, no self-heal): when live columns
+      // are missing, downgrade to warn naming them with the migrate-only
+      // re-run hint. Diff failure is best-effort — the ledger ok stands.
+      // Dynamic import is deliberate: the positional source guard in
+      // test/doctor-schema-column-diff.test.ts pins that the diff consult
+      // lives INSIDE this ledger-current branch.
+      let columnDiffWarned = false;
+      try {
+        const { detectMissingColumns } = await import('../core/schema-verify.ts');
+        const diff = await detectMissingColumns(engine);
+        if (diff.missing.length > 0) {
+          const sample = diff.missing.slice(0, 5).map(m => `${m.table}.${m.column}`).join(', ');
+          const more = diff.missing.length > 5 ? ` (+${diff.missing.length - 5} more)` : '';
+          checks.push({
+            name: 'schema_version',
+            status: 'warn',
+            message:
+              `Version ${schemaVersion} (latest: ${LATEST_VERSION}) but ${diff.missing.length} expected column(s) ` +
+              `are missing from the live schema: ${sample}${more}. The migration ledger advanced past a swallowed ` +
+              `ALTER TABLE (PgBouncer transaction-mode is the usual cause). Fix: gbrain init --migrate-only ` +
+              `(runs the schema self-heal); if it persists, connect directly to Postgres (not the pooler) first.`,
+          });
+          columnDiffWarned = true;
+        }
+      } catch { /* read-only diff is best-effort; ledger ok stands */ }
+      if (!columnDiffWarned) {
+        checks.push({ name: 'schema_version', status: 'ok', message: `Version ${schemaVersion} (latest: ${LATEST_VERSION})` });
+      }
     } else if (schemaVersion === 0) {
       checks.push({
         name: 'schema_version',
@@ -1890,6 +2059,10 @@ export async function buildChecks(
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
+
+  // Note: the #4421/#4425 live-column drift diff (detectMissingColumns) is
+  // wired INSIDE the schema_version ledger-current branch above — one
+  // column-drift wiring, not a separate check.
 
   // Note: we intentionally DO NOT fail on "schema v7+ but no preferences.json".
   // That's a valid fresh-install state after `gbrain init` — the migration
@@ -2353,7 +2526,12 @@ export async function buildChecks(
     // that brains seeded only with code sources don't get spurious warnings
     // about missing link/timeline coverage on pages that are test fixtures, not
     // real knowledge entities.
-    const eligibleStats = (await engine.executeRaw<{ entities: number; linked_from: number; timeline: number }>(
+    // #4191: an entity counts as CONNECTED with an inbound OR outbound link.
+    // Counting outbound only (from_page_id) contradicted onboard's
+    // entity_link_coverage (inbound EXISTS, target 70%): a brain of
+    // inbound-only entities (meetings link TO people) read ok there and
+    // warn here. Same in/out predicate + 70% target both places now.
+    const eligibleStats = (await engine.executeRaw<{ entities: number; connected: number; timeline: number }>(
       `WITH eligible AS (
         SELECT id FROM pages
         WHERE deleted_at IS NULL
@@ -2363,12 +2541,14 @@ export async function buildChecks(
       )
       SELECT
         (SELECT count(*)::int FROM eligible) AS entities,
-        (SELECT count(DISTINCT from_page_id)::int FROM links WHERE from_page_id IN (SELECT id FROM eligible)) AS linked_from,
+        (SELECT count(*)::int FROM eligible e
+           WHERE EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = e.id)
+              OR EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id)) AS connected,
         (SELECT count(DISTINCT page_id)::int FROM timeline_entries WHERE page_id IN (SELECT id FROM eligible)) AS timeline`,
-    ))[0] ?? { entities: entityCount, linked_from: 0, timeline: 0 };
+    ))[0] ?? { entities: entityCount, connected: 0, timeline: 0 };
 
     const eligibleEntityCount = Number(eligibleStats.entities ?? entityCount);
-    const linkCoverage = eligibleEntityCount > 0 ? Number(eligibleStats.linked_from ?? 0) / eligibleEntityCount : 0;
+    const linkCoverage = eligibleEntityCount > 0 ? Number(eligibleStats.connected ?? 0) / eligibleEntityCount : 0;
     const timelineCoverage = eligibleEntityCount > 0 ? Number(eligibleStats.timeline ?? 0) / eligibleEntityCount : 0;
     const linkPct = (linkCoverage * 100).toFixed(0);
     const timelinePct = (timelineCoverage * 100).toFixed(0);
@@ -2386,13 +2566,13 @@ export async function buildChecks(
         status: 'ok',
         message: `Only code/test fixture entity pages found (${entityCount}); graph_coverage not applicable`,
       });
-    } else if (linkCoverage >= 0.5 && timelineCoverage >= 0.5) {
-      checks.push({ name: 'graph_coverage', status: 'ok', message: `Entity link coverage ${linkPct}%, entity timeline coverage ${timelinePct}%` });
+    } else if (linkCoverage >= 0.7 && timelineCoverage >= 0.5) {
+      checks.push({ name: 'graph_coverage', status: 'ok', message: `Entity connected coverage (in/out) ${linkPct}%, entity timeline coverage ${timelinePct}%` });
     } else {
       checks.push({
         name: 'graph_coverage',
         status: 'warn',
-        message: `Entity link coverage ${linkPct}%, entity timeline coverage ${timelinePct}% (${eligibleEntityCount} entity pages). Run: gbrain extract all`,
+        message: `Entity connected coverage (in/out) ${linkPct}% (target 70%), entity timeline coverage ${timelinePct}% (${eligibleEntityCount} entity pages). Run: gbrain extract all`,
       });
     }
 
@@ -2488,6 +2668,18 @@ export async function buildChecks(
     }
   } catch {
     checks.push({ name: 'orphan_ratio', status: 'warn', message: 'Could not check orphan ratio' });
+  }
+
+  // 9c. stale_mentions (#3674, lands PR #3711) — read-only drift surface for
+  // by-mention links the current gazetteer no longer produces. Logic lives in
+  // doctor/checks/stale-mentions.ts (module-dir rule); it never throws.
+  progress.heartbeat('stale_mentions');
+  const staleMentionsHb = startHeartbeat(progress, 're-deriving by-mention links…');
+  try {
+    const { staleMentionsCheck } = await import('./doctor/checks/stale-mentions.ts');
+    checks.push(await staleMentionsCheck(engine));
+  } finally {
+    staleMentionsHb();
   }
 
   // 10. Integrity sample scan (v0.13 knowledge runtime).
@@ -2727,23 +2919,25 @@ export async function buildChecks(
   progress.heartbeat('markdown_body_completeness');
   const mbcHb = startHeartbeat(progress, 'scanning pages for truncation…');
   try {
-    const sql = db.getConnection();
-    const rows = await sql`
-      SELECT p.slug,
-             length(p.compiled_truth) AS body_len,
-             length(rd.data ->> 'content') AS raw_len
-      FROM pages p
-      JOIN raw_data rd ON rd.page_id = p.id
-      WHERE rd.data ? 'content'
-        AND length(rd.data ->> 'content') > 1000
-        AND length(p.compiled_truth) < length(rd.data ->> 'content') * 0.3
-        AND (rd.data ->> 'content') ~ '(^|\n)##+ '
-      LIMIT 100
-    `;
+    // #1871: engine.executeRaw (NOT db.getConnection() — that's the postgres
+    // singleton, dead on the default PGLite engine; this check silently
+    // reported "Skipped" on every PGLite brain).
+    const rows = await engine.executeRaw<{ slug: string; body_len: number; raw_len: number }>(
+      `SELECT p.slug,
+              length(p.compiled_truth) AS body_len,
+              length(rd.data ->> 'content') AS raw_len
+       FROM pages p
+       JOIN raw_data rd ON rd.page_id = p.id
+       WHERE rd.data ? 'content'
+         AND length(rd.data ->> 'content') > 1000
+         AND length(p.compiled_truth) < length(rd.data ->> 'content') * 0.3
+         AND (rd.data ->> 'content') ~ '(^|\n)##+ '
+       LIMIT 100`,
+    );
     if (rows.length === 0) {
       checks.push({ name: 'markdown_body_completeness', status: 'ok', message: 'No truncated bodies detected' });
     } else {
-      const sample = rows.slice(0, 3).map((r: any) => r.slug).join(', ');
+      const sample = rows.slice(0, 3).map((r) => r.slug).join(', ');
       checks.push({
         name: 'markdown_body_completeness',
         status: 'warn',
@@ -2767,6 +2961,16 @@ export async function buildChecks(
   //   counting pages whose body (compiled_truth + timeline, UTF-8 bytes
   //   via octet_length per Codex r2 #13) exceeds the block threshold.
   //   Status warn when 1+ rows; never fail (oversize is now a soft state).
+  //   Excludes frontmatter.embed_skip pages via the canonical
+  //   EMBED_SKIP_FILTER_FRAGMENT (src/core/embed-skip.ts) — key existence,
+  //   not a boolean value comparison, matching every other embed-skip
+  //   consumer in the codebase. The warn message itself says "existing
+  //   oversized pages can be ... accepted as non-embeddable" (i.e.
+  //   embed_skip set), so a page that already took that accepted
+  //   remediation must not still count against this check — otherwise the
+  //   warning can never clear for a page an operator already resolved the
+  //   documented way (found via dogfooding: a page with embed_skip set
+  //   kept re-appearing in this check's output every run).
   // - scraper_junk_pages: capped 1000-most-recent default + --content-audit
   //   opt-in for full scan (D10 mirrors --index-audit precedent). Applies
   //   the assessor per-page on title + 2KB head-slice + frontmatter.
@@ -2778,7 +2982,6 @@ export async function buildChecks(
   const fullContentAudit = args.includes('--content-audit');
   progress.heartbeat('oversized_pages');
   try {
-    const sql = db.getConnection();
     // Read effective bytes_block from the cached effectiveCfg loaded
     // earlier in this doctor run if available; otherwise default.
     // (We re-read here per-check to avoid threading config through
@@ -2787,20 +2990,23 @@ export async function buildChecks(
     const { loadConfig: _loadCfg } = await import('../core/config.ts');
     const _cfg = _loadCfg();
     const bytesBlock = _cfg?.content_sanity?.bytes_block ?? 500_000;
-    const rows = await sql`
-      SELECT p.slug, p.source_id,
-             octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) AS bytes
-      FROM pages p
-      WHERE p.deleted_at IS NULL
-        AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > ${bytesBlock}
-      ORDER BY bytes DESC
-      LIMIT 100
-    `;
+    // #1871: engine.executeRaw, not the dead-on-PGLite postgres singleton.
+    const rows = await engine.executeRaw<{ slug: string; source_id: string; bytes: number }>(
+      `SELECT p.slug, p.source_id,
+              octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) AS bytes
+       FROM pages p
+       WHERE p.deleted_at IS NULL
+         AND ${EMBED_SKIP_FILTER_FRAGMENT}
+         AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
+       ORDER BY bytes DESC
+       LIMIT 100`,
+      [bytesBlock],
+    );
     if (rows.length === 0) {
       checks.push({
         name: 'oversized_pages',
         status: 'ok',
-        message: `No pages exceed ${bytesBlock} bytes`,
+        message: `No pages exceed ${bytesBlock} bytes (excluding embed_skip pages, which already took the accepted non-embeddable remediation)`,
       });
     } else {
       const oversizeRows = rows as unknown as Array<{ slug: string; source_id: string; bytes: number }>;
@@ -2824,30 +3030,31 @@ export async function buildChecks(
 
   progress.heartbeat('scraper_junk_pages');
   try {
-    const sql = db.getConnection();
     const { assessContentSanity } = await import('../core/content-sanity.ts');
     const { loadOperatorLiterals } = await import('../core/content-sanity-literals.ts');
     const literals = loadOperatorLiterals();
     const scanLimit = fullContentAudit ? null : 1000;
+    // #1871: engine.executeRaw, not the dead-on-PGLite postgres singleton.
     const rows = scanLimit
-      ? await sql`
-          SELECT p.slug, p.source_id, p.title,
-                 LEFT(p.compiled_truth, 2048) AS body_head,
-                 LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
-                 p.frontmatter
-            FROM pages p
-           WHERE p.deleted_at IS NULL
-           ORDER BY p.updated_at DESC
-           LIMIT ${scanLimit}
-        `
-      : await sql`
-          SELECT p.slug, p.source_id, p.title,
-                 LEFT(p.compiled_truth, 2048) AS body_head,
-                 LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
-                 p.frontmatter
-            FROM pages p
-           WHERE p.deleted_at IS NULL
-        `;
+      ? await engine.executeRaw(
+          `SELECT p.slug, p.source_id, p.title,
+                  LEFT(p.compiled_truth, 2048) AS body_head,
+                  LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
+                  p.frontmatter
+             FROM pages p
+            WHERE p.deleted_at IS NULL
+            ORDER BY p.updated_at DESC
+            LIMIT $1`,
+          [scanLimit],
+        )
+      : await engine.executeRaw(
+          `SELECT p.slug, p.source_id, p.title,
+                  LEFT(p.compiled_truth, 2048) AS body_head,
+                  LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
+                  p.frontmatter
+             FROM pages p
+            WHERE p.deleted_at IS NULL`,
+        );
     const hits: Array<{ slug: string; matched: string[] }> = [];
     const scanRows = rows as unknown as Array<{ slug: string; source_id: string; title: string; body_head: string; tl_head: string; frontmatter: Record<string, unknown> | null }>;
     for (const r of scanRows) {
@@ -3212,11 +3419,9 @@ export async function buildChecks(
       }
       const total = high + medium + low;
       if (total === 0) {
-        checks.push({
-          name: 'contradictions',
-          status: 'ok',
-          message: `Latest probe run (${latest.ran_at.slice(0, 10)}) found no suspected contradictions across ${latest.queries_evaluated} queries.`,
-        });
+        // #3889: warn (not ok) when the latest run judged zero pairs but
+        // errored — "0 contradictions" from an all-error run is a lie.
+        checks.push({ name: 'contradictions', ...zeroTotalContradictionsCheck(latest) });
       } else {
         const ciLow = (latest.wilson_ci_lower * 100).toFixed(0);
         const ciHigh = (latest.wilson_ci_upper * 100).toFixed(0);
@@ -3287,11 +3492,46 @@ export async function buildChecks(
     );
 
     if (rows.length === 0) {
-      checks.push({
-        name: 'facts_extraction_health',
-        status: 'ok',
-        message: 'No facts:absorb failures in the last 24h.',
-      });
+      // Zero failure rows is only "healthy" when extraction is actually
+      // configured. Keyless installs deliberately write NO absorb rows (the
+      // calm expected state) — reporting "ok: no failures" there would read
+      // as extraction-healthy while extraction never runs. Doctor HOLDS the
+      // engine, so probe the ACTUAL resolved extraction model (sees DB-plane
+      // facts.extraction_model / models.* overrides the engine-blind
+      // detectCapabilities() cannot) — the same gate the runtime uses.
+      const { getFactsExtractionModel } = await import('../core/facts/extract.ts');
+      const { isAvailable } = await import('../core/ai/gateway.ts');
+      const extractionAvailable = isAvailable('chat', await getFactsExtractionModel(engine));
+      if (!extractionAvailable) {
+        // Keyless vs keyed-but-misrouted split (same classification the
+        // backstop uses): a quiet keyed brain whose pinned extraction model
+        // lost its key must NOT read as calm "(keyless)" — that masks a
+        // fixable misconfiguration.
+        const { KEYLESS_EXTRACTION_GUIDANCE, classifyUnavailable } = await import('../core/facts/backstop.ts');
+        const { getFactsExtractionModel } = await import('../core/facts/extract.ts');
+        const unavailableModel = await getFactsExtractionModel(engine);
+        if ((await classifyUnavailable(unavailableModel)) === 'keyed') {
+          checks.push({
+            name: 'facts_extraction_health',
+            status: 'warn',
+            message:
+              `Automatic fact extraction is misconfigured: resolved model ${unavailableModel} has no usable ` +
+              `provider key. Fix: set the provider's API key, or \`gbrain config set facts.extraction_model <provider:model>\`.`,
+          });
+        } else {
+          checks.push({
+            name: 'facts_extraction_health',
+            status: 'ok',
+            message: `Automatic fact extraction not configured (keyless) — ${KEYLESS_EXTRACTION_GUIDANCE}`,
+          });
+        }
+      } else {
+        checks.push({
+          name: 'facts_extraction_health',
+          status: 'ok',
+          message: 'No facts:absorb failures in the last 24h.',
+        });
+      }
     } else {
       // Group per source so the breakdown is operator-friendly.
       const bySource = new Map<string, Array<{ reason: string; n: number }>>();
@@ -3352,32 +3592,87 @@ export async function buildChecks(
   //
   // Sample 1000 random rows by default to keep the check fast on 200K-page
   // brains. The expression index pages_coalesce_date_idx makes the future-
-  // date and pre-1990 scans cheap; the parseable-fm-date scan reads
-  // frontmatter JSONB and is the slow path.
+  // date and pre-1990 scans cheap. The "fell back despite parseable date"
+  // arm can't be a pure SQL COUNT(*) — JSONB `?` only proves a key exists,
+  // not that its value parses — so it fetches the candidate rows and
+  // re-runs computeEffectiveDate() in JS (same function `gbrain
+  // reindex-frontmatter` uses) to confirm a real date was missed.
   progress.heartbeat('effective_date_health');
   try {
     const result = await engine.executeRaw<{ kind: string; count: string }>(
       `WITH sample AS (
-         SELECT slug, frontmatter, effective_date, effective_date_source
+         SELECT effective_date
            FROM pages
           ORDER BY id DESC
           LIMIT 1000
        )
-       SELECT 'fallback_with_fm_date' AS kind, COUNT(*)::text AS count
-         FROM sample
-        WHERE effective_date_source = 'fallback'
-          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')
-       UNION ALL
-       SELECT 'future_dated', COUNT(*)::text FROM sample
+       SELECT 'future_dated' AS kind, COUNT(*)::text AS count FROM sample
         WHERE effective_date IS NOT NULL AND effective_date > NOW() + INTERVAL '1 year'
        UNION ALL
        SELECT 'pre_1990', COUNT(*)::text FROM sample
         WHERE effective_date IS NOT NULL AND effective_date < TIMESTAMPTZ '1990-01-01'`,
     );
     const counts = new Map(result.map(r => [r.kind, Number(r.count)]));
-    const fallbackWithFm = counts.get('fallback_with_fm_date') ?? 0;
     const future = counts.get('future_dated') ?? 0;
     const pre1990 = counts.get('pre_1990') ?? 0;
+
+    // `frontmatter ? 'date'` (JSONB key-existence) only proves the key is
+    // present — an empty string, null, or unparseable value still passes
+    // it, so a naive COUNT(*) on that predicate over-reports "fell back
+    // despite a parseable date". Fetch the candidate rows instead and run
+    // them through the SAME parse/range rules `gbrain reindex-frontmatter`
+    // uses (computeEffectiveDate) to confirm the frontmatter value itself
+    // is parseable. This is a ONE-DIRECTIONAL guarantee, not equivalence:
+    // every row counted here is a row reindex-frontmatter's dry run would
+    // also flag, but reindex-frontmatter's dry run additionally flags rows
+    // this arm intentionally excludes (filename-derived dates only, no
+    // parseable frontmatter — that's a different message). Two queries
+    // against the "last 1000 pages" window means this and the counts above
+    // can drift by a row or two under concurrent writes — acceptable for a
+    // sampled health check that already says "sample of last 1000 pages"
+    // in its message.
+    const candidates = await engine.executeRaw<{
+      slug: string;
+      frontmatter: unknown;
+      created_at: string;
+      updated_at: string;
+    }>(
+      `WITH sample AS (
+         SELECT slug, frontmatter, effective_date_source, created_at, updated_at
+           FROM pages
+          ORDER BY id DESC
+          LIMIT 1000
+       )
+       SELECT slug, frontmatter, created_at, updated_at
+         FROM sample
+        WHERE effective_date_source = 'fallback'
+          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')`,
+    );
+    let fallbackWithFm = 0;
+    for (const row of candidates) {
+      // filename: null — this arm asks "does the frontmatter ALONE have a
+      // parseable date", independent of whichever source wins the full
+      // precedence chain. Passing the row's real filename would let a
+      // daily/meetings-prefixed slug's filename-first precedence (see
+      // effective-date.ts) resolve to source='filename' whenever the slug
+      // also carries a YYYY-MM-DD prefix — silently hiding a genuinely
+      // parseable frontmatter date (Codex review: reproduced with
+      // `daily/2024-03-15-standup` + `{ date: '2024-04-01' }`, which
+      // reindex-frontmatter WOULD still act on). filename=null makes
+      // computeEffectiveDate fall straight through to the frontmatter
+      // fields regardless of slug prefix.
+      const recomputed = computeEffectiveDate({
+        slug: row.slug,
+        frontmatter: parseFrontmatter(row.frontmatter),
+        filename: null,
+        updatedAt: new Date(row.updated_at),
+        createdAt: new Date(row.created_at),
+      });
+      if (recomputed.source === 'event_date' || recomputed.source === 'date' || recomputed.source === 'published') {
+        fallbackWithFm++;
+      }
+    }
+
     if (fallbackWithFm > 0 || future > 0 || pre1990 > 0) {
       const parts: string[] = [];
       if (fallbackWithFm > 0) parts.push(`${fallbackWithFm} fell back to updated_at despite parseable frontmatter date`);
@@ -3560,24 +3855,23 @@ export async function buildChecks(
   if (engine) {
     progress.heartbeat('image_assets');
     try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
+      const rows = await engine.executeRaw<{ storage_path: string; source_local_path: string | null }>(
+        `SELECT f.storage_path, s.local_path AS source_local_path FROM files f LEFT JOIN sources s ON s.id = COALESCE(f.source_id, 'default') WHERE f.mime_type LIKE 'image/%' LIMIT 1000`
       );
       let vanished = 0;
       let foreign = 0;
       const vanishedPaths: string[] = [];
       const fs = await import('node:fs');
-      const { resolveAssetPath } = await import('./doctor-asset-paths.ts');
-      // storage_path is repo-relative for sync-ingested assets. Resolving
-      // against cwd made this check a false-positive WARN whenever doctor
-      // ran outside the brain repo.
+      const { resolveImageAssetPath } = await import('./doctor-asset-paths.ts');
+      // storage_path is repo-relative for sync-ingested assets. Prefer the
+      // owning source's root; sync.repo_path is only a legacy fallback.
       const repoRoot = (await engine.getConfig('sync.repo_path')) ?? process.cwd();
       for (const r of rows) {
         // #1835: Windows drive paths (D:/…) translate to the WSL automount
         // (/mnt/d/…) under WSL, and are SKIPPED (not "missing") on hosts
         // where they cannot exist (macOS / plain Linux) — never joined onto
         // repoRoot, which produced a false "restore from git" WARN.
-        const resolved = resolveAssetPath(r.storage_path, repoRoot);
+        const resolved = resolveImageAssetPath(r.storage_path, r.source_local_path, repoRoot);
         if (resolved.abs === null) {
           foreign++;
           continue;
@@ -3617,7 +3911,9 @@ export async function buildChecks(
       const succeeded = parseInt((await engine.getConfig('ocr_succeeded')) ?? '0', 10);
       const failedNoKey = parseInt((await engine.getConfig('ocr_failed_no_key')) ?? '0', 10);
       const failedOther = parseInt((await engine.getConfig('ocr_failed_other')) ?? '0', 10);
-      if (attempted === 0) {
+      // #3973: images skipped by the per-run OCR budget cap (maybeOcr).
+      const skippedBudget = parseInt((await engine.getConfig('ocr_skipped_budget')) ?? '0', 10);
+      if (attempted === 0 && skippedBudget === 0) {
         checks.push({ name: 'ocr_health', status: 'ok', message: 'OCR not in use (or no images ingested with OCR opt-in)' });
       } else if (succeeded === 0 && (failedNoKey > 0 || failedOther > 0)) {
         const reasons: string[] = [];
@@ -3628,6 +3924,13 @@ export async function buildChecks(
           status: 'warn',
           message: `OCR is opted-in but no calls succeeded (${attempted} attempted, ${reasons.join(', ')}). ` +
                    `Fix: verify OPENAI_API_KEY is set, or set embedding_image_ocr=false to disable.`,
+        });
+      } else if (skippedBudget > 0) {
+        checks.push({
+          name: 'ocr_health',
+          status: 'warn',
+          message: `OCR budget cap skipped ${skippedBudget} image(s) (${succeeded}/${attempted} attempted calls succeeded). ` +
+                   `Fix: raise embedding_image_ocr_max_images / embedding_image_ocr_max_usd and re-import, or ignore if the cap is intentional.`,
         });
       } else {
         checks.push({
@@ -3665,6 +3968,10 @@ export async function buildChecks(
     // duplicates, undeclared DB-only pages, collector-output-in-db_only.
     progress.heartbeat('content_hash_duplicates');
     checks.push(await checkContentHashDuplicates(engine));
+    // #3970: code-page chunks missing symbol metadata (unhealable without
+    // reindex-code --force — the content_hash short-circuit skips them).
+    progress.heartbeat('code_chunk_metadata');
+    checks.push(await checkCodeChunkMetadata(engine));
     progress.heartbeat('undeclared_db_only_pages');
     checks.push(await checkUndeclaredDbOnlyPages(engine));
     progress.heartbeat('db_only_collector_collision');
@@ -3674,6 +3981,9 @@ export async function buildChecks(
   // v0.32.3 search-lite — mode + eval_drift surfaces. Status stays 'ok' per
   // [CDX-20]; hint lives in `message`.
   if (engine !== null) {
+    progress.heartbeat('chat_fallback_chain_inert');
+    const inertFallbackChain = await checkChatFallbackChainInert(engine);
+    if (inertFallbackChain) checks.push(inertFallbackChain);
     progress.heartbeat('search_mode');
     checks.push(await checkSearchMode(engine));
     // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
@@ -3693,6 +4003,8 @@ export async function buildChecks(
     // waiting, zero live-lock active, stale completions) as a health error.
     progress.heartbeat('wedged_queue');
     checks.push(await computeWedgedQueueCheck(engine));
+    progress.heartbeat('orphaned_private_queue');
+    checks.push(await computeOrphanedPrivateQueueCheck(engine));
     // #2194 fix #5 — autopilot fan-out vs worker concurrency mismatch.
     progress.heartbeat('autopilot_fanout_concurrency');
     checks.push(await computeAutopilotFanoutConcurrencyCheck(engine));
@@ -3700,6 +4012,10 @@ export async function buildChecks(
     // graph_signals is enabled in the active mode bundle.
     progress.heartbeat('graph_signals_coverage');
     checks.push(await checkGraphSignalsCoverage(engine));
+    // #4222 junk_entity_hubs — near-empty entity pages that accreted huge
+    // edge counts (generic-token names like "Will"). Warn + list only.
+    progress.heartbeat('junk_entity_hubs');
+    checks.push(await checkJunkEntityHubs(engine));
     // v0.37.0 brainstorm_health — migration v79, track_retrieval, calibration cold-start.
     progress.heartbeat('brainstorm_health');
     checks.push(await checkBrainstormHealth(engine));
@@ -3745,6 +4061,9 @@ export async function buildChecks(
     // 5L — oauth_confidential_client_health (success-path probe per codex CF8)
     progress.heartbeat('oauth_confidential_client_health');
     checks.push(await checkOauthConfidentialHealth(engine));
+    // oauth_client_scope_health — dangling federated grants + orphaned empty workspace sources
+    progress.heartbeat('oauth_client_scope_health');
+    checks.push(await checkOauthClientScopeHealth(engine));
     // 5M — autopilot_lock_scope (PID-safe hint per codex CF11)
     progress.heartbeat('autopilot_lock_scope');
     checks.push(checkAutopilotLockScope());
@@ -4228,7 +4547,17 @@ export async function runRemediate(
     console.log(JSON.stringify(result, null, 2));
   } else if (result.submitted.length > 0) {
     console.log(`\nBrain score: ${result.brain_score_initial} → ${result.brain_score_final} (target ${targetScore})`);
-    console.log(`Submitted: ${result.submitted.length} job(s), ${result.aborted_count} aborted/failed`);
+    // #3626: split the count honestly — a step that deduped onto an in-flight
+    // job did not submit new work; a rotated re-run did.
+    const coalesced = result.submitted.filter((s) => s.coalesced).length;
+    const rotated = result.submitted.filter((s) => s.deduped_job_id !== undefined).length;
+    const notes = [
+      ...(rotated > 0 ? [`${rotated} re-ran under a rotated key (prior terminal row held it)`] : []),
+      ...(coalesced > 0 ? [`${coalesced} coalesced onto in-flight job(s)`] : []),
+    ];
+    console.log(
+      `Submitted: ${result.submitted.length - coalesced} job(s)${notes.length > 0 ? ` (${notes.join('; ')})` : ''}, ${result.aborted_count} aborted/failed`,
+    );
   }
 
   const anyFailed = result.submitted.some(

@@ -383,6 +383,23 @@ discipline as the database-URL vars — so a dev shell configured for a real
 brain can't ride through. `GBRAIN_DEBUG_PRELOAD=1` prints the allocated
 scratch home for debugging.
 
+**Provider-key strip preload.** `test/helpers/provider-keys-preload.ts` (bunfig
+`[test]` preload) strips the ambient provider credentials the canonical fold
+recognizes (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, Gemini/Google, Voyage,
+OpenRouter, ZeroEntropy, DashScope, and the Azure OpenAI endpoint fields) and
+defaults `GBRAIN_MODEL_DISCOVERY=off` (respecting an explicit operator
+override), so key-aware model routing (`resolveTierDefault`) resolves
+identically to keyless CI and latest-model discovery never makes a real
+network call from a test. Without it, a chat key exported in the dev shell
+flips default-model assertions AND turns gated paths into live provider calls
+(observed: 183 unit failures + 15-minute retry hangs on an
+`OPENAI_API_KEY`-exporting shell). Tests that want keys inject them explicitly
+(`configureGateway({env})`, `withEnv`, serial-file `process.env`) — the
+preload removes ambient shell state only, before any test file loads. The e2e
+wrapper (`scripts/run-e2e.sh`) opts back in at its boundary via
+`GBRAIN_TEST_KEEP_PROVIDER_KEYS=1` — e2e is the lane where real keys are
+deliberate (live embed/parity tests skip-gate on them).
+
 **Database-URL run guard (#3485).** A `bun test` invocation REFUSES to start while
 `DATABASE_URL` or `GBRAIN_DATABASE_URL` is ambient in the environment, because some
 tests run destructive SQL against whatever those URLs point at (a bare `bun test`
@@ -462,9 +479,9 @@ Unit tests and what they cover:
 - `test/search.test.ts` — RRF normalization, compiled truth boost, cosine similarity, dedup key.
 - `test/sql-ranking.test.ts` — source-boost helpers: longest-prefix-match in SQL CASE, `detail=high` temporal-bypass, three-meta-char LIKE escape (`%`, `_`, `\`), single-quote SQL-literal doubling, env override parsing for `GBRAIN_SOURCE_BOOST` + `GBRAIN_SEARCH_EXCLUDE`, `resolveBoostMap` / `resolveHardExcludes` merge semantics.
 - `test/dedup.test.ts` — source-aware dedup, compiled truth guarantee, layer interactions.
-- `test/intent.test.ts` — query intent classification: entity/temporal/event/general.
+- `test/query-intent-legacy.test.ts` — query intent classification: entity/temporal/event/general (pre-concept behavior pins). `test/query-intent-concept.test.ts` — the `concept` intent: definitional/landscape cue detection, the proper-noun / quoted-phrase / sub-3-word guards, vector-lean weight routing.
 - `test/eval.test.ts` — retrieval metrics: `precisionAtK`, `recallAtK`, `mrr`, `ndcgAtK`, `parseQrels`.
-- `test/brainbench-fixtures.test.ts` / `test/brainbench-generator.test.ts` / `test/brainbench-metrics.test.ts` / `test/brainbench-continuity.test.ts` / `test/brainbench-writeback.test.ts` / `test/brainbench-adapters.test.ts` / `test/brainbench-scoreboard.test.ts` — the BrainBench memory-conformance unit suites (`src/eval/brainbench/`): fixture loader/validator + the sealed-gold seal (a `gold` key inside a fixture must reject) and committed-corpus integrity; generator determinism (the committed corpus is exactly what `gen.ts` produces, holdout discipline, category counts); metric formulas over hand-built turn rows (zero should-retrieve turns, empty injections, acceptable-vs-gold asymmetry, micro-averaging); cross-harness continuity (writer's decision persists through the production write-back pipeline, reader recalls on the SAME brain); write-back grading the PRODUCTION conversation→facts pipeline via the injected gold extractor; adapter seam contracts over hermetic PGLite (budget caps, suppression modes); scoreboard + gate governance (baseline determinism, count-aware gating, corpus-bless modes, justification flow, isolation gates-at-zero).
+- `test/brainbench-fixtures.test.ts` / `test/brainbench-generator.test.ts` / `test/brainbench-metrics.test.ts` / `test/brainbench-continuity.test.ts` / `test/brainbench-writeback.test.ts` / `test/brainbench-adapters.test.ts` / `test/brainbench-scoreboard.test.ts` — the BrainBench memory-conformance unit suites (`src/eval/brainbench/`): fixture loader/validator + the sealed-gold seal (a `gold` key inside a fixture must reject) and committed-corpus integrity; generator determinism (the committed corpus is exactly what `gen.ts` produces, holdout discipline, category counts); metric formulas over hand-built turn rows (zero should-retrieve turns, empty injections, acceptable-vs-gold asymmetry, micro-averaging); cross-harness continuity (writer's decision persists through the production write-back pipeline, reader recalls on the SAME brain); write-back grading the PRODUCTION conversation→facts pipeline via the injected gold extractor; adapter seam contracts over hermetic PGLite (budget caps, suppression modes); scoreboard + gate governance (baseline determinism, count-aware gating, corpus-bless modes, justification flow, isolation gates-at-zero). `test/brainbench-floors.test.ts` — the pre-registered quality floors as executable assertions against the committed baseline (a baseline bless can't bank a threshold violation).
 - `test/eval-brainbench-e2e.test.ts` — BrainBench CLI end-to-end via subprocess against a small tmp corpus: the literal exit codes (0 pass / 1 regression / 2 error-or-inconclusive — the CI product), `--out` artifact validity incl. `_meta.metric_glossary`, byte-deterministic `--update-baseline`, anti-vacuous-pass, and the `eval run-all` in-process wiring.
 - `test/check-resolvable.test.ts` — resolver reachability, MECE overlap, gap detection, proximity-based DRY detection, `extractDelegationTargets` coverage.
 - `test/dry-fix.test.ts` — auto-fix: three shape-aware expander pure-function tests; five guards (working-tree-dirty, no-git-backup, inside-code-fence, already-delegated within 40 lines, ambiguous-multi-match, block-is-callout).
@@ -521,7 +538,7 @@ Unit tests and what they cover:
 - `test/routing-eval.test.ts` — fixture parsing, structural routing, `ambiguous_with`, Haiku tie-break layer.
 - `test/skill-manifest.test.ts` — skill manifest parser: drift detection, managed-block markers.
 - `test/skillify-scaffold.test.ts` — `gbrain skillify scaffold` stubs: SKILL.md, script, tests, routing-eval fixtures.
-- `test/skillpack-install.test.ts` — `gbrain skillpack install` managed-block install / update / no-clobber semantics.
+- `test/skillpack-install.test.ts` — skillpack bundle + surviving installer primitives: `bundle.ts` enumeration (manifest load/validate, dependency closure, `--all`) and the `installer.ts` seams that outlived the removed `skillpack install` command (`diffSkill` behind `gbrain skillpack diff`, managed-block build/parse, lockfile concurrency, atomic writes).
 - `test/skillpack-sync-guard.test.ts` — sync-guard: bundled skills stay byte-identical to `skills/` source.
 - `test/http-transport.test.ts` — HTTP transport: bearer auth + missing/no-Bearer/unknown/revoked + `/health` bypass; dispatch.ts round-trip; invalid_params; application/json response shape (not SSE); CORS default-deny + allowlist; body cap on Content-Length AND chunked; two-bucket rate limit (refill, exhaust+Retry-After, LRU eviction, TTL prune, pre-auth IP fires before DB); `mcp_request_log` audit on success + auth_failed.
 - `test/restart-sweep.test.ts` — `recipes/restart-sweep.md` inlined script: sentinel-anchored fenced-block extraction with salted tmp filenames to bypass ESM cache; constructor-time env reads (proves no module-load snapshot); idempotency layer load/save/atomic-tmp-rename/corrupt-JSON-recovery/30-day-prune; `(sessionKey, lastAlertedAt)` cooldown gate with 6h threshold; AGGRESSIVE-gate two-state tests; execFile argv shape proving shell metachars in `OPENCLAW_TELEGRAM_GROUP` cannot reach `/bin/sh`; real-`\n`-not-literal alert formatting; `GBRAIN_HOME` state path override.

@@ -1,4 +1,5 @@
 import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from './embed-failure.ts';
+import { detectGatewayErrorFromCause } from './embed-retry.ts';
 import { isMustAbortError } from './worker-pool.ts';
 
 /**
@@ -40,7 +41,24 @@ export function isPartialStaleSplitWorthyError(error: unknown): boolean {
   // Configuration faults and transient/rate-limit errors (#3037 cost
   // bounding) are run-global. Every other provider error gets a one-chunk
   // salvage attempt in the stale-only pipeline.
-  if (isTransientEmbedError(error)) return false;
+  //
+  // 2026-08-25 upstream merge (v0.46.16.0→v0.46.29.0): upstream's #3966
+  // WIDENED the no-fan-out contract from 429-only to gateway 5xx
+  // (502/503/504). The fork's isTransientEmbedError only detects 429 /
+  // rate-limit, so a sustained 502 fell through to per-chunk salvage —
+  // exactly the cost blow-up #3037 exists to prevent (caught by upstream's
+  // test/embed-partial-failure-3037 "sustained 502 … does not fan out").
+  // Discriminator is the STRUCTURED status on the error's cause chain, not a
+  // message match: upstream's guard fires on `cause.status = 502` (a real
+  // provider-level outage — run-global), while a free-text message that
+  // merely mentions 502 ("provider 502 upstream reset") is an unknown
+  // provider error that must still reach the per-chunk provider_other ledger
+  // (fork test: "unknown transient provider errors enter the ledger").
+  // isEmbedRetriableError's message regex would swallow both; the cause-chain
+  // check separates them, and it never matches a bare "timed out", so the
+  // provider_timeout ladder above and the Ollama EOF/socket-close split
+  // below are untouched.
+  if (isTransientEmbedError(error) || detectGatewayErrorFromCause(error)) return false;
   return classified.kind === 'failure';
 }
 
