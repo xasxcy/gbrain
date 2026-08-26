@@ -322,6 +322,11 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       // _upsertChunksOnce, which that path bypasses), so the merged code cannot
       // commit a vector on a brain missing the column.
       //
+      // masking-exempt: 134 — see the paragraph below. The sync script's
+      // check_fork_migration_masking() reads this marker; without it the guard
+      // would demand a repair for 134 on every future run and block a state
+      // that is already correct.
+      //
       // 134 is deliberately EXCLUDED. It is the one migration in the range
       // upstream does not declare `idempotent: true`, and it is provably
       // already satisfied here: both partial indexes it restores
