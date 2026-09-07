@@ -14,7 +14,7 @@
 
 import { describe, test, expect, afterEach } from 'bun:test';
 import { __setChatTransportForTests, resetGateway } from '../../src/core/ai/gateway.ts';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
@@ -851,6 +851,109 @@ describe('E2E synthesize — PGLite inline subagent drain (takeover of #2699)', 
   }, 30_000);
 });
 
+// ── #4077 cooperative abort — a cancelled cycle stops writing ─────────
+
+describe('E2E synthesize — cooperative abort (#4077)', () => {
+  test('abort during the triage judge fails the phase before cache, job, or page writes', async () => {
+    const rig = await setupRig();
+    const abort = new AbortController();
+    try {
+      await rig.engine.setConfig('dream.synthesize.enabled', 'true');
+      await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      // deepseek: makeJudgeClient needs no local key (A9) — auth is the
+      // gateway's problem, and the transport below is stubbed anyway.
+      await rig.engine.setConfig('models.dream.synthesize_verdict', 'deepseek:deepseek-chat');
+      const filePath = join(rig.corpusDir, '2026-08-13-abort-during-judge.txt');
+      const body = 'a durable conversation about cancellation safety\n'.repeat(100);
+      writeFileSync(filePath, body);
+
+      // Judge call slow enough that the abort (10ms) fires while it is
+      // in flight; the phase must unwind before caching the verdict.
+      __setChatTransportForTests(async () => {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return {
+          text: JSON.stringify({ score: 0.9, content_type: 'strategy', segments: [], entities: [], reasons: ['durable cancellation contract'] }),
+          blocks: [],
+          stopReason: 'end' as const,
+          usage: { input_tokens: 10, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'deepseek:deepseek-chat',
+          providerId: 'deepseek',
+        };
+      });
+
+      setTimeout(() => abort.abort(new Error('test-cancel')), 10);
+      const result = await runPhaseSynthesize(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+        signal: abort.signal,
+      });
+
+      expect(result.status).toBe('fail');
+      expect(JSON.stringify(result.error)).toContain('test-cancel');
+      const { createHash } = await import('node:crypto');
+      const hash = createHash('sha256').update(body, 'utf8').digest('hex');
+      expect(await rig.engine.getDreamVerdict(filePath, hash)).toBeNull();
+      const jobs = await rig.engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM minion_jobs`,
+      );
+      const pages = await rig.engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pages`,
+      );
+      expect(jobs[0]?.count).toBe('0');
+      expect(pages[0]?.count).toBe('0');
+    } finally {
+      resetGateway();
+      await rig.cleanup();
+    }
+  }, 30_000);
+
+  test('caller abort cancels an active inline child well inside the 30s force-evict grace', async () => {
+    const rig = await setupRig();
+    try {
+      const { MinionQueue } = await import('../../src/core/minions/queue.ts');
+      const queue = new MinionQueue(rig.engine);
+      const queueName = `dream-inline-test-abort-${Date.now()}`;
+      const child = await queue.add(
+        'subagent',
+        { prompt: 'test', model: 'anthropic:claude-sonnet-4-6', max_turns: 1 },
+        { queue: queueName, max_attempts: 1 },
+        { allowProtectedSubmit: true },
+      );
+      const controller = new AbortController();
+      const started = Date.now();
+      setTimeout(() => controller.abort(new Error('test-cancel-inline')), 10);
+
+      // Handler only ends when ctx.signal fires — like the real subagent
+      // handler mid-LLM-call. The external abort must reach ctx.signal AND
+      // leave the child truthfully 'cancelled', not dead/delayed.
+      await expect(synthTesting.runSubagentsInline(
+        rig.engine,
+        queue,
+        queueName,
+        undefined,
+        async (ctx) => {
+          await new Promise((_, reject) => {
+            ctx.signal.addEventListener('abort', () => reject(new Error('provider aborted')), { once: true });
+          });
+        },
+        undefined,
+        undefined,
+        null,
+        controller.signal,
+      )).rejects.toThrow('test-cancel-inline');
+
+      expect(Date.now() - started).toBeLessThan(30_000);
+      expect((await queue.getJob(child.id))?.status).toBe('cancelled');
+      const pages = await rig.engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pages`,
+      );
+      expect(pages[0]?.count).toBe('0');
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+});
+
 // ── #4216 oneshot mode — full-phase E2E ─────────────────────
 
 describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
@@ -878,6 +981,7 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.setConfig('cycle.timezone', 'Asia/Kolkata');
       const content = 'User: an important new idea about widget scaling\n'.repeat(120);
       const filePath = join(rig.corpusDir, '2026-08-16-widget-idea.txt');
       writeFileSync(filePath, content);
@@ -907,9 +1011,19 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
         } as any;
       });
 
-      const result = await runPhaseSynthesize(rig.engine, { brainDir: rig.brainDir, dryRun: false });
+      // #4348: the first instant projects to 2037-04-06 in Kolkata. A second
+      // read would cross another day, so this also pins one phase-start sample.
+      let clockCalls = 0;
+      const result = await runPhaseSynthesize(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+        now: () => new Date(clockCalls++ === 0
+          ? '2037-04-05T21:30:00.000Z'
+          : '2037-04-07T21:30:00.000Z'),
+      });
       expect(result.status).toBe('ok');
       expect(oneshotCalls).toBe(1); // ONE round-trip replaced the whole loop
+      expect(clockCalls).toBe(1);
 
       const synthesis = (result.details as { synthesis: Record<string, unknown> }).synthesis;
       expect(synthesis.mode).toBe('oneshot');
@@ -917,13 +1031,21 @@ describe('E2E synthesize — oneshot mode (#4216, DEFAULT)', () => {
       expect(synthesis.fallback_jobs).toBe(0);
       expect(synthesis.dead_jobs).toBe(0);
 
-      // Pages landed with the dream-provenance stamp.
+      // Pages landed with the dream-provenance stamp, bucketed by local day.
       const pageA = await rig.engine.getPage(slugA);
       expect(pageA).not.toBeNull();
       expect((pageA!.frontmatter as Record<string, unknown>).dream_generated).toBeTruthy();
+      expect((pageA!.frontmatter as Record<string, unknown>).dream_cycle_date).toBe('2037-04-06');
+      expect((pageA!.frontmatter as Record<string, unknown>).dream_created_cycle_date).toBe('2037-04-06');
       // Reverse-written to the brain checkout.
       const { existsSync } = require('node:fs') as typeof import('node:fs');
-      expect(existsSync(join(rig.brainDir, `${slugA}.md`))).toBe(true);
+      const reversePath = join(rig.brainDir, `${slugA}.md`);
+      expect(existsSync(reversePath)).toBe(true);
+      const reverseMarkdown = readFileSync(reversePath, 'utf8');
+      expect(reverseMarkdown).toMatch(/dream_cycle_date:\s*['"]?2037-04-06/);
+      expect(reverseMarkdown).toMatch(/dream_created_cycle_date:\s*['"]?2037-04-06/);
+      expect(reverseMarkdown).not.toContain('dream_cycle_date: 2026-08-16');
+      expect(await rig.engine.getPage('dream-cycle-summaries/2037-04-06')).not.toBeNull();
       // Deferred embeds: chunks exist and are unembedded (no embed provider here).
       const chunks = await rig.engine.executeRaw<{ n: number }>(
         `SELECT count(*)::int AS n FROM content_chunks cc JOIN pages p ON p.id = cc.page_id

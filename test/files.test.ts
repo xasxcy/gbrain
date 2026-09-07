@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, symlinkSync, mkdtempSync } from 'fs';
+import { writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync, mkdtempSync } from 'fs';
 import { join, basename } from 'path';
 import { createHash } from 'crypto';
 import { tmpdir } from 'os';
-import { collectFiles, formatFileSizeKb, getMimeType } from '../src/commands/files.ts';
+import { collectFiles, formatFileSizeKb, getMimeType, noStorageBackendMessage } from '../src/commands/files.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import * as db from '../src/core/db.ts';
 
@@ -362,6 +362,47 @@ describe('files upload-raw git-storage branch (#2297)', () => {
     }
     expect(cap.errs.join('\n')).toContain('--page');
   });
+
+  // A file argument whose basename() is exactly '.' or '..' (rather than a
+  // real leaf filename) would otherwise join onto the sidecar dest dir
+  // (`destDir/${filename}`) and walk the join back OUT of the intended
+  // `.raw/<page-name>/` dir before the copy — reject it early with a clear
+  // error instead of an opaque failure deep inside copyFileSync.
+  test('file argument resolving to "." exits 1 with a clear error, not a filesystem crash', async () => {
+    await engine.setConfig('sync.repo_path', repo);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    const cap = captureLogs();
+    try {
+      await runFiles(engine, ['upload-raw', '.', '--page', 'notes/small-doc']);
+      throw new Error('expected exit 1');
+    } catch (e) {
+      expect((e as Error).message).toBe('EXIT:1');
+    } finally {
+      cap.restore();
+      exitSpy.mockRestore();
+    }
+    expect(cap.errs.join('\n')).toContain('resolves to "."');
+  });
+
+  test('file argument resolving to ".." exits 1 with a clear error, not a filesystem crash', async () => {
+    await engine.setConfig('sync.repo_path', repo);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    const cap = captureLogs();
+    try {
+      await runFiles(engine, ['upload-raw', '..', '--page', 'notes/small-doc']);
+      throw new Error('expected exit 1');
+    } catch (e) {
+      expect((e as Error).message).toBe('EXIT:1');
+    } finally {
+      cap.restore();
+      exitSpy.mockRestore();
+    }
+    expect(cap.errs.join('\n')).toContain('resolves to ".."');
+  });
 });
 
 // ---- verify git lane resolves each row via its OWNING source's local_path ----
@@ -447,5 +488,51 @@ describe('files verify git lane (per-source root resolution)', () => {
       exitSpy.mockRestore();
       rmSync(srcDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('storage precondition — the silent-no-op class (#4022)', () => {
+  test('refusal message names the subcommand and why it refuses', () => {
+    const msg = noStorageBackendMessage('upload');
+    expect(msg).toContain('gbrain files upload');
+    // The two facts a user needs: nothing was stored, and metadata-only is why.
+    expect(msg).toContain('refusing to continue');
+    expect(msg).toMatch(/metadata only|no blob column/);
+    expect(noStorageBackendMessage('redirect')).toContain('gbrain files redirect');
+  });
+
+  /**
+   * The guard rung: a bug is a sample, not the population. `upload`, `sync`,
+   * and `redirect` each tested storage permissively (`if (config?.storage)`)
+   * and continued when the answer was "no" — inserting rows, printing
+   * "uploaded", and in `redirect` unlinking local originals whose bytes had
+   * never left the machine. This scan fails if anyone reintroduces the
+   * permissive form, so the whole class stays dead rather than just the three
+   * instances.
+   */
+  test('[GUARD] no storage-dependent path uses the permissive `if (config?.storage)` form', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'files.ts'), 'utf8');
+    // Strip comments so prose describing the old bug doesn't trip the scan.
+    const code = src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim();
+        return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
+      })
+      .join('\n');
+
+    expect(code).not.toMatch(/if\s*\(\s*config\?\.storage\s*\)/);
+    // And the storage-dependent commands must route through the shared guard.
+    for (const op of ['upload', 'sync', 'mirror', 'redirect']) {
+      expect(code).toContain(`requireStorageBackend('${op}')`);
+    }
+  });
+
+  test('[GUARD] verify never hardcodes its mismatch/missing counts', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'files.ts'), 'utf8');
+    // The original printed `${verified} files verified, 0 mismatches, 0 missing`
+    // with both counts literal, so phantom rows reported as verified.
+    expect(src).not.toMatch(/files verified, 0 mismatches, 0 missing/);
+    expect(src).toContain('${verified} files verified, ${mismatches} mismatches, ${missing} missing');
   });
 });

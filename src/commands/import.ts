@@ -15,6 +15,7 @@ import {
   isImageFilePath as isImageFilePathFromSync,
   matchesAnyGlob,
   pruneDir,
+  isPathPruned,
   SYNC_SKIP_FILES,
   type SyncStrategy,
 } from '../core/sync.ts';
@@ -176,6 +177,15 @@ export async function runImport(
      */
     exclude?: string[];
     /**
+     * #2404-class: repeatable glob patterns (same dialect as `exclude`)
+     * that waive the leading-dot prune heuristic for matching paths — see
+     * `isPathPruned` in core/sync.ts. Unlike `exclude`, this cannot be a
+     * post-collection filter: a pruned path is never collected in the
+     * first place, so it has to reach `collectSyncableFiles` itself.
+     * Threaded by performFullSync for `gbrain sync --include-hidden`.
+     */
+    includeHidden?: string[];
+    /**
      * Opt out of the git-visible fast path and walk the filesystem directly,
      * so markdown/code files matched by .gitignore can still be imported.
      */
@@ -291,7 +301,13 @@ export async function runImport(
     const { resolveSourceId } = await import('../core/source-resolver.ts');
     sourceId = await resolveSourceId(engine, null);
   } else if (!sourceId) {
-    const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
+    const {
+      resolveSourceWithTier,
+      formatSoleNonDefaultNudge,
+      defaultWriteAllowedByEnv,
+      assessDefaultWriteGuardOnce,
+      formatDefaultWriteWarning,
+    } = await import('../core/source-resolver.ts');
     const resolved = await resolveSourceWithTier(engine, null);
     // Only adopt the resolution when it improves on the seed_default
     // fallback — that preserves the v0.30.x "default-only when unset"
@@ -301,6 +317,28 @@ export async function runImport(
       sourceId = resolved.source_id;
       const nudge = formatSoleNonDefaultNudge(sourceId);
       if (nudge) process.stderr.write(nudge + '\n');
+    } else if (!defaultWriteAllowedByEnv()) {
+      // #4583 (fixes #4564's misrouted-write symptom): an unscoped import that
+      // would silently land in 'default' on a bulk-non-default brain gets a
+      // loud warning. Keyed on the REAL destination, not the tier: only the
+      // sole_non_default adoption above changes where this run writes, so for
+      // EVERY other tier — seed_default, but also dotfile / local_path /
+      // brain_default, whose resolutions runImport deliberately does not
+      // adopt — `sourceId` stays undefined and the write lands in 'default'.
+      // (Warning only on seed_default let exactly those non-adopted tiers
+      // land in 'default' silently while the user believed the dotfile or
+      // sources.default had scoped the import.) Advisory only — refusing here
+      // would change behaviour for callers that never asked about source
+      // routing, and runImport also runs in-process (sync_brain MCP op,
+      // autopilot daemon, minion sync), where aborting takes the host down
+      // mid-call. The CLI escape is the source-id flag; scripted pipelines
+      // set GBRAIN_ALLOW_DEFAULT_WRITE=1. The assessment (an unindexed
+      // full-`pages` aggregate) is memoized per engine for the process — the
+      // in-process callers above run runImport many times on one engine.
+      const assessment = await assessDefaultWriteGuardOnce(engine);
+      if (assessment.shouldGuard) {
+        console.error(formatDefaultWriteWarning(assessment, '--source-id'));
+      }
     }
   }
   const workersIdx = args.indexOf('--workers');
@@ -308,7 +346,11 @@ export async function runImport(
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
   // (--workers 0, -3, "foo") with a loud error instead of silently falling
   // through to 1. Mirrors sync.ts's flag handling.
-  const { parseWorkers } = await import('../core/sync-concurrency.ts');
+  const {
+    clampWorkersForConnectionBudget,
+    parseWorkers,
+    resolveMaxConnections,
+  } = await import('../core/sync-concurrency.ts');
   let workerCount: number;
   try {
     workerCount = parseWorkers(workersArg ?? undefined) ?? 1;
@@ -379,6 +421,7 @@ export async function runImport(
   const malformedExcluded: string[] = [];
   let allFiles = collectSyncableFiles(dir, {
     strategy, excludePaths: opts.excludePaths, includeGitignored,
+    includeHidden: opts.includeHidden,
     onExcluded: (rel) => { malformedExcluded.push(rel); },
   });
   console.error(
@@ -431,8 +474,35 @@ export async function runImport(
   }
   const files = resumeFilter(allFiles, dir, completed);
 
-  // Determine actual worker count
-  const actualWorkers = workerCount > 1 ? workerCount : 1;
+  // Determine actual worker count. Import owns the same per-worker Postgres
+  // pools as sync, so it must honor the shared opt-in connection budget too
+  // (GBRAIN_MAX_CONNECTIONS, same clamp sync.ts applies before its fan-out).
+  // Resolve this before choosing the parallel branch: a budget that cannot
+  // fit even one child worker falls through to the provided parent engine.
+  let actualWorkers = workerCount > 1 ? workerCount : 1;
+  if (actualWorkers > 1 && engine.kind !== 'pglite') {
+    const maxConnections = resolveMaxConnections();
+    if (maxConnections !== undefined) {
+      const { resolvePoolSize } = await import('../core/db.ts');
+      const parentPool = resolvePoolSize();
+      const perWorkerPool = Math.min(2, resolvePoolSize(2));
+      const clampResult = clampWorkersForConnectionBudget(actualWorkers, {
+        maxConnections,
+        parentPool,
+        perWorkerPool,
+      });
+      if (clampResult.clamped) {
+        const budgetDetail = clampResult.workers === 1
+          ? `(serial parent engine; parent pool ${parentPool}).`
+          : `(parent ${parentPool} + ${clampResult.workers}x${perWorkerPool} per-worker).`;
+        console.error(
+          `  [import] GBRAIN_MAX_CONNECTIONS=${maxConnections}: clamped workers ` +
+          `${actualWorkers} -> ${clampResult.workers} ${budgetDetail}`,
+        );
+      }
+      actualWorkers = clampResult.workers;
+    }
+  }
   if (actualWorkers > 1) {
     info(`Using ${actualWorkers} parallel workers`);
   }
@@ -588,9 +658,9 @@ export async function runImport(
     } else {
       const { PostgresEngine } = await import('../core/postgres-engine.ts');
       const { resolvePoolSize } = await import('../core/db.ts');
-      // Default per-worker pool is 2 (small, parallel import case). Users on
-      // constrained poolers (e.g. Supabase port 6543) can cap below this via
-      // GBRAIN_POOL_SIZE=1.
+      // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
+      // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
+      // count above so the combined footprint stays within the operator's cap.
       const workerPoolSize = Math.min(2, resolvePoolSize(2));
       const databaseUrl = config.database_url;
 
@@ -742,10 +812,16 @@ export async function runImport(
 
   // Log the ingest. #3969: skip the row when the run changed nothing
   // (imported=0, errors=0, chunks=0) unless --log-noop — see shouldLogIngest.
+  // `sourceId ?? 'default'` mirrors the fallback `processFile` itself uses
+  // when calling importFile/importImageFile — this must report the source
+  // the pages actually landed in, not the unresolved CLI arg (see #3838:
+  // pre-fix this field always read 'default' regardless of where
+  // resolveSourceWithTier actually routed the run).
   if (shouldLogIngest({ imported, errors, chunksCreated }, logNoop)) {
     await engine.logIngest({
       source_type: 'directory',
       source_ref: dir,
+      source_id: sourceId ?? 'default',
       pages_updated: importedSlugs,
       summary: `Imported ${imported} pages, ${skipped} skipped, ${chunksCreated} chunks`,
     });
@@ -775,7 +851,13 @@ export async function runImport(
     // state as last time" from "new broken state." Source-scoped (#1939 #2).
     if (failures.length > 0) {
       const { recordFailures } = await import('../core/sync.ts');
-      recordFailures(opts.sourceId ?? 'default', failures, gitHead);
+      // #3838: `opts.sourceId` is the caller-supplied value, which stays
+      // undefined for a bare CLI invocation unless the resolver's
+      // sole_non_default tier explicitly adopted it (see the comment above
+      // this function's sourceId resolution). Use the resolved `sourceId`
+      // — the same value every importFile/importImageFile call in this run
+      // actually wrote to — so the ledger is keyed by the true source.
+      recordFailures(sourceId ?? 'default', failures, gitHead);
     }
 
     // #3839: a path that failed on a prior run and succeeded (imported or
@@ -787,7 +869,9 @@ export async function runImport(
     // is only partially clean.
     if (succeededPaths.length > 0) {
       const { clearFailures } = await import('../core/sync.ts');
-      clearFailures(opts.sourceId ?? 'default', succeededPaths);
+      // #3838: keyed by the resolved source, matching recordFailures above —
+      // a row recorded under the resolved source must clear under it too.
+      clearFailures(sourceId ?? 'default', succeededPaths);
     }
 
     // #2114 guard: the global sync.* keys describe THE brain repo (the
@@ -822,7 +906,80 @@ export async function runImport(
     // this import's to move (its sync anchors live on the `sources` row).
   }
 
+  // #1691: a named source registered with `local_path` but fed only via
+  // `gbrain import` (never `gbrain sync`) never got `sources.last_sync_at`
+  // touched, so doctor's `sync_freshness` read it as permanently
+  // "never synced". Stamp it on a clean run only (mirrors the bookmark
+  // gate above). `!opts.managedBookmark` excludes performFullSync's call —
+  // that path stamps its own, more-authoritative `last_sync_at` via
+  // writeSyncAnchor AFTER its full gate (applySyncFailureGate) decides the
+  // sync actually advanced; stamping here too would race ahead of that
+  // decision. remote_url sources are excluded too: autopilot's freshness
+  // dispatcher (autopilot.ts) reads last_sync_at to decide when to queue a
+  // real `git pull` for those, and a plain import never pulls. A git-tracked
+  // local_path is excluded too (scoped to #1691's actual "non-git local
+  // source" case): `gbrain import` never advances the source's own
+  // `last_commit`, so stamping last_sync_at for a git checkout would mask
+  // real commit-level staleness that `gbrain sync` (not `import`) is the
+  // correct pipeline to detect. Detection reuses sync's own
+  // `discoverGitRoot` (rev-parse --show-toplevel, walks UP) rather than a
+  // bare `.git`-at-local_path probe, so a source anchored at a SUBDIR of a
+  // git checkout (the #753/#774 monorepo shape) is excluded too — that is
+  // exactly the shape sync's git-root slug anchoring exists for.
+  // Malformed-filename exclusions/skips (tallied into `totalMalformed`
+  // below, NOT into `failures`) count toward the clean-run gate too — a run
+  // that silently dropped files isn't "clean" for freshness purposes even
+  // with zero recorded failures.
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
+    try {
+      const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+        `SELECT local_path, config FROM sources WHERE id = $1`,
+        [sourceId],
+      );
+      const { sourceConfigHasRemoteUrl, parseSourceConfig } = await import('../core/sources-load.ts');
+      // Connector-managed sources (config.kind: github/google, v0.47 API-backed
+      // shapes) own their last_sync_at via the connector's sync path — a google
+      // source has a non-git local_path and no remote_url, so without this
+      // check a stray `import --source-id` would mask connector staleness
+      // (and flip `gbrain waiting`'s google-freshness gate). parseSourceConfig,
+      // not a bare JSON.parse: nested-string / historical-array configs are
+      // real shapes (#2829) and must not slip past the kind check.
+      const cfg = parseSourceConfig(row?.config);
+      const isConnectorManaged = typeof cfg.kind === 'string' && cfg.kind.length > 0;
+      // Freshness is a claim about the WHOLE registered root. Configured-root
+      // enforcement is default-off, so an import of an unrelated directory —
+      // or of a mere subdirectory of the root — can complete cleanly with
+      // --source-id; neither says anything about the rest of the root, so
+      // only an import whose canonical target IS the registered local_path
+      // may stamp. `dir` is already the canonical realpath (#1728).
+      let coversRegisteredRoot = false;
+      if (row?.local_path) {
+        try {
+          const { realpathSync } = await import('fs');
+          coversRegisteredRoot = realpathSync(row.local_path) === dir;
+        } catch {
+          coversRegisteredRoot = false;
+        }
+      }
+      let isGitTracked = false;
+      if (row?.local_path) {
+        try {
+          const { discoverGitRoot } = await import('../core/sync-git.ts');
+          discoverGitRoot(row.local_path);
+          isGitTracked = true;
+        } catch {
+          isGitTracked = false;
+        }
+      }
+      if (row?.local_path && coversRegisteredRoot && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
+        await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
+      }
+    } catch {
+      // best-effort — a freshness nicety never fails the import (see above).
+    }
+  }
+
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),
@@ -859,6 +1016,8 @@ interface CollectOpts {
    * file — no rename guidance, no skipped count (structured-review finding).
    */
   onExcluded?: (relPath: string) => void;
+  /** See `RunImportOpts.includeHidden` — same repeatable-glob semantics. */
+  includeHidden?: string[];
 }
 
 /**
@@ -882,17 +1041,21 @@ function isCollectibleForWalker(
   path: string,
   strategy: SyncStrategy,
   multimodalOn: boolean,
+  includeHidden?: string[],
 ): boolean {
   // #2607: apply the SAME segment-level prune gate as incremental sync's
-  // `classifySync` (core/sync.ts). The FS walk below prunes at descent time,
+  // `classifySync` (core/sync.ts) — via the shared `isPathPruned`, so this
+  // and `classifySync` cannot drift the way #923/#202 drifted before
+  // `PRUNE_DIR_NAMES` existed. The FS walk below prunes at descent time,
   // but the git fast path enumerates via `git ls-files` and historically
   // filtered only by extension — so `sync --full` imported (and resurrected
   // previously-deleted) pages under dot-dirs / vendored trees that incremental
   // sync excludes. Full and incremental must agree on the exclusion set.
-  // (In the FS-walk route `path` is a basename, so this is the same dot-file
-  // check pruneDir already applied there — no behavior change on that route.)
-  const segments = path.split('/');
-  if (segments.some((seg) => !pruneDir(seg))) return false;
+  // (In the FS-walk route `path` is a basename, so `includeHidden` has no
+  // segment to waive there — that route's directory-level prune already ran
+  // via unmodified `pruneDir` before a file entry is ever reached; see
+  // `isPathPruned`'s doc comment for that scope note.)
+  if (isPathPruned(path, includeHidden)) return false;
 
   // Malformed filenames (brackets / control chars — markdown-link syntax as a
   // literal filename) are rejected on BOTH collection routes, same as
@@ -902,6 +1065,7 @@ function isCollectibleForWalker(
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
   // resolver), not typed brain pages — same exclusion `sync`'s `isSyncable`
   // applies. Guards both the FS-walk and the git-fast-path collection routes.
+  const segments = path.split('/');
   const basename = segments[segments.length - 1] || '';
   if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return false;
 
@@ -943,6 +1107,7 @@ function gitListSyncableFiles(
   strategy: SyncStrategy,
   multimodalOn: boolean,
   onExcluded?: (relPath: string) => void,
+  includeHidden?: string[],
 ): string[] | null {
   let stdout: string;
   try {
@@ -961,7 +1126,7 @@ function gitListSyncableFiles(
     // exclusion is reportable — other filters (strategy, prune, metafile)
     // are silent by design; this one hides renameable content.
     if (hasMalformedPathSegment(rel)) { onExcluded?.(rel); continue; }
-    if (!isCollectibleForWalker(rel, strategy, multimodalOn)) continue;
+    if (!isCollectibleForWalker(rel, strategy, multimodalOn, includeHidden)) continue;
     const full = join(dir, rel);
     let st;
     try {
@@ -1013,7 +1178,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
   if (!opts.includeGitignored) {
-    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded);
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded, opts.includeHidden);
     if (gitFiles) return excludeNorm.length > 0 ? gitFiles.filter(f => !isExcluded(relative(dir, f))) : gitFiles;
   }
 

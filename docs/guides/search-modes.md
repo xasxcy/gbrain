@@ -25,6 +25,8 @@ The bundles are frozen in `src/core/search/mode.ts` (`MODE_BUNDLES`):
 | `expansion` (LLM multi-query) | false          | false      | **true**       |
 | `relationalRetrieval`         | false          | **true**   | **true**       |
 | `searchLimit` default         | 10             | 25         | 50             |
+| `reranker` (cross-encoder)    | off            | `voyage:rerank-2.5` | `voyage:rerank-2.5` |
+| `autocut` (rerank-cliff cut)  | off            | on (0.35)  | on (0.35)      |
 
 - **`conservative`** — smallest payloads. Pairs naturally with a cheap
   downstream model (Haiku-class) or a high query volume.
@@ -32,7 +34,7 @@ The bundles are frozen in `src/core/search/mode.ts` (`MODE_BUNDLES`):
 - **`tokenmax`** — no token budget, LLM query expansion on, 50 results.
   Pairs with an expensive downstream model you want fully fed.
 
-Two of the knobs deserve a sentence:
+Three of the knobs deserve a sentence:
 
 - **`expansion`** rewrites your query into multiple variants via a cheap
   LLM call per search (adds roughly $1.50 per 1K queries) — better recall,
@@ -41,6 +43,11 @@ Two of the knobs deserve a sentence:
   questions ("who invested in X", "what connects A and B"); it's a pure
   no-op for non-relational queries. The `query` op's `relational` flag
   forces it on/off per call.
+- **`keywordOrFallback`** (on in every mode; config key
+  `search.keywordOrFallback`) relaxes the keyword and title arms from AND
+  to OR when strict AND matching finds nothing, so a multi-word query still
+  gets keyword recall instead of leaning on vectors alone. Set the config
+  key to `false` to keep strict AND matching.
 
 ### Setting and resolving the mode
 
@@ -92,6 +99,20 @@ gbrain search diagnose "<query>" --target <slug>
                                  # trace where a page surfaces (or fails to)
                                  # across the keyword/vector/alias/hybrid layers
 ```
+
+`gbrain search modes` also answers the question the knob table cannot: is
+the resolved reranker actually going to run? Below the attribution table it
+prints one runtime line — `Reranker: voyage:rerank-2.5 (enabled) —
+VOYAGE_API_KEY present`, `Reranker: off (resolved) — …`, or `Reranker:
+<model> (enabled but NOT running) — <paste-ready fix>` — and each bundle row
+carries `reranker=… topNIn=… autocut=…`. `--json` exposes the same verdict
+as `reranker_readiness`. Without the key, search still works: results come
+back in fusion order, `gbrain search "<query>" --explain` shows
+`degraded: reranker_skipped (no_key)`, and `gbrain doctor`'s
+`reranker_health` names the fix. **Say to your agent:** *"check whether my
+brain's reranker is actually running"* — *"turn reranking off for now"* —
+your agent runs `gbrain search modes` / `gbrain doctor`, then either exports
+`VOYAGE_API_KEY` or runs `gbrain config set search.reranker.enabled false`.
 
 The mode picker runs inside `gbrain init` (non-TTY auto-selects `balanced`).
 
@@ -174,7 +195,7 @@ on user_asks_about(topic):
 3. Run `gbrain get alice-example` -- confirm it returns the full page with compiled truth and timeline.
 4. Compare: search for the same entity using all three modes. Keyword should be fastest, hybrid should surface conceptual matches, direct should return the complete page.
 5. After a search returns a chunk, run `gbrain get` on the slug from that chunk. Confirm the full page contains more context than the chunk alone.
-6. Run `gbrain search modes` -- confirm the active mode bundle and any per-key overrides are what you expect.
+6. Run `gbrain search modes` -- confirm the active mode bundle, any per-key overrides, and the `Reranker:` line (`enabled` with the key present, or `off`) are what you expect.
 
 ---
 *Part of the [GBrain Skillpack](../GBRAIN_SKILLPACK.md).*

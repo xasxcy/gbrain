@@ -66,7 +66,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       expansion: false,
       searchLimit: 10,
       reranker_enabled: false,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-2.5',
       reranker_top_n_in: 30,
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
@@ -101,7 +101,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       expansion: false,
       searchLimit: 25,
       reranker_enabled: true,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-2.5',
       // v0.42.3.0 D4: topNIn = searchLimit (25), was 30.
       reranker_top_n_in: 25,
       reranker_top_n_out: null,
@@ -135,7 +135,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       expansion: true,
       searchLimit: 50,
       reranker_enabled: true,
-      reranker_model: 'zeroentropyai:zerank-2',
+      reranker_model: 'voyage:rerank-2.5',
       // v0.42.3.0 D4: topNIn = searchLimit (50), was 30.
       reranker_top_n_in: 50,
       reranker_top_n_out: null,
@@ -484,10 +484,16 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // (pagedRequest previously skipped only offset>0).
     // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
     // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
-    // fork: 26→27 — reranker_max_document_chars (rrc=) changes the text the
+    // 26→27: ar=/arem=/arom=/armk=/ari= — adaptive-return gate params +
+    // resolved intent class fold (2026-08 fix wave E5b + outside-voice F11);
+    // adaptive-on calls now cache instead of skipping.
+    // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
+    // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
+    // fused rows for identical knobs; version-only invalidation.
+    // 28→29 (fork): reranker_max_document_chars (rrc=) changes the text the
     // cross-encoder scores, so a different truncation threshold must not reuse
     // cached rankings.
-    expect(KNOBS_HASH_VERSION).toBe(27);
+    expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -512,10 +518,15 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // #4358 residual: 23→24 negative-offset cache-skip gap.
     // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
     // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
-    // fork: 26→27 — reranker_max_document_chars (rrc=) changes the text the
+    // 26→27: ar=/arem=/arom=/armk=/ari= — adaptive-return gate params +
+    // resolved intent class fold (2026-08 fix wave E5b + outside-voice F11);
+    // adaptive-on calls now cache instead of skipping.
+    // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
+    // version-only invalidation.
+    // 28→29 (fork): reranker_max_document_chars (rrc=) changes the text the
     // cross-encoder scores, so a different truncation threshold must not reuse
     // cached rankings.
-    expect(KNOBS_HASH_VERSION).toBe(27);
+    expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
   test('#4352 follow-up: excludePrivate true vs false produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -731,8 +742,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 27 (21→22 result-stamp/injection epoch #1663 #3995 #3783 #4220; 22→23 excludePrivate posture fold #4352; 23→24 negative-offset cache-skip gap #4358 residual; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 reranker document truncation rrc=, fork)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(27);
+  test('KNOBS_HASH_VERSION is 29 (…; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 reranker document truncation rrc= (fork))', () => {
+    expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
@@ -940,5 +951,32 @@ describe('keywordOrFallback knob (v=25)', () => {
     const on = knobsHash(resolveSearchMode({ mode: 'balanced' }));
     const off = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { keywordOrFallback: false } }));
     expect(on).not.toBe(off);
+  });
+});
+
+describe('adaptive-return knobs hash fold (v=27, 2026-08 fix wave E5b)', () => {
+  const knobs = resolveSearchMode({ mode: 'balanced' });
+  const ar = (over: Partial<{ enabled: boolean; entityMax: number; otherMax: number; minKeep: number; intent: string }>) =>
+    knobsHash(knobs, {
+      adaptiveReturn: { enabled: true, entityMax: 2, otherMax: 6, minKeep: 1, intent: 'general', ...over },
+    });
+
+  test('gate-off and absent-ctx hash identically (legacy rows stay reachable)', () => {
+    expect(knobsHash(knobs, { adaptiveReturn: { enabled: false, entityMax: 2, otherMax: 6, minKeep: 1, intent: 'entity' } }))
+      .toBe(knobsHash(knobs));
+  });
+
+  test('gate-on diverges from gate-off', () => {
+    expect(ar({})).not.toBe(knobsHash(knobs));
+  });
+
+  test('differing caps diverge (an e1/o1 row cannot serve an e1/o2 lookup)', () => {
+    expect(ar({ otherMax: 1 })).not.toBe(ar({ otherMax: 2 }));
+    expect(ar({ entityMax: 1 })).not.toBe(ar({ entityMax: 2 }));
+    expect(ar({ minKeep: 2 })).not.toBe(ar({ minKeep: 1 }));
+  });
+
+  test('differing resolved intent class diverges (outside-voice F11: an entity-capped row cannot serve a concept lookup via semantic similarity)', () => {
+    expect(ar({ intent: 'entity' })).not.toBe(ar({ intent: 'concept' }));
   });
 });

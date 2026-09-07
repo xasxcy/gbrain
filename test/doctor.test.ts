@@ -124,10 +124,29 @@ describe('doctor command', () => {
     expect(check.message).toContain('Subagent model resolves via models.subagent to "anthropic:claude-opus-4-7"');
   });
 
-  test('subagent_capability checks models.default before tier fallback', async () => {
+  test('subagent_capability checks models.tier.subagent before models.default (#4575)', async () => {
+    // The runtime hoisted models.tier.<tier> above models.default in #3873;
+    // the check must mirror that order. Pre-fix it read models.default first
+    // and reported an unclearable degraded:no_caching warn on any brain that
+    // set both keys — following the warning's own advice (set
+    // models.tier.subagent) could never retire it.
     const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
     const config = new Map<string, string | null>([
       ['models.tier.subagent', 'anthropic:claude-sonnet-4-6'],
+      ['models.default', 'google:gemini-1.5-pro'],
+    ]);
+    const check = await checkSubagentCapability({
+      async getConfig(key: string): Promise<string | null> {
+        return config.get(key) ?? null;
+      },
+    } as any);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('Subagent model resolves via models.tier.subagent to "anthropic:claude-sonnet-4-6"');
+  });
+
+  test('subagent_capability still explains models.default when it alone is set', async () => {
+    const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
+    const config = new Map<string, string | null>([
       ['models.default', 'google:gemini-1.5-pro'],
     ]);
     const check = await checkSubagentCapability({
@@ -143,10 +162,18 @@ describe('doctor command', () => {
     const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-doctor-'));
     try {
-      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+      // v0.48.2: the default reranker is keyed on VOYAGE_API_KEY; without it
+      // the check warns "not running" before reading the audit rows.
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir, VOYAGE_API_KEY: 'pa-test-voyage' }, async () => {
+        // readiness reads the live gateway plane — give it the key the CLI
+        // would have folded so the audit ladder below is what gets exercised.
+        (await import('../src/core/ai/gateway.ts')).configureGateway({
+          embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536,
+          env: { OPENAI_API_KEY: 'sk-test', VOYAGE_API_KEY: 'pa-test-voyage' },
+        });
         for (let i = 0; i < 3; i++) {
           logRerankFailure({
-            model: 'zeroentropyai:zerank-2',
+            model: 'voyage:rerank-2.5', // the resolved default — rows for other models are filtered out
             reason: 'unknown',
             query_hash: `unknown${i}`,
             doc_count: 30,
@@ -173,9 +200,17 @@ describe('doctor command', () => {
     const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-budget-doctor-'));
     try {
-      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+      // v0.48.2: the default reranker is keyed on VOYAGE_API_KEY; without it
+      // the check warns "not running" before reading the audit rows.
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir, VOYAGE_API_KEY: 'pa-test-voyage' }, async () => {
+        // readiness reads the live gateway plane — give it the key the CLI
+        // would have folded so the audit ladder below is what gets exercised.
+        (await import('../src/core/ai/gateway.ts')).configureGateway({
+          embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536,
+          env: { OPENAI_API_KEY: 'sk-test', VOYAGE_API_KEY: 'pa-test-voyage' },
+        });
         logRerankFailure({
-          model: 'acmecorp:unpriced-reranker-v9',
+          model: 'voyage:rerank-2.5', // rows are filtered to the resolved model
           reason: 'budget',
           query_hash: 'budget01',
           doc_count: 30,
@@ -196,14 +231,89 @@ describe('doctor command', () => {
     }
   });
 
+  test('#4648: reranker_health warns on >= 3 empty/malformed pass-throughs (named as pass-through)', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-passthrough-doctor-'));
+    try {
+      // v0.48.2: the check filters audit rows to the RESOLVED reranker (the
+      // Voyage default, keyed on VOYAGE_API_KEY) and reads readiness from the
+      // live gateway plane — configure both so the pass-through ladder is
+      // what gets exercised.
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir, VOYAGE_API_KEY: 'pa-test-voyage' }, async () => {
+        (await import('../src/core/ai/gateway.ts')).configureGateway({
+          embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536,
+          env: { OPENAI_API_KEY: 'sk-test', VOYAGE_API_KEY: 'pa-test-voyage' },
+        });
+        const reasons = ['empty_result_set', 'malformed_shape', 'empty_result_set'] as const;
+        reasons.forEach((reason, i) => {
+          logRerankFailure({
+            model: 'voyage:rerank-2.5', // the resolved default — rows for other models are filtered out
+            reason,
+            query_hash: `passthru${i}`,
+            doc_count: 12,
+            error_summary: 'provider answered successfully with an empty result set; results passed through unreranked',
+          });
+        });
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('warn');
+        expect(check.message).toContain('pass-through');
+        expect(check.message).toContain('3');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#4648: two pass-throughs stay below the threshold — no pass-through warn', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-passthrough-doctor-2-'));
+    try {
+      // v0.48.2: the check filters audit rows to the RESOLVED reranker (the
+      // Voyage default, keyed on VOYAGE_API_KEY) and reads readiness from the
+      // live gateway plane — configure both so the pass-through ladder is
+      // what gets exercised.
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir, VOYAGE_API_KEY: 'pa-test-voyage' }, async () => {
+        (await import('../src/core/ai/gateway.ts')).configureGateway({
+          embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536,
+          env: { OPENAI_API_KEY: 'sk-test', VOYAGE_API_KEY: 'pa-test-voyage' },
+        });
+        for (const [i, reason] of (['empty_result_set', 'malformed_shape'] as const).entries()) {
+          logRerankFailure({
+            model: 'voyage:rerank-2.5', // the resolved default — rows for other models are filtered out
+            reason,
+            query_hash: `passthru-low${i}`,
+            doc_count: 12,
+            error_summary: 'provider answered successfully with a non-array result shape; results passed through unreranked',
+          });
+        }
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('ok');
+        expect(check.message).not.toContain('pass-through');
+        expect(check.message).toContain('below threshold');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test('runDoctor accepts null engine for filesystem-only mode', async () => {
     const { runDoctor } = await import('../src/commands/doctor.ts');
     // runDoctor should accept null engine — it runs filesystem checks only.
-    // Signature is (engine, args, dbSource?) — third param is optional and
-    // used by --fast to distinguish "no config" from "user skipped DB check".
-    // Function.length counts required params only (JS ignores ?-marked).
+    // Signature is (engine, args, dbSource?, connectError?) — third param is
+    // optional and used by --fast to distinguish "no config" from "user
+    // skipped DB check"; fourth (db-availability wave) carries the connect
+    // error so the null-engine path can synthesize a classified `connection`
+    // check instead of omitting it entirely on a total outage.
     expect(runDoctor.length).toBeGreaterThanOrEqual(2);
-    expect(runDoctor.length).toBeLessThanOrEqual(3);
+    expect(runDoctor.length).toBeLessThanOrEqual(4);
   });
 
   test('doctor --json suppresses implicit progress unless --progress-json is explicit', async () => {
@@ -1350,12 +1460,17 @@ describe('stub_guard_24h check (v0.34.5)', () => {
 });
 
 describe('v0.40.4 — graph_signals_coverage check', () => {
-  const { PGLiteEngine } = require('../src/core/pglite-engine.ts');
-  const { checkGraphSignalsCoverage } = require('../src/commands/doctor.ts');
+  // await import, not require: a sync require() of the ESM doctor graph makes
+  // Bun's warm transpiler cache parse `with { type: 'file' }` template assets
+  // as code (Syntax Error → "module not instantiated" cascade on re-runs).
+  let PGLiteEngine: any;
+  let checkGraphSignalsCoverage: any;
 
   let engine: any;
 
   beforeAll(async () => {
+    ({ PGLiteEngine } = await import('../src/core/pglite-engine.ts'));
+    ({ checkGraphSignalsCoverage } = await import('../src/commands/doctor.ts'));
     engine = new PGLiteEngine();
     await engine.connect({ engine: 'pglite' });
     await engine.initSchema();
@@ -1457,12 +1572,15 @@ describe('v0.40.4 — graph_signals_coverage check', () => {
 // ─── issue #972 — link_resolution_opportunity check ───────────────────────
 
 describe('issue #972 — link_resolution_opportunity check', () => {
-  const { PGLiteEngine } = require('../src/core/pglite-engine.ts');
-  const { checkLinkResolutionOpportunity } = require('../src/commands/doctor.ts');
+  // await import, not require — see graph_signals_coverage describe above.
+  let PGLiteEngine: any;
+  let checkLinkResolutionOpportunity: any;
 
   let engine: any;
 
   beforeAll(async () => {
+    ({ PGLiteEngine } = await import('../src/core/pglite-engine.ts'));
+    ({ checkLinkResolutionOpportunity } = await import('../src/commands/doctor.ts'));
     engine = new PGLiteEngine();
     await engine.connect({ engine: 'pglite' });
     await engine.initSchema();

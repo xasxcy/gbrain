@@ -28,12 +28,32 @@ import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 const DEDUP_THRESHOLD = 0.95;
 const DEDUP_CANDIDATE_LIMIT = 5;
 
+/**
+ * #4755: null-like entity tokens LLM extractors emit for subjectless
+ * statements. A caller passing the STRING "null" means what JSON `null`
+ * means — no entity. Without this filter the token sails past the
+ * non-empty check, fails resolution, falls back to itself as the slug,
+ * and the facts land unreachable under entity_slug='null' (the stub
+ * guard rightly refuses to create the page, so no page renders them and
+ * no entity lookup can reach them).
+ */
+const NULL_LIKE_ENTITY_TOKENS: ReadonlySet<string> = new Set([
+  'null', 'undefined', 'none', 'n/a', 'nil', '-',
+]);
+
+/** True when an entity ref is absent or a null-like placeholder token. */
+export function isNullLikeEntity(entity: string | null | undefined): boolean {
+  if (entity == null) return true;
+  const t = entity.trim().toLowerCase();
+  return t === '' || NULL_LIKE_ENTITY_TOKENS.has(t);
+}
+
 export interface SingleFactInput {
   fact: string;
   /** Free-text attribution, stored verbatim as the fact's `source`. */
   provenance: string;
   kind?: NewFact['kind'];
-  /** Free-form entity ref; canonicalized via resolveEntitySlug. */
+  /** Free-form entity ref; canonicalized via resolveEntitySlugWithSource. */
   entity?: string | null;
   /** Facts-layer default 'private'; the remember VERB passes 'world' [F2]. */
   visibility?: 'private' | 'world';
@@ -56,7 +76,7 @@ export async function writeSingleFact(
   sourceId: string,
   input: SingleFactInput,
 ): Promise<SingleFactResult> {
-  const { resolveEntitySlug } = await import('../entities/resolve.ts');
+  const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
   const { isAvailable, embedOne } = await import('../ai/gateway.ts');
@@ -66,9 +86,19 @@ export async function writeSingleFact(
   const visibility = input.visibility ?? 'private';
   const validUntil = input.validUntil ?? null;
 
-  const resolvedSlug = input.entity
-    ? ((await resolveEntitySlug(engine, sourceId, input.entity)) ?? input.entity)
+  // #4755: normalize null-like entity refs to ABSENT before resolution so
+  // the `resolved?.slug ?? entityRef` fallback can never adopt "null" as a
+  // slug. Applied here (not only at the verb boundary) so every
+  // writeSingleFact caller (google/loops-extract, future verbs) gets the
+  // same guard.
+  const entityRef = isNullLikeEntity(input.entity) ? null : input.entity!.trim();
+  const resolved = entityRef
+    ? await resolveEntitySlugWithSource(engine, sourceId, entityRef)
     : null;
+  const resolvedSlug = entityRef ? (resolved?.slug ?? entityRef) : null;
+  // #4108: provenance for the fence writer's stub guard. Null when the
+  // resolver returned nothing (fail-closed — no live page was verified).
+  const resolutionSource = resolved?.source ?? null;
 
   // Embedding (NOT an LLM call): powers dedup + downstream recall. Fail-soft —
   // a missing/failing provider degrades dedup, never the write.
@@ -139,7 +169,7 @@ export async function writeSingleFact(
   if (fenceable) {
     const result = await writeFactsToFence(
       engine,
-      { sourceId, localPath, slug: resolvedSlug },
+      { sourceId, localPath, slug: resolvedSlug, resolutionSource },
       [
         {
           fact: factText,

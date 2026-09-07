@@ -20,7 +20,8 @@
  * AND lose to new-key config when both are set.
  */
 
-import type { BrainEngine } from './engine.ts';
+import type { ConfigReader } from './config-snapshot.ts';
+import { openrouterModelSupportsSubagentLoop } from './ai/openrouter-families.ts';
 import { splitProviderModelId } from './model-id.ts';
 import type { GBrainConfig } from './config.ts';
 import { loadConfig } from './config.ts';
@@ -64,7 +65,13 @@ export const DEFAULT_ALIASES: Record<string, string> = {
   opus:   'anthropic:claude-opus-4-7',
   sonnet: 'anthropic:claude-sonnet-4-6',
   haiku:  'anthropic:claude-haiku-4-5-20251001',
-  gemini: 'google:gemini-3-pro',
+  // `gemini` repointed (#2507): `gemini-3-pro` only ever existed as a preview
+  // id (`gemini-3-pro-preview`) and was shut down — it was never chat-listed
+  // in the google recipe nor priced. 2.5-flash is the recipe's chat models[0];
+  // there is NO GA pro-class Gemini chat target today, so the alias
+  // deliberately sits a capability class below the opus convention until
+  // Google ships a GA pro. Guarded by test/default-alias-liveness.test.ts.
+  gemini: 'google:gemini-2.5-flash',
   // `gpt` resolves DYNAMICALLY in resolveAlias (account-discovered OpenAI
   // flagship, recipe-ranked static floor) — this entry keeps the alias
   // enumerable but the value here is only the documentation floor; a pinned
@@ -318,6 +325,19 @@ export function isOpenRouterAnthropic(modelString: string): boolean {
     && model.toLowerCase().startsWith('anthropic/');
 }
 
+/**
+ * `openrouter:<family>/…` where the family has a live abort/retry pin for the
+ * subagent loop (anthropic/, deepseek/ — see src/core/ai/openrouter-families.ts).
+ * The subagent handler auto-enables the gateway loop for these, because the
+ * legacy Anthropic-direct pin would otherwise refuse them when
+ * `agent.use_gateway_loop` is off.
+ */
+export function isOpenRouterSubagentFamily(modelString: string): boolean {
+  if (!modelString) return false;
+  const { provider, model } = splitProviderModelId(modelString);
+  return provider?.trim().toLowerCase() === 'openrouter' && openrouterModelSupportsSubagentLoop(model);
+}
+
 const _subagentTierWarningsEmitted = new Set<string>();
 
 // Module-level set of deprecated config keys we've already warned about.
@@ -338,6 +358,22 @@ function emitDeprecationWarning(oldKey: string, newKey: string, ignored: boolean
     );
   }
 }
+
+/**
+ * #4575 — the config-key precedence the subagent tier resolves through at
+ * runtime (`resolveModelDetailed` with configKey 'models.subagent' + tier
+ * 'subagent': steps 2 → 4 → 5 below). Doctor's `subagent_capability` check
+ * iterates THIS list so the check and the runtime cannot drift again —
+ * #3873 hoisted `models.tier.<tier>` above `models.default` in the runtime
+ * and the check kept the pre-fix order, producing an unclearable false
+ * positive whose own suggested fix (set models.tier.subagent) was the key
+ * the check read last.
+ */
+export const SUBAGENT_CONFIG_KEY_PRECEDENCE = [
+  'models.subagent',
+  'models.tier.subagent',
+  'models.default',
+] as const;
 
 /** Which step of the resolution chain produced the model. */
 export type ResolveSource =
@@ -360,7 +396,7 @@ export type ResolveSource =
  * unservable Anthropic default.
  */
 export async function resolveModelDetailed(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<{ model: string; source: ResolveSource }> {
   const envVar = opts.envVar ?? 'GBRAIN_MODEL';
@@ -439,7 +475,7 @@ export async function resolveModelDetailed(
  * `resolveModelDetailed` for the ~30 callers that don't care which step won.
  */
 export async function resolveModel(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<string> {
   return (await resolveModelDetailed(engine, opts)).model;
@@ -554,7 +590,7 @@ void enforceSubagentAnthropic;
  * to `super-opus` which aliases to `opus`, we return `super-opus` and stop.
  */
 export async function resolveAlias(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   name: string,
   depth = 0,
 ): Promise<string> {

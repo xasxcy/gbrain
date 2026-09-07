@@ -1,9 +1,8 @@
 # MCP surface runbook
 
-Operator moves for the remote MCP surface (the truthful-surface wave:
-honest per-token tools/list, per-client surfaces, strict-params grace
-period, STARTER_OPS). Current behavior only; release history lives in
-`CHANGELOG.md` + git. Companion references: the generated
+Operator moves for the remote MCP surface (honest per-token tools/list,
+per-client surfaces, strict-params grace period, STARTER_OPS). Current
+behavior only; release history lives in `CHANGELOG.md` + git. Companion references: the generated
 [`docs/TOOL_CATALOG.md`](../TOOL_CATALOG.md) (every non-localOnly op with
 scope/starter/gate), `docs/protocol/MEMORY_VERBS_v1.md` (surface modes),
 `docs/protocol/MCP_META_CHANNELS.md` (`_meta` conventions).
@@ -71,7 +70,7 @@ gbrain config set mcp.default_surface_dcr starter   # verbs | starter | full
 
 Dual-plane read (DB > file), applied on each client's next request,
 ceiling-bounded like everything else; unset means NULL-surface clients
-resolve to the server ceiling (pre-wave behavior). Pre-seed important
+resolve to the server ceiling. Pre-seed important
 clients with an explicit `rescope-client --surface full` before flipping it.
 
 ## Move 3 — flip strict params from warn to reject
@@ -82,7 +81,7 @@ model-visible notice block, and logs the success as
 `status='success_with_warnings'`; `reject` returns `invalid_params` with
 did-you-mean suggestions.
 
-**Flip criterion (evidence-based, amendment 13):** near-zero
+**Flip criterion (evidence-based):** near-zero
 `success_with_warnings` rows over 30 days of production traffic —
 
 ```sql
@@ -138,8 +137,12 @@ remote/untrusted read path by default (fail-closed; trusted local CLI —
 `ctx.remote === false` — always sees everything). The gate covers search +
 recall's query arm, entity cards / context_pack / delta, and the page read
 ops: `get_page` / `fetch` / `list_pages`, `get_chunks` / `get_versions` /
-`get_timeline` / `get_raw_data`, `resolve_slugs`, and
-`get_links` / `get_backlinks` / `traverse_graph`. A gated page reads exactly
+`get_timeline` / `get_raw_data`, `resolve_slugs`,
+`get_links` / `get_backlinks` / `traverse_graph`, and the list-style
+analytics ops `find_orphans` / `get_recent_salience` / `find_anomalies` /
+`find_experts` (published counts and derived statistics are adjusted with
+the filtered rows, so remote responses stay self-consistent and reveal
+nothing about what was filtered). A gated page reads exactly
 like a missing one (no existence oracle), and link/graph output never
 enumerates private slugs.
 
@@ -170,7 +173,7 @@ restores enforcement on the same schedule. Resolver:
   past the configured ceiling; widening requires an explicit `--surface`
   restart. Use it to clamp a misbehaving deployment down to verbs without
   touching client rows.
-- **`GBRAIN_SEARCH_SALVAGE=off`** — restores pre-wave all-or-nothing
+- **`GBRAIN_SEARCH_SALVAGE=off`** — switches to all-or-nothing
   retrieval (no allSettled salvage, strict budget, no minKeep failsafe)
   if the fail-loud retrieval behavior itself misbehaves.
 
@@ -185,7 +188,7 @@ failed, vector arm failed) get short-TTL cache entries.
 
 ## The honest-catalog metric (trend to zero)
 
-The wave's working metric (amendment 33): op-level call-time denials the
+The working metric: op-level call-time denials the
 tools/list filter should have made impossible. serve-http logs them as
 `status='denied_after_list'` — scope denials, publish-gate backstop
 denials (`config_key=...`), and bound-client fence OP-level denials

@@ -224,3 +224,58 @@ identified all remain open. The raw CI failure assertion/log was never captured.
 **A later green CI run is not evidence this is fixed.** It reproduces rarely; absence
 of failure across a handful of runs is what a flake looks like. Next occurrence:
 capture the failing assertion text and the shard's file list before anything else.
+
+---
+
+## FB-004 · SUP-3874 in-place oversized-chunk split is absent on the fork's cursor-batched embed paths
+
+Recorded 2026-09-06, upstream sync v0.46.29.0 → v0.48.2.0.
+
+### What is wrong
+
+Upstream v0.47.x added `healOversizedPageChunks` — splitting a legacy stored
+`content_chunks` row whose `chunk_text` exceeds the model input cap into
+multiple compliant rows — at three embed sites: `embedPage` (single slug),
+`embedStaleForSlugs` (slug list), and the per-page body of `embedAll` /
+`embedStaleForSource` (the cursor-batched `--stale` drains).
+
+The fork replaced that per-page body with a `persistStaleSlice` slicing loop
+(SPEC V4 — the fork's embed-failure ledger + quarantine infrastructure). The
+2026-09-06 merge kept the heal on the first two sites (clean auto-merge) but did
+**not** port it into the fork's slicing loop. `healedChunksToStaleRows` — the
+helper that only exists to feed the per-key path — is now imported nowhere and
+was removed from both files; that orphaning is the structural proof the site
+upstream patched no longer exists in the fork.
+
+Invariant, stated so the next merge does not re-litigate it: **the fork's
+cursor-batched slice loops (`embedAll --stale`, `embedStaleForSource`) do not
+in-place-split oversized stored chunks. They rely on
+`embedWithTruncationFallbackPartial` truncating the embed *input* instead.**
+
+### Why it is not urgent (production, measured 2026-09-06)
+
+- `SELECT count(*) FROM content_chunks WHERE token_count > 2000` (the resolved
+  cap) = **0**. No oversized stored row exists, so the divergence is currently
+  theoretical.
+- `content_chunks`: 65 351 rows, **0 NULL embeddings** — no stale backlog for a
+  cursor drain to even reach.
+- Even if an oversized row appeared: truncation-fallback lands a (lower-quality)
+  non-NULL embedding, so the row leaves the NULL cursor. Only if the truncation
+  ladder is exhausted and the row stays NULL would it be re-selected every
+  round, and `_embedFailureCounts` quarantine bounds that after N attempts.
+
+### Trigger conditions — promote to active work when EITHER holds
+
+- `content_chunks WHERE token_count > <resolveMaxChunkTokens()>` becomes nonzero
+  AND those rows are observed staying NULL across drain passes (check the
+  quarantine counter and `embed_failures`).
+- Upstream moves the heal into a shared pre-pass that both the per-slug and the
+  cursor paths call (then it merges cleanly and this note is obsolete).
+
+### Shape of the fix, when taken
+
+Add a pre-loop `healOversizedPageChunks` call in the fork's `embedOneKey` (both
+files), guarded so a `getChunks` failure skips the page for the pass rather than
+embedding a diverged snapshot, and update the ~9 SPEC V4 test mocks in
+`test/embed.serial.test.ts` to stub `getChunks`. Keep it symmetric across both
+cursor sites.

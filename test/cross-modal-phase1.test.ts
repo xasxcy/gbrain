@@ -179,7 +179,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 27 (cross-modal still appended; 20→21 recency fallback re-key #895; 21→22 result-stamp/injection epoch; 22→23 excludePrivate posture fold #4352; 23→24 negative-offset cache-skip gap #4358 residual; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 reranker document truncation, fork)', () => {
+  test('KNOBS_HASH_VERSION is 29 (cross-modal still appended; …; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 reranker document truncation rrc= (fork))', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -206,10 +206,15 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // replaces the wholesale cache skip for excludePrivate=true callers.
     // 23→24 (#4358 residual): negative-offset requests could read/write the
     // same cache row an offset=0 request shares.
-    // 24→25: kof= (keyword AND→OR fallback knob) joins the key.
+    // 24→25 (#3617): kof= (keyword AND→OR fallback knob) joins the key.
     // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
-    // fork: 26→27 — reranker_max_document_chars (rrc=).
-    expect(KNOBS_HASH_VERSION).toBe(27);
+
+    // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
+    // version-only invalidation.
+    // 28→29 (fork): reranker_max_document_chars (rrc=) changes the text the
+    // cross-encoder scores, so a different truncation threshold must not reuse
+    // cached rankings.
+    expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

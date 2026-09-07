@@ -11,6 +11,7 @@ import type {
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { resolveSupersededByRow, isInt4RowRef, type SupersedeTarget } from '../facts/supersede-resolve.ts';
+import { escapeLikePattern } from '../cjk.ts';
 
 /** Narrow slice of PGLiteEngine the facts operations use. */
 export interface PgliteFactsDeps {
@@ -415,10 +416,17 @@ export async function listSupersessions(
   }
 
 export async function countUnconsolidatedFacts(deps: PgliteFactsDeps, source_id: string): Promise<number> {
+    // Audit checkpoint rows never set consolidated_at, so without the source
+    // exclusion each one counts as forever-pending consolidation backlog.
+    // Validity-lapsed rows are excluded too: the consolidator reads via
+    // listFactsByEntity(activeOnly), which filters them at read time — counting
+    // them here would report a backlog the consolidator can never drain.
     const r = await deps.db.query<{ count: number }>(
       `SELECT COUNT(*)::int AS count FROM facts
-       WHERE source_id = $1 AND consolidated_at IS NULL AND expired_at IS NULL`,
-      [source_id],
+       WHERE source_id = $1 AND consolidated_at IS NULL AND expired_at IS NULL
+         AND (valid_until IS NULL OR valid_until > now())
+         AND NOT (source = ANY($2::text[]))`,
+      [source_id, [...AUDIT_ROW_SOURCES]],
     );
     return Number(r.rows[0]?.count ?? 0);
   }
@@ -431,6 +439,8 @@ export async function findCandidateDuplicates(
     opts?: { k?: number; embedding?: Float32Array },
   ): Promise<FactRow[]> {
     const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
+    // Validity-lapsed rows are not dedup candidates: a re-stated fact after
+    // its valid_until lapses re-inserts fresh (WP5 read-time TTL honesty).
     if (opts?.embedding) {
       // Embedding-cosine ordered candidates within the entity bucket.
       const vec = toPgVectorLiteral(opts.embedding);
@@ -439,6 +449,7 @@ export async function findCandidateDuplicates(
          WHERE source_id = $1
            AND entity_slug = $2
            AND expired_at IS NULL
+           AND (valid_until IS NULL OR valid_until > now())
            AND embedding IS NOT NULL
          ORDER BY embedding <=> $3::vector
          LIMIT $4`,
@@ -452,6 +463,7 @@ export async function findCandidateDuplicates(
        WHERE source_id = $1
          AND entity_slug = $2
          AND expired_at IS NULL
+         AND (valid_until IS NULL OR valid_until > now())
        ORDER BY created_at DESC, id DESC
        LIMIT $3`,
       [source_id, entitySlug, k],
@@ -468,7 +480,10 @@ export async function findTrajectory(deps: PgliteFactsDeps, opts: import('../eng
     const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
     const sourceIds = useArray ? opts.sourceIds! : null;
     const sourceId = opts.sourceId ?? 'default';
-    const remoteFilter = opts.remote === true;
+    // Fail-closed (CV6 / v0.26.9 F7b posture): anything not strictly local
+    // is remote. An omitted flag (cast-bypassed context, caller that forgot
+    // to thread it) degrades to world-only reads, never to a private-fact leak.
+    const remoteFilter = opts.remote !== false;
 
     // Build SQL dynamically. PGLite uses $N positional params; we
     // assemble the WHERE clauses + params array in tandem to keep them
@@ -570,15 +585,19 @@ export async function consolidateFact(deps: PgliteFactsDeps, id: number, takeId:
   }
 
 export async function getFactsHealth(deps: PgliteFactsDeps, source_id: string): Promise<FactsHealth> {
+    // WP5 TTL honesty: validity-lapsed rows (valid_until <= now(), expired_at
+    // NULL) count as expired-style, never active — matches the read-time
+    // filtering on every active recall path. active + expired still
+    // partitions the table exactly.
     const total = await deps.db.query<{
       total_active: number; total_today: number; total_week: number;
       total_expired: number; total_consolidated: number;
     }>(
       `SELECT
-         COUNT(*) FILTER (WHERE expired_at IS NULL)                                    AS total_active,
-         COUNT(*) FILTER (WHERE expired_at IS NULL AND created_at > now() - interval '24 hours') AS total_today,
-         COUNT(*) FILTER (WHERE expired_at IS NULL AND created_at > now() - interval '7 days')   AS total_week,
-         COUNT(*) FILTER (WHERE expired_at IS NOT NULL)                                AS total_expired,
+         COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()))                                    AS total_active,
+         COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND created_at > now() - interval '24 hours') AS total_today,
+         COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND created_at > now() - interval '7 days')   AS total_week,
+         COUNT(*) FILTER (WHERE expired_at IS NOT NULL OR (valid_until IS NOT NULL AND valid_until <= now()))                           AS total_expired,
          COUNT(*) FILTER (WHERE consolidated_at IS NOT NULL)                           AS total_consolidated
        FROM facts WHERE source_id = $1`,
       [source_id],
@@ -586,7 +605,9 @@ export async function getFactsHealth(deps: PgliteFactsDeps, source_id: string): 
     const top = await deps.db.query<{ entity_slug: string; count: number }>(
       `SELECT entity_slug, COUNT(*)::int AS count
        FROM facts
-       WHERE source_id = $1 AND expired_at IS NULL AND entity_slug IS NOT NULL
+       WHERE source_id = $1 AND expired_at IS NULL
+         AND (valid_until IS NULL OR valid_until > now())
+         AND entity_slug IS NOT NULL
        GROUP BY entity_slug
        ORDER BY count DESC, entity_slug ASC
        LIMIT 5`,
@@ -624,7 +645,15 @@ async function _listFacts(
     const whereParts: string[] = [`source_id = $source_id`];
     const params: Record<string, unknown> = { source_id };
     if (opts.activeOnly !== false) {
+      // WP5 TTL honesty: active reads exclude validity-lapsed rows at read
+      // time (exact-time, zero-maintenance). History readers pass
+      // activeOnly:false and stay unfiltered. Parity with the postgres
+      // engine's active-read predicate.
       whereParts.push(`expired_at IS NULL`);
+      whereParts.push(`(valid_until IS NULL OR valid_until > now())`);
+    }
+    if (opts.unconsolidatedOnly === true) {
+      whereParts.push(`consolidated_at IS NULL`);
     }
     if (opts.kinds && opts.kinds.length > 0) {
       whereParts.push(`kind = ANY($kinds)`);
@@ -633,6 +662,13 @@ async function _listFacts(
     if (opts.visibility && opts.visibility.length > 0) {
       whereParts.push(`visibility = ANY($visibility)`);
       params.visibility = opts.visibility;
+    }
+    if (opts.grep && opts.grep.trim()) {
+      // SQL-side substring filter (before limit) — a client-side post-limit
+      // grep silently misses matches outside the newest-N window on
+      // high-cardinality entities. Parity with the postgres engine.
+      whereParts.push(`fact ILIKE $grepPat ESCAPE '\\'`);
+      params.grepPat = '%' + escapeLikePattern(opts.grep.trim()) + '%';
     }
     for (const c of opts.whereClauses ?? []) whereParts.push(c);
     Object.assign(params, opts.whereParams ?? {});

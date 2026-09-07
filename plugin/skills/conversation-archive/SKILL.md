@@ -62,11 +62,12 @@ users own. This skill makes it first-class brain content instead of a JSON
 blob in a downloads folder.
 
 **A native importer now exists: `gbrain transcripts ingest`.** It parses
-agent session logs (Claude Code, Codex, OpenClaw, Hermes) AND extracted
-consumer exports (ChatGPT `conversations.json`, Claude.ai export) directly:
-detection, secret redaction, imessage-slack rendering, long-session
-splitting, and idempotent re-runs are all native. Prefer it over the manual
-procedure whenever the source is one of those six formats:
+agent session logs (Claude Code, Codex, OpenClaw, Hermes, Grok Build) AND
+extracted consumer exports (ChatGPT `conversations.json`, Claude.ai export)
+directly: detection, secret redaction, imessage-slack rendering,
+long-session splitting, and idempotent re-runs are all native. Prefer it
+over the manual procedure whenever the source is one of those seven
+formats:
 
 ```
 gbrain transcripts ingest ~/Downloads/conversations.json   # unzip first
@@ -363,6 +364,13 @@ Evolution:
 
 ## Dedup (sharp boundaries)
 
+- **[chat-connectors](../chat-connectors/SKILL.md)** — the LIVE, account-connected
+  lane: connect a ChatGPT/Claude account and sync new conversations
+  automatically (cookie/OAuth, incremental watermark, scheduled). This skill owns
+  the EXPORT-FILE lane (a downloaded `conversations.json`) and ALL retrieval/
+  tracing. Route "connect my chatgpt / keep my conversations synced" there;
+  route "I downloaded my export" / "when did I first discuss X" here. Perplexity
+  (no live connector) uses this skill's manual conversion.
 - **[voice-note-ingest](../voice-note-ingest/SKILL.md)** — audio. Voice
   memos and audio messages route there (transcription + exact-phrasing
   filing). This skill handles text chat exports and session logs.

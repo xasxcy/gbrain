@@ -363,8 +363,10 @@ CREATE INDEX IF NOT EXISTS idx_raw_data_page ON raw_data(page_id);
 -- ============================================================
 -- files: binary asset metadata (v0.27.1 — PGLite parity for multimodal)
 -- Image bytes never enter the DB; storage_path references a path in the
--- brain repo. Identity is (source_id, storage_path) via the UNIQUE
--- constraint on storage_path; upserts replace metadata in place.
+-- brain repo. FORK: identity is the COMPOSITE (source_id, storage_path) —
+-- two sources importing the same relative path must not fight over one row.
+-- Upserts replace metadata in place. Constraint is named to match fork
+-- migration v147 (files_source_id_storage_path_unique).
 -- ============================================================
 CREATE TABLE IF NOT EXISTS files (
   id           SERIAL PRIMARY KEY,
@@ -379,7 +381,7 @@ CREATE TABLE IF NOT EXISTS files (
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(storage_path)
+  CONSTRAINT files_source_storage_key UNIQUE (source_id, storage_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_page ON files(page_slug);
@@ -1074,6 +1076,48 @@ CREATE INDEX IF NOT EXISTS idx_chat_usage_log_created
   ON chat_usage_log (created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_usage_log_model
   ON chat_usage_log (model, created_at);
+
+-- open_loops + loop_suppressions (migration v144). See src/schema.sql for rationale.
+CREATE TABLE IF NOT EXISTS open_loops (
+  id                 BIGSERIAL PRIMARY KEY,
+  source_id          TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  dedup_key          TEXT NOT NULL,
+  loop_type          TEXT NOT NULL CHECK (loop_type IN (
+                       'commitment_owed_by_me','commitment_owed_to_me',
+                       'unanswered_inbound','unanswered_outbound','decision_pending')),
+  counterparty_slug  TEXT,
+  counterparty_email TEXT,
+  summary            TEXT NOT NULL,
+  evidence           JSONB NOT NULL DEFAULT '[]'::jsonb,
+  thread_id          TEXT,
+  page_slug          TEXT,
+  due_at             TIMESTAMPTZ,
+  status             TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done','dropped','stale')),
+  detector           TEXT NOT NULL CHECK (detector IN ('deterministic_thread','llm_extract','manual')),
+  confidence         REAL NOT NULL DEFAULT 1.0,
+  fact_id            BIGINT,
+  opened_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_activity_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at          TIMESTAMPTZ,
+  closed_by          TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT open_loops_dedup UNIQUE (source_id, dedup_key)
+);
+CREATE INDEX IF NOT EXISTS open_loops_status_idx
+  ON open_loops (source_id, status, last_activity_at DESC);
+CREATE INDEX IF NOT EXISTS open_loops_counterparty_idx
+  ON open_loops (source_id, counterparty_slug) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS open_loops_thread_idx
+  ON open_loops (source_id, thread_id) WHERE status = 'open';
+CREATE TABLE IF NOT EXISTS loop_suppressions (
+  id         BIGSERIAL PRIMARY KEY,
+  source_id  TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('sender','thread')),
+  value      TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT loop_suppressions_uniq UNIQUE (source_id, kind, value)
+);
 
 -- ============================================================
 -- migration_impact_log (v0.41.18.0 — gbrain onboard wave)

@@ -49,12 +49,12 @@ export interface ForkMigrationDeps {
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 142;
+export const FORK_MIGRATION_FLOOR = 146;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 142,
+      version: 146,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +72,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 143,
+      version: 147,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +99,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 144,
+      version: 148,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +128,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 145,
+      version: 149,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +163,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 146,
+      version: 150,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -222,7 +222,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 147,
+      version: 151,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -250,7 +250,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 148,
+      version: 152,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -291,7 +291,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 149,
+      version: 153,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -359,6 +359,86 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
             WHERE table_name = 'content_chunks' AND column_name = 'embedded_text_hash'`,
         );
         return (rows[0]?.n ?? 0) > 0;
+      },
+    },
+    {
+      version: 154,
+      name: 'repair_masked_upstream_142_145',
+      // Fourth instance of the masking class this file's header describes, from
+      // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
+      //
+      // Before that merge upstream's high-water was 141 and the fork occupied
+      // 142-149. Upstream then claimed 142-145 for its own migrations, so the
+      // fork renumbered to 146-153 per ADR-087 — but renumbering only moves the
+      // fork's DEFINITIONS. runMigrations gates on a single high-water integer,
+      // and a brain stamped 149 by the FORK's old 142-149 has `m.version > current`
+      // false for upstream's real 142-145 forever: skipped silently, exactly as
+      // v151/v152/v153 above describe.
+      //
+      // Verified read-only on the production brain before writing this
+      // (2026-09-06, counter at 153 — the postinstall hook had already replayed
+      // the renumbered fork migrations 150-153):
+      //   142 takes_embedding_dimension_matches_config .. extract_rollup_7d
+      //       .expected_limit_count PRESENT; takes.embedding was vector(1536)
+      //       vs config embedding_dimensions = 2000 — MISMATCH, but `takes` is
+      //       EMPTY (0 rows), so the migration's `UPDATE takes SET embedding =
+      //       NULL` is a no-op and the DROP/ADD COLUMN + HNSW rebuild run on an
+      //       empty table: zero data loss, aligns the column to config.
+      //   143 dream_verdicts.expires_at ................. MISSING
+      //   144 open_loops table + v143 skew re-apply ..... MISSING
+      //   145 facts_kind_check allows kind='idea' ....... MISSING (constraint
+      //       was event/preference/commitment/belief/fact)
+      //
+      // All four declare `idempotent: true`; none is excluded.
+      //
+      // Same lookup-don't-copy shape as v151/v152/v153: the DDL is read out of
+      // the live MIGRATIONS registry, so this can never drift from what it
+      // repairs.
+      idempotent: true,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [142, 143, 144, 145]) {
+          const masked = deps.allMigrations().find(m => m.version === version);
+          if (!masked) continue;
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 142/143/144/145 masked by the 2026-09-06 fork renumber\n',
+        );
+      },
+      // Exact postcondition for all four targets. Postgres-only shape check;
+      // PGLite reports its own catalog, so gate on the engine kind.
+      verify: async (engine) => {
+        if (engine.kind !== 'postgres') return true;
+        const rows = await engine.executeRaw<{
+          rollup_col: number;
+          takes_dim: string | null;
+          dv_col: number;
+          open_loops: string | null;
+          facts_idea: number;
+        }>(
+          `SELECT
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'extract_rollup_7d' AND column_name = 'expected_limit_count') AS rollup_col,
+             (SELECT format_type(a.atttypid, a.atttypmod)
+                FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+               WHERE c.relname = 'takes' AND a.attname = 'embedding' AND NOT a.attisdropped) AS takes_dim,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'dream_verdicts' AND column_name = 'expires_at') AS dv_col,
+             to_regclass('public.open_loops')::text AS open_loops,
+             (SELECT count(*)::int FROM pg_constraint
+               WHERE conname = 'facts_kind_check' AND conrelid = 'facts'::regclass
+                 AND pg_get_constraintdef(oid) LIKE '%''idea''%') AS facts_idea`,
+        );
+        const r = rows[0];
+        if (!r) return false;
+        return (
+          r.rollup_col > 0 &&
+          r.takes_dim === 'vector(2000)' &&
+          r.dv_col > 0 &&
+          r.open_loops === 'open_loops' &&
+          r.facts_idea > 0
+        );
       },
     },
   ];

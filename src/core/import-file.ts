@@ -45,7 +45,7 @@ import {
 } from './embedding-context.ts';
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
-import { isUndefinedTableError, warnOncePerProcess, validateSlug, contentHash, contentHashLegacy } from './utils.ts';
+import { isUndefinedTableError, warnOncePerProcess, validateSlug, contentHash, contentHashLegacy, ATOMS_SCAN_HASH_KEY } from './utils.ts';
 import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
@@ -276,7 +276,7 @@ export interface ImportResult {
   type_warning?: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string };
 }
 
-const MAX_FILE_SIZE = 5_000_000; // 5MB
+export const MAX_FILE_SIZE = 5_000_000; // 5MB
 
 function invalidYamlFrontmatterError(parsed: ReturnType<typeof parseMarkdown>): string | null {
   const yamlError = parsed.errors?.find((error) => error.code === 'YAML_PARSE');
@@ -419,6 +419,12 @@ export async function importFromContent(
     delete parsed.frontmatter[QUARANTINE_KEY];
     delete parsed.frontmatter[CONTENT_FLAG_KEY];
     delete parsed.frontmatter[EMBED_SKIP_KEY];
+    // #1699 part 2: the extract_atoms completion marker is phase-owned. A
+    // remote writer planting a matching marker would suppress atom mining
+    // for the page (a silent extraction bypass); planting a stale one is
+    // harmless but still not the caller's to set. Trusted local sync/export
+    // round-trips (remote unset/false) preserve it.
+    delete parsed.frontmatter[ATOMS_SCAN_HASH_KEY];
   }
 
   // Vendor-neutral guardrail seam (observe-only, fail-open). Runs AFTER
@@ -512,6 +518,13 @@ export async function importFromContent(
       prose_check_enabled: cs.prose_check_enabled,
       page_kind: parsed.type,
       extra_literals,
+      // #4702 `content_sanity.disabled_patterns`: turn off individual
+      // built-in junk patterns without junk_patterns_enabled (all patterns)
+      // or the kill-switch (which also drops the size gates). Defensive
+      // Array.isArray: the file plane is hand-edited JSON.
+      disabled_patterns: Array.isArray(cs.disabled_patterns)
+        ? cs.disabled_patterns
+        : undefined,
     });
 
     if (sanityDisabled) {
@@ -579,8 +592,11 @@ export async function importFromContent(
         logContentSanityAssessment(slug, sourceId ?? 'default', sanityResult, {
           disposition: 'soft_block',
         });
-        process.stderr.write(
-          `[gbrain] content-sanity flag (oversized): ${slug} (${sanityResult.bytes} bytes) — page lands, embedding skipped, agent warned\n`,
+        // #3893 (reimplemented from @y2688): console.warn, not bare stderr —
+        // soft_block silently drops embedding, and console-level warns are
+        // what operator log hooks and collectors can observe.
+        console.warn(
+          `[gbrain] content-sanity flag (oversized): ${slug} (${sanityResult.bytes} bytes) — page lands, embedding skipped, agent warned`,
         );
       } else {
         // markup_heavy: page ingests NORMALLY (keeps chunks, embeds). The
@@ -1954,10 +1970,11 @@ async function readExifSafe(buf: Buffer): Promise<Record<string, unknown>> {
 }
 
 /**
- * Cherry-1 OCR: optional gpt-4o-mini pass extracting visible text from an
+ * Cherry-1 OCR: optional vision-model pass extracting visible text from an
  * image. Returns '' when:
  * - the embedding_image_ocr config flag is off (default)
- * - the configured expansion model is unavailable (no API key)
+ * - the configured OCR model (embedding_image_ocr_model, else the expansion
+ *   model — #4107) is unavailable (no API key / no expansion touchpoint)
  * - the OCR call itself fails (logged once per session)
  * - the per-run OCR budget is exhausted (#3973 — see _ocrRunBudget below)
  *
@@ -2070,10 +2087,14 @@ async function maybeOcrGated(
 
   await bump('ocr_attempted');
   try {
-    const { isAvailable, generateOcrText } = await import('./ai/gateway.ts');
-    if (!isAvailable('expansion')) {
+    const { isAvailable, generateOcrText, getImageOcrModel } = await import('./ai/gateway.ts');
+    // getImageOcrModel throws on an unconfigured gateway; count that as
+    // no-key (the pre-#4107 isAvailable gate returned false there).
+    let ocrModel: string | null = null;
+    try { ocrModel = getImageOcrModel(); } catch { /* unconfigured gateway */ }
+    if (!ocrModel || !isAvailable('expansion', ocrModel)) {
       if (!_ocrWarnedThisSession) {
-        console.warn('[gbrain] OCR opt-in is true but expansion model is unavailable; skipping OCR for this session');
+        console.warn(`[gbrain] OCR opt-in is true but the OCR model (${ocrModel ?? 'gateway unconfigured'}) is unavailable; skipping OCR for this session`);
         _ocrWarnedThisSession = true;
       }
       await bump('ocr_failed_no_key');

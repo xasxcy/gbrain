@@ -1,14 +1,12 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from '../core/embed-skip.ts';
-// Leaf module (no flag surface of its own) — see that file for why this
-// isn't imported from extract-conversation-facts.ts directly (#4135).
-import { ALLOWED_TYPES } from '../core/facts/conversation-types.ts';
+import { quarantineFilterFragment } from '../core/quarantine.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport } from '../core/dry-fix.ts';
-import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
+import { parseFlags as parseSkillsDirFlags, resolveSkillsDir } from './check-resolvable.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
@@ -17,22 +15,29 @@ import { rankIssues, type RankedIssue } from '../core/doctor-cause-rank.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
 import { gbrainPath, loadConfig } from '../core/config.ts';
-import { dirname, join } from 'path';
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
+import { join } from 'path';
+import { existsSync, readFileSync } from 'fs';
 import { resolveEnvNumber, resolveHoursEnv } from '../core/env-number.ts';
 import { currentEmbeddingSignature } from '../core/embedding.ts';
 import { computeEffectiveDate } from '../core/effective-date.ts';
 import { parseFrontmatter } from '../core/backfill-effective-date.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
+import { schemaVersionHealth } from '../core/schema-version-health.ts';
 import { zeroTotalContradictionsCheck } from '../core/eval-contradictions/run-health.ts';
 // Peeled doctor modules (containment sprint): each is a verbatim move out of
 // this file. doctor.ts re-exports every moved public symbol under its
 // original name so existing importers (tests, scripts/live-brain-first-check.ts,
 // the run_doctor op's dynamic import of doctorReportRemote) keep working
 // unchanged.
-import { multiSourceDriftAdvice } from './doctor/schema-pack-checks.ts';
+import { multiSourceDriftAdvice, multiSourceDriftGitRootSkipNote } from './doctor/schema-pack-checks.ts';
 import { bootstrapDoctorChecks } from './doctor/bootstrap-checks.ts';
+import { buildMemorableRelayCheck } from './doctor/checks/integrations-memorable.ts';
+export { buildMemorableRelayCheck } from './doctor/checks/integrations-memorable.ts';
+import { buildHomeDirInWorktreeCheck } from './doctor/checks/home-worktree.ts';
+export { buildHomeDirInWorktreeCheck, isValidGitMarker } from './doctor/checks/home-worktree.ts';
+import { buildMemoryWritebackCheck } from './doctor/checks/memory-writeback.ts';
+export { buildMemoryWritebackCheck } from './doctor/checks/memory-writeback.ts';
 import {
   skillConformanceCheck,
   skillsManifestIntegrityCheck,
@@ -42,6 +47,7 @@ import {
 } from './doctor/skill-checks.ts';
 export {
   multiSourceDriftAdvice,
+  multiSourceDriftGitRootSkipNote,
   bootstrapDoctorChecks,
   skillConformanceCheck,
   skillsManifestIntegrityCheck,
@@ -129,15 +135,20 @@ export {
   checkUndeclaredDbOnlyPages,
   checkDbOnlyCollectorCollision,
   computeExtractAtomsBacklogCheck,
+  computeAtomProvenanceDriftCheck,
   computeExtractHealthCheck,
   checkSyncFreshness,
 } from './doctor/checks/extraction-sync.ts';
+export { computeConversationFormatCoverageCheck } from './doctor/checks/conversation-coverage.ts';
 export {
   checkSyncConsolidation,
   computePoolBudgetCheck,
   checkPoolBudget,
   checkCycleFreshness,
 } from './doctor/checks/consolidation-cycle.ts';
+import { dbRepairRecurrenceCheck, pgliteScaleCheck } from './doctor/checks/engine-fit.ts';
+import { classifyPgAccessError } from '../core/pg-access-classify.ts';
+export { dbRepairRecurrenceCheck, pgliteScaleCheck } from './doctor/checks/engine-fit.ts';
 export {
   computePgliteDataDirCheck,
   computeWorkerOomLoopCheck,
@@ -211,9 +222,11 @@ import {
   checkUndeclaredDbOnlyPages,
   checkDbOnlyCollectorCollision,
   computeExtractAtomsBacklogCheck,
+  computeAtomProvenanceDriftCheck,
   computeExtractHealthCheck,
   checkSyncFreshness,
 } from './doctor/checks/extraction-sync.ts';
+import { computeConversationFormatCoverageCheck } from './doctor/checks/conversation-coverage.ts';
 import {
   checkSyncConsolidation,
   checkCycleFreshness,
@@ -313,6 +326,13 @@ export interface DoctorReport {
    * the ranking. Additive + optional; schema_version stays at 2.
    */
   top_issues?: RankedIssue[];
+  /**
+   * db-availability loop — which engine this report was measured against and
+   * where its URL came from. Additive + optional (schema_version stays 2);
+   * absent on remote/report-only paths that don't know them.
+   */
+  engine?: 'postgres' | 'pglite';
+  db_url_source?: DbUrlSource | null;
 }
 
 function _penaltyScore(checks: Check[]): number {
@@ -338,7 +358,10 @@ function _penaltyScore(checks: Check[]): number {
  * categorizer is the single source of truth in
  * `src/core/doctor-categories.ts`.
  */
-export function computeDoctorReport(checks: Check[]): DoctorReport {
+export function computeDoctorReport(
+  checks: Check[],
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null },
+): DoctorReport {
   const tagged = checks.map((c) =>
     c.category ? c : { ...c, category: categorizeCheck(c.name) },
   );
@@ -366,6 +389,8 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
     },
     checks: tagged,
     top_issues: rankIssues(tagged),
+    ...(extras?.engine ? { engine: extras.engine } : {}),
+    ...(extras?.db_url_source !== undefined ? { db_url_source: extras.db_url_source } : {}),
   };
 }
 
@@ -551,17 +576,68 @@ const _resolveEnvNumber = resolveEnvNumber;
 const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 /**
- * Run doctor with filesystem-first, DB-second architecture.
- * Filesystem checks (resolver, conformance) run without engine.
- * DB checks run only if engine is provided.
+ * PgBouncer / prepared-statement compatibility. URL-only inspection — no DB
+ * round-trip — extracted so it runs BOTH before the connection check and in
+ * the dead-DB filesystem lane (a URL problem is diagnosable with the DB down).
+ */
+async function pgbouncerPrepareCheck(): Promise<Check | null> {
+  try {
+    const { resolvePrepare } = await import('../core/db.ts');
+    const config = loadConfig();
+    const url = config?.database_url || '';
+    if (!url) return null;
+    const prepare = resolvePrepare(url);
+    if (prepare === false) {
+      return { name: 'pgbouncer_prepare', status: 'ok', message: 'Prepared statements disabled (PgBouncer-safe)' };
+    }
+    try {
+      const parsed = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://'));
+      if (parsed.port === '6543') {
+        return {
+          name: 'pgbouncer_prepare',
+          status: 'warn',
+          message:
+            'Port 6543 (PgBouncer transaction mode) detected but prepared statements are enabled. ' +
+            'This causes "prepared statement does not exist" errors under concurrent load. ' +
+            'Fix: unset GBRAIN_PREPARE (or set =false), or add ?prepare=false to the connection URL.',
+        };
+      }
+    } catch {
+      // URL parse failure — skip, nothing actionable
+    }
+    return null;
+  } catch {
+    return null; // best-effort; never fail doctor on this check
+  }
+}
+
+/**
+ * db-availability loop (2c/2c-bis): the ONE classified-connection-fail shape,
+ * shared by the live connection check and the dead-DB synthesized entry.
+ * `connection` is in ROOT_CAUSE_CHECKS, so top_issues[0].fix carries the
+ * classified remediation instead of a raw pg error. Deliberately NOT
+ * makeRemediationStep: that lane feeds `--remediate`, whose Minion jobs need
+ * the very DB that's down (db-repair is the engine-free applier here).
+ */
+function classifiedConnectionCheck(e: unknown): Check {
+  const d = classifyPgAccessError(e, { url: loadConfig()?.database_url ?? null });
+  return {
+    name: 'connection',
+    status: 'fail',
+    message: d.message,
+    details: { reason: d.reason, transient: d.transient, fix_hint: `${d.remediation} Run: gbrain db-repair` },
+  };
+}
+
+/**
+ * Build the full check list for `gbrain doctor` against an engine + arg vector.
+ * Filesystem-first, DB-second: filesystem checks (resolver, conformance) run
+ * without an engine; DB checks run only if one is provided.
  *
  * `dbSource` is passed only from the `--fast` and DB-unavailable paths in
  * cli.ts so we can emit a precise "why no DB check" message. When null, the
  * user has no DB configured anywhere; otherwise the caller chose --fast or
  * we failed to connect despite a configured URL.
- */
-/**
- * Build the full check list for `gbrain doctor` against an engine + arg vector.
  *
  * The check-building seam: takes the same args as `runDoctor` minus the
  * --locks shortcut (locks-mode is a focused diagnostic the CLI wrapper
@@ -586,6 +662,11 @@ export async function buildChecks(
   engine: BrainEngine | null,
   args: string[],
   dbSource?: DbUrlSource,
+  // db-availability loop (2c-bis): the connect error captured by the CLI's
+  // dead-DB fallback. Lets the null-engine path synthesize a CLASSIFIED
+  // `connection` check — without it, a total outage produced NO connection
+  // entry at all, which is exactly the field smoke-test branches on.
+  connectError?: unknown,
 ): Promise<Check[]> {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
@@ -632,13 +713,17 @@ export async function buildChecks(
   //
   // We also skip `--fix` execution under scope=brain because --fix
   // exclusively targets DRY violations inside SKILL.md files. Use the same
-  // auto-detect as `check-resolvable` so doctor sees a workspace/skills dir
-  // reachable via $OPENCLAW_WORKSPACE or ~/.openclaw/workspace, not just a
-  // `skills/` walked up from cwd. Read-only variant adds the install-path
-  // fallback so a hosted-CLI install run from `~` (e.g., `bun install -g
-  // github:garrytan/gbrain && cd ~ && gbrain doctor`) can still find the
-  // bundled skills/ dir without warning.
-  const detected = scope === 'all' ? autoDetectSkillsDirReadOnly() : { dir: null, source: 'none' as const };
+  // resolution as `check-resolvable` (#4673: flag-first — doctor accepted
+  // `--skills-dir` and silently ignored it, so every skill check graded the
+  // auto-detected workspace and `--fix` could write SKILL.md edits into a
+  // workspace the operator explicitly steered away from). Sharing
+  // check-resolvable's exported resolveSkillsDir keeps the three skills-dir
+  // commands (doctor, check-resolvable, routing-eval) on one precedence:
+  // --skills-dir → $GBRAIN_SKILLS_DIR / $OPENCLAW_WORKSPACE / walk-up →
+  // install-path read-only fallback. `source: 'explicit'` correctly bypasses
+  // the install_path --fix refusal below — an explicit flag is exactly the
+  // operator signal that gate wants.
+  const detected = scope === 'all' ? resolveSkillsDir(parseSkillsDirFlags(args)) : { dir: null, source: 'none' as const };
   const skillsDir = detected.dir;
   if (scope === 'all' && skillsDir) {
 
@@ -763,6 +848,31 @@ export async function buildChecks(
   // null. Emits NOTHING on machines with no bootstrap state, so ordinary
   // brains keep a clean doctor.
   checks.push(...(await bootstrapDoctorChecks(engine)));
+
+  // 2e. Memorable relay health — engine-free, file-plane only, so it runs
+  // unconditionally (survives --fast and every --scope). Gate off = one quiet
+  // ok row; the states it exists to catch are enabled-without-disclosure and
+  // enabled-but-never-actually-relaying.
+  checks.push(await buildMemorableRelayCheck());
+
+  // 2e-bis. Ambient-writeback health (WP6): resolved mode/TTL/visibility +
+  // brain audience, installed instruction blocks (receipt vs live probe vs
+  // drift), validity-lapsed count, and the 7d local counters. Off = one
+  // quiet ok row (opt-in convention).
+  progress.heartbeat('memory_writeback');
+  checks.push(await buildMemoryWritebackCheck(engine));
+
+  // 2f. Chat-connector health (D3.2): re-auth-needed / stalled-sync / drift.
+  // Credential-gated + auto_sync-gated — emits a plain "ok" (no nag) on brains
+  // with no connectors or a manual-only user.
+  if (engine) {
+    try {
+      const { connectorsHealthCheck } = await import('./doctor/checks/connectors.ts');
+      checks.push(await connectorsHealthCheck(engine));
+    } catch {
+      // best-effort; a connectors check failure must never break doctor
+    }
+  }
 
   // 3. Half-migrated Minions detection (filesystem-only).
   // If completed.jsonl has any status:"partial" entry with no later
@@ -1120,12 +1230,12 @@ export async function buildChecks(
   }
 
   // 3b-tris. Stub-guard fire count (last 24h). The v0.34.5 stub guard in
-  // fence-write.ts refuses to spawn unprefixed entity pages (e.g. bare
-  // `alice.md` at brain root). Each fire is appended to
-  // ~/.gbrain/audit/stub-guard-YYYY-Www.jsonl. This check is the operator
-  // visibility surface for the guard's v0.36 sunset criterion: when the
-  // 24h count is consistently low, the prefix-expansion in
-  // resolveEntitySlug is doing its job and the guard can be removed.
+  // fence-write.ts refuses to spawn unprefixed entity pages (bare `alice.md`
+  // at brain root); the #4108 arm refuses pages for fallback-resolved slugs
+  // no live page backs. Fires append per-arm `reason` lines to
+  // ~/.gbrain/audit/stub-guard-YYYY-Www.jsonl (pre-#4108 lines lack one and
+  // count as unprefixed). The v0.36 sunset criterion covers 'unprefixed'
+  // ONLY; the fallback_resolution arm never sunsets.
   //
   // WARN at >10 fires/24h — at that rate the resolver is probably missing
   // a case (typo prefix, alias, non-Latin script). Operators should grep
@@ -1134,20 +1244,20 @@ export async function buildChecks(
   try {
     const { readRecentStubGuardEvents } = await import('../core/facts/stub-guard-audit.ts');
     const events = readRecentStubGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    const fallbackCount = events.filter((e) => e.reason === 'fallback_resolution').length;
+    const reasonSplit = `unprefixed=${events.length - fallbackCount}, fallback_resolution=${fallbackCount}`;
     if (events.length > 10) {
       // Surface the top 3 slugs that hit it so operators have somewhere to start.
       const slugCounts = new Map<string, number>();
       for (const e of events) slugCounts.set(e.slug, (slugCounts.get(e.slug) ?? 0) + 1);
       const topSlugs = [...slugCounts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-        .map(([slug, n]) => `${slug}(${n})`)
-        .join(', ');
+        .sort((a, b) => b[1] - a[1]).slice(0, 3)
+        .map(([slug, n]) => `${slug}(${n})`).join(', ');
       checks.push({
         name: 'stub_guard_24h',
         status: 'warn',
         message:
-          `Stub guard fired ${events.length}x in last 24h (top: ${topSlugs}). ` +
+          `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; top: ${topSlugs}). ` +
           `If this stays elevated, the prefix-expansion in resolveEntitySlug is ` +
           `missing a case. Check ~/.gbrain/audit/stub-guard-*.jsonl for the slugs ` +
           `that hit it.`,
@@ -1156,7 +1266,7 @@ export async function buildChecks(
       checks.push({
         name: 'stub_guard_24h',
         status: 'ok',
-        message: `Stub guard fired ${events.length}x in last 24h (below WARN threshold of 10).`,
+        message: `Stub guard fired ${events.length}x in last 24h (${reasonSplit}; below WARN threshold of 10).`,
       });
     }
     // Zero hits is the goal — emit no check at all so the doctor output stays clean.
@@ -1374,72 +1484,21 @@ export async function buildChecks(
     } catch {
       // Best-effort; backlog query failure shouldn't stop doctor.
     }
+    // The mirror of the backlog check: atoms whose source_hash no longer
+    // resolves to any live page (#4566). Same best-effort posture.
+    try {
+      checks.push(await computeAtomProvenanceDriftCheck(engine));
+    } catch {
+      // Best-effort; provenance query failure shouldn't stop doctor.
+    }
   }
 
-  // 3d.3 v0.41.13.0 — conversation_format_coverage. Scans up to 200
-  // most-recent conversation-type pages, runs parseConversation in
-  // dry mode, reports per-pattern hit counts + unmatched count. Warn
-  // at >10% unmatched with paste-ready hint pointing at
-  // `gbrain conversation-parser scan <slug>` so the operator can
-  // triage the misses interactively.
+  // 3d.3 v0.41.13.0 — conversation_format_coverage. Peeled to
+  // doctor/checks/conversation-coverage.ts (#4193) so it is unit-testable;
+  // summary-only conversation pages report separately instead of counting
+  // as parser misses. Error handling lives inside the compute function.
   if (engine) {
-    try {
-      const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
-      const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      // Single source of truth for the conversation-facts type allowlist (#4135).
-      const allowedTypes = ALLOWED_TYPES;
-      // PageFilters supports singular `type` only; iterate the allowed types
-      // and cap at ~50/each to land at ~200 total max.
-      const sample: import('../core/types.ts').Page[] = [];
-      for (const t of allowedTypes) {
-        const slice = await engine.listPages({ limit: 50, type: t as import('../core/types.ts').PageType });
-        sample.push(...slice);
-      }
-      if (sample.length === 0) {
-        checks.push({
-          name: 'conversation_format_coverage',
-          status: 'ok',
-          message: 'No conversation-type pages — coverage check not applicable',
-        });
-      } else {
-        const hitsByPattern: Record<string, number> = {};
-        let unmatched = 0;
-        for (const page of sample) {
-          const body = await readConversationBodyForParsing(engine, page);
-          const result = parseConversation(body, { page, noPolish: true, noFallback: true });
-          const id = result.matched_pattern_id ?? '_no_match';
-          hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
-          if (result.phase === 'no_match') unmatched++;
-        }
-        const unmatchedPct = (unmatched / sample.length) * 100;
-        const breakdown = Object.entries(hitsByPattern)
-          .sort(([, a], [, b]) => b - a)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(', ');
-        if (unmatchedPct > 10) {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'warn',
-            message:
-              `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
-              `Breakdown: ${breakdown}. ` +
-              `Investigate: gbrain conversation-parser scan <slug>`,
-          });
-        } else {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'ok',
-            message: `${sample.length} pages: ${breakdown}`,
-          });
-        }
-      }
-    } catch (err) {
-      checks.push({
-        name: 'conversation_format_coverage',
-        status: 'warn',
-        message: `Could not check conversation format coverage: ${(err as Error)?.message ?? String(err)}`,
-      });
-    }
+    checks.push(await computeConversationFormatCoverageCheck(engine));
   }
 
   // 3d.4 v0.41.13.0 — progressive_batch_audit_health. Reads last 7
@@ -1513,65 +1572,16 @@ export async function buildChecks(
     // Best-effort; audit-log read failure shouldn't stop doctor.
   }
 
-  // 3e. home_dir_in_worktree (v0.35.8.0). Walks up from `gbrainPath()`
-  // looking for a `.git` directory OR file. If found, warns: `~/.gbrain/`
-  // lives inside a git worktree, so an accidental `git add` from the
-  // worktree root could stage the brain. Pairs with the retroactive
-  // `~/.gbrain/.gitignore` (single-line `*`) laid down by saveConfig +
-  // post-upgrade. Honest scope: the .gitignore covers casual `git add`
-  // but NOT already-tracked files, screenshots, backups, or `git add -f`.
-  //
-  // Walk termination: stops at $HOME (don't keep walking into / on a user
-  // who set GBRAIN_HOME=/tmp/something). Handles `.git` as both a directory
-  // (main repo) and a file (linked worktree pointing at parent's worktrees/).
+  // 3e. home_dir_in_worktree (v0.35.8.0; peeled to doctor/checks/home-worktree.ts).
+  // Walks up from `gbrainPath()` toward $HOME looking for a VALIDATED `.git`
+  // marker (#4683: an empty/invalid `.git` git itself rejects no longer warns).
   // Honors GBRAIN_HOME via gbrainPath().
   try {
-    const gbrainHome = gbrainPath();
-    const home = process.env.HOME || '';
-    let worktreeRoot: string | null = null;
-    if (gbrainHome && home && gbrainHome.startsWith(home + '/')) {
-      // Walk up from gbrainHome's parent toward $HOME, stopping at $HOME.
-      // We don't check gbrainHome itself: a `.git` directly inside ~/.gbrain
-      // isn't a containing-worktree, it would be a brain repo cloned there.
-      let cur = dirname(gbrainHome);
-      while (cur && cur.length >= home.length) {
-        const gitPath = join(cur, '.git');
-        try {
-          const st = statSync(gitPath);
-          // Either a directory (main repo) or a file (linked worktree pointer).
-          if (st.isDirectory() || st.isFile()) {
-            worktreeRoot = cur;
-            break;
-          }
-        } catch {
-          // No .git at this level; continue.
-        }
-        if (cur === home) break;
-        const parent = dirname(cur);
-        if (parent === cur) break;
-        cur = parent;
-      }
-    }
-    if (worktreeRoot) {
-      const homeEnvHint = process.env.GBRAIN_HOME
-        ? `# Or move \`~/.gbrain\` outside the worktree by setting GBRAIN_HOME elsewhere.`
-        : `# Fix: \`export GBRAIN_HOME=/some/path/outside/the/worktree\` (gbrain appends \`.gbrain\`).`;
-      checks.push({
-        name: 'home_dir_in_worktree',
-        status: 'warn',
-        message:
-          `~/.gbrain lives inside git worktree at ${worktreeRoot}. ` +
-          `Config + brain DB could be committed by accident. ` +
-          `A retroactive ~/.gbrain/.gitignore blocks casual \`git add\`, but does NOT cover ` +
-          `already-tracked files, screenshots, backups, or \`git add -f\`. ${homeEnvHint}`,
-      });
-    } else {
-      checks.push({
-        name: 'home_dir_in_worktree',
-        status: 'ok',
-        message: 'gbrain home is outside any enclosing git worktree.',
-      });
-    }
+    checks.push(buildHomeDirInWorktreeCheck(
+      gbrainPath(),
+      process.env.HOME || '',
+      Boolean(process.env.GBRAIN_HOME),
+    ));
   } catch {
     // Best-effort filesystem-hygiene check; never block doctor.
   }
@@ -1650,6 +1660,20 @@ export async function buildChecks(
     // unparseable config.json lands here and skips, same fail-open posture).
   }
 
+  // 3a-bis. default_source_local_path (#4739, narrowed). A null
+  // default.local_path is the DESIGNED fallback topology (pages nest under
+  // sync.repo_path), so this only warns when that fallback demonstrably
+  // fails: file-backed default pages with no resolvable root, or a
+  // sync.repo_path the #2018 leak guard silently skips. Logic lives in
+  // doctor/checks/default-source-path.ts (module-dir rule).
+  if (engine !== null) try {
+    const { defaultSourceLocalPathCheck } = await import('./doctor/checks/default-source-path.ts');
+    const dspCheck = await defaultSourceLocalPathCheck(engine!);
+    if (dspCheck) checks.push(dspCheck);
+  } catch {
+    // Best-effort. A broken sources table should not stop doctor.
+  }
+
   // 3b-multi-source. Multi-source drift (v0.31.8 — D8 + D17 + OV12 + OV13).
   // Pre-v0.30.3 putPage misrouted multi-source writes to (default, slug).
   // For each non-default source with local_path set, walk the FS and surface
@@ -1678,16 +1702,32 @@ export async function buildChecks(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
+        const skipNote = result.git_root_skipped.length > 0
+          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+          : '';
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
-          message: multiSourceDriftAdvice(result.count, sampleStr),
+          message: multiSourceDriftAdvice(result.count, sampleStr) + skipNote,
         });
       } else {
+        // #4712: if EVERY candidate source was skipped as git-root-pinned,
+        // no walk actually ran — 'ok' would misreport "verified clean" when
+        // nothing was checked at all. 'warn' only in that all-skipped case;
+        // a partial skip alongside real, clean coverage stays 'ok'.
+        const allSkipped =
+          result.git_root_skipped.length > 0 &&
+          result.git_root_skipped.length >= nonDefaultWithPath.length;
         checks.push({
           name: 'multi_source_drift',
-          status: 'ok',
-          message: 'No cross-source slug drift detected.',
+          status: allSkipped ? 'warn' : 'ok',
+          message: allSkipped
+            ? `Multi-source drift check performed no verification` +
+              multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+            : result.git_root_skipped.length > 0
+              ? `No cross-source slug drift detected among checked sources.` +
+                multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+              : 'No cross-source slug drift detected.',
         });
       }
     }
@@ -1811,15 +1851,27 @@ export async function buildChecks(
       // whether a URL exists (env or config-file) — the caller simply
       // skipped the connection. When null, there really is no config
       // anywhere.
-      let msg: string;
-      if (fastMode && dbSource) {
-        msg = `Skipping DB checks (--fast mode, URL present from ${dbSource})`;
-      } else if (!fastMode && dbSource) {
-        msg = `Could not connect to configured DB (URL from ${dbSource}); filesystem checks only`;
+      if (!fastMode && dbSource && connectError !== undefined) {
+        // 2c-bis: a REAL connect failure — synthesize the classified check so
+        // `checks[name=="connection"]` exists in every failure shape.
+        checks.push(classifiedConnectionCheck(connectError));
       } else {
-        msg = 'No database configured (filesystem checks only). Set GBRAIN_DATABASE_URL or run `gbrain init`.';
+        let msg: string;
+        if (fastMode && dbSource) {
+          msg = `Skipping DB checks (--fast mode, URL present from ${dbSource})`;
+        } else if (!fastMode && dbSource) {
+          msg = `Could not connect to configured DB (URL from ${dbSource}); filesystem checks only`;
+        } else {
+          msg = 'No database configured (filesystem checks only). Set GBRAIN_DATABASE_URL or run `gbrain init`.';
+        }
+        checks.push({ name: 'connection', status: 'warn', message: msg });
       }
-      checks.push({ name: 'connection', status: 'warn', message: msg });
+      // URL-only + engine-free checks still run on a dead DB — that is the
+      // point of them.
+      const pgbouncer = await pgbouncerPrepareCheck();
+      if (pgbouncer) checks.push(pgbouncer);
+      const recurrence = dbRepairRecurrenceCheck();
+      if (recurrence) checks.push(recurrence);
     }
     // Early return: caller renders the partial check list + decides exit code.
     // Pre-v0.39 this site called outputResults + process.exit directly; the
@@ -1832,14 +1884,30 @@ export async function buildChecks(
   // heartbeat the binary looks hung when stdout is piped).
   progress.start('doctor.db_checks');
 
+  // 3a. PgBouncer / prepared-statement compatibility — HOISTED above the
+  // connection check because it is URL-only (no round-trip) and must still
+  // run when the connection below fails.
+  progress.heartbeat('pgbouncer_prepare');
+  {
+    const pgbouncer = await pgbouncerPrepareCheck();
+    if (pgbouncer) checks.push(pgbouncer);
+  }
+
+  // 3b. db-repair recurrence — engine-free receipts read; runs regardless of
+  // connection state (repeat repairs are most interesting when the DB is sick).
+  {
+    const recurrence = dbRepairRecurrenceCheck();
+    if (recurrence) checks.push(recurrence);
+  }
+
   // 3. Connection
   progress.heartbeat('connection');
   try {
     const stats = await engine.getStats();
     checks.push({ name: 'connection', status: 'ok', message: `Connected, ${stats.page_count} pages` });
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    checks.push({ name: 'connection', status: 'fail', message: msg });
+    // db-availability loop (2c): classified + redacted, with the fix hint.
+    checks.push(classifiedConnectionCheck(e));
     progress.finish();
     // Early return: caller renders the partial check list + decides exit code.
     // Pre-v0.39 this site called outputResults + process.exit directly; the
@@ -1856,43 +1924,15 @@ export async function buildChecks(
   progress.heartbeat('pages_upsert_arbiter');
   checks.push(await pagesUpsertArbiterCheck(engine));
 
-  // 4b. PgBouncer / prepared-statement compatibility.
-  // URL-only inspection — no DB roundtrip — so this is cheap and works
-  // regardless of whether the caller is the module singleton or a
-  // worker-instance engine.
-  progress.heartbeat('pgbouncer_prepare');
-  try {
-    const { resolvePrepare } = await import('../core/db.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const config = loadConfig();
-    const url = config?.database_url || '';
-    const prepare = resolvePrepare(url);
-    if (prepare === false) {
-      checks.push({
-        name: 'pgbouncer_prepare',
-        status: 'ok',
-        message: 'Prepared statements disabled (PgBouncer-safe)',
-      });
-    } else {
-      try {
-        const parsed = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://'));
-        if (parsed.port === '6543') {
-          checks.push({
-            name: 'pgbouncer_prepare',
-            status: 'warn',
-            message:
-              'Port 6543 (PgBouncer transaction mode) detected but prepared statements are enabled. ' +
-              'This causes "prepared statement does not exist" errors under concurrent load. ' +
-              'Fix: unset GBRAIN_PREPARE (or set =false), or add ?prepare=false to the connection URL.',
-          });
-        }
-      } catch {
-        // URL parse failure — skip, nothing actionable
-      }
-    }
-  } catch {
-    // best-effort; never fail doctor on this check
+  // 4b. pglite_scale — engine-fit signal: makes the init-time 1000-file
+  // Supabase suggestion re-evaluable for the life of the brain.
+  progress.heartbeat('pglite_scale');
+  {
+    const scale = await pgliteScaleCheck(engine);
+    if (scale) checks.push(scale);
   }
+  // (pgbouncer_prepare moved ABOVE the connection check — URL-only, must
+  // survive a dead DB.)
 
   // 5. RLS — check ALL public tables, not just gbrain's own.
   // Any table without RLS in the public schema is a security risk:
@@ -1994,75 +2034,49 @@ export async function buildChecks(
   try {
     const version = await engine.getConfig('version');
     schemaVersion = parseInt(version || '0', 10);
+    checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION) });
+
+    // 6b. Schema columns — gbrain#4421/#4425. The ledger counter alone can
+    // lie: a PgBouncer transaction-mode pooler can swallow an ALTER TABLE
+    // while the migration runner still advances config.version, leaving the
+    // ledger "current" over a physically narrower table. The read-only column
+    // diff below does the same live-column check `gbrain init --migrate-only`
+    // already self-heals with — but a plain diagnostic run never issues DDL.
     if (schemaVersion > LATEST_VERSION) {
-      // Forward skew: another node migrated the shared DB past what this
-      // client knows (multi-node brain, hub + spokes on one Postgres). This
-      // client will read/write tables, columns, and indexes it doesn't know
-      // about — more dangerous than backward skew, which at least blocks on
-      // the next `apply-migrations`. See #2036. Takes precedence over the
-      // column diff below: an ahead DB is a superset of this client's
-      // expected columns, and "upgrade this client" is the real fix.
-      checks.push({
-        name: 'schema_version',
-        status: 'warn',
-        message: `Version ${schemaVersion} is AHEAD of this client's latest known version (${LATEST_VERSION}). ` +
-                 `Another node migrated this DB past what this client knows — upgrade this client before writing.`,
-      });
+      // Forward skew (schemaVersionHealth warns AHEAD above): an ahead DB is
+      // a superset of this client's expected columns — the diff below would
+      // only mislead. "Upgrade this client" is the real fix; skip the diff.
     } else if (schemaVersion >= LATEST_VERSION) {
-      // #4421: the ledger counter alone can lie — a PgBouncer transaction-
-      // mode pooler can swallow an ALTER TABLE while the migration runner
-      // still advances config.version, leaving the ledger "current" over a
-      // physically narrower table. Add a READ-ONLY column diff via
-      // detectMissingColumns (#4425 — the detection half of
-      // schema-verify.ts's verifySchema, no self-heal): when live columns
-      // are missing, downgrade to warn naming them with the migrate-only
-      // re-run hint. Diff failure is best-effort — the ledger ok stands.
-      // Dynamic import is deliberate: the positional source guard in
-      // test/doctor-schema-column-diff.test.ts pins that the diff consult
-      // lives INSIDE this ledger-current branch.
-      let columnDiffWarned = false;
+      // Ledger-current branch. Dynamic import is deliberate: the positional
+      // source guard in test/doctor-schema-column-diff.test.ts pins that the
+      // diff consult lives INSIDE this branch (a behind DB is EXPECTED to
+      // miss columns from unapplied migrations — schema_version's own warn
+      // covers that already, so the diff would only mislead there too).
+      progress.heartbeat('schema_columns');
       try {
         const { detectMissingColumns } = await import('../core/schema-verify.ts');
-        const diff = await detectMissingColumns(engine);
-        if (diff.missing.length > 0) {
-          const sample = diff.missing.slice(0, 5).map(m => `${m.table}.${m.column}`).join(', ');
-          const more = diff.missing.length > 5 ? ` (+${diff.missing.length - 5} more)` : '';
+        const detected = await detectMissingColumns(engine);
+        if (detected.missing.length === 0) {
+          checks.push({ name: 'schema_columns', status: 'ok', message: `${detected.checked} column(s) verified against live schema` });
+        } else {
+          const cols = detected.missing.map(m => `${m.table}.${m.column}`).join(', ');
           checks.push({
-            name: 'schema_version',
+            name: 'schema_columns',
             status: 'warn',
             message:
-              `Version ${schemaVersion} (latest: ${LATEST_VERSION}) but ${diff.missing.length} expected column(s) ` +
-              `are missing from the live schema: ${sample}${more}. The migration ledger advanced past a swallowed ` +
-              `ALTER TABLE (PgBouncer transaction-mode is the usual cause). Fix: gbrain init --migrate-only ` +
-              `(runs the schema self-heal); if it persists, connect directly to Postgres (not the pooler) first.`,
+              `${detected.missing.length} column(s) missing despite schema_version reporting up to date: ${cols}. ` +
+              `The migration ledger advanced past a swallowed ALTER TABLE (PgBouncer transaction-mode is the ` +
+              `usual cause). Fix: gbrain init --migrate-only (runs the schema self-heal); if it persists, ` +
+              `connect directly to Postgres (not the pooler) first.`,
           });
-          columnDiffWarned = true;
         }
-      } catch { /* read-only diff is best-effort; ledger ok stands */ }
-      if (!columnDiffWarned) {
-        checks.push({ name: 'schema_version', status: 'ok', message: `Version ${schemaVersion} (latest: ${LATEST_VERSION})` });
+      } catch {
+        checks.push({ name: 'schema_columns', status: 'warn', message: 'Could not verify live schema columns' });
       }
-    } else if (schemaVersion === 0) {
-      checks.push({
-        name: 'schema_version',
-        status: 'fail',
-        message: `No schema version recorded. Migrations never ran. Fix: gbrain apply-migrations --yes. ` +
-                 `If you installed via 'bun install -g github:...', see https://github.com/garrytan/gbrain/issues/218.`,
-      });
-    } else {
-      checks.push({
-        name: 'schema_version',
-        status: 'warn',
-        message: `Version ${schemaVersion}, latest is ${LATEST_VERSION}. Fix: gbrain apply-migrations --yes`,
-      });
     }
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
-
-  // Note: the #4421/#4425 live-column drift diff (detectMissingColumns) is
-  // wired INSIDE the schema_version ledger-current branch above — one
-  // column-drift wiring, not a separate check.
 
   // Note: we intentionally DO NOT fail on "schema v7+ but no preferences.json".
   // That's a valid fresh-install state after `gbrain init` — the migration
@@ -2518,7 +2532,9 @@ export async function buildChecks(
       // warn about coverage on pages the rest of the system treats as gone.
       // buildGazetteer (src/core/by-mention.ts) already filters this way, so
       // without it the two disagree about whether entity pages exist at all.
-      "SELECT COUNT(*)::int AS count FROM pages WHERE deleted_at IS NULL AND type IN ('entity', 'person', 'company', 'organization')",
+      // #4280: quarantined shells are excluded too — parity with onboard's
+      // VISIBLE_ENTITY_PREDICATE, which never counted them.
+      `SELECT COUNT(*)::int AS count FROM pages WHERE deleted_at IS NULL AND type IN ('entity', 'person', 'company', 'organization') AND ${quarantineFilterFragment('pages')}`,
     ))[0]?.count ?? 0;
 
     // Compute coverage against eligible entities only — exclude test fixtures
@@ -2536,6 +2552,7 @@ export async function buildChecks(
         SELECT id FROM pages
         WHERE deleted_at IS NULL
           AND type IN ('entity','person','company','organization')
+          AND ${quarantineFilterFragment('pages')}
           AND slug NOT LIKE 'tools/gbrain/test/%'
           AND slug <> 'templates/new-person'
       )
@@ -3952,6 +3969,13 @@ export async function buildChecks(
     // default (false) — that's the trust-boundary preservation Codex
     // P0-1 flagged.
     checks.push(await checkSyncFreshness(engine, { localOnly: true }));
+    // Monthly backup-coverage check (same D4 trust stance as sync_freshness:
+    // localOnly:true probes git; the remote path stays a cache-only reader).
+    progress.heartbeat('backup_coverage');
+    {
+      const { checkBackupCoverage } = await import('./doctor/checks/backup-coverage.ts');
+      checks.push(await checkBackupCoverage(engine, { localOnly: true }));
+    }
     // v0.41.19.0 (Issue 5): sync --all consolidation nudge.
     progress.heartbeat('sync_consolidation');
     checks.push(await checkSyncConsolidation(engine));
@@ -4008,6 +4032,14 @@ export async function buildChecks(
     // #2194 fix #5 — autopilot fan-out vs worker concurrency mismatch.
     progress.heartbeat('autopilot_fanout_concurrency');
     checks.push(await computeAutopilotFanoutConcurrencyCheck(engine));
+    // v0.47 google connector: credential-vault health incl. the day-6
+    // Testing-mode expiry warning (zero-network; live probes live in
+    // `gbrain google status`).
+    progress.heartbeat('google_oauth');
+    {
+      const { computeGoogleOauthCheck } = await import('./doctor/checks/google-oauth.ts');
+      checks.push(await computeGoogleOauthCheck());
+    }
     // v0.40.4 graph_signals_coverage — global inbound-link density when
     // graph_signals is enabled in the active mode bundle.
     progress.heartbeat('graph_signals_coverage');
@@ -4110,6 +4142,9 @@ export async function runDoctor(
   engine: BrainEngine | null,
   args: string[],
   dbSource?: DbUrlSource,
+  // db-availability loop: the connect error from the CLI's dead-DB fallback,
+  // threaded to buildChecks for the synthesized `connection` check (2c-bis).
+  connectError?: unknown,
 ) {
   const jsonOutput = args.includes('--json');
   const locksMode = args.includes('--locks');
@@ -4122,8 +4157,8 @@ export async function runDoctor(
     return;
   }
 
-  const checks = await buildChecks(engine, args, dbSource);
-  const hasFail = outputResults(checks, jsonOutput);
+  const checks = await buildChecks(engine, args, dbSource, connectError);
+  const hasFail = outputResults(checks, jsonOutput, { engine: engine?.kind, db_url_source: dbSource ?? null });
 
   // Features teaser (non-JSON, non-failing only)
   if (!jsonOutput && !hasFail && engine) {
@@ -4182,10 +4217,14 @@ function printAutoFixReport(report: AutoFixReport, dryRun: boolean, jsonOutput: 
   if (dryRun && n > 0) console.log('\nRun without --dry-run to apply.');
 }
 
-function outputResults(checks: Check[], json: boolean): boolean {
+function outputResults(
+  checks: Check[],
+  json: boolean,
+  extras?: { engine?: 'postgres' | 'pglite'; db_url_source?: DbUrlSource | null },
+): boolean {
   // v0.41.19.0 — render goes through computeDoctorReport so the human
   // output, JSON output, and remote MCP envelope all share one shape.
-  const report = computeDoctorReport(checks);
+  const report = computeDoctorReport(checks, extras);
   const hasFail = report.status === 'unhealthy';
   const hasWarn = report.status === 'warnings';
   const score = report.health_score;

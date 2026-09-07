@@ -18,7 +18,15 @@ export const ollama: Recipe = {
         'nomic-embed-text',
         'mxbai-embed-large',
         'all-minilm',
+        // Real Ollama library tags (verified 2026-08-08): the family is
+        // published as `qwen3-embedding` with size tags, and Arctic Embed
+        // 2.0 as `snowflake-arctic-embed2`. The earlier `qwen3-embed-8b` /
+        // HF-style `snowflake-arctic-embed-l-v2` spellings stay listed so
+        // brains initialized with them keep validating, but they never
+        // matched a pullable Ollama tag.
+        'qwen3-embedding:8b',
         'qwen3-embed-8b',
+        'snowflake-arctic-embed2',
         'snowflake-arctic-embed-l-v2',
         'bge-m3',
       ],
@@ -33,7 +41,9 @@ export const ollama: Recipe = {
         'nomic-embed-text': 768,
         'mxbai-embed-large': 1024,
         'all-minilm': 384,
+        'qwen3-embedding:8b': 4096,
         'qwen3-embed-8b': 4096,
+        'snowflake-arctic-embed2': 1024,
         'snowflake-arctic-embed-l-v2': 1024,
         'bge-m3': 1024,
       },
@@ -60,6 +70,25 @@ export const ollama: Recipe = {
       supports_subagent_loop: false,
       supports_prompt_cache: false,
       supports_structured_outputs: false,
+      // Reasoning-by-default local families spend output budget on internal
+      // reasoning before emitting answer text, and Ollama bills it against
+      // `max_tokens` — so callers that size output caps must grant headroom
+      // (same contract as DeepSeek v4, gbrain#4172). Without this, a 4000-token
+      // default is consumed entirely by reasoning and the caller gets EMPTY
+      // content with finish_reason "length". Verified on qwen38-27b:latest:
+      // max_tokens=16 returned "" (16 reasoning tokens), max_tokens=600
+      // returned "PONG". Model ids are user-managed, so this is a predicate
+      // over the known reasoning families rather than a recipe-wide boolean —
+      // non-reasoning local models (qwen2.5-coder, llama3.x, mistral) keep the
+      // conservative default. `qwen3` is matched with a boundary so the
+      // qwen2.5-* tags can never be swallowed by it, and `qwen3-coder` (the
+      // instruct-only Qwen3 variant, no thinking mode) is excluded by
+      // lookahead. `phi4-mini-reasoning` is a reasoning model and matches
+      // alongside `phi4-reasoning`.
+      thinking_by_default: (modelId: string) =>
+        /^(?:qwen3[0-9]*(?!-coder)(?:[.\-:]|$)|deepseek-r[0-9]|gpt-oss(?:[.\-:]|$)|magistral(?:[.\-:]|$)|phi[0-9]+(?:-mini)?-reasoning)/i.test(
+          modelId,
+        ),
       // Provider-wide routing ceiling only; Ollama still enforces each loaded
       // model's actual context window at request time.
       max_context_tokens: 128_000,

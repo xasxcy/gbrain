@@ -56,6 +56,7 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
  */
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
+  'atom_provenance_drift',
   'brain_score',
   'calibration_freshness',
   'child_table_orphans',
@@ -89,6 +90,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_health',
   'frontmatter_integrity',
   'malformed_path_pages',
+  'memory_writeback',
   'grade_confidence_drift',
   'graph_coverage',
   'graph_signals_coverage',
@@ -162,16 +164,20 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'bootstrap_harness_health',
   'bootstrap_hooks_heartbeat',
   'bootstrap_last_verify',
+  'memorable_relay_health',
+  'backup_coverage',
   'bootstrap_push_health',
   'bootstrap_durability_job',
   'bootstrap_runbook_skew',
   'bootstrap_serve_lock',
   'batch_retry_health',
   'brainstorm_health',
+  'connectors',
   'chat_fallback_chain_inert',
   'connection',
   'db_only_collector_collision',
   'federation_health',
+  'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
   'npm_squat',
@@ -180,6 +186,9 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  // db-availability loop: engine-fit + repair-recurrence signals.
+  'pglite_scale',
+  'db_repair_recurrence',
   'pglite_leftovers',
   'pgvector',
   'plugin_lane_collision',
@@ -212,6 +221,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cycle_phase_scope',
+  'default_source_local_path',
   'eval_capture',
   'minions_migration',
   'multi_source_drift',
@@ -220,6 +230,7 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   // coherence healed by `gbrain apply-migrations` (sibling of
   // timeline_dedup_index / schema_version).
   'pages_upsert_arbiter',
+  'schema_columns',
   'schema_pack_active',
   'schema_pack_consistency',
   'schema_pack_source_drift',

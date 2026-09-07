@@ -324,7 +324,7 @@ describe('wave-C review: splice-under-lock, never whole-file regeneration', () =
     // deletes the fence-owned fact rows.
     const fence = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug },
+      { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' },
       [fenceFact('Founded Widget-Co in 2017')],
     );
     expect(fence.inserted).toBe(1);
@@ -350,19 +350,25 @@ describe('wave-C review: splice-under-lock, never whole-file regeneration', () =
   test('bullet splices among existing bullets, not past a trailing facts fence', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'people/fence-placement';
+    // #4756: writeFactsToFence no longer produces this shape (a first fence
+    // now lands ABOVE the sentinel), but legacy pages written by older
+    // versions still carry a trailing below-sentinel fence — the splice must
+    // keep honoring the bullet boundary on them. Seed the legacy shape by
+    // hand.
     const body = [
       '---', 'title: T', 'type: note', '---', '',
       '# Body', '',
       '<!-- timeline -->', '',
       '## Timeline', '',
       '- **2026-07-01** | kickoff — Project kicked off.', '',
+      '## Facts', '',
+      '<!--- gbrain:facts:begin -->', '',
+      '| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |',
+      '|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|',
+      '| 1 | Fence row that must stay last | fact | 1.0 | world | medium | 2026-01-01 |  | test |  |',
+      '<!--- gbrain:facts:end -->', '',
     ].join('\n');
     const filePath = await seedPage(slug, body);
-    await writeFactsToFence(
-      engine,
-      { sourceId: 'default', localPath: brainDir, slug },
-      [fenceFact('Fence row that must stay last')],
-    );
 
     await addTimelineEntryOp.handler(makeCtx(), {
       slug,
@@ -390,7 +396,7 @@ describe('wave-C review: splice-under-lock, never whole-file regeneration', () =
     const [fenceRes, opRes] = await Promise.all([
       writeFactsToFence(
         engine,
-        { sourceId: 'default', localPath: brainDir, slug },
+        { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' },
         [fenceFact('Concurrent fence fact')],
       ),
       addTimelineEntryOp.handler(makeCtx(), {

@@ -44,11 +44,13 @@ import { loadWorkspaceAllowlist, matchesGlob, scanFiles, type SecretFinding } fr
 import { PUSH_DENY_GLOBS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses } from '../workspace-push.ts';
 import { FACTS_DEFAULT_VISIBILITY_KEY } from '../facts/visibility.ts';
 import { byteFloors } from './render.ts';
+import { CLAUDE_HOOK_EVENTS, GBRAIN_HOOK_MARKER_KEY, claudeUserSettingsPath } from './host-specs.ts';
 import { BOOTSTRAP_TEMPLATES, loadQuestionBank } from './assets.ts';
 import { readManifest, writeManifest } from './format.ts';
 import { status as interviewStatus } from './interview.ts';
 import { gitOriginUrl, hooksInstalled } from './status.ts';
 import { resolveSourceId } from '../source-resolver.ts';
+import { auditWritebackContract } from './contract.ts';
 import {
   ensureIpcSecret,
   resolveSocketPath,
@@ -271,6 +273,21 @@ function checkByteFloors(ws: string): VerifyCheck {
   }
 }
 
+/** A healthy retrieval surface without a same-turn write-back contract is a
+ * one-way memory: useful now, stale later. Fresh bootstrap renders this gate;
+ * the check catches pre-bootstrap/custom workspaces and points at the
+ * additive repair command rather than overwriting their AGENTS.md. */
+export function checkWritebackContract(ws: string): VerifyCheck {
+  const audit = auditWritebackContract(ws);
+  return audit.ok
+    ? { id: 'writeback_contract', ok: true, detail: audit.detail }
+    : {
+        id: 'writeback_contract',
+        ok: false,
+        detail: `${audit.detail}. Fix: run \`gbrain bootstrap contract --repair\` from the workspace (or pass --workspace explicitly).`,
+      };
+}
+
 /** Tracked files via git; falls back to the rendered file set + state/ when
  * the workspace is not (yet) a git repo. */
 function trackedWorkspaceFiles(ws: string): { files: string[]; via: 'git' | 'fallback' } {
@@ -352,29 +369,48 @@ function checkMcpJsonHygiene(ws: string): VerifyCheck {
   }
 }
 
-/** [D12 upgrade-path guard]: an event carried by BOTH hook files double-fires
- * every turn (possible when the committed carrier arrives via git pull onto a
- * machine whose local file predates the dedupe-aware writers). Warn-only. */
-function checkHookCarrierOverlap(ws: string): VerifyCheck {
+/** [D12 upgrade-path guard, #4585]: an event carried by MORE THAN ONE hook
+ * carrier double-fires every turn — Claude Code merges hook scopes, so the
+ * carriers compared are ALL the files that can inject a gbrain hook for this
+ * workspace: user-scope settings.json (what `bootstrap harness` writes) plus
+ * workspace-scope .claude/settings.json and .claude/settings.local.json
+ * (what `bootstrap hooks` writes). Same-scope overlap arises when the
+ * committed carrier arrives via git pull onto a machine whose local file
+ * predates the dedupe-aware writers; cross-scope overlap arises when both
+ * installers ran on the same box. Warn-only. Exported for tests
+ * (userSettingsPath injectable). */
+export function checkHookCarrierOverlap(
+  ws: string,
+  userSettingsPath = claudeUserSettingsPath(),
+): VerifyCheck {
   const id = 'hook_carrier_overlap';
   try {
-    const events = (['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] as const).filter((event) => {
-      const has = (rel: string): boolean => {
+    const carriers: Array<{ label: string; path: string }> = [
+      { label: 'user-scope settings.json', path: userSettingsPath },
+      { label: '.claude/settings.json', path: join(ws, '.claude', 'settings.json') },
+      { label: '.claude/settings.local.json', path: join(ws, '.claude', 'settings.local.json') },
+    ];
+    const overlaps: string[] = [];
+    for (const event of CLAUDE_HOOK_EVENTS) {
+      const hits = carriers.filter(({ path }) => {
         try {
-          const parsed = JSON.parse(readFileSync(join(ws, rel), 'utf8')) as { hooks?: Record<string, unknown> };
+          const parsed = JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> };
           const groups = parsed?.hooks?.[event];
-          return Array.isArray(groups) && JSON.stringify(groups).includes('"_gbrain"');
+          return Array.isArray(groups) && JSON.stringify(groups).includes(`"${GBRAIN_HOOK_MARKER_KEY}"`);
         } catch {
           return false;
         }
-      };
-      return has(join('.claude', 'settings.json')) && has(join('.claude', 'settings.local.json'));
-    });
-    if (events.length === 0) return { id, ok: true, detail: 'no event fires from both hook carriers' };
+      });
+      if (hits.length >= 2) overlaps.push(`${event} (${hits.map((h) => h.label).join(' + ')})`);
+    }
+    if (overlaps.length === 0) return { id, ok: true, detail: 'no event fires from more than one hook carrier' };
     return {
       id,
       ok: true, // warn-only self-repair channel
-      detail: `WARN: ${events.join(', ')} fire from BOTH .claude/settings.json and settings.local.json (double-fire) — run \`gbrain bootstrap hooks --repair\` to dedupe`,
+      detail:
+        `WARN: double-fire — ${overlaps.join('; ')} carry a gbrain hook in more than one carrier. ` +
+        'Workspace-scope duplication: run `gbrain bootstrap hooks --repair`. ' +
+        'User-scope + workspace overlap: remove one installer\'s wiring (`gbrain bootstrap harness --remove` or `gbrain bootstrap uninstall`), then re-run the one you keep.',
     };
   } catch (e) {
     return { id, ok: true, detail: `carrier overlap probe failed (${(e as Error).message})` };
@@ -1093,6 +1129,7 @@ export async function verifyWorkspace(
 
   checks.push(checkTokenSweep(ws));
   checks.push(checkByteFloors(ws));
+  checks.push(checkWritebackContract(ws));
   checks.push(checkSecretScan(ws));
   checks.push(checkDenyGlobs(ws));
   checks.push(await checkRepoPrivacy(ws));

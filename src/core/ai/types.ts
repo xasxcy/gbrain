@@ -320,6 +320,8 @@ export interface ChatTouchpoint {
    * known to honor it.
    */
   supports_structured_outputs?: boolean;
+  /** Per-model overrides for providers whose chat models have different context windows. */
+  model_context_tokens?: Record<string, number>;
   max_context_tokens?: number;
   cost_per_1m_input_usd?: number;
   cost_per_1m_output_usd?: number;
@@ -465,7 +467,7 @@ export interface Recipe {
   };
   /**
    * v0.32 (D13=A): optional runtime readiness check for local-server
-   * recipes (ollama, llama-server, future lmstudio-recipe). Returns
+   * recipes (ollama, llama-server, lmstudio). Returns
    * `ready: false` when the local endpoint isn't reachable, with a `hint`
    * the wizard / doctor can surface.
    *
@@ -495,6 +497,13 @@ export interface AIGatewayConfig {
    * Allows brains using OpenAI for text to use Voyage for image embeddings.
    */
   embedding_multimodal_model?: string;
+  /**
+   * Separate model for image OCR (e.g. "openai:gpt-4o-mini"). When set,
+   * generateOcrText() routes to this model instead of expansion_model.
+   * A direct "provider:model" string like embedding_multimodal_model —
+   * deliberately never models.tier-resolved (#4107).
+   */
+  embedding_image_ocr_model?: string;
   /** Current expansion model as "provider:modelId". */
   expansion_model?: string;
   /** Default chat model for `gateway.chat()` callers (subagent default). */

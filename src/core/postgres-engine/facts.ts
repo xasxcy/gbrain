@@ -16,6 +16,16 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { tryParseEmbedding } from '../utils.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { resolveSupersededByRow, isInt4RowRef, type SupersedeTarget } from '../facts/supersede-resolve.ts';
+import { escapeLikePattern } from '../cjk.ts';
+
+/**
+ * SQL-side substring filter (before limit) — a client-side post-limit grep
+ * silently misses matches outside the newest-N window on high-cardinality
+ * entities. Parity with the pglite engine's `_listFacts`.
+ */
+function grepPattern(opts: FactListOpts | undefined): string | null {
+  return (opts?.grep && opts.grep.trim()) ? '%' + escapeLikePattern(opts.grep.trim()) + '%' : null;
+}
 
 /** Narrow slice of PostgresEngine the facts operations use. */
 export interface PgFactsDeps {
@@ -310,17 +320,25 @@ export async function listFactsByEntity(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const excludeAuditRows = opts?.excludeAuditRows === true;
+    const grepPat = grepPattern(opts);
+    // WP5 TTL honesty: activeOnly reads exclude validity-lapsed rows
+    // (valid_until <= now()) at read time — exact-time, zero-maintenance.
+    // History readers pass activeOnly:false and stay unfiltered. Parity with
+    // the pglite engine's _listFacts predicate.
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND entity_slug = ${entitySlug}
-        ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${activeOnly ? sql`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
+        ${grepPat ? sql`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sql``}
       ORDER BY valid_from DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -337,20 +355,24 @@ export async function listFactsSince(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const entitySlug = opts?.entitySlug ?? null;
     const eventTime = opts?.eventTime === true;
     const excludeAuditRows = opts?.excludeAuditRows === true;
+    const grepPat = grepPattern(opts);
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND ${eventTime ? sql`COALESCE(valid_from, created_at)` : sql`created_at`} >= ${since}
         ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
-        ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${activeOnly ? sql`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
+        ${grepPat ? sql`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sql``}
       ORDER BY ${eventTime ? sql`COALESCE(valid_from, created_at)` : sql`created_at`} DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -367,17 +389,21 @@ export async function listFactsBySession(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const excludeAuditRows = opts?.excludeAuditRows === true;
+    const grepPat = grepPattern(opts);
     const rows = await sql<FactRowSqlShape[]>`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
-        ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${activeOnly ? sql`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
+        ${grepPat ? sql`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sql``}
       ORDER BY created_at DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -413,11 +439,18 @@ export async function listSupersessions(
 
 export async function countUnconsolidatedFacts(deps: PgFactsDeps, source_id: string): Promise<number> {
     const sql = deps.sql;
+    // Audit checkpoint rows never set consolidated_at, so without the source
+    // exclusion each one counts as forever-pending consolidation backlog.
+    // Validity-lapsed rows are excluded too: the consolidator reads via
+    // listFactsByEntity(activeOnly), which filters them at read time — counting
+    // them here would report a backlog the consolidator can never drain.
     const rows = await sql<{ count: number }[]>`
       SELECT COUNT(*)::int AS count FROM facts
       WHERE source_id = ${source_id}
         AND consolidated_at IS NULL
         AND expired_at IS NULL
+        AND (valid_until IS NULL OR valid_until > now())
+        AND source != ALL(${AUDIT_ROW_SOURCES}::text[])
     `;
     return Number(rows[0]?.count ?? 0);
   }
@@ -431,6 +464,8 @@ export async function findCandidateDuplicates(
   ): Promise<FactRow[]> {
     const sql = deps.sql;
     const k = Math.min(Math.max(opts?.k ?? 5, 1), 20);
+    // Validity-lapsed rows are not dedup candidates: a re-stated fact after
+    // its valid_until lapses re-inserts fresh (WP5 read-time TTL honesty).
     if (opts?.embedding) {
       const lit = toPgVectorLiteral(opts.embedding);
       const rows = await sql<FactRowSqlShape[]>`
@@ -438,6 +473,7 @@ export async function findCandidateDuplicates(
         WHERE source_id = ${source_id}
           AND entity_slug = ${entitySlug}
           AND expired_at IS NULL
+          AND (valid_until IS NULL OR valid_until > now())
           AND embedding IS NOT NULL
         ORDER BY embedding <=> ${sql.unsafe(`'${lit}'::vector`)}
         LIMIT ${k}
@@ -449,6 +485,7 @@ export async function findCandidateDuplicates(
       WHERE source_id = ${source_id}
         AND entity_slug = ${entitySlug}
         AND expired_at IS NULL
+        AND (valid_until IS NULL OR valid_until > now())
       ORDER BY created_at DESC, id DESC
       LIMIT ${k}
     `;
@@ -470,7 +507,10 @@ export async function findTrajectory(deps: PgFactsDeps, opts: import('../engine.
     const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
     const sourceIds = useArray ? opts.sourceIds! : null;
     const sourceId = opts.sourceId ?? 'default';
-    const remoteFilter = opts.remote === true;
+    // Fail-closed (CV6 / v0.26.9 F7b posture): anything not strictly local
+    // is remote. An omitted flag (cast-bypassed context, caller that forgot
+    // to thread it) degrades to world-only reads, never to a private-fact leak.
+    const remoteFilter = opts.remote !== false;
 
     // Source-scope predicate: array path (federated) wins over scalar.
     // Engine.ts contract: returns chronological points; regressions +
@@ -525,22 +565,28 @@ export async function findTrajectory(deps: PgFactsDeps, opts: import('../engine.
 
 export async function getFactsHealth(deps: PgFactsDeps, source_id: string): Promise<FactsHealth> {
     const sql = deps.sql;
+    // WP5 TTL honesty: validity-lapsed rows (valid_until <= now(), expired_at
+    // NULL) count as expired-style, never active — matches the read-time
+    // filtering on every active recall path. active + expired still
+    // partitions the table exactly.
     const totals = await sql<Array<{
       total_active: bigint; total_today: bigint; total_week: bigint;
       total_expired: bigint; total_consolidated: bigint;
     }>>`
       SELECT
-        COUNT(*) FILTER (WHERE expired_at IS NULL)                                     AS total_active,
-        COUNT(*) FILTER (WHERE expired_at IS NULL AND created_at > now() - interval '24 hours') AS total_today,
-        COUNT(*) FILTER (WHERE expired_at IS NULL AND created_at > now() - interval '7 days')   AS total_week,
-        COUNT(*) FILTER (WHERE expired_at IS NOT NULL)                                 AS total_expired,
+        COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()))                                     AS total_active,
+        COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND created_at > now() - interval '24 hours') AS total_today,
+        COUNT(*) FILTER (WHERE expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) AND created_at > now() - interval '7 days')   AS total_week,
+        COUNT(*) FILTER (WHERE expired_at IS NOT NULL OR (valid_until IS NOT NULL AND valid_until <= now()))                            AS total_expired,
         COUNT(*) FILTER (WHERE consolidated_at IS NOT NULL)                            AS total_consolidated
       FROM facts WHERE source_id = ${source_id}
     `;
     const top = await sql<Array<{ entity_slug: string; count: bigint }>>`
       SELECT entity_slug, COUNT(*) AS count
       FROM facts
-      WHERE source_id = ${source_id} AND expired_at IS NULL AND entity_slug IS NOT NULL
+      WHERE source_id = ${source_id} AND expired_at IS NULL
+        AND (valid_until IS NULL OR valid_until > now())
+        AND entity_slug IS NOT NULL
       GROUP BY entity_slug
       ORDER BY count DESC, entity_slug ASC
       LIMIT 5

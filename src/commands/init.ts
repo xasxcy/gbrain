@@ -1,3 +1,4 @@
+import { isZeroEntropyModel } from '../core/ai/defaults.ts';
 import { execSync } from 'child_process';
 import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -111,8 +112,46 @@ export async function runInit(args: string[]) {
     nonInteractive: isNonInteractive,
   });
 
+  // db-availability loop (5a): Postgres-first ladder for agent-harness
+  // installs. Explicit opt-in flag — the zero-config `gbrain init` default
+  // stays PGLite (owner decision; the preference lives in the plugin lane).
+  if (args.includes('--prefer-postgres')) {
+    const { runPreferPostgresLadder } = await import('./init-prefer-postgres.ts');
+    return runPreferPostgresLadder({
+      jsonOutput,
+      apiKey,
+      customPath,
+      aiOpts,
+      schemaPack,
+      skipEmbedCheck,
+      allowDocker: args.includes('--allow-docker'),
+      allowCreateDb: args.includes('--allow-create-db'),
+      localPostgres: args.includes('--local-postgres'),
+    });
+  }
+
+  // #3753: a --force re-init with NO explicit engine choice preserves the
+  // configured engine — the D5 persisted-config-wins rule extended to the
+  // engine field. Pre-fix, the PGLite default branch below swallowed a
+  // postgres config: following the deferred-setup hint verbatim
+  // (`gbrain init --force --embedding-model ...`) silently rewrote
+  // config.json to engine=pglite, orphaning the postgres data behind a
+  // config that no longer pointed at it. Switching engines stays available
+  // by saying so (--pglite / --supabase / --url). loadConfigFileOnly, NOT
+  // loadConfig: a transient env DATABASE_URL must not count as a configured
+  // engine here (CDX2-7); the env plane keeps its existing precedence in
+  // the non-interactive branch below.
+  let preservedPostgresUrl: string | null = null;
+  if (isForce && !isPGLite && !isSupabase && !manualUrl) {
+    const fileCfg = loadConfigFileOnly();
+    if (fileCfg?.engine === 'postgres' && fileCfg.database_url) {
+      preservedPostgresUrl = fileCfg.database_url;
+      console.error('[init] Existing postgres engine preserved (pass --pglite to switch engines).');
+    }
+  }
+
   // Explicit PGLite mode
-  if (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive)) {
+  if (!preservedPostgresUrl && (isPGLite || (!isSupabase && !manualUrl && !isNonInteractive))) {
     // Smart detection: scan for .md files unless --pglite flag forces it
     if (!isPGLite && !isSupabase) {
       const fileCount = countMarkdownFiles(process.cwd());
@@ -142,10 +181,14 @@ export async function runInit(args: string[]) {
     const envUrl = effectiveEnvDatabaseUrl();
     if (envUrl) {
       databaseUrl = envUrl;
+    } else if (preservedPostgresUrl) {
+      databaseUrl = preservedPostgresUrl;
     } else {
       console.error('--non-interactive requires --url <connection_string> or GBRAIN_DATABASE_URL env var');
       process.exit(1);
     }
+  } else if (preservedPostgresUrl) {
+    databaseUrl = preservedPostgresUrl;
   } else {
     databaseUrl = await supabaseWizard();
   }
@@ -163,6 +206,11 @@ const INIT_BOOLEAN_FLAGS = new Set([
   '--json',
   '--no-embedding',
   '--skip-embed-check',
+  // db-availability loop (5a): Postgres-first ladder for harness installs.
+  '--prefer-postgres',
+  '--allow-docker',
+  '--allow-create-db',
+  '--local-postgres',
 ]);
 
 const INIT_VALUE_FLAGS = new Set([
@@ -557,24 +605,27 @@ function printNoEmbeddingProviderHint(typos: Array<{ userSet: string; suggested:
 }
 
 /**
- * v0.46.3: voyage-keyed installs (any picked embedding provider) get the
- * recommended reranker written as EXPLICIT per-brain config — the mode-bundle
- * reranker default stays on the sunsetting legacy provider until the
- * September removal (split-default), so without this write a fresh voyage
- * brain would resolve a reranker whose key it doesn't have; keyed non-voyage
- * installs get explicit `search.reranker.enabled false` instead, and keyless
- * installs get no write. Never clobbers an existing explicit choice (re-init
- * preserves user config). Best-effort: reranking is fail-open, a missed
- * override degrades to no-rerank, never breaks init. Shared by the PGLite and
- * Postgres init paths (one edit site for the September bundle flip).
+ * v0.48.2: the mode-bundle reranker default IS `voyage:rerank-2.5` now
+ * (`DEFAULT_RERANKER_MODEL`), so a Voyage-keyed install needs NO reranker
+ * config row — an explicit `search.reranker.model` equal to the bundle value
+ * would only earn doctor's `search_mode` reset nag. Keyed NON-voyage installs
+ * (e.g. openai) still get explicit `search.reranker.enabled false`: they have
+ * no key for the default and silence beats a `no_key` audit row per process.
+ * KEYLESS installs deliberately get NO write — the documented keyless-recovery
+ * re-init must find virgin reranker config, and keyless brains take the
+ * no-embedding search path, which never reaches applyReranker. A ZeroEntropy
+ * embedding pick is just another keyed non-Voyage install now (its hosted
+ * reranker dies 2026-09-04; doctor names the migration). Never clobbers an existing explicit
+ * choice (re-init preserves user config). Best-effort: reranking is fail-open,
+ * a missed override degrades to no-rerank, never breaks init. Shared by the
+ * PGLite and Postgres init paths. Readiness comes from the same predicate
+ * doctor and `gbrain search modes` use (`reranker-readiness.ts`), fed the
+ * file-plane + process env (init cannot use the gateway or `loadConfig()`).
  */
 async function writeNewInstallRerankerDefault(
   engine: { getConfig(key: string): Promise<string | null>; setConfig(key: string, value: string): Promise<void> },
   resolvedModel: string | undefined,
 ): Promise<void> {
-  // Deliberate legacy setups keep the legacy bundle reranker (works until the
-  // provider's shutdown; warn-on-use covers it).
-  if (resolvedModel?.startsWith('zeroentropyai:')) return;
   try {
     // Never-clobber: an existing explicit reranker model OR enabled override
     // means the user already decided — leave both keys alone.
@@ -583,28 +634,33 @@ async function writeNewInstallRerankerDefault(
       engine.getConfig('search.reranker.enabled'),
     ]);
     if (existingModel || existingEnabled != null) return;
-    // Voyage key on either plane (env or ~/.gbrain/config.json) → point the
-    // reranker at it. Otherwise the bundle default still resolves the legacy
-    // sunset reranker, which this install has no key for and which dies on
-    // 2026-09-04 — disable it explicitly so fresh installs don't inherit a
-    // doomed fail-open (per-search timeout penalty after the shutdown).
-    const hasVoyageKey =
-      !!process.env.VOYAGE_API_KEY || !!loadConfigFileOnly()?.voyage_api_key;
-    if (resolvedModel?.startsWith('voyage:') || hasVoyageKey) {
-      const { NEW_INSTALL_DEFAULT_RERANKER_MODEL } = await import('../core/ai/defaults.ts');
-      await engine.setConfig('search.reranker.model', NEW_INSTALL_DEFAULT_RERANKER_MODEL);
-      console.log(`  Reranker: ${NEW_INSTALL_DEFAULT_RERANKER_MODEL} (same VOYAGE_API_KEY)`);
-    } else if (resolvedModel) {
-      // Keyed non-voyage install (e.g. openai): make the no-reranker state
-      // explicit instead of inheriting the legacy sunset bundle default this
-      // brain has no key for. KEYLESS installs deliberately get NO write —
-      // the documented recovery re-init must find virgin reranker config so
-      // its voyage override still lands (never-clobber would block it).
+    const { DEFAULT_RERANKER_MODEL } = await import('../core/ai/defaults.ts');
+    const { rerankerReadiness } = await import('../core/ai/reranker-readiness.ts');
+    const { mergedProviderEnv } = await import('../core/ai/provider-env.ts');
+    // Same plane the CLI hands the gateway: env > file > DB-plane provider keys
+    // (a `--force` re-init of a brain whose Voyage key lives only in the config
+    // table must not be classified keyless and locked into `enabled=false`).
+    const fileCfg = loadConfigFileOnly();
+    let mergedCfg = fileCfg;
+    try {
+      const { loadConfigWithEngine } = await import('../core/config.ts');
+      mergedCfg = await loadConfigWithEngine(engine as any, fileCfg);
+    } catch { mergedCfg = fileCfg; }
+    const readiness = rerankerReadiness(DEFAULT_RERANKER_MODEL, mergedProviderEnv(mergedCfg, process.env));
+    if (readiness.ready) {
+      // Nothing to write: the bundle default already resolves to it.
+      console.log(
+        `  Reranker: ${DEFAULT_RERANKER_MODEL} (mode-bundle default` +
+        `${readiness.requiredKey ? `; same ${readiness.requiredKey}` : ''})`,
+      );
+      return;
+    }
+    if (resolvedModel) {
+      const key = readiness.requiredKey ?? 'VOYAGE_API_KEY';
       await engine.setConfig('search.reranker.enabled', 'false');
       console.log(
-        '  Reranker: disabled (no VOYAGE_API_KEY — enable later: ' +
-        'gbrain config set search.reranker.enabled true && ' +
-        'gbrain config set search.reranker.model voyage:rerank-2.5)',
+        `  Reranker: disabled (no ${key} — enable later: export ${key}=… && ` +
+        'gbrain config set search.reranker.enabled true)',
       );
     }
   } catch {
@@ -1104,7 +1160,7 @@ function printResolvedAIChoice(
   // OR in the file plane, surface the setup gap at init time instead of
   // letting the first embed call blow up. After Lane C, file-plane
   // zeroentropy_api_key propagates through buildGatewayConfig.
-  if (resolved.embedding_model.startsWith('zeroentropyai:')) {
+  if (isZeroEntropyModel(resolved.embedding_model)) {
     const fileCfg = loadConfigFileOnly();
     if (!process.env.ZEROENTROPY_API_KEY && !fileCfg?.zeroentropy_api_key) {
       console.warn('');
@@ -1119,7 +1175,7 @@ function printResolvedAIChoice(
   }
 }
 
-async function initPGLite(opts: {
+export async function initPGLite(opts: {
   jsonOutput: boolean;
   apiKey: string | null;
   customPath: string | null;
@@ -1360,6 +1416,12 @@ async function initPGLite(opts: {
       const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
       await runInitNudge(engine);
 
+      // Ambient-writeback consent ask (WP8): personal brains only, fires
+      // once ever (sentinel), [AGENT]-relayed on non-TTY, never auto-enables,
+      // never blocks init.
+      const { runWritebackNudge } = await import('../core/onboard/writeback-nudge.ts');
+      await runWritebackNudge(engine, { context: 'init' });
+
       // The single primary action, last-on-screen.
       printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0, onPglite: true });
     }
@@ -1400,7 +1462,30 @@ function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boo
   );
 }
 
-async function initPostgres(opts: {
+/**
+ * db-availability loop (5a): typed failure for initPostgresCore. The ladder
+ * (`init --prefer-postgres`) treats it as RUNG FAILURE and falls through to
+ * the next rung; the initPostgres wrapper preserves the historical
+ * process.exit(1) for direct `--supabase`/`--url` invocations.
+ */
+export class InitPostgresFailure extends Error {
+  constructor(public reason: string, message?: string) {
+    super(message ?? reason);
+    this.name = 'InitPostgresFailure';
+  }
+}
+
+/** Exit-preserving wrapper — direct invocations keep their contract. */
+async function initPostgres(opts: Parameters<typeof initPostgresCore>[0]) {
+  try {
+    await initPostgresCore(opts);
+  } catch (e) {
+    if (e instanceof InitPostgresFailure) process.exit(1);
+    throw e;
+  }
+}
+
+export async function initPostgresCore(opts: {
   databaseUrl: string;
   jsonOutput: boolean;
   apiKey: string | null;
@@ -1435,7 +1520,7 @@ async function initPostgres(opts: {
       if (opts.jsonOutput) {
         console.log(JSON.stringify({ status: 'error', reason: 'preflight_failed', error: pre.error }));
       }
-      process.exit(1);
+      throw new InitPostgresFailure('preflight_failed', pre.error);
     }
     resolvedDim = pre.dim;
     resolvedModel = pre.model;
@@ -1520,8 +1605,13 @@ async function initPostgres(opts: {
           throw new Error('pgvector extension missing');
         }
       }
-    } catch {
-      // Non-fatal
+    } catch (e) {
+      // 5b: the deliberate throw above used to be EATEN here, so an install
+      // with no pgvector "succeeded" into initSchema and died later with a
+      // worse message. Rethrow it; only the pg_extension PROBE failure stays
+      // non-fatal (odd hosted PG catalogs — initSchema surfaces the truth).
+      if (e instanceof Error && e.message === 'pgvector extension missing') throw e;
+      // Non-fatal: probe-read failure only.
     }
 
     // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
@@ -1548,12 +1638,13 @@ async function initPostgres(opts: {
             requested_dims: resolvedDim,
           }));
         }
-        process.exit(1);
+        throw new InitPostgresFailure('embedding_dim_mismatch');
       }
     }
 
     console.log('Running schema migration...');
-    await engine.initSchema();
+    const { runInitSchemaWithRetry } = await import('../core/init-schema-retry.ts');
+    await runInitSchemaWithRetry(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion guardrail.
     if (resolvedDim) {
@@ -1569,7 +1660,7 @@ async function initPostgres(opts: {
           source: 'init',
           engineKind: 'postgres',
         }));
-        process.exit(1);
+        throw new InitPostgresFailure('post_init_dim_invariant');
       }
     }
 
@@ -1653,6 +1744,10 @@ async function initPostgres(opts: {
       // Fail-open; 3s wallclock cap. Skipped silently in non-TTY contexts.
       const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
       await runInitNudge(engine);
+
+      // Ambient-writeback consent ask (WP8) — same contract as the PGLite arm.
+      const { runWritebackNudge } = await import('../core/onboard/writeback-nudge.ts');
+      await runWritebackNudge(engine, { context: 'init' });
 
       // The single primary action, last-on-screen.
       printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0 });
@@ -1948,3 +2043,6 @@ NOTES
   - Existing config is preserved unless --force is passed.
 `.trim());
 }
+
+/** Test-only seam (v0.48.2): the reranker-default write is pure enough to unit-test with a stub engine. */
+export const _exports_for_test = { writeNewInstallRerankerDefault };
