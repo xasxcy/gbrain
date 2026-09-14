@@ -49,12 +49,12 @@ export interface ForkMigrationDeps {
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 146;
+export const FORK_MIGRATION_FLOOR = 150;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 146,
+      version: 150,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +72,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 147,
+      version: 151,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +99,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 148,
+      version: 152,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +128,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 149,
+      version: 153,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +163,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 150,
+      version: 154,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -222,7 +222,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 151,
+      version: 155,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -250,7 +250,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 152,
+      version: 156,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -291,7 +291,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 153,
+      version: 157,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -362,7 +362,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 154,
+      version: 158,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -438,6 +438,86 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           r.dv_col > 0 &&
           r.open_loops === 'open_loops' &&
           r.facts_idea > 0
+        );
+      },
+    },
+    {
+      version: 159,
+      name: 'repair_masked_upstream_146_149',
+      // Fifth instance of the masking class this file's header describes, from
+      // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
+      //
+      // Before that merge upstream's high-water was 145 and the fork occupied
+      // 146-154. Upstream then claimed 146-149 for its own migrations, so the
+      // fork renumbered to 150-158 — but renumbering only moves the fork's
+      // DEFINITIONS. runMigrations gates on a single high-water integer, and a
+      // brain stamped 154 by the FORK's old 146-154 has `m.version > current`
+      // false for upstream's real 146-149 forever: skipped silently, exactly
+      // as v151/v152/v153/v154 above describe.
+      //
+      // Verified read-only on the production brain before writing this
+      // (2026-09-14, counter still at 154 — this repair has not run yet):
+      //   146 extract_atoms_transcript_state table ....... MISSING
+      //   147 oauth_clients.allowed_operations column
+      //       + oauth_grant_audit table .................. MISSING
+      //   148 fact_withdrawals table ...................... MISSING
+      //   149 minion_jobs.submission_authority/
+      //       claim_generation columns ................... MISSING
+      //
+      // All four declare `idempotent: true`; none is excluded.
+      //
+      // ⚠️ v149 (minion_submission_authority) is not a plain additive DDL: it
+      // LOCKs minion_jobs and RAISEs if any row has status='active', because
+      // the protocol cutover it installs (submission_authority/claim_generation
+      // required on every insert/claim) breaks any worker still running the
+      // pre-cutover protocol. Verified 0 active minion_jobs at read time above,
+      // so replaying it here should succeed — but the migration's own gate is
+      // the real safety net if that has changed by the time this repair
+      // actually runs: it aborts the whole repair rather than half-applying.
+      //
+      // Same lookup-don't-copy shape as v151/v152/v153/v154: the DDL is read
+      // out of the live MIGRATIONS registry, so this can never drift from what
+      // it repairs.
+      idempotent: true,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [146, 147, 148, 149]) {
+          const masked = deps.allMigrations().find(m => m.version === version);
+          if (!masked) continue;
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 146/147/148/149 masked by the 2026-09-14 fork renumber\n',
+        );
+      },
+      // Exact postcondition for all four targets. Postgres-only shape check;
+      // PGLite reports its own catalog, so gate on the engine kind.
+      verify: async (engine) => {
+        if (engine.kind !== 'postgres') return true;
+        const rows = await engine.executeRaw<{
+          transcript_state: string | null;
+          oauth_col: number;
+          oauth_audit: string | null;
+          fact_withdrawals: string | null;
+          minion_col: number;
+        }>(
+          `SELECT
+             to_regclass('public.extract_atoms_transcript_state')::text AS transcript_state,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'oauth_clients' AND column_name = 'allowed_operations') AS oauth_col,
+             to_regclass('public.oauth_grant_audit')::text AS oauth_audit,
+             to_regclass('public.fact_withdrawals')::text AS fact_withdrawals,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'minion_jobs' AND column_name IN ('submission_authority', 'claim_generation')) AS minion_col`,
+        );
+        const r = rows[0];
+        if (!r) return false;
+        return (
+          r.transcript_state === 'extract_atoms_transcript_state' &&
+          r.oauth_col > 0 &&
+          r.oauth_audit === 'oauth_grant_audit' &&
+          r.fact_withdrawals === 'fact_withdrawals' &&
+          r.minion_col === 2
         );
       },
     },

@@ -1,7 +1,7 @@
 import type { BrainEngine, EmbedFailureSummary } from '../core/engine.ts';
 import { currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
-import { carryChunkMetadata, probeEmbedder } from '../core/embed-stale.ts';
+import { carryChunkMetadata, probeEmbedder, resolveProvenanceStamp, stampIfPageProvenanceComplete } from '../core/embed-stale.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { resolveMaxChunkTokens } from '../core/embedding-input-limit.ts';
 import { healOversizedPageChunks } from '../core/embed-oversize-heal.ts';
@@ -1947,6 +1947,7 @@ async function embedAllStale(
     return true;
   };
 
+  const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -2119,6 +2120,16 @@ async function embedAllStale(
         // is only known to be fully covered once every slice has committed.
         if (!pageHadFailure && pageStaleSkipped === 0) {
           const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
+          // 2026-09-14 upstream sync (#4825): stamp provenance from DB state,
+          // not batch alignment — the keyset drain has no page alignment, so
+          // a page straddling a batch/slice boundary is never wholly in one
+          // pass; the pass that lands its last chunk stamps it here. Ported
+          // from upstream v0.50.0.0 onto the fork's per-slice restructuring
+          // (persistStaleSlice already handled the chunk merge/upsert this
+          // fix originally sat next to; only the stamp call itself is new).
+          if (stamp) {
+            await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp));
+          }
           if (stale.length === existing.length) {
             // codex review round 2 finding #1: a restamp failure here is
             // AFTER vectors already committed successfully — it must not be

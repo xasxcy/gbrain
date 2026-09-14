@@ -142,30 +142,71 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
   }
 }
 
+/** Parses portable `ps -o etime=` output (`[[dd-]hh:]mm:ss`) to milliseconds. */
+export function parseEtimeToMs(etime: string): number | null {
+  const raw = etime.trim();
+  if (!raw) return null;
+
+  let days = 0;
+  let rest = raw;
+  const dash = rest.indexOf('-');
+  if (dash !== -1) {
+    days = Number(rest.slice(0, dash));
+    rest = rest.slice(dash + 1);
+    if (!Number.isInteger(days) || days < 0) return null;
+  }
+
+  const parts = rest.split(':');
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (!parts.every(part => part.length > 0 && /^\d+$/.test(part))) return null;
+
+  const numbers = parts.map(Number);
+  const [hours, minutes, seconds] =
+    numbers.length === 3 ? numbers : [0, numbers[0]!, numbers[1]!];
+
+  return (((days * 24 + hours!) * 60 + minutes!) * 60 + seconds!) * 1000;
+}
+
 /**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
  * us report an unrelated process's niceness (Codex #8). Returns null when
  * undeterminable — callers must NOT treat null as "reused".
+ *
+ * Elapsed time (`etime`) is zone-free. The previous `lstart` path printed a
+ * zoneless local timestamp in the libc zone while `Date.parse` read it in the
+ * runtime zone; the two can differ (bun test pins UTC without exporting TZ,
+ * `TZ=:/etc/localtime` resolves to UTC in ICU, and Bun does not propagate a
+ * runtime `process.env.TZ` change to the ps child), shifting every start by
+ * the offset and dropping live workers on UTC+ hosts (#4885). `etime` is used
+ * instead of Linux-only `etimes` so this also works on macOS.
  */
 function processStartMs(pid: number): number | null {
   try {
-    // `ps lstart` prints LOCAL time with no timezone suffix (ctime format:
-    // "Mon Aug 17 20:06:28 2026"). Date.parse() on a naive string like that
-    // assumes UTC, so on any non-UTC host the result is off by exactly the
-    // local UTC offset (~8h on a UTC+8 machine) — enough to blow through
-    // PID_REUSE_TOLERANCE_MS and make every live worker look "reused",
-    // silently emptying readWorkers(). Force TZ=UTC on the `ps` child so
-    // its output IS UTC, matching Date.parse()'s assumption.
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    // 2026-09-14 upstream sync: git's 3-way merge auto-resolved this whole
+    // function into a Frankenstein — `ps -o lstart=` (an absolute local-time
+    // string) feeding `parseEtimeToMs` (an ELAPSED-time parser), because the
+    // fork's TZ=UTC fix (below) touched only this line while upstream's
+    // etime rewrite touched this line AND the parse call after it, so git
+    // took upstream's unconflicted tail silently. Caught before typecheck by
+    // diffing this file's auto-merged region against upstream by hand.
+    // Adopting upstream's `etime` approach wholesale: it sidesteps the
+    // local/UTC ambiguity the fork's TZ=UTC env fix (decisions/02-gbrain.md
+    // bug ①, `ps lstart` prints LOCAL time with no timezone suffix, e.g.
+    // "Mon Aug 17 20:06:28 2026", so Date.parse() assumed UTC and was off by
+    // the host's UTC offset — ~8h on a UTC+8 machine, enough to blow through
+    // PID_REUSE_TOLERANCE_MS and silently empty readWorkers()) was working
+    // around: etime is an elapsed DURATION, not a timestamp, so there is no
+    // timezone to get wrong in the first place. The TZ env var is dropped —
+    // it fixed the old lstart approach's own bug and has no effect on etime.
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, TZ: 'UTC' },
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseEtimeToMs(out);
+    return elapsedMs === null ? null : Date.now() - elapsedMs;
   } catch {
     return null;
   }
