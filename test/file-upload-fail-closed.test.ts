@@ -144,7 +144,7 @@ describe('file_upload fail-closed (#4302)', () => {
     for (const f of ['src/commands/files.ts', 'src/core/ops/files.ts']) {
       const src = readFileSync(join(import.meta.dir, '..', f), 'utf8');
       expect(src).not.toMatch(/files\.metadata\s*\|\|\s*EXCLUDED\.metadata/);
-      const conflicts = src.match(/ON CONFLICT \(storage_path\)/g)?.length ?? 0;
+      const conflicts = src.match(/ON CONFLICT \((?:source_id, )?storage_path\)/g)?.length ?? 0;
       expect(conflicts).toBeGreaterThan(0);
       expect(src.match(/\$\{FILES_METADATA_MERGE_SQL\}/g)?.length ?? 0).toBe(conflicts);
     }
