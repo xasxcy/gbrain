@@ -1,9 +1,10 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 import { readFileSync, readdirSync, statSync, lstatSync, existsSync, writeFileSync, unlinkSync, mkdirSync, copyFileSync } from 'fs';
 import { join, relative, extname, basename, dirname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
 import type { StorageBackend, StorageConfig } from '../core/storage.ts';
-import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
+import { sqlQueryForEngine, executeRawJsonb, FILES_METADATA_MERGE_SQL } from '../core/sql-query.ts';
 import { humanSize } from '../core/file-resolver.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -182,7 +183,7 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
   // Precondition first: a backend-less upload can only produce a phantom row
   // (metadata for bytes that were never stored), so refuse before touching the
   // DB or reporting anything as uploaded.
-  const { storage } = await requireStorageBackend('upload');
+  const { storage, storageConfig } = await requireStorageBackend('upload');
 
   const stat = statSync(filePath);
   const hash = fileHash(filePath);
@@ -209,6 +210,9 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
   // of casting a string into ::jsonb (the #2339 double-encode class).
   // FORK: files unique constraint is (source_id, storage_path) — carry the
   // source_id column + 'default' value + conflict target from the fork schema.
+  // #4910: stamp the lane so readers (doctor image_assets, files verify)
+  // know storage_path is a bucket key; the upsert merges metadata so a
+  // legacy `{}` row heals on its next content change.
   await executeRawJsonb(
     engine,
     `INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
@@ -216,9 +220,10 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
      ON CONFLICT (source_id, storage_path) DO UPDATE SET
        content_hash = EXCLUDED.content_hash,
        size_bytes = EXCLUDED.size_bytes,
-       mime_type = EXCLUDED.mime_type`,
+       mime_type = EXCLUDED.mime_type,
+       ${FILES_METADATA_MERGE_SQL}`,
     [pageSlug, filename, storagePath, mimeType, stat.size, hash],
-    [{}],
+    [{ storage: storageConfig.backend }],
   );
 
   console.log(`Uploaded: ${storagePath} (${humanSize(stat.size)})`);
@@ -297,6 +302,7 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- identity comparison only (skip self-copy when source already IS the dest); no fs path is derived from this expression
     if (resolve(dest) !== resolve(filePath)) {
       mkdirSync(destDir, { recursive: true });
+      assertManagedFilesystemWrite(dest);
       copyFileSync(filePath, dest);
     }
     const hash = fileHash(filePath);
@@ -314,9 +320,10 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
        ON CONFLICT (source_id, storage_path) DO UPDATE SET
          content_hash = EXCLUDED.content_hash,
          size_bytes = EXCLUDED.size_bytes,
-         mime_type = EXCLUDED.mime_type`,
+         mime_type = EXCLUDED.mime_type,
+         ${FILES_METADATA_MERGE_SQL}`,
       [sourceId, pageSlug, filename, storagePath, mimeType, stat.size, 'sha256:' + hash],
-      [{ storage: 'git', type: fileType }],
+      [{ storage: 'git', ...(fileType ? { type: fileType } : {}) }],
     );
     console.log(JSON.stringify({
       success: true,
@@ -367,6 +374,7 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
     });
     // Write pointer next to the original file
     pointerPath = filePath + '.redirect.yaml';
+    assertManagedFilesystemWrite(pointerPath);
     writeFileSync(pointerPath, pointer);
     console.error(`Pointer written: ${pointerPath}`);
   }
@@ -381,9 +389,10 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
      ON CONFLICT (source_id, storage_path) DO UPDATE SET
        content_hash = EXCLUDED.content_hash,
        size_bytes = EXCLUDED.size_bytes,
-       mime_type = EXCLUDED.mime_type`,
+       mime_type = EXCLUDED.mime_type,
+       ${FILES_METADATA_MERGE_SQL}`,
     [pageSlug, filename, storagePath, mimeType, stat.size, 'sha256:' + hash],
-    [{ type: fileType, upload_method: method }],
+    [{ storage: (config.storage as StorageConfig).backend, ...(fileType ? { type: fileType } : {}), upload_method: method }],
   );
 
   // Output JSON for scripting
@@ -431,7 +440,7 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
   // Pre-fix this command inserted a `files` row per file and reported them as
   // "uploaded" without ever calling the storage backend — every row it produced
   // was a phantom, even on a brain WITH storage configured.
-  const { storage } = await requireStorageBackend('sync');
+  const { storage, storageConfig } = await requireStorageBackend('sync');
 
   const files = collectFiles(dir);
   console.log(`Found ${files.length} files to sync`);
@@ -478,9 +487,10 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
        ON CONFLICT (source_id, storage_path) DO UPDATE SET
          content_hash = EXCLUDED.content_hash,
          size_bytes = EXCLUDED.size_bytes,
-         mime_type = EXCLUDED.mime_type`,
+         mime_type = EXCLUDED.mime_type,
+         ${FILES_METADATA_MERGE_SQL}`,
       [pageSlug, filename, storagePath, mimeType, stat.size, hash],
-      [{}],
+      [{ storage: storageConfig.backend }],
     );
 
     uploaded++;
@@ -651,6 +661,7 @@ async function mirrorFiles(args: string[]) {
     prefix: basename(dir) + '/',
     file_count: uploaded,
   });
+  assertManagedFilesystemWrite(dir);
   writeFileSync(join(dir, '.supabase'), marker);
 
   console.log(`Mirrored ${uploaded} files. Marker written to ${dir}/.supabase`);
@@ -662,6 +673,7 @@ async function unmirrorFiles(args: string[]) {
 
   const markerPath = join(dir, '.supabase');
   if (existsSync(markerPath)) {
+    assertManagedFilesystemWrite(markerPath);
     unlinkSync(markerPath);
     console.log(`Removed mirror marker from ${dir}. Files remain in storage.`);
   } else {
@@ -729,6 +741,7 @@ async function redirectFiles(args: string[]) {
       mime: mimeType || 'application/octet-stream',
       uploaded: new Date().toISOString(),
     });
+    assertManagedFilesystemWrite(filePath);
     writeFileSync(filePath + '.redirect.yaml', pointer);
     unlinkSync(filePath);
     redirected++;
@@ -779,6 +792,7 @@ async function restoreFiles(args: string[]) {
     try {
       const storagePath = info.storage_path || info.path; // v0.9 or legacy format
       const data = await storage.download(storagePath);
+      assertManagedFilesystemWrite(originalPath);
       writeFileSync(originalPath, data);
       unlinkSync(redirectPath);
       restored++;
@@ -818,7 +832,7 @@ async function cleanFiles(args: string[]) {
       }
       if (stat.isSymbolicLink()) continue;
       if (stat.isDirectory()) findAndClean(full);
-      else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) { unlinkSync(full); cleaned++; }
+      else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) { assertManagedFilesystemWrite(full); unlinkSync(full); cleaned++; }
     }
   }
   findAndClean(dir);

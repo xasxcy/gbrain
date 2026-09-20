@@ -28,12 +28,30 @@ import type { Page } from './types.ts';
  */
 export async function restampIfDemotedToTitleTier(
   engine: BrainEngine,
-  page: Pick<Page, 'contextual_retrieval_mode'> | null | undefined,
+  page: Pick<Page, 'contextual_retrieval_mode' | 'knowledge_revision'> | null | undefined,
   slug: string,
   sourceId: string,
+  /** `pages.corpus_generation` as observed when `page` was read (see readCorpusGeneration). */
+  observedCorpusGeneration?: string | null,
 ): Promise<void> {
-  if (page?.contextual_retrieval_mode !== 'per_chunk_synopsis') return;
-  await engine.updatePageContextualRetrievalState(slug, sourceId, 'title', titleTierCorpusGeneration());
+  if (page?.contextual_retrieval_mode !== 'per_chunk_synopsis' || !page.knowledge_revision) return;
+  await engine.transaction(async tx => {
+    await tx.lockPageKeys([{ sourceId, slug }]);
+    const current = await tx.readPageSnapshot(slug, { sourceId });
+    if (current?.revision !== page.knowledge_revision) return;
+    // fork: the --stale drain commits vectors in their own checkpoint, so a
+    // contextual service can land BETWEEN that commit and this restamp without
+    // moving knowledge_revision (mode/generation are not part of it). If the
+    // corpus generation moved since the caller read the page, that newer run
+    // owns the stamp — demoting it to 'title' would split vectors from
+    // mode/generation.
+    if (observedCorpusGeneration !== undefined) {
+      const [state] = await tx.executeRaw<{ corpus_generation: string | null }>(
+        'SELECT corpus_generation FROM pages WHERE slug = $1 AND source_id = $2', [slug, sourceId]);
+      if ((state?.corpus_generation ?? null) !== observedCorpusGeneration) return;
+    }
+    await tx.updatePageContextualRetrievalState(slug, sourceId, 'title', titleTierCorpusGeneration());
+  });
 }
 
 /**
@@ -303,4 +321,11 @@ export function isTransientNetworkEmbedError(e: unknown): boolean {
   }
   const msg = e instanceof Error ? e.message : String(e);
   return /\b(DNS_ETIMEOUT|ETIMEOUT|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|EPIPE|EAI_AGAIN)\b|socket hang up|fetch failed|connect(ion)? timeout|connection (reset|closed)|network (error|timeout)|request timed out|timed out/i.test(msg);
+}
+
+/** Read `pages.corpus_generation` for the observed-generation guard above. */
+export async function readCorpusGeneration(engine: BrainEngine, slug: string, sourceId: string): Promise<string | null> {
+  const [row] = await engine.executeRaw<{ corpus_generation: string | null }>(
+    'SELECT corpus_generation FROM pages WHERE slug = $1 AND source_id = $2', [slug, sourceId]);
+  return row?.corpus_generation ?? null;
 }

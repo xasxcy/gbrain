@@ -10,6 +10,7 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { mockEmbedProjectionEngine, embeddingUpdates } from './helpers/embed-projection-mock.ts';
 
 let embedCalls: string[][] = [];
 let embedImpl = async (texts: string[]): Promise<Float32Array[]> => {
@@ -96,7 +97,6 @@ describe('foreground stale embed fallback', () => {
         { chunk_index: 0, chunk_text: 'later', chunk_source: 'compiled_truth', token_count: 2, embedded_at: null },
       ]],
     ]);
-    const stored = new Map<string, any[]>();
     embedImpl = async (texts) => {
       if (texts.some((text) => text === 'always-fail')) {
         throw new Error('The operation timed out.');
@@ -106,10 +106,12 @@ describe('foreground stale embed fallback', () => {
       }
       return texts.map(() => new Float32Array(1536));
     };
-    const engine = mockEngine({
+    // Upstream v0.51 installs the inline per-slug vectors through the revision-
+    // bound projection (UPDATE-only), not a page-wide upsertChunks — so this
+    // seam uses the shared projection mock and reads the vector UPDATEs.
+    const engine = mockEmbedProjectionEngine({
       getPage: async (slug: string) => ({ slug, compiled_truth: slug, timeline: '' }),
       getChunks: async (slug: string) => chunksBySlug.get(slug) ?? [],
-      upsertChunks: async (slug: string, chunks: any[]) => { stored.set(slug, chunks); },
       setPageEmbeddingSignature: async () => {},
     });
 
@@ -122,7 +124,8 @@ describe('foreground stale embed fallback', () => {
     // Required P2 behaviour: fallback lands the first page, a permanently
     // failing chunk is logged/skipped, and the following page still lands.
     expect(result.embedded).toBe(3);
-    expect(Array.from(stored.keys())).toEqual(['sync-mixed', 'sync-later']);
+    const landed = embeddingUpdates(engine).map((call: any) => call.args[1][5]).sort();
+    expect(landed).toEqual(['later', 'long'.repeat(2000), 'short'].sort());
     expect(embedCalls.map((call) => call[0].length)).toContain(4500);
-  });
+  }, 60_000); // the permanently-failing page rides embedBatchWithBackoff's real retry delays
 });

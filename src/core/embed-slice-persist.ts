@@ -24,6 +24,16 @@ export interface PersistStaleSliceOptions {
    * changed to every other staleness check.
    */
   embedTexts?: string[];
+  /**
+   * Registry-active vector column (already SQL-quoted). When set, a page is
+   * only stamped with the new signature once no chunk of it is still PENDING
+   * (NULL vector with no live ledger row for this generation) — #5051: an
+   * interrupted drain must leave the old signature so the untouched chunks
+   * are not orphaned behind a new-generation stamp. Ledgered (quarantined /
+   * backing-off) chunks do not count as pending, which is what keeps the
+   * B5 quarantine-storm fix intact.
+   */
+  activeColumn?: string;
 }
 
 export interface PersistStaleSliceResult {
@@ -54,7 +64,7 @@ const hashChunk = (text: string): string => createHash('md5').update(text).diges
  * checkpoint. Legacy callers intentionally never invoke this function.
  */
 export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise<PersistStaleSliceResult> {
-  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write, embedTexts } = opts;
+  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write, embedTexts, activeColumn } = opts;
   const first = rows[0];
   if (!first) return { embedded: 0, pageCommitted: false, persistFailed: false, failureCount: 0, aborted: !!signal?.aborted };
 
@@ -156,14 +166,22 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
       const stateRows = await engine.executeRaw<{
         embedding_signature: string | null;
         chunk_count: number;
+        pending_count: number;
       }>(
         `SELECT p.embedding_signature,
-                COUNT(cc.id)::integer AS chunk_count
+                COUNT(cc.id)::integer AS chunk_count,
+                ${activeColumn
+                  ? `COUNT(cc.id) FILTER (WHERE cc.${activeColumn} IS NULL AND NOT EXISTS (
+                       SELECT 1 FROM embed_failures l
+                        WHERE l.source_id = p.source_id AND l.page_id = cc.page_id
+                          AND l.chunk_index = cc.chunk_index AND l.embedding_signature = $3
+                          AND l.chunk_hash = md5(cc.chunk_text)))::integer`
+                  : '0'} AS pending_count
            FROM pages p
            LEFT JOIN content_chunks cc ON cc.page_id = p.id
           WHERE p.id = $1 AND p.source_id = $2
           GROUP BY p.embedding_signature`,
-        [first.page_id, first.source_id],
+        activeColumn ? [first.page_id, first.source_id, embeddingSignature] : [first.page_id, first.source_id],
       );
       const [state] = Array.isArray(stateRows) ? stateRows : [];
       const storedSignature = state?.embedding_signature ?? null;
@@ -173,6 +191,7 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
       // NULL-signature pages were never invalidated, so they still require this
       // slice to cover the whole page before stamping.
       const shouldStamp = !signatureInvalidationFailed
+        && Number(state?.pending_count ?? 0) === 0
         && storedSignature !== embeddingSignature
         && (storedSignature !== null || rows.length === Number(state?.chunk_count ?? -1));
       if (shouldStamp) {

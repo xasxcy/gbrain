@@ -914,9 +914,10 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 - **Drive the brain to a target health score:** the one-command
   loop. `gbrain doctor --remediation-plan --json` previews what would be
   fixed; `gbrain doctor --remediate --yes --target-score 90 --max-usd 5`
-  walks a dependency-ordered plan (sync before extract, embed after
-  consolidate), re-checking score between every step, refusing to spend
-  past the cost cap. Empty brains (no entity pages) or unconfigured embedding
+  walks a dependency-ordered plan, re-checking score between every step and
+  refusing to spend past the cost cap. Stale extraction uses source-scoped
+  database pages, including DB-only pages; it does not require a repository
+  sync first. Empty brains (no entity pages) or unconfigured embedding
   keys hit a `max_reachable_score` ceiling and bail with what's missing.
   Three phase handlers (synthesize / patterns / consolidate) are
   PROTECTED — only trusted local callers can submit them; MCP cannot.
@@ -1201,6 +1202,11 @@ project resolves through `src/core/search/mode.ts`.
 | `autocut` (rerank-cliff cut)  | off            | off        | off            |
 | `searchLimit` default         | 10             | 25         | 50             |
 
+The `expansion` row governs no shipped verb today: `gbrain query` expands by
+default in every mode (`--no-expand` / `expand: false` opts out); `search`, the
+memory verbs and the eval harnesses pin it per call; only a caller that leaves
+`expansion` unset AND wires an `expandFn` would inherit the bundle value.
+
 **Cost anchors (downstream agent input cost — gbrain itself is rounding error).**
 The corner-to-corner spread is 25x once you pair mode with downstream model.
 Chunks ~400 tokens avg. Per-query cost @ 10K queries/month (typical
@@ -1218,8 +1224,9 @@ Mismatches (tokenmax+Haiku, conservative+Opus) waste capacity differently
 — too-big payload overwhelms a cheap model; too-small payload starves an
 expensive one.
 
-tokenmax adds ~\$1.50 per 1K queries in Haiku expansion calls on top of
-the matrix (\$15/mo @ 10K). Semantic result caching is temporarily disabled; budget for fresh retrieval on every query. **The matrix
+`gbrain query` adds ~\$1.50 per 1K queries for the Haiku expansion call in
+EVERY mode (\$15/mo @ 10K; `--no-expand` skips it) — `gbrain search` and the
+memory verbs never expand, so no mode buys that line item back. Semantic result caching is temporarily disabled; budget for fresh retrieval on every query. **The matrix
 has three verbatim homes: this section, the `gbrain init` picker copy
 (`src/commands/init-mode-picker.ts`), and `INSTALL_FOR_AGENTS.md` Step
 3.5** — update all three when refreshing.
@@ -1500,7 +1507,7 @@ ms, max waiters) for `--json`; a one-line summary prints to stderr.
 
 ## Build
 
-`bun build --compile --outfile bin/gbrain src/cli.ts`
+`bun build --compile --no-compile-autoload-bunfig --outfile bin/gbrain src/cli.ts`
 
 ## Version locations (single source of truth: `VERSION` file)
 
@@ -2144,6 +2151,9 @@ Per-query cost @ 10K queries/mo (typical single-user volume):
 >
 >   3) tokenmax (recommended default — preserves v0.31.x retrieval shape) —
 >      no budget, LLM expansion ON, 50 chunks. Best for Opus/frontier models.
+>
+> ("no expansion" governs `gbrain search` and callers that leave expansion
+> unset; `gbrain query` expands in every mode unless you pass `--no-expand`.)
 >
 > Cost depends on BOTH the mode AND the downstream model you run. See the
 > matrix above for the 9-cell breakdown.
@@ -2861,7 +2871,7 @@ commands, embedding costs, and the restrictions that remain after rebuilding.
 - **[Muse personal agent](docs/guides/muse.md)** — first verify its durable user-files location, then install the local CLI. Native MCP configuration and skill activation are not assumed.
 - **[Grok Build](docs/mcp/GROK.md)** — `grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- gbrain serve --surface verbs`. The add is lazy (exit 0 without connecting) — verify with `grok mcp doctor gbrain`, which spawns the server and reports `7 tools discovered`. Verified against Grok Build v1.0.4.
 - **[opencode](docs/mcp/OPENCODE.md)** (opencode.ai / SST — not OpenClaw) — `opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- gbrain serve --surface verbs`, or let `gbrain bootstrap hooks --harness opencode` write the config for you (opencode is a bootstrap-supported harness — it reads AGENTS.md natively). The add is lazy — verify with `opencode mcp list`, which spawns the server (`✓ gbrain connected`). Remote: `gbrain connect https://your-host/mcp --token gbrain_xxx --agent opencode [--install]` — the config stores only the `{env:GBRAIN_REMOTE_TOKEN}` interpolation. Verified against opencode v1.18.18.
-- **[OpenClaw](docs/mcp/OPENCLAW.md)** — the ClawHub bundle plugin registers gbrain automatically (`openclaw.plugin.json` ships in this repo), or add `{"command": "gbrain", "args": ["serve"]}` to `~/.openclaw/config.json`'s `mcpServers`.
+- **[OpenClaw](docs/mcp/OPENCLAW.md)** — the ClawHub bundle plugin registers gbrain automatically (`openclaw.plugin.json` ships in this repo), or register the stdio server with `openclaw mcp add gbrain --command "$(command -v gbrain)" --arg serve --env GBRAIN_HOME=$HOME` (absolute path: the launchd gateway PATH lacks `~/.bun/bin`); verify with `openclaw mcp list`.
 - **[Claude Desktop (Cowork)](docs/mcp/CLAUDE_DESKTOP.md)** — Settings → Integrations → add the URL of your HTTP server. Remote only; the local `claude_desktop_config.json` does not work for remote servers.
 - **[Claude Cowork (team plan)](docs/mcp/CLAUDE_COWORK.md)** — org Owner adds the connector under Organization Settings → Connectors.
 - **[Perplexity Computer](docs/mcp/PERPLEXITY.md)** — `gbrain connect https://your-host/mcp --agent perplexity --oauth --register` mints a least-privilege OAuth client and prints the Issuer/Client ID/Secret to paste into Settings → Connectors (OAuth is the right path for a cloud connector; a bearer token also works for local use). Pro subscription required.
@@ -2912,7 +2922,7 @@ echo "from a pipe" | gbrain capture --stdin
 SLUG=$(gbrain capture "..." --quiet)
 ```
 
-The page lands in the database and on disk in one move. Default slug `inbox/YYYY-MM-DD-<hash8>` so captures cluster in a predictable triage location. On thin-client installs the verb routes through MCP to the server: same command, same UX.
+Page writes return durable receipts. Replacements require the revision you read or explicit `force`; keep the request UUID when retrying. Accepted work can remain queued while its owner is unavailable, and uncertain publication has an explicit recovery state. Embedding completion is separate from canonical commitment. A source without a configured repository can hold DB-only pages, which need a database backup alongside withdrawal and receipt records. See [concurrent writes](docs/guides/concurrent-writes.md) and the [persistence boundary](docs/architecture/system-of-record.md#page-write-persistence-boundary). Default slug `inbox/YYYY-MM-DD-<hash8>` so captures cluster in a predictable triage location. On thin-client installs the verb routes through MCP to the server.
 
 **Say to your agent:** *"Remember this: ..."* — *"Save this thought to my brain"* — *"Capture this."* And to fill an empty brain from your existing life: *"Fill my brain"* (the cold-start skill walks your email, calendar, contacts, and archives one consented step at a time).
 
@@ -2953,10 +2963,14 @@ How the open-loop engine decides who's waiting: [`docs/guides/open-loops.md`](do
 Your other agents' histories import in one command. `gbrain transcripts ingest`
 parses agent session logs (Claude Code, Codex, OpenClaw, Hermes, Grok Build) and extracted
 consumer chat exports (ChatGPT / Claude.ai `conversations.json`) into readable
-conversation pages with provenance back to the exact session file. Secrets are
-scrubbed from message bodies, titles, speakers, and session metadata before
-anything is written, embedding is off by default for bulk backfills, and
-re-runs are free — unchanged sessions skip on content hash:
+conversation pages with provenance back to the exact session file. Pattern-based redaction runs over message bodies, titles, speakers, and session
+metadata before anything is written — vendor key prefixes, JWTs, cloud/API key
+shapes, `Bearer` headers, connection-string credentials, and high-entropy
+`KEY=`/`TOKEN=` assignments become `<REDACTED:…>` placeholders (preview with
+`--dry-run`; no pattern set is complete, so if a secret still lands see
+["If a secret reached the brain"](SECURITY.md#if-a-secret-reached-the-brain):
+rotate it, then `gbrain delete <slug> --purge`). Embedding is off by default
+for bulk backfills, and re-runs are free — unchanged sessions skip on content hash:
 
 ```bash
 gbrain transcripts ingest                    # discover importable session logs
@@ -3001,7 +3015,7 @@ Most personal-knowledge tools force one fixed layout: their idea of "notes" + "p
 **gbrain doesn't have a fixed layout.** It ships with bundled schema packs and lets you author your own when none fit:
 
 - **`gbrain-base-v2`** (default) — 15-type DRY/MECE canonical taxonomy (14 canonical + `note` catch-all): `person`, `company`, `media`, `tweet`, `social-digest`, `analysis`, `atom`, `concept`, `source`, `deal`, `email`, `slack`, `writing`, `project`, `note`. Subtypes/format/origin pushed to frontmatter.
-- **`gbrain-base`** (legacy) — the wider 24-type layout. Stays bundled for back-compat; brains on it can upgrade via `gbrain onboard --check --explain` → `gbrain jobs submit unify-types --allow-protected --params '{"target_pack":"gbrain-base-v2","apply":true}'` (omit `"apply":true` for a dry-run preview — that is the default).
+- **`gbrain-base`** (legacy) — the wider 24-type layout. Stays bundled for back-compat; brains on it can upgrade via `gbrain onboard --check --explain` → `gbrain jobs submit unify-types --params '{"target_pack":"gbrain-base-v2","apply":true}'` (omit `"apply":true` for a dry-run preview — that is the default).
 - **`gbrain-recommended`** — extends `gbrain-base` with the 13 additional directories from `docs/GBRAIN_RECOMMENDED_SCHEMA.md` (source, place, trip, conversation, personal, civic, project, etc.). Activate with `gbrain schema use gbrain-recommended`.
 - **Your own pack** — `gbrain schema detect` clusters your actual filesystem into proposed types, `gbrain schema suggest` runs an LLM pass over them, and `gbrain schema review-candidates --apply` promotes the ones you like. Three commands and the brain knows your shape. Authoring a successor pack (declares `migration_from:` so existing brains can opt in): see [`docs/architecture/pack-upgrade-mechanism.md`](docs/architecture/pack-upgrade-mechanism.md).
 
@@ -3042,7 +3056,7 @@ Want to see a tutorial that isn't here yet? [Open an issue](https://github.com/g
 
 - **Signal detector**, after you opt in, captures durable ideas and entity mentions from substantive messages. Explicit remembering works without automatic capture; paid enrichment is a separate choice.
 - **Brain-first lookup** before any external API call. The cheapest, fastest, most personal information source you have.
-- **Auto-link** fires on every page write. No LLM calls; pure pattern matching on `[[wiki/people/bob]]` style references. New entity → new page stub → graph grows.
+- **Auto-link** extracts graph links for trusted local page writes. No LLM calls; pure pattern matching on page references such as `[[people/alice-example]]`. Unresolved extracted facts keep their provenance without inventing a backing page.
 - **Cron-driven enrichment** runs while you sleep: dedup people pages, fix citations, score salience, find contradictions, prep tomorrow's tasks.
 
 The whole loop is described in [`docs/architecture/topologies.md`](docs/architecture/topologies.md) with diagrams.
@@ -3177,7 +3191,7 @@ flowchart LR
 
 **Two engines, one contract.** PGLite (Postgres 17 via WASM, zero-config, default) for personal brains up to ~50K pages. Postgres + pgvector (Supabase or self-hosted) for shared / large / multi-machine deployments. The contract-first `BrainEngine` interface in [`src/core/engine.ts`](src/core/engine.ts) defines the 140+ methods both engines implement; CLI and MCP server are generated from one source.
 
-**Brain repo is the system of record.** Your knowledge lives in a regular git repo (your "brain repo") as markdown files. GBrain syncs the repo into Postgres for retrieval; deletes in git become soft-deletes in DB. You can publish public subsets, share team mounts, run thin-client setups pointing at a colleague's brain server. Topologies in [`docs/architecture/topologies.md`](docs/architecture/topologies.md).
+**Canonical files preserve file-backed knowledge.** Your brain repo holds Markdown that GBrain indexes for retrieval; deletes in git become soft-deletes in the database. DB-only pages, unresolved facts, revision history, and operational state need a separate database backup. See the [system-of-record contract](docs/architecture/system-of-record.md). You can publish public subsets, share team mounts, and run thin-client setups pointing at a colleague's brain server. Topologies in [`docs/architecture/topologies.md`](docs/architecture/topologies.md).
 
 **Two organizational axes (brain ⊥ source).** A *brain* is a database (your personal brain, a team mount you joined). A *source* is a repo inside that brain (wiki, gstack, an essay, a knowledge base). Routing lives in `.gbrain-source` dotfiles and resolves via a documented 6-tier precedence chain. Full diagrams in [`docs/architecture/brains-and-sources.md`](docs/architecture/brains-and-sources.md).
 
@@ -3292,12 +3306,12 @@ gbrain sync --no-schema-pack --no-pull --no-embed --yes
 shapes (`(a+)+`, `(a*)*`, …) in pack regexes, and the runtime caps
 inference-regex input length (override via `GBRAIN_MAX_REGEX_INPUT_CHARS`).
 Third, on a PGLite brain with a live `gbrain serve` (your agent's MCP
-server), `gbrain sync` delegates the run to the serve process over its
-local IPC socket — the lock owner does the work, your agent stays up,
-and Ctrl-C aborts to a checkpoint the next sync resumes from. Embeds
-defer to the serve's background sweep. See
+server), `gbrain sync` delegates through authenticated local IPC to the
+owner, whether it serves HTTP or stdio. If the client exits, accepted page
+requests can finish; repeat the same options to resume the managed sync
+cursor. Embeds defer to the owner's background work. See
 [`docs/architecture/serve-sync-concurrency.md`](docs/architecture/serve-sync-concurrency.md)
-for the limits (unsupported flags, `serve --http`) and the full triage.
+for supported flags, managed-mode limits and the full triage.
 
 **`gbrain init --migrate-only` / a schema migration fails on Windows
 with `getaddrinfo ENOTFOUND`?** Run `gbrain upgrade`. Schema bring-up
@@ -3656,7 +3670,10 @@ cwd-.env guard (gbrain never adopts a `DATABASE_URL` that Bun auto-loaded
 from the working directory's `.env` family: `.env`, `.env.local`, and the
 `.env.<NODE_ENV>` / `.env.<NODE_ENV>.local` variants for `development`,
 `production` and `test`; with the precedence note when both `GBRAIN_DATABASE_URL` and
-`DATABASE_URL` are set), redacted URLs only, and — on Postgres — a
+`DATABASE_URL` are set — this `DATABASE_URL` guard matches the file's VALUE; the
+security-relevant `GBRAIN_*` variables get the stricter key-presence quarantine
+described under "Environment variables and cwd `.env` files" in `SECURITY.md`),
+redacted URLs only, and — on Postgres — a
 zero-round-trip pooler block (Supabase pooler detection, prepared-statement
 resolution, pool sizes, direct/session-pooler derivability). `--brain <id>`
 resolves a mounted brain and reports the MOUNT's engine and URL source, never
@@ -4394,11 +4411,17 @@ A dot-directory you deliberately keep content in (say `.decisions/`) can be
 waived back in with `--include-hidden '<glob>'` on `gbrain sync` — the glob
 names exactly which hidden paths to admit
 (`gbrain sync --include-hidden '.decisions/**'`); everything else hidden
-stays pruned, and vendored/generated exclusions are never waived. Two
-bounds: the flag scopes a single sync invocation (it cannot combine with
-`--all` — register the subdirectory as the source's `local_path` instead),
-and it does not reach a non-git directory's filesystem-walk import fallback
-(every git-tracked source, the normal case, is covered).
+stays pruned, and vendored/generated exclusions are never waived. The flag
+scopes a single sync invocation and cannot combine with `--all`; to make the
+waiver hold on every path — `sync --all`, autopilot, the dream cycle — persist
+it as the `sync.include_hidden` config key (same dialect as `sync.exclude`; a
+trailing `/` means the whole subtree). Unset admits nothing, and a per-call
+flag unions with the persisted list rather than replacing it. One remaining
+bound: neither form reaches a non-git directory's filesystem-walk import
+fallback (every git-tracked source, the normal case, is covered).
+
+**Say to your agent:** *"index my repo's .github folder on every sync"* — your
+agent runs `gbrain config set sync.include_hidden '.github/'`.
 
 Everything else is ordinary synced content — including `ops/` (the bundled
 daily-task-manager skill files its canonical page under `ops/tasks`).
@@ -5764,6 +5787,26 @@ Existing sessions are preserved. Before upgrading an installation with queued
 work, follow the [authorization and worker upgrade guide](../guides/authorization-upgrade.md)
 for the coordinated cutover, consent recovery, and Bun requirements.
 
+**The owner-approval step.** `/authorize` never returns an authorization code
+on its own. It records a pending request and redirects the browser to the admin
+dashboard (`/admin/?oauth_request=…`), where the brain owner signs in (bootstrap
+token or magic link), reviews the client name, redirect URI and requested
+scopes, and approves or denies. Only an approval mints the code, which is then
+delivered to the client's registered redirect URI; a denial returns
+`error=access_denied`. This applies to every authorization-code client,
+including clients that self-registered via DCR — self-registration alone never
+yields a token. Pending requests expire after ten minutes, do not survive a
+server restart, and are bounded: at most ten awaiting-decision requests per
+client and a fixed server-wide ceiling. Beyond either, `/authorize` sends the
+client back to its registered redirect URI with `error=too_many_requests`
+(and no code) until earlier requests are decided or expire; a `429` status on
+`/authorize` comes only from the MCP SDK's per-IP rate limit.
+
+**Say to your agent:** *"Start the brain server over HTTP with self-service
+registration, then approve my client in the admin dashboard — your agent runs
+`gbrain serve --http --enable-dcr` and you finish the connection by approving
+it at `/admin/`."*
+
 ## Three Paths
 
 ### Local stdio (zero setup)
@@ -5858,6 +5901,45 @@ and per-client config export.
 > stderr warning fires at startup). Multi-tenant deployments should leave it on
 > the redacted default.
 
+### Owner login links for AI agents
+
+**Say to your agent:** *"Give me the GBrain admin login link"* — the agent
+uses the existing HTTP mint endpoint described below.
+
+When an authenticated owner asks **"Give me the GBrain admin login link"**,
+use the existing single-use login flow. A static `/admin/` URL opens the login
+page; it does not authenticate the owner.
+
+1. Confirm the requesting owner and a private destination for the login link.
+2. Obtain the running server's bootstrap credential through the host's existing
+   protected credential mechanism. `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` is the supported
+   deployment setting. Never expose its value in chat, logs, shell arguments,
+   or a URL. If the credential is unavailable, report that specific setup blocker;
+   do not claim the login-link capability is missing.
+3. Send `POST /admin/api/issue-magic-link` to the running server, with the
+   bootstrap credential in the `Authorization: Bearer` header through that
+   protected mechanism. An MCP client bearer token or client secret is not the
+   server bootstrap credential.
+4. The response contains `url` and `expires_in` (300 seconds). The returned URL
+   uses the server's configured `--public-url`; without it, the fallback is
+   localhost. Ensure the deployment has an owner-reachable public URL rather
+   than substituting a remembered tunnel address.
+5. Deliver the returned short-lived login link only to the requesting owner in
+   private. In a shared channel, acknowledge private delivery without reproducing
+   the link. Never put it into a public issue or commit.
+
+**Do not GET or fetch the generated login URL to verify it.** That redeems the
+single-use nonce before the owner can use it. Check the base `/admin/` page and
+non-secret response metadata separately. The link expires after five minutes,
+cannot be replayed, and is invalidated by a server restart. Successful redemption
+establishes the admin browser session and redirects to `/admin/`.
+
+This logs the owner into the dashboard; it does not create, reveal, or rotate an
+MCP client credential. Register the intended OAuth client separately in the
+credential-reveal screen below. For unattended deployments, provision the
+bootstrap credential through the operator's protected configuration before
+starting the server; generated secrets are deliberately hidden in captured logs.
+
 ### 2. Register OAuth clients
 
 Register clients from the **`/admin` dashboard**:
@@ -5916,6 +5998,40 @@ await oauthProvider.registerClientManual(
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
 
+**Say to your agent:** *"Start my brain's MCP server with self-service client
+registration — your agent runs `gbrain serve --http --enable-dcr`, and you
+approve each new connection in the admin UI."*
+
+A self-registered client goes through three gates:
+
+1. **Scope ceiling at registration.** Dynamic registration may request at most
+   `read write`. A request naming `admin`, `sources_admin`, `users_admin`, or
+   `agent` is rejected with HTTP 400 `invalid_client_metadata` (never silently
+   narrowed), and the error text points at the operator path. Under
+   `--enable-dcr-insecure`, a `client_credentials` registration is capped at
+   `read` — a grant that skips owner approval never carries `write`. While
+   DCR is enabled (either mode), OAuth discovery advertises the `read write`
+   self-registration ceiling as `scopes_supported` (authorization-server and
+   protected-resource metadata alike), so a client that registers with the
+   advertised scopes succeeds;
+   with DCR off, discovery lists every scope an operator-registered client
+   may hold. `agent` is never advertised — it needs delegation bindings no
+   OAuth request can carry.
+2. **Owner approval on `/authorize`.** Every authorization-code connection
+   redirects to the admin dashboard, where you see the client, its redirect
+   URI, and the requested scopes, and approve or deny. No code is minted
+   until you approve. Consent never widens the registered scope.
+3. **Per-request clamp.** Issued codes and tokens are re-intersected with the
+   client's current registered scope, so a later `rescope-client` takes effect
+   on the next request.
+
+To give a self-registered client more than `read write`, widen it yourself
+after the fact — `gbrain auth rescope-client <client_id> --scopes read,write,sources_admin`
+(or the admin dashboard's Agents page) — or pre-register it with
+`gbrain auth register-client` / the admin API, which accept every scope.
+`gbrain doctor` warns about active clients that hold a privileged scope but
+look self-registered.
+
 Native MCP clients register cleanly: `redirect_uris` may use an app custom
 scheme (RFC 8252, e.g. `myapp://callback`) or `http://` loopback alongside
 `https://`; scopes the server doesn't know are filtered rather than fatal;
@@ -5950,7 +6066,14 @@ gbrain serve --http --port 3131 --bind 0.0.0.0 --public-url https://your-brain.n
 
 When `--public-url` is set without `--bind`, a stderr WARN fires at
 startup so the misconfiguration ("the tunnel is up but my agent gets
-ECONNREFUSED") is loud.
+ECONNREFUSED") is loud. Binding `0.0.0.0` without `GBRAIN_HTTP_CORS_ORIGIN`
+warns too: browser-based clients get no CORS header until you set the
+allowlist (see [SECURITY.md — CORS](../../SECURITY.md#cors)).
+
+`--source-guard` is a stdio-lane flag: with `--http` it prints a warning and
+is ignored. HTTP writes are fenced by each token's scopes instead, so
+operators migrating from stdio mint narrowed tokens
+(`gbrain auth create <name> --scopes read`) rather than relying on the guard.
 
 ```bash
 brew install ngrok
@@ -5968,6 +6091,53 @@ clients), and every 401 carries `WWW-Authenticate: Bearer
 resource_metadata="<that URL>"`, so an MCP client pointed at
 `https://your-brain.ngrok.app/mcp` finds the token endpoint from a fresh
 connection without any pasted URLs.
+
+**Dual-mode auth on `/mcp`.** The same route verifies OAuth 2.1 access
+tokens and `gbrain auth create` bearers (OAuth first, then the
+`access_tokens` fallback). The 401 + `resource_metadata` challenge is emitted
+by the MCP SDK middleware for ANY request lacking an `Authorization` header
+(RFC 9728 / MCP auth spec §5.1 discovery) and says nothing about whether a
+configured token works. A client status probe that omits the header will
+therefore report `needsAuth` / `authentication_required` even while the
+configured bearer succeeds. Judge auth from `whoami`
+(`transport: legacy|oauth`) or `gbrain auth test <url> --token <t>`; treat a
+client's needsAuth flag as advisory unless the authenticated call itself
+returns 401 / `invalid_token`.
+
+#### Tailnet / LAN-only (no public tunnel)
+
+Two shapes work without exposing anything to the internet. In both, clients
+authenticate with `gbrain auth create` bearer tokens.
+
+**Tailscale Serve (HTTPS, tailnet-only).** Keep the default `127.0.0.1`
+bind, let Tailscale terminate TLS on the tailnet, and point `--public-url` at
+your MagicDNS name:
+
+```bash
+gbrain serve --http --port 3131 --public-url https://your-machine.your-tailnet.ts.net
+tailscale serve --bg 3131
+```
+
+Clients on the tailnet use `https://your-machine.your-tailnet.ts.net/mcp`.
+The "--public-url is set but --bind is not" WARN is expected in this shape —
+Tailscale Serve forwards to loopback. `tailscale serve` stays inside your
+tailnet; `tailscale funnel` is public exposure (see
+[ALTERNATIVES.md](ALTERNATIVES.md)).
+
+**Plain HTTP, bearer-only.** Bind the tailnet/LAN interface and omit
+`--public-url` entirely:
+
+```bash
+gbrain serve --http --port 3131 --bind 100.x.y.z   # or --bind 0.0.0.0
+```
+
+The OAuth issuer defaults to `http://localhost:3131`, which the MCP SDK
+accepts, and bearer-token verification never reads the issuer. Clients connect
+to `http://100.x.y.z:3131/mcp` with `Authorization: Bearer …`. OAuth discovery
+is the one thing this shape does not offer (the advertised issuer is
+loopback), so OAuth-only clients such as ChatGPT need the HTTPS shape above.
+Passing `--public-url http://100.x.y.z:3131` instead fails at startup — see
+[Troubleshooting](#troubleshooting).
 
 ### 4. Scopes and localOnly
 
@@ -6142,8 +6312,27 @@ Include the Authorization header: `Authorization: Bearer YOUR_TOKEN`
 **"invalid_token" error**
 Run `gbrain auth list` to see active tokens.
 
+**Client status shows needsAuth / authentication_required but tool calls succeed**
+The client probed `/mcp` without an `Authorization` header and read the
+spec-mandated discovery 401 as a failed login. Both OAuth tokens and legacy
+bearers are accepted on `/mcp`; confirm with `whoami` (`transport: legacy`)
+or `gbrain auth test <url> --token <t>` and only re-authenticate if THAT
+call returns 401. See
+[Dual-mode auth on /mcp](#3-expose-the-server).
+
 **"service_unavailable" error**
 Database connection failed. Check your Supabase dashboard for outages.
+
+**"Issuer URL must be HTTPS" at startup**
+The MCP SDK rejects a non-HTTPS OAuth issuer unless the host is `localhost`
+or `127.0.0.1`, so `--public-url http://<lan-or-tailnet-ip>:3131` exits
+before the server listens. Either terminate TLS in front (Tailscale Serve,
+ngrok, Cloudflare Tunnel) and pass the `https://` URL, or drop `--public-url`
+for a bearer-only LAN endpoint — both shapes are in
+[Tailnet / LAN-only](#tailnet--lan-only-no-public-tunnel). Last resort, for
+plain-HTTP OAuth discovery on a private network you fully control: the SDK's
+own `MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL=1` opt-in. Bearer auth works
+either way; OAuth clients may still refuse a non-HTTPS issuer.
 
 **Claude Desktop doesn't connect**
 Remote servers must be added via Settings > Integrations, NOT
@@ -6319,7 +6508,7 @@ matched. **create_safety** (enum): `exists` (a page for this already exists)
 signal). The derivation of both is implementation-defined and may improve;
 the values are frozen.
 
-### remember(fact, provenance, ttl?, entity?, kind?, visibility?) — write
+### remember(fact, provenance, ttl?, entity?, kind?, visibility?, request_id?) — write
 
 Save ONE fact with mandatory attribution.
 
@@ -6445,7 +6634,7 @@ purpose, no dedicated status); a `max_tokens`-cut envelope parses as
 `output_truncated` (warning `LLM_OUTPUT_TRUNCATED`) so a too-small output
 budget is distinguishable from malformed model output.
 
-### forget(id, reason?) — write
+### forget(id, reason?, request_id?) — write
 
 Expire a fact by its opaque string id (from `remember` or
 `recall.facts[].fact_id` — never a page slug). Idempotent: re-forgetting an
@@ -6453,6 +6642,44 @@ already-expired fact returns `expired: false` (success); unknown id ⇒
 `not_found`. Facts are expired with an audit trail, never deleted.
 
 Response: `{ id, expired, reason, protocol_version }`.
+
+#### Durable write receipts (additive)
+
+Write receipts distinguish accepted work from committed memory. Their public
+shape is `{request_id, state, retry_after_ms, revision?, outcome?, persistence?,
+compacted?, created_at?, updated_at?}`. States are `queued`, `running`,
+`recovering`, `committed`, `conflict`, `failed`, and `cancelled`. Terminal
+receipts have `retry_after_ms: null`. `persistence.mode` distinguishes a
+filesystem-backed write from an intentional database-only write; Git progress
+does not change the meaning of committed memory.
+
+A pending write is a protocol `unavailable` error with a populated suggestion,
+`protocol_version: 1`, and optional `write_request` and `write_error` fields.
+It never returns a success `status` or `expired` value. `write_error` carries
+the detailed concurrency reason without changing the frozen protocol error
+enum. A committed receipt retains the original memory-verb success fields.
+Compaction may remove diagnostics, but must preserve those frozen result fields.
+
+The optional caller-generated UUID `request_id` identifies one write intent.
+Retry the same verb with the original arguments and the same ID to recover
+its outcome, including on the verbs-only surface. A terminal request is never
+executed again. Corrected input requires a new ID. Clients that lose a response
+without retaining its request ID cannot assume that retrying content is an
+exactly-once write. A receipt never contains queued content, recovery paths or
+execution credentials.
+
+The starter/full helpers `get_write_request`, `list_write_requests`, and
+`cancel_write_request` require write scope and explicit current operation
+permission. Existing operation snapshots are not widened by an upgrade.
+Helpers expose only the caller's currently authorized receipts; a foreign,
+missing, or no-longer-accessible UUID has the same `not_found` response. Their
+absence from a verb-only or agent-only grant does not prevent same-verb replay.
+See [concurrent writes](../guides/concurrent-writes.md) for exact read guarantees,
+bounded retention, ownership transfer, and the explicit regrant procedure.
+
+For `forget`, a committed source- and visibility-scoped withdrawal is the
+durable memory outcome. Its filesystem mirror may remain pending; stale
+source imports must still respect the withdrawal.
 
 ### context_pack(entities, budget_tokens?, since?, session_id?, include_private?) — read, zero LLM
 
@@ -6463,8 +6690,10 @@ after compaction to rehydrate what the summary dropped. Composes existing arms
 (`entity` card builder + the hot-facts arm); never calls an LLM.
 
 `entities` is comma-separated, capped at 8 (the response echoes the capped list). `budget_tokens` packs
-server-side (cards first, then facts) and the response reports
-`budget_used` + `dropped_count` — it never trims client-side. `since` filters
+server-side (cards first, then facts; each item costs its rendered line and the
+envelope + section headers are reserved first, so `text` fits the budget) and the
+response reports `budget_used` (the token estimate of `text`) + `dropped_count`
+— it never trims client-side. `since` filters
 open-thread events to those after the cursor. **Visibility is WORLD-ONLY by
 default** on every arm (a pack is injected into an agent context window that may
 be logged or synced to a cloud model). `include_private` widens ALL arms in
@@ -6473,7 +6702,8 @@ remote caller never widens (fail-closed).
 
 Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count? }`. `text` is the
-pre-rendered, envelope-wrapped injectable block.
+pre-rendered, envelope-wrapped injectable block; with `budget_tokens` it is
+rendered from the packed sets and never exceeds the declared budget.
 
 ### delta(since?, entities?, budget_tokens?, session_id?, include_private?) — read, zero LLM
 
@@ -6501,9 +6731,17 @@ of livelocking. Stateless callers resume by passing the response's
 
 Response: `{ protocol_version, since, pages[], facts[], threads[], text,
 has_more, next_cursor: { since, slug }, degraded_reason?, budget_tokens?,
-budget_used?, dropped_count? }`. `text` is rendered from the budget-packed sets
-(it honors the declared budget) and `since` is always normalized ISO (never the
-raw input string).
+budget_used?, dropped_count? }`. `budget_tokens` applies to pages and facts
+(pages pack first, then facts) — each item costs its rendered line and the
+envelope + section headers are reserved first, so `text` (rendered from the
+packed sets) fits the declared budget. **Threads are never truncated**: every
+open-thread event after `since` is delivered and its line is reserved ahead of
+pages and facts, so `dropped_count` / `has_more` count only pages and facts.
+If the envelope + headers + threads alone exceed `budget_tokens`, all threads
+are still returned and `budget_used` (the token estimate of `text`) reports the
+real rendered size, which then exceeds the budget. Cursor semantics are the v1
+page keyset alone — facts and threads never move `next_cursor`. `since` is
+always normalized ISO (never the raw input string).
 
 ## Latency classes (per verb)
 
@@ -7139,12 +7377,16 @@ across every affected column. Idempotent. Second run reports 0 rows. Use
 `--dry-run` to preview, `--json` for structured output. The `v0_12_2`
 version migration runs this automatically on `gbrain upgrade`.
 
-For truncated markdown bodies (source-dependent):
+For truncated markdown bodies (source-dependent): the importer skips a file
+whose content hash has not changed, and trailing whitespace is trimmed before
+hashing, so a re-import needs a real edit to the page body. Make the edit, then
+re-import:
 
 ```
-gbrain sync --force
-# or per-page
-gbrain import <slug> --force
+gbrain sync                  # git-backed brain: commit the edit first
+gbrain sync --working-tree   # or import the uncommitted working tree
+gbrain import <brain-root> --fresh   # or re-import the root you originally imported;
+                                     # --fresh ignores a resume checkpoint that would skip the path
 ```
 
 gbrain cannot recover content that is already lost if you no longer have

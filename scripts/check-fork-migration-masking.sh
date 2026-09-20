@@ -105,7 +105,7 @@ def fail(msg):
     print(f'{LABEL} {msg}', file=sys.stderr)
 
 def versions(text):
-    return [int(v) for v in re.findall(r'^\s+version:\s*(\d+),', text, re.M)]
+    return [int(v) for v in re.findall(r'^\s*(?:\{\s*)?version:\s*(\d+),', text, re.M)]
 
 upstream = versions(migrate)
 fork_versions = versions(fork)

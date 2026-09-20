@@ -49,12 +49,12 @@ export interface ForkMigrationDeps {
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 150;
+export const FORK_MIGRATION_FLOOR = 160;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 150,
+      version: 160,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +72,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 151,
+      version: 161,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +99,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 152,
+      version: 162,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +128,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 153,
+      version: 163,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +163,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 154,
+      version: 164,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -222,7 +222,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 155,
+      version: 165,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -250,7 +250,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 156,
+      version: 166,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -291,7 +291,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 157,
+      version: 167,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -362,7 +362,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 158,
+      version: 168,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -442,7 +442,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 159,
+      version: 169,
       name: 'repair_masked_upstream_146_149',
       // Fifth instance of the masking class this file's header describes, from
       // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
@@ -518,6 +518,96 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           r.oauth_audit === 'oauth_grant_audit' &&
           r.fact_withdrawals === 'fact_withdrawals' &&
           r.minion_col === 2
+        );
+      },
+    },
+    {
+      version: 170,
+      name: 'repair_masked_upstream_150_159',
+      // Sixth instance of the masking class this file's header describes, from
+      // the 2026-09-20 upstream sync (v0.50.0.0 → v0.51.0.0).
+      //
+      // Before that merge upstream's high-water was 149 and the fork occupied
+      // 150-159. Upstream then claimed 150-159 for its own migrations (the
+      // durable-persistence / revision-safe-writes wave), so the fork renumbered
+      // to 160-170 — but renumbering only moves the fork's DEFINITIONS.
+      // runMigrations gates on a single high-water integer, and a brain stamped
+      // 159 by the FORK's old 150-159 has `m.version > current` false for
+      // upstream's real 150-159 forever: skipped silently.
+      //
+      // Verified read-only on the production brain before writing this
+      // (2026-09-20, counter at 159 — this repair has not run yet):
+      //   150 page_write_guards / pages.knowledge_revision + triggers .. MISSING
+      //   151 persistence_requests / persistence_* tables .............. MISSING
+      //   155 persistence_effects ...................................... MISSING
+      //   157 persistence_topology_changes ............................. MISSING
+      //   sources_incarnation_key index (150) .......................... MISSING
+      //
+      // All ten declare `idempotent: true`; none is excluded. Applied in
+      // ascending order, since 151+ build on 150's revision columns.
+      //
+      // ⚠️ 150 adds `pages.knowledge_revision UUID NOT NULL DEFAULT
+      // gen_random_uuid()`: a volatile default, so Postgres rewrites the whole
+      // pages table under ACCESS EXCLUSIVE. It also installs BEFORE UPDATE /
+      // tag triggers on pages and tags. Take a backup and pause the sync cron
+      // before the first run against a large brain.
+      //
+      // Same lookup-don't-copy shape as v151-v154 and v159 above: the DDL is
+      // read out of the live MIGRATIONS registry, so this can never drift from
+      // what it repairs.
+      idempotent: true,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [150, 151, 152, 153, 154, 155, 156, 157, 158, 159]) {
+          const masked = deps.allMigrations().find(m => m.version === version);
+          if (!masked) continue;
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 150-159 masked by the 2026-09-20 fork renumber\n',
+        );
+      },
+      // Exact postcondition for the load-bearing targets. Postgres-only shape
+      // check; PGLite reports its own catalog, so gate on the engine kind.
+      verify: async (engine) => {
+        if (engine.kind !== 'postgres') return true;
+        const rows = await engine.executeRaw<{
+          page_write_guards: string | null;
+          projection_jobs: string | null;
+          requests: string | null;
+          effects: string | null;
+          topology: string | null;
+          revision_col: number;
+          deletion_col: number;
+          incarnation_idx: number;
+          revision_trigger: number;
+        }>(
+          `SELECT
+             to_regclass('public.page_write_guards')::text AS page_write_guards,
+             to_regclass('public.page_projection_jobs')::text AS projection_jobs,
+             to_regclass('public.persistence_requests')::text AS requests,
+             to_regclass('public.persistence_effects')::text AS effects,
+             to_regclass('public.persistence_topology_changes')::text AS topology,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'pages' AND column_name IN ('knowledge_revision', 'text_projection_revision')) AS revision_col,
+             (SELECT count(*)::int FROM information_schema.columns
+               WHERE table_name = 'page_versions' AND column_name = 'is_deleted') AS deletion_col,
+             (SELECT count(*)::int FROM pg_indexes WHERE indexname = 'sources_incarnation_key') AS incarnation_idx,
+             (SELECT count(*)::int FROM pg_trigger
+               WHERE tgname = 'pages_knowledge_revision' AND NOT tgisinternal) AS revision_trigger`,
+        );
+        const r = rows[0];
+        if (!r) return false;
+        return (
+          r.page_write_guards === 'page_write_guards' &&
+          r.projection_jobs === 'page_projection_jobs' &&
+          r.requests === 'persistence_requests' &&
+          r.effects === 'persistence_effects' &&
+          r.topology === 'persistence_topology_changes' &&
+          r.revision_col === 2 &&
+          r.deletion_col === 1 &&
+          r.incarnation_idx === 1 &&
+          r.revision_trigger === 1
         );
       },
     },

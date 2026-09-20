@@ -74,6 +74,19 @@ surface area.
 Recommended ChatGPT scope: `read write`. Leave `admin` for your local CLI
 and the admin dashboard.
 
+The initial MCP authentication challenge requests only `read`. Clients that
+follow that hint bootstrap with read access, even when their registration
+allows `read write`; registration is a ceiling, not automatic authorization
+for every listed scope. Saving requires the client to explicitly request
+`write` and the operator to approve it. Existing authorized writer sessions
+keep their permissions.
+
+OAuth discovery omits the operator-only `agent` scope so clients that register
+using advertised scopes do not request unsupported delegation. Explicit DCR
+requests for `agent` still fail; delegation requires a separately approved
+host grant. The server's SDK/HTTP tests cover these flows, not a live ChatGPT
+or Claude connector session.
+
 ## Deep research
 
 ChatGPT's **deep research** mode has a stricter MCP contract than normal
@@ -99,6 +112,20 @@ mints is zero-scope. The connector then connects fine but every tool call
 from the `/admin` dashboard or the CLI, then reconnect. Manual
 registration per step 2 above never hits this — you pick the scopes
 explicitly.
+
+**DCR scope ceiling.** The reverse also holds: a self-registering connector
+may request at most `read write`, and while `--enable-dcr` is on, OAuth
+discovery (`scopes_supported` in both the authorization-server and the
+protected-resource metadata) advertises exactly that set — so a connector
+that copies the advertised scopes into its registration succeeds. If it
+explicitly asks for `admin` anyway, registration fails with HTTP 400
+`invalid_client_metadata` rather than being quietly narrowed, and the
+connector shows a connection error. Either register the client manually
+(step 2) with the scopes you want, or let it self-register with `read
+write` and widen it afterwards with
+`gbrain auth rescope-client <client_id> --scopes ...`. Every self-registered
+connection also stops at the admin dashboard for your approval before a
+token is issued.
 
 ## Troubleshooting
 

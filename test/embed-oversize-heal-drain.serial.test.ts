@@ -1,3 +1,4 @@
+import { installFixtureChunks } from './helpers/page-projection.ts';
 /**
  * SUP-3874 drain-integration pin — healOversizedPageChunks must be CALLED by
  * the drains the fork actually routes it through, not merely exist as a
@@ -123,7 +124,7 @@ async function seedOversizedPage(slug: string): Promise<void> {
       embedding: undefined, // NULL = stale
     },
   ];
-  await engine.upsertChunks(slug, chunks);
+  await installFixtureChunks(engine, slug, chunks);
 }
 
 /** Shared post-drain assertions: split-in-DB, cap respected, sibling vector alive. */
