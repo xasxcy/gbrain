@@ -560,3 +560,12 @@ describe('storage precondition — the silent-no-op class (#4022)', () => {
     expect(src).toContain('${verified} files verified, ${mismatches} mismatches, ${missing} missing');
   });
 });
+
+describe('files CLI existence check is source-scoped (fork: unique key is (source_id, storage_path))', () => {
+  test('both upload and sync dedupe reads filter on source_id like the writes', () => {
+    const src = readFileSync(join(import.meta.dir, '../src/commands/files.ts'), 'utf8');
+    const reads = src.match(/SELECT id FROM files WHERE [^`]*content_hash[^`]*`/g) ?? [];
+    expect(reads.length).toBe(2);
+    for (const r of reads) expect(r).toContain("source_id = 'default'");
+  });
+});

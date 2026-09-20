@@ -195,7 +195,7 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
 
   // Check for existing file by hash — but only trust the row when the
   // BACKEND really holds the object (#4302); vanished bytes must re-upload.
-  const existing = await sql`SELECT id FROM files WHERE content_hash = ${hash} AND storage_path = ${storagePath}`;
+  const existing = await sql`SELECT id FROM files WHERE source_id = 'default' AND content_hash = ${hash} AND storage_path = ${storagePath}`;
   if (existing.length > 0 && (await storage.exists(storagePath).catch(() => false))) {
     console.log(`File already uploaded (hash match): ${storagePath}`);
     return;
@@ -464,7 +464,7 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
     const stat = statSync(filePath);
 
     const sql = sqlQueryForEngine(engine);
-    const existing = await sql`SELECT id FROM files WHERE content_hash = ${hash} AND storage_path = ${storagePath}`;
+    const existing = await sql`SELECT id FROM files WHERE source_id = 'default' AND content_hash = ${hash} AND storage_path = ${storagePath}`;
     if (existing.length > 0) {
       skipped++;
       continue;
