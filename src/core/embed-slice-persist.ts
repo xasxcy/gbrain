@@ -34,6 +34,8 @@ export interface PersistStaleSliceOptions {
    * B5 quarantine-storm fix intact.
    */
   activeColumn?: string;
+  /** Observed `pages.corpus_generation` (see PersistEmbedOutcomeRequest.expectedCorpusGeneration). */
+  expectedCorpusGeneration?: string | null;
 }
 
 export interface PersistStaleSliceResult {
@@ -64,7 +66,7 @@ const hashChunk = (text: string): string => createHash('md5').update(text).diges
  * checkpoint. Legacy callers intentionally never invoke this function.
  */
 export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise<PersistStaleSliceResult> {
-  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write, embedTexts, activeColumn } = opts;
+  const { engine, rows, embeddingSignature, signatureInvalidationFailed, embedFn, signal, slice, write, embedTexts, activeColumn, expectedCorpusGeneration } = opts;
   const first = rows[0];
   if (!first) return { embedded: 0, pageCommitted: false, persistFailed: false, failureCount: 0, aborted: !!signal?.aborted };
 
@@ -145,6 +147,7 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
         slug: first.slug,
         embeddingSignature: embeddingSignature ?? 'legacy',
         entries,
+        expectedCorpusGeneration,
       });
     } catch (error) {
       write(`[embed-persist-fail] slug=${first.slug} slice=${slice.index}/${slice.total} err=${error instanceof Error ? error.message : String(error)}`);

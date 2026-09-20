@@ -560,7 +560,9 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       handler: async (engine) => {
         for (const version of [150, 151, 152, 153, 154, 155, 156, 157, 158, 159]) {
           const masked = deps.allMigrations().find(m => m.version === version);
-          if (!masked) continue;
+          // Fail closed: silently skipping a missing entry would let v170 stamp
+          // as repaired while part of upstream's 150-159 was never applied.
+          if (!masked) throw new Error(`repair_masked_upstream_150_159: upstream migration ${version} not found in the live MIGRATIONS registry`);
           await deps.applyOneMigration(engine, masked);
         }
         deps.migrationNotice(

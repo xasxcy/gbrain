@@ -38,6 +38,7 @@ import { persistStaleSlice } from '../core/embed-slice-persist.ts';
 import { resolveEmbedSubBatchSize } from '../core/embed-slices.ts';
 import { AITransientError, AIConfigError } from '../core/ai/errors.ts';
 import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
+import { quoteIdentifier } from '../core/search/embedding-column.ts';
 import {
   restampIfDemotedToTitleTier,
   readCorpusGeneration,
@@ -1985,8 +1986,10 @@ async function embedAllStale(
         // silently stripping contextual prefixes — `embed --stale` is the
         // NORMAL post-model-migration path, so raw-text embedding here
         // quietly converted whole corpora to the unwrapped convention.
-        const pageRow = await observed(pacer, () => engine.getPage(slug, { sourceId: keySourceId }));
+        // Generation BEFORE the page row: a contextual run committing in between then shows up as
+        // a generation change at restamp/persist time instead of being absorbed into the baseline.
         const observedCorpusGeneration = await observed(pacer, () => readCorpusGeneration(engine, slug, keySourceId));
+        const pageRow = await observed(pacer, () => engine.getPage(slug, { sourceId: keySourceId }));
         const wrappedTexts = wrapChunkTextsForStoredMode(pageRow, stale);
         const slices = Math.ceil(stale.length / subBatchSize);
         let pageHadFailure = false;
@@ -2005,6 +2008,8 @@ async function embedAllStale(
               engine,
               rows: sliceRows,
               embeddingSignature: signature,
+              activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
+              expectedCorpusGeneration: observedCorpusGeneration,
               embedFn: (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
               signal: effectiveSignal,
               slice: { index: (offset / subBatchSize) + 1, total: slices },

@@ -6,7 +6,7 @@ import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
-import { dotenvValuesForKey } from './env-trust.ts';
+import { dotenvValuesForKey, isCwdDotenvProtectedKey } from './env-trust.ts';
 import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
 
 /**
@@ -695,6 +695,10 @@ function loadRepoDotenv(): void {
   }
 
   for (const [key, value] of Object.entries(parsed)) {
+    // The repo-root .env is the operator's own file, but the cwd-.env quarantine
+    // (env-trust.ts) strips these families on purpose and re-execs sanitized —
+    // and the cron's cwd IS the repo root. Reloading them here would undo that.
+    if (isCwdDotenvProtectedKey(key)) continue;
     if (process.env[key] === undefined) process.env[key] = value;
   }
 

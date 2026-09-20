@@ -105,6 +105,13 @@ export interface PersistEmbedOutcomeRequest {
   slug: string;
   embeddingSignature: string;
   entries: PersistEmbedOutcomeEntry[];
+  /**
+   * `pages.corpus_generation` the caller observed before embedding. When the
+   * property is present (even as null), vectors only land while the page still
+   * carries that generation — a contextual-retrieval run that committed in
+   * between owns the vectors. Undefined = unguarded (legacy callers).
+   */
+  expectedCorpusGeneration?: string | null;
 }
 
 export interface PersistEmbedOutcomeResult {

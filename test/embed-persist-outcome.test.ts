@@ -25,6 +25,34 @@ beforeEach(async () => {
 });
 
 describe('persistEmbedOutcome', () => {
+  test('vectors carry the model label and respect the observed corpus generation (v0.51 merge)', async () => {
+    const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'ledger'`);
+    await engine.executeRaw(`UPDATE pages SET corpus_generation = 'gen-1' WHERE id = $1`, [pageId]);
+    const entry = (chunkIndex: number, text: string) => ({
+      chunkIndex,
+      chunkHash: require('node:crypto').createHash('md5').update(text).digest('hex'),
+      outcome: { vector: new Float32Array(1536).fill(0.01) },
+    });
+    const base = { sourceId: 'default', pageId, slug: 'ledger', embeddingSignature: 'prov:model-x:1536' };
+
+    // A contextual run that moved the generation since the caller observed it owns the vectors.
+    const skipped = await engine.persistEmbedOutcome({ ...base, entries: [entry(0, 'good')], expectedCorpusGeneration: 'gen-0' });
+    expect(skipped).toMatchObject({ vectorCommittedChunks: 0, staleSkippedChunks: 1 });
+    expect((await engine.executeRaw(`SELECT 1 FROM content_chunks WHERE page_id = $1 AND chunk_index = 0 AND embedding IS NOT NULL`, [pageId]))).toHaveLength(0);
+
+    // Matching generation lands, and stamps the installed model so the current-space predicate sees it.
+    const landed = await engine.persistEmbedOutcome({ ...base, entries: [entry(0, 'good')], expectedCorpusGeneration: 'gen-1' });
+    expect(landed).toMatchObject({ vectorCommittedChunks: 1, staleSkippedChunks: 0 });
+    const [row] = await engine.executeRaw<{ model: string | null }>(`SELECT model FROM content_chunks WHERE page_id = $1 AND chunk_index = 0`, [pageId]);
+    expect(row?.model).toBe('prov:model-x');
+
+    // Unguarded callers (property absent) and the 'legacy' placeholder signature never mislabel the model.
+    const legacy = await engine.persistEmbedOutcome({ ...base, embeddingSignature: 'legacy', entries: [entry(1, 'bad')] });
+    expect(legacy.vectorCommittedChunks).toBe(1);
+    const [row1] = await engine.executeRaw<{ model: string | null }>(`SELECT model FROM content_chunks WHERE page_id = $1 AND chunk_index = 1`, [pageId]);
+    expect(row1?.model).not.toBe('legacy');
+  });
+
   test('signature-aware stale list/count/sum exclude only active exact ledger rows', async () => {
     const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug = 'ledger'`);
     await engine.executeRaw(

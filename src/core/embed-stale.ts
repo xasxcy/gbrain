@@ -428,10 +428,12 @@ export async function embedStaleForSource(
       // re-embed reproduces the page's wrapping convention instead of
       // silently stripping contextual prefixes (mirrors
       // src/commands/embed.ts:embedAllStale).
+      // Generation BEFORE the page row (see commands/embed.ts): a contextual run landing in between must
+      // surface as a generation change, not be absorbed into the baseline.
+      const observedCorpusGeneration = await observed(pacer, () => readCorpusGeneration(engine, slug, keySourceId));
       const pageRow = await observed(pacer, () =>
         engine.getPage(slug, { sourceId: keySourceId }),
       );
-      const observedCorpusGeneration = await observed(pacer, () => readCorpusGeneration(engine, slug, keySourceId));
       const wrappedTexts = wrapChunkTextsForStoredMode(pageRow, stale);
       const slices = Math.ceil(stale.length / subBatchSize);
       let pageHadFailure = false;
@@ -450,6 +452,7 @@ export async function embedStaleForSource(
           embeddingSignature: signature,
           signatureInvalidationFailed,
           activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
+          expectedCorpusGeneration: observedCorpusGeneration,
           embedFn,
           signal,
           slice: { index: (offset / subBatchSize) + 1, total: slices },

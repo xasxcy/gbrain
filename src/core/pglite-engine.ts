@@ -3085,6 +3085,11 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async persistEmbedOutcome(request: PersistEmbedOutcomeRequest): Promise<PersistEmbedOutcomeResult> {
+    // The registry-active plane, not a hard-coded legacy column: stale discovery,
+    // invalidation and the current-space predicate all resolve it the same way.
+    const activeColumn = await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
+    const activeColId = quoteIdentifier(activeColumn.name);
+    const guardCorpusGeneration = request.expectedCorpusGeneration !== undefined;
     return this.transaction(async (tx) => {
       const result: PersistEmbedOutcomeResult = {
         committedChunks: 0,
@@ -3110,7 +3115,7 @@ export class PGLiteEngine implements BrainEngine {
                 -- path embedded looked content-drifted forever. Hashed in SQL
                 -- (not JS) so stamp and drift comparison share one md5, per
                 -- upstream's own note at the upsert site.
-                SET embedding = $1::vector, embedded_at = now(),
+                SET ${activeColId} = $1${vectorCastSuffix(activeColumn)}, embedded_at = now(),
                     embedded_text_hash = md5(cc.chunk_text),
                     model = COALESCE($6, cc.model)
                FROM pages p
@@ -3119,12 +3124,14 @@ export class PGLiteEngine implements BrainEngine {
                 AND p.source_id = $3
                 AND cc.chunk_index = $4
                 AND md5(cc.chunk_text) = $5
+                AND ($7::boolean IS NOT TRUE OR p.corpus_generation IS NOT DISTINCT FROM $8::text)
               RETURNING cc.id`,
             [vector, request.pageId, request.sourceId, entry.chunkIndex, entry.chunkHash,
               // v0.51: the installed-model label rides with the vector so the
               // current-space predicate (signature invalidation, provenance
               // stamping) recognizes chunks this path embedded.
-              request.embeddingSignature ? splitEmbeddingSignature(request.embeddingSignature).model : null],
+              request.embeddingSignature && request.embeddingSignature !== 'legacy' ? splitEmbeddingSignature(request.embeddingSignature).model : null,
+              guardCorpusGeneration, request.expectedCorpusGeneration ?? null],
           );
           matched = rows.length > 0;
         } else {
