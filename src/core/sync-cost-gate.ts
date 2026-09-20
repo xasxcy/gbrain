@@ -498,6 +498,12 @@ export async function runInlineCostGate(
   }
 
   // ── Inline path ───────────────────────────────────────────────
+  // FORK: --yes bypasses the gate entirely, so don't pay for the estimate first.
+  // On a chunker-version bump every source takes the 'chunker_drift' ceiling,
+  // whose full-tree walk reads every syncable file synchronously (~13 min and
+  // 2.1B estimated tokens on the LifeOS vault, 2026-09-20) — before any
+  // `[gbrain phase]` line prints. cron passes --yes, so it only ever paid.
+  if (yesFlag && !dryRun) return { action: 'proceed', autoDeferEmbeds: false };
   const inline = estimateInlineNewTokens(sources, String(CHUNKER_VERSION), {
     forceFullTree: ctx.includeGitignored === true,
   });
