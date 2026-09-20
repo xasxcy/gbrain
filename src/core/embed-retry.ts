@@ -325,7 +325,7 @@ export function isTransientNetworkEmbedError(e: unknown): boolean {
 
 /** Read `pages.corpus_generation` for the observed-generation guard above. */
 export async function readCorpusGeneration(engine: BrainEngine, slug: string, sourceId: string): Promise<string | null> {
-  const [row] = await engine.executeRaw<{ corpus_generation: string | null }>(
+  const rows = await engine.executeRaw<{ corpus_generation: string | null }>(
     'SELECT corpus_generation FROM pages WHERE slug = $1 AND source_id = $2', [slug, sourceId]);
-  return row?.corpus_generation ?? null;
+  return rows?.[0]?.corpus_generation ?? null;
 }
