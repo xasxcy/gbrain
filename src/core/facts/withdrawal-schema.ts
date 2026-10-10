@@ -111,6 +111,18 @@ INSERT INTO fact_withdrawals(source_id, visibility, subject, fact_hash, withdraw
   ON CONFLICT DO NOTHING;
 DROP INDEX IF EXISTS idx_facts_withdrawal_fingerprint;
 CREATE INDEX idx_facts_withdrawal_fingerprint ON facts (source_id, visibility, gbrain_fact_fingerprint(fact));
+-- The managed writer guard requires a transaction-local authorization for
+-- canonical fact updates. Grant only sources that this backfill can actually
+-- match; the migration runner wraps this SQL in one transaction, so true
+-- cannot leak the grant to a pooled connection.
+SELECT set_config('gbrain.write_sources', COALESCE((
+  SELECT jsonb_agg(DISTINCT f.source_id)::text
+    FROM facts f
+    JOIN fact_withdrawals w ON f.source_id = w.source_id AND f.visibility = w.visibility
+   WHERE f.expired_at IS NULL
+     AND (w.subject = '*' OR w.subject = f.entity_slug)
+     AND gbrain_fact_fingerprint(f.fact) = w.fact_hash
+), '[]'), true);
 UPDATE facts f SET expired_at = w.withdrawn_at, valid_until = LEAST(COALESCE(f.valid_until, w.withdrawn_at), w.withdrawn_at)
   FROM (SELECT source_id, visibility, subject, fact_hash, min(withdrawn_at) AS withdrawn_at FROM fact_withdrawals
     GROUP BY source_id, visibility, subject, fact_hash) w

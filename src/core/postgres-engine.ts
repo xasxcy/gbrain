@@ -1755,13 +1755,14 @@ export class PostgresEngine implements BrainEngine {
     const stateRows = await this.sql.unsafe(
       `SELECT
          count(*) FILTER (WHERE l.quarantined_at IS NULL AND l.next_retry_at > now())::int AS backoff_deferred,
-         count(*) FILTER (WHERE l.quarantined_at IS NOT NULL)::int AS quarantined
+         count(*) FILTER (WHERE l.quarantined_at IS NOT NULL)::int AS quarantined,
+         min(l.next_retry_at) FILTER (WHERE l.quarantined_at IS NULL AND l.next_retry_at > now()) AS earliest_retry_at
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
        LEFT JOIN embed_failures l ON ${ledgerJoin}
        WHERE ${base.where}`,
       params as Parameters<typeof this.sql.unsafe>[1],
     );
-    const state = stateRows[0] as { backoff_deferred?: number; quarantined?: number } | undefined;
+    const state = stateRows[0] as { backoff_deferred?: number; quarantined?: number; earliest_retry_at?: Date | string | null } | undefined;
     const by_error_class = (await this.sql.unsafe(
       `SELECT l.error_class, count(*)::int AS count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
@@ -1795,6 +1796,7 @@ export class PostgresEngine implements BrainEngine {
         backoff_deferred: Number(state?.backoff_deferred ?? 0),
         quarantined: Number(state?.quarantined ?? 0),
       },
+      earliest_retry_at: state?.earliest_retry_at == null ? null : new Date(state.earliest_retry_at),
       by_error_class,
       quarantined_top,
     };

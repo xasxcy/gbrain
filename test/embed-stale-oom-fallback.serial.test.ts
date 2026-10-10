@@ -475,6 +475,30 @@ describe('SPEC V4 fallback contracts', () => {
     expect(partial.fatalError).toBeUndefined();
   });
 
+  test('partial-stale merges zero-norm vectors from an invalid-input bisection subgroup', async () => {
+    const invalid = new Error('invalid input in batch');
+    const zeroNorm = new EmbeddingZeroNormError(
+      [{ index: 1, reason: 'zero_norm' }], [makeVec(10), null], 'test:model',
+    );
+    const calls: string[][] = [];
+    const partial = await embedWithTruncationFallbackPartial(['left-good', 'left-bad', 'right-good'], async (texts) => {
+      calls.push(texts);
+      if (texts.length === 3) throw invalid;
+      if (texts[0] === 'left-good') throw zeroNorm;
+      return [makeVec(30)];
+    }, { policy: 'partial-stale', expectedDimensions: DIM });
+
+    expect(calls).toEqual([
+      ['left-good', 'left-bad', 'right-good'],
+      ['left-good', 'left-bad'],
+      ['right-good'],
+    ]);
+    expect(partial.vectors).toEqual([makeVec(10), null, makeVec(30)]);
+    expect(partial.failures).toEqual([{ index: 1, error: zeroNorm }]);
+    expect(partial.fatalError).toBeUndefined();
+    expect(partial.aborted).toBe(false);
+  });
+
   test('partial retains prefix vectors, reports fatal, and does not try later chunks', async () => {
     const calls: string[][] = [];
     const fatal = new Error('rate_limit_exceeded: 429');

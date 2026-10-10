@@ -23,9 +23,13 @@
  * contains) rather than on the edits, because a checker that greps for the
  * edits passes on an empty result.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MIGRATIONS, LATEST_VERSION } from '../src/core/migrate.ts';
-import { FORK_MIGRATION_FLOOR } from '../src/core/fork-migrations.ts';
+import { buildForkMigrations, FORK_MIGRATION_FLOOR } from '../src/core/fork-migrations.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
+import type { Migration } from '../src/core/migrate.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { FACT_WITHDRAWAL_NORMALIZED_SQL } from '../src/core/facts/withdrawal-schema.ts';
 
 describe('fork migration registry seam', () => {
   test('LATEST_VERSION is computed AFTER the fork migrations are pushed', () => {
@@ -69,4 +73,65 @@ describe('fork migration registry seam', () => {
       .map(m => `${m.version}:${m.name}`);
     expect(notIdempotent).toEqual([]);
   });
+
+  test('v240 never commits v149\'s obsolete queue protocol when canonical restoration is interrupted', async () => {
+    const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
+    let committedProtocol = 'canonical protocol';
+    const engine = {
+      kind: 'pglite',
+      transaction: async (work: (tx: Pick<BrainEngine, 'runMigration'>) => Promise<void>) => {
+        let stagedProtocol = committedProtocol;
+        const tx = {
+          runMigration: async (_version: number, sql: string) => {
+            if (sql === 'old protocol') stagedProtocol = 'old protocol';
+            else throw new Error('interrupted before canonical protocol can commit');
+          },
+        };
+        await work(tx);
+        committedProtocol = stagedProtocol;
+      },
+    } as unknown as BrainEngine;
+    const migrations = buildForkMigrations({
+      allMigrations: () => [v149],
+      applyOneMigration: async () => { throw new Error('v149 must not use the independently committing helper'); },
+      migrationNotice: () => {},
+    });
+    const repair = migrations.find(migration => migration.version === 240)!;
+
+    await expect(repair.handler!(engine)).rejects.toThrow('interrupted before canonical protocol can commit');
+    expect(committedProtocol).toBe('canonical protocol');
+  });
+});
+
+describe('fork repair under the managed PGLite writer guard', () => {
+  let engine: PGLiteEngine;
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  }, 60_000);
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  test('v243 can replay v174 withdrawal expiry under the managed PGLite writer guard without leaking its source grant', async () => {
+    const fact = await engine.insertFact(
+      { fact: 'Managed repair withdrawal sentinel', source: 'test', visibility: 'world' },
+      { source_id: 'default' },
+    );
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id, visibility, subject, fact_hash, withdrawn_at)
+      VALUES ('default', 'world', '*', gbrain_fact_fingerprint($1), '2026-10-10T00:00:00Z')`,
+    ['Managed repair withdrawal sentinel']);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+
+    await expect(engine.executeRaw('UPDATE facts SET valid_until=now() WHERE id=$1', [fact.id]))
+      .rejects.toThrow('writer_coordinator_required');
+    // runMigration is the production SQL runner: unlike executeRaw it
+    // accepts a multi-statement migration body and preserves its transaction.
+    await engine.transaction(tx => tx.runMigration(174, FACT_WITHDRAWAL_NORMALIZED_SQL));
+    expect(await engine.executeRaw('SELECT expired_at, valid_until FROM facts WHERE id=$1', [fact.id]))
+      .toEqual([{ expired_at: new Date('2026-10-10T00:00:00.000Z'), valid_until: new Date('2026-10-10T00:00:00.000Z') }]);
+    await expect(engine.executeRaw('UPDATE facts SET valid_until=now() WHERE id=$1', [fact.id]))
+      .rejects.toThrow('writer_coordinator_required');
+  }, 60_000);
 });

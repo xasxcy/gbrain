@@ -13,6 +13,8 @@ export interface PersistStaleSliceOptions {
   signatureInvalidationFailed?: boolean;
   embedFn: EmbedFn;
   signal?: AbortSignal;
+  /** Same deadline as the source lease; checked immediately before commit. */
+  deadline?: number;
   slice: { index: number; total: number };
   write: (message: string) => void;
   /**
@@ -111,7 +113,9 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     const row = rows[index]!;
     const vector = partial.vectors[index];
     if (vector !== null) {
-      entries.push({ chunkIndex: row.chunk_index, chunkHash: hashChunk(row.chunk_text), outcome: { vector } });
+      // A truncated fallback vector has no canonical input-hash representation
+      // yet. Keep it usable, but never certify it as the full chunk input.
+      entries.push({ chunkIndex: row.chunk_index, chunkHash: hashChunk(row.chunk_text), inputHash: partial.truncated[index] ? null : undefined, outcome: { vector } });
     }
   }
   for (const failure of partial.failures) {
@@ -173,9 +177,24 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     try {
       if (!prepared) throw preparedError ?? new Error('projection unavailable before embedding slice persistence');
       let engineOutcome: PersistEmbedOutcomeResult | undefined;
+      const assertFence = async (tx: BrainEngine): Promise<void> => {
+        if (signal?.aborted || Date.now() >= (opts.deadline ?? Infinity)) {
+          const abort = new Error('embedding persistence fence aborted');
+          abort.name = 'AbortError';
+          throw abort;
+        }
+        try { await opts.assertOwned?.(tx); } catch (error) { ownershipFailure = { error }; throw error; }
+        // Ownership may involve I/O; re-check stop state before the transaction
+        // gets to its write/commit boundary.
+        if (signal?.aborted || Date.now() >= (opts.deadline ?? Infinity)) {
+          const abort = new Error('embedding persistence fence expired');
+          abort.name = 'AbortError';
+          throw abort;
+        }
+      };
       const installed = await installPageEmbeddings(engine, prepared, [], undefined, undefined, {
         assertOwned: async tx => {
-          try { await opts.assertOwned?.(tx); } catch (error) { ownershipFailure = { error }; throw error; }
+          await assertFence(tx);
         },
         outcome: { embeddingSignature: embeddingSignature ?? 'legacy', entries, expectedCorpusGeneration },
         onOutcome: value => { engineOutcome = value; },

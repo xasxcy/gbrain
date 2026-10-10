@@ -133,6 +133,9 @@ describe('embed-backfill handler — happy path', () => {
     allowEmbed();
     await expect(running).resolves.toMatchObject({ status: 'aborted' });
     expect(_registeredShutdownWorkCountForTests()).toBe(0);
+    // A fenced cancellation correctly leaves this chunk stale. Remove this
+    // fixture explicitly so the following lock-only tests stay provider-free.
+    await engine.executeRaw("DELETE FROM pages WHERE slug='shutdown-registry'");
   });
 });
 
@@ -233,9 +236,12 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
         return [new Float32Array(1536)];
       },
     });
-    const result = await handler(fakeJob({ sourceId: 'default' }, controller));
+    // Keep the durable prefix in a prior checkpoint: F2's transaction fence
+    // correctly rolls back the entire active slice once this controller fires.
+    const result = await handler(fakeJob({ sourceId: 'default', batchSize: 1 }, controller));
     expect(result).toMatchObject({ status: 'aborted', embedded: 1, pagesProcessed: 1 });
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+    await engine.executeRaw("DELETE FROM pages WHERE slug='abort'");
   });
 
   test('BudgetExhausted maps to status:budget_exhausted after prefix persistence', async () => {
@@ -313,6 +319,23 @@ describe('embed-backfill handler — #4283 honesty gates', () => {
     });
     const result = await handler(fakeJob({ sourceId: 'default' }));
     expect(result).toMatchObject({ status: 'aborted', embedded: 0, invalidated: 5 });
+  });
+
+  test('deferred-only work returns a retryable deferred status instead of a failed incomplete drain', async () => {
+    const retryAt = new Date('2030-01-02T03:04:05.000Z');
+    const handler = makeEmbedBackfillHandler(engine, {
+      runStale: async () => ({
+        ...drainBase, embedded: 0, chunksProcessed: 0, invalidated: 0,
+        deferred: true, remaining: 1,
+        failureSummary: {
+          counts: { total_null: 1, eligible_now: 0, backoff_deferred: 1, quarantined: 0 },
+          earliest_retry_at: retryAt, by_error_class: [], quarantined_top: [],
+        },
+      }),
+    });
+    const result = await handler(fakeJob({ sourceId: 'default' }));
+    expect(result).toMatchObject({ status: 'deferred', sourceId: 'default', embedded: 0 });
+    expect(result.reason).toContain(retryAt.toISOString());
   });
 
   test('success carries invalidated + invalidationSkipped counts in the job result row', async () => {

@@ -500,14 +500,22 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       idempotent: true,
       sql: '',
       handler: async (engine) => {
-        for (const version of [146, 147, 148, 149]) {
+        for (const version of [146, 147, 148]) {
           const masked = deps.allMigrations().find(m => m.version === version);
           if (!masked) continue;
           await deps.applyOneMigration(engine, masked);
         }
         // v149 replaces this function with its pre-spend-authorization body.
-        // Restore only the current protocol body, not all unrelated v205 DDL.
-        await engine.executeRaw(MINION_QUEUE_PROTOCOL_FUNCTION_SQL);
+        // Handlers normally run outside the migration SQL transaction, so
+        // replaying it through applyOneMigration and then restoring the
+        // canonical protocol would expose a committed old function on an
+        // interrupt. Keep both statements in this explicit transaction.
+        const v149 = requireMaskedMigration(deps, 'repair_masked_upstream_146_149', 149);
+        const v149Sql = v149.sqlFor?.[engine.kind] ?? v149.sql;
+        await engine.transaction(async (tx) => {
+          await tx.runMigration(v149.version, v149Sql);
+          await tx.runMigration(v149.version, MINION_QUEUE_PROTOCOL_FUNCTION_SQL);
+        });
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 146/147/148/149 masked by the 2026-09-14 fork renumber\n',
         );

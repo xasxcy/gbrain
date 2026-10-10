@@ -68,8 +68,9 @@ export interface EmbedBackfillJobData {
 }
 
 export interface EmbedBackfillResult {
-  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted';
+  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted' | 'deferred';
   sourceId: string;
+  reason?: string;
   embedded: number;
   chunksProcessed: number;
   pagesProcessed: number;
@@ -359,6 +360,20 @@ export function makeEmbedBackfillHandler(
           spentUsd: tracker.totalSpent,
         };
       }
+      if (result.deferred) {
+        return {
+          status: 'deferred',
+          sourceId,
+          embedded: result.embedded,
+          chunksProcessed: result.chunksProcessed,
+          pagesProcessed: result.pagesProcessed,
+          invalidated: result.invalidated,
+          spentUsd: tracker.totalSpent,
+          reason: result.failureSummary?.counts.quarantined
+            ? 'embedding chunks are quarantined; change content or clear the failure ledger before retrying'
+            : `embedding retry deferred until ${result.failureSummary?.earliest_retry_at?.toISOString() ?? 'the recorded backoff expires'}`,
+        };
+      }
       // #4283 honesty gate: a completed drain that embedded NOTHING while
       // having work to do (it NULLed vectors, or it pulled stale chunks) is a
       // broken-embedder run, not a success. Throw so the queue marks the job
@@ -398,6 +413,21 @@ export function makeEmbedBackfillHandler(
           invalidated: 0, // Unknown — the drain's counters are lost with the throw
           spentUsd: tracker.totalSpent,
           budgetCapUsd: capUsd,
+        };
+      }
+      // The persistence fence deliberately rethrows AbortError so it cannot
+      // be counted as a page-level failure.  At this outer job boundary an
+      // operator/shutdown cancellation is still a resumable terminal state,
+      // while ownership loss (LockStolenError) must continue to reject.
+      if (!stalled && err instanceof Error && err.name === 'AbortError') {
+        return {
+          status: 'aborted',
+          sourceId,
+          embedded: 0,
+          chunksProcessed: 0,
+          pagesProcessed: 0,
+          invalidated: 0,
+          spentUsd: tracker.totalSpent,
         };
       }
       throw err;

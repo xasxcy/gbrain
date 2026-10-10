@@ -101,6 +101,9 @@ export interface EmbedStaleResult {
   remaining?: number;
   failures?: number;
   complete?: boolean;
+  failureSummary?: import('./engine.ts').EmbedFailureSummary;
+  /** No chunk can run now; caller should defer rather than retry as a failure. */
+  deferred?: boolean;
   /** Chunks newly embedded in this call. */
   embedded: number;
   /** Total chunks pulled across all batches (including ones that errored). */
@@ -180,9 +183,15 @@ export async function stampIfPageProvenanceComplete(
       if (!current || current.page.deleted_at || current.revision !== opts.prepared.snapshot.revision
         || current.sourceIncarnation !== opts.prepared.snapshot.sourceIncarnation || current.page.id !== opts.prepared.snapshot.page.id
         || current.page.text_projection_revision !== current.revision) return false;
-      // The checked column descriptor of the prepared snapshot must be the
-      // column this drain judges; it was resolved once for the drain.
-      if (opts.prepared.embeddingColumn.name !== column) return false;
+      // Re-read the installer snapshot while holding the same page lock. The
+      // provider result may have landed just before an active-plane/config
+      // change; a signature is a whole-page claim and must never bridge that
+      // change merely because model and dimensions happen to match.
+      const fresh = await readProjectionSnapshot(tx, slug, sourceId, { requireLiveSource: true });
+      if (!fresh || fresh.indexingContext !== opts.prepared.indexingContext
+        || fresh.embeddingColumn.name !== column
+        || fresh.embeddingColumn.name !== opts.prepared.embeddingColumn.name
+        || fresh.embeddingColumn.dimensions !== opts.prepared.embeddingColumn.dimensions) return false;
     }
     // Signature is `<provider:model>:<dims>`; the model part is what
     // upsertChunks records in content_chunks.model.
@@ -190,7 +199,7 @@ export async function stampIfPageProvenanceComplete(
     const colId = quoteIdentifier(column);
     const rows = await tx.executeRaw<{ complete: boolean }>(
       `SELECT count(*) > 0
-              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}) AS complete
+              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)} AND cc.embedding_input_hash IS NOT NULL) AS complete
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
         WHERE p.slug = $2 AND p.source_id = $3 AND p.text_projection_revision=p.knowledge_revision
           AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,
@@ -364,6 +373,22 @@ export async function embedStaleForSource(
   if (stopped()) return { ...result, aborted: true };
   await opts.assertOwned?.();
   if (stopped()) return { ...result, aborted: true };
+  // Deferred/quarantined chunks are still incomplete, but are not runnable
+  // work. Exit before readiness or provider probing so a deferred-only source
+  // neither spends a health probe nor enters a normal failure loop.
+  if (signature) {
+    const failureSummary = await engine.getEmbedFailureSummary({ sourceId, signature });
+    if (failureSummary.counts.total_null > 0 && failureSummary.counts.eligible_now === 0) {
+      return {
+        ...result,
+        done: true,
+        complete: false,
+        remaining: failureSummary.counts.total_null,
+        deferred: true,
+        failureSummary,
+      };
+    }
+  }
   const archivedWork = await countArchivedEmbeddingWork(engine, { sourceId, signature });
   if (archivedWork) return { ...result, blocked: archivedWork, failures: archivedWork, complete: false, done: true,
     remaining: await engine.countStaleChunks({ sourceId, ...(signature && { signature }) }) };
@@ -562,21 +587,34 @@ export async function embedStaleForSource(
         if (stopped()) return;
         await opts.assertOwned?.(); // ownership re-check before each slice commit (persistStaleSlice has no tx hook)
         const sliceRows = stale.slice(offset, offset + subBatchSize);
-        const checkpoint = await persistStaleSlice({
-          engine,
-          embedTexts: wrappedTexts.slice(offset, offset + subBatchSize),
-          rows: sliceRows,
-          embeddingSignature: signature,
-          signatureInvalidationFailed,
-          activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
-          expectedCorpusGeneration: observedCorpusGeneration,
-          prepared,
-          assertOwned: opts.assertOwned,
-          embedFn,
-          signal,
-          slice: { index: (offset / subBatchSize) + 1, total: slices },
-          write,
-        });
+        let checkpoint: Awaited<ReturnType<typeof persistStaleSlice>>;
+        try {
+          checkpoint = await persistStaleSlice({
+            engine,
+            embedTexts: wrappedTexts.slice(offset, offset + subBatchSize),
+            rows: sliceRows,
+            embeddingSignature: signature,
+            signatureInvalidationFailed,
+            activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
+            expectedCorpusGeneration: observedCorpusGeneration,
+            prepared,
+            assertOwned: opts.assertOwned,
+            embedFn,
+            signal,
+            deadline: opts.deadline,
+            slice: { index: (offset / subBatchSize) + 1, total: slices },
+            write,
+          });
+        } catch (error) {
+          // The transaction fence deliberately throws cancellation rather
+          // than recording it as a page failure. Preserve earlier slices and
+          // surface the drain's resumable aborted state to its caller.
+          if (error instanceof Error && error.name === 'AbortError') {
+            result.aborted = true;
+            return;
+          }
+          throw error;
+        }
         result.embedded += checkpoint.embedded;
         if (checkpoint.failureCount > 0) { pageHadFailure = true; result.failures = (result.failures ?? 0) + checkpoint.failureCount; } // ledgered chunk failures still count as run failures (upstream contract)
         if (checkpoint.persistFailed) {

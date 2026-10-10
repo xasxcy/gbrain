@@ -1836,6 +1836,7 @@ async function embedAllStale(
     const resolvedSignature = signature ?? currentEmbeddingSignature() ?? undefined;
     const emptyFailureSummary = {
       counts: { total_null: 0, eligible_now: 0, backoff_deferred: 0, quarantined: 0 },
+      earliest_retry_at: null,
       by_error_class: [],
       quarantined_top: [],
     } satisfies EmbedFailureSummary;

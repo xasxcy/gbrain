@@ -259,7 +259,9 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
       const entries = opts.outcome.entries.map(entry => {
         const original = byIndex.get(entry.chunkIndex);
         return 'vector' in entry.outcome && original
-          ? { ...entry, inputHash: embeddingInputHash(provenance, tier, original) }
+          // Undefined asks the installer for canonical provenance; explicit
+          // null is an honest "unknown" marker for transformed input.
+          ? { ...entry, inputHash: entry.inputHash === undefined ? embeddingInputHash(provenance, tier, original) : entry.inputHash }
           : entry;
       });
       const outcome = await tx.persistEmbedOutcome({

@@ -103,7 +103,7 @@ export type PersistEmbedOutcomeEntry = {
    * caller from its checked projection snapshot and written atomically with
    * the vector. Omitted = unknown provenance (stored as NULL).
    */
-  inputHash?: string;
+  inputHash?: string | null;
   outcome:
     | { vector: Float32Array }
     | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string } };
@@ -167,6 +167,8 @@ export interface EmbedFailureSummary {
     backoff_deferred: number;
     quarantined: number;
   };
+  /** Earliest retry time among deferred chunks, if any. */
+  earliest_retry_at: Date | null;
   by_error_class: Array<{ error_class: EmbedFailureClass; count: number }>;
   quarantined_top: Array<{
     slug: string;
