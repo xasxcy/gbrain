@@ -15,6 +15,40 @@ export type EmbedFn = (
   opts: { abortSignal?: AbortSignal },
 ) => Promise<Float32Array[]>;
 
+/** A provider response shape that cannot safely reach vector persistence. */
+class EmbeddingOutputValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmbeddingOutputValidationError';
+  }
+}
+
+function validateEmbeddingOutput(
+  vectors: Float32Array[],
+  expectedCount: number,
+  expectedDimensions?: number,
+): Float32Array[] {
+  if (!Array.isArray(vectors) || vectors.length !== expectedCount) {
+    throw new EmbeddingOutputValidationError(
+      `embedding provider returned ${Array.isArray(vectors) ? vectors.length : 'a non-array'} result(s) for ${expectedCount} input(s)`,
+    );
+  }
+  for (const [index, vector] of vectors.entries()) {
+    if (!(vector instanceof Float32Array)) {
+      throw new EmbeddingOutputValidationError(`embedding provider returned a non-Float32Array vector at index ${index}`);
+    }
+    if (expectedDimensions !== undefined && vector.length !== expectedDimensions) {
+      throw new EmbeddingOutputValidationError(
+        `embedding provider returned ${vector.length} dimensions at index ${index}; expected ${expectedDimensions}`,
+      );
+    }
+    if (!vector.every(Number.isFinite)) {
+      throw new EmbeddingOutputValidationError(`embedding provider returned a non-finite vector at index ${index}`);
+    }
+  }
+  return vectors;
+}
+
 /** Batch layer: failures worth splitting into independent chunk attempts. */
 export function isOllamaBatchSplitWorthyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -102,7 +136,7 @@ function isSplitWorthy(error: unknown, policy: PartialFallbackPolicy): boolean {
 async function attemptSingleChunk(
   text: string,
   embedFn: EmbedFn,
-  opts: { abortSignal?: AbortSignal },
+  opts: { abortSignal?: AbortSignal; expectedDimensions?: number },
   originalAlreadyTried: boolean,
   previousError?: unknown,
   policy: PartialFallbackPolicy = 'legacy',
@@ -118,7 +152,7 @@ async function attemptSingleChunk(
     if (opts.abortSignal?.aborted) return { kind: 'aborted' };
     const candidate = text.length > maxLength ? text.slice(0, maxLength) : text;
     try {
-      const [vector] = await embedFn([candidate], opts);
+      const [vector] = validateEmbeddingOutput(await embedFn([candidate], opts), 1, opts.expectedDimensions);
       if (candidate.length < text.length) {
         process.stderr.write(
           `  [embed-fallback] chunk truncated ${text.length}→${candidate.length} chars for embedding\n`,
@@ -127,6 +161,9 @@ async function attemptSingleChunk(
       return { kind: 'success', vector };
     } catch (error) {
       if (opts.abortSignal?.aborted) return { kind: 'aborted', error };
+      // A zero-norm refusal of this one input is a terminal per-item result
+      // under the partial-stale contract, not a run-global config fault.
+      if (policy === 'partial-stale' && isEmbeddingZeroNormError(error)) return { kind: 'ollamaFailure', error };
       if (!isOllamaOomLikeError(error)) {
         return isSplitWorthy(error, policy)
           ? { kind: 'ollamaFailure', error }
@@ -155,7 +192,7 @@ function terminalResult(
 async function bisectInvalidInputs(
   texts: string[],
   embedFn: EmbedFn,
-  opts: { abortSignal?: AbortSignal },
+  opts: { abortSignal?: AbortSignal; expectedDimensions?: number },
   vectors: (Float32Array | null)[],
   failures: { index: number; error: unknown }[],
   offset: number,
@@ -173,7 +210,7 @@ async function bisectInvalidInputs(
   for (const [start, end] of [[0, mid], [mid, texts.length]] as const) {
     const group = texts.slice(start, end);
     try {
-      const embedded = await embedFn(group, opts);
+      const embedded = validateEmbeddingOutput(await embedFn(group, opts), group.length, opts.expectedDimensions);
       for (let index = 0; index < embedded.length; index++) vectors[offset + start + index] = embedded[index]!;
     } catch (error) {
       if (opts.abortSignal?.aborted) return { aborted: true };
@@ -193,13 +230,13 @@ async function bisectInvalidInputs(
 export async function embedWithTruncationFallbackPartial(
   texts: string[],
   embedFn: EmbedFn,
-  opts: { abortSignal?: AbortSignal; policy?: PartialFallbackPolicy },
+  opts: { abortSignal?: AbortSignal; policy?: PartialFallbackPolicy; expectedDimensions?: number },
 ): Promise<PartialEmbedResult> {
   const vectors: (Float32Array | null)[] = Array.from({ length: texts.length }, () => null);
   const failures: { index: number; error: unknown }[] = [];
 
   try {
-    const embedded = await embedFn(texts, opts);
+    const embedded = validateEmbeddingOutput(await embedFn(texts, opts), texts.length, opts.expectedDimensions);
     return { vectors: embedded, failures, aborted: false };
   } catch (error) {
     if (opts.abortSignal?.aborted) return terminalResult(vectors, failures, opts.abortSignal);

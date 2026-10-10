@@ -14,6 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { AITransientError } from '../src/core/ai/errors.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { persistStaleSlice } from '../src/core/embed-slice-persist.ts';
 
 let engine: PGLiteEngine;
@@ -34,7 +35,10 @@ beforeEach(async () => {
 
 async function seedStaleChunks(count: number) {
   await engine.putPage('outage-page', { type: 'note', title: 'outage-page', compiled_truth: '# outage-page' });
-  await engine.upsertChunks(
+  // A real, sealed projection: vectors and ledger rows are installed only
+  // against a sealed revision (the canonical installer's CAS).
+  await installFixtureChunks(
+    engine,
     'outage-page',
     Array.from({ length: count }, (_, chunk_index) => ({
       chunk_index,

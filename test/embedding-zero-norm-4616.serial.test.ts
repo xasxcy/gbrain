@@ -121,6 +121,10 @@ for (const kind of testBackends()) describe(`#4616 per-item refusal on write pat
       const embedded = await embeddedIndexes(slug);
       expect(embedded).toHaveLength(99);
       expect(embedded).not.toContain(42);
+      expect(await engine.executeRaw<{ error_class: string }>(
+        `SELECT error_class FROM embed_failures ef JOIN pages p ON p.id=ef.page_id
+          WHERE p.slug=$1 AND ef.chunk_index=42`, [slug],
+      )).toEqual([{ error_class: 'invalid_input' }]);
       // The degenerate chunk was sent once and never retried as a transient failure.
       expect(sent.flat().filter(t => t.includes('DEGENERATE'))).toHaveLength(1);
       await engine.deletePage(slug, { sourceId: 'default' });

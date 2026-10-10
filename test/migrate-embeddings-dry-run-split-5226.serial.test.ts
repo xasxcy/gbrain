@@ -121,6 +121,14 @@ describe('#5226 embed summary line', () => {
     } finally {
       log.mockRestore();
     }
-    expect(out.find(l => l.startsWith('Embedded '))).toBe('Embedded 9 chunks across 3 pages');
+    // Upstream's page-count contract (each page counted once) and the fork's
+    // retry-backlog fields are asserted separately: neither weakens the other.
+    const summary = out.find(l => l.startsWith('Embedded '));
+    expect(summary).toMatch(/^Embedded 9 chunks across 3 pages(;|$)/);
+    expect(summary).toContain('persistFailures=0');
+    expect(summary).toContain('total_null=0');
+    expect(summary).toContain('eligible_now=0');
+    expect(summary).toContain('backoff_deferred=0');
+    expect(summary).toContain('quarantined=0');
   });
 });

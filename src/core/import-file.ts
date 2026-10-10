@@ -640,7 +640,7 @@ export async function importFromContent(
   const reused = reusable && !opts.noEmbed && !opts.prepare ? await reuseStoredVectors(engine, chunks) : new Map<number, number | null>();
 
   let embeddingPartial: EmbeddingZeroNormError | undefined;
-  const embedChunks = async () => {
+  const embedChunks = async (abortSignal?: AbortSignal) => {
     const pending = chunks.map((_, i) => i).filter(i => !reused.has(i));
     if (opts.noEmbed || pending.length === 0) return;
     const prefix =
@@ -655,14 +655,15 @@ export async function importFromContent(
     // two hardenings compose. Upstream's #4616 partial-vector semantics (store
     // the usable vectors; refused chunks stay NULL for embed --stale) are kept
     // by catching the zero-norm error the fallback rethrows unchanged.
-    // FORK: register in-flight provider work so SIGTERM/SIGHUP drains it before
-    // cleanup releases DB/lock resources (scoped to the provider call here;
-    // the fork wrapped the whole function, upstream's prepare/return shape
-    // made that unsafe to port mechanically).
-    const shutdownAbort = new AbortController();
+    // A caller that also owns a following transaction supplies its signal and
+    // keeps the registration alive until that transaction commits. Preparation
+    // has no such local transaction, so it retains a provider-only guard.
+    const providerAbort = abortSignal ? undefined : new AbortController();
     let resolveDrain!: () => void;
     const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
-    const deregisterShutdown = registerShutdownWork({ abort: shutdownAbort, drain });
+    const deregisterShutdown = providerAbort
+      ? registerShutdownWork({ abort: providerAbort, drain })
+      : undefined;
     let embeddings: (Float32Array | null)[];
     let refused: EmbeddingZeroNormError | undefined;
     try {
@@ -670,7 +671,7 @@ export async function importFromContent(
         embeddings = await embedWithTruncationFallback(
           wrappedTexts,
           (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
-          { abortSignal: shutdownAbort.signal },
+          { abortSignal: abortSignal ?? providerAbort!.signal },
         );
       } catch (e) {
         // #4616: keep the usable vectors of a partially refused batch.
@@ -679,8 +680,10 @@ export async function importFromContent(
         refused = e;
       }
     } finally {
-      resolveDrain();
-      deregisterShutdown();
+      if (providerAbort) {
+        resolveDrain();
+        deregisterShutdown!();
+      }
     }
     embeddingPartial = refused;
     pending.forEach((i, j) => {
@@ -696,9 +699,23 @@ export async function importFromContent(
   // (`gbrain embed --stale`, sync's embed pass, the cycle) embeds them once
   // the provider recovers.
   let embeddingDeferred = false;
+  let embeddingFailureNotice: string | undefined;
+  // Inline import owns both the provider call and the canonical transaction;
+  // retain its shutdown registration through the commit. A prepared action is
+  // deliberately excluded: its future transaction belongs to its executor.
+  const inlineShutdown = !opts.prepare && !opts.onPostCommitEmbedding && !opts.noEmbed && chunks.length > 0
+    ? (() => {
+      const abort = new AbortController();
+      let resolveDrain!: () => void;
+      const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
+      const deregister = registerShutdownWork({ abort, drain });
+      return { signal: abort.signal, complete: () => { resolveDrain(); deregister(); } };
+    })()
+    : undefined;
+  try {
   if (!opts.onPostCommitEmbedding) {
     try {
-      await embedChunks();
+      await embedChunks(inlineShutdown?.signal);
       if (embeddingPartial) {
         embeddingDeferred = true;
         process.stderr.write(`[import] ${slug}: ${embeddingPartial.message} ${embeddingPartial.suggestionFor(slug, sourceId)}\n`);
@@ -706,10 +723,9 @@ export async function importFromContent(
     } catch (err) {
       embeddingDeferred = true;
       chunks.forEach((c, i) => { if (!reused.has(i)) { c.embedding = undefined; c.token_count = undefined; } });
-      process.stderr.write(
+      embeddingFailureNotice =
         `[import] ${slug}: embedding failed (${err instanceof Error ? err.message : String(err)}); ` +
-        `text saved, chunks queued for \`gbrain embed --stale\`.\n`
-      );
+        `text saved, chunks queued for \`gbrain embed --stale\`.\n`;
     }
   }
 
@@ -900,18 +916,28 @@ export async function importFromContent(
     }
     throw decorateEmbeddingDimError(err, slug, activeColName);
   });
+  // This message is deliberately emitted only after maintenanceTransaction
+  // returns: before that point the text is still rollbackable.
+  if (embeddingFailureNotice) process.stderr.write(embeddingFailureNotice);
 
 
   if (opts.onPostCommitEmbedding && !opts.noEmbed && chunks.length > 0) {
     opts.onPostCommitEmbedding(async () => {
+      const shutdownAbort = new AbortController();
+      let resolveDrain!: () => void;
+      const drain = new Promise<void>((resolve) => { resolveDrain = resolve; });
+      const deregisterShutdown = registerShutdownWork({ abort: shutdownAbort, drain });
       try {
         if (!persistedProjection) return { status: 'superseded' };
         const signature = currentEmbeddingSignature();
-        await embedChunks();
+        await embedChunks(shutdownAbort.signal);
         const installed = await installPageEmbeddings(engine, persistedProjection, chunks, embeddingPartial ? undefined : signature ?? undefined);
         return { status: installed ? 'embedded' : 'superseded' };
       } catch {
         return { status: 'failed', error: 'Page content was saved, but embedding failed. Check the embedding provider and database on the brain host, then run gbrain embed --stale --source <source-id>.' };
+      } finally {
+        resolveDrain();
+        deregisterShutdown();
       }
     });
   }
@@ -926,6 +952,9 @@ export async function importFromContent(
     ...(typeWarning ? { type_warning: typeWarning } : {}),
     ...(embeddingDeferred ? { embedding_deferred: true } : {}), ...fences.fields,
   };
+  } finally {
+    inlineShutdown?.complete();
+  }
 }
 
 /**

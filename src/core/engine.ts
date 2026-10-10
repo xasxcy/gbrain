@@ -98,6 +98,12 @@ export type PersistEmbedOutcomeEntry = {
   chunkIndex: number;
   /** md5(chunk_text) calculated by the stale-row caller. */
   chunkHash: string;
+  /**
+   * Canonical embedding_input_hash for a vector outcome, computed by the
+   * caller from its checked projection snapshot and written atomically with
+   * the vector. Omitted = unknown provenance (stored as NULL).
+   */
+  inputHash?: string;
   outcome:
     | { vector: Float32Array }
     | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string } };
@@ -116,6 +122,12 @@ export interface PersistEmbedOutcomeRequest {
    * between owns the vectors. Undefined = unguarded (legacy callers).
    */
   expectedCorpusGeneration?: string | null;
+  /**
+   * Target vector column resolved BEFORE the provider call and re-verified by
+   * the caller under the page lock. When omitted the registry-active column
+   * is resolved now (legacy callers).
+   */
+  column?: ResolvedColumn;
 }
 
 export interface PersistEmbedOutcomeResult {

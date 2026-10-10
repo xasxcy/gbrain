@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { AIConfigError, AITransientError, PER_ITEM_HTTP_STATUSES } from './ai/errors.ts';
+import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
 
 export type EmbedFailureClass =
   | 'provider_timeout'
@@ -35,6 +36,14 @@ export function isTransientEmbedError(error: unknown): boolean {
 }
 
 export function classifyEmbedFailure(error: unknown): EmbedFailureClassification {
+  // A zero-norm response is an aligned, terminal refusal for individual
+  // inputs. Although its public error extends AIConfigError for callers that
+  // cannot preserve partial vectors, stale embedding can: it must ledger the
+  // refused chunks instead of turning a provider response for one item into a
+  // global credential/config failure.
+  if (isEmbeddingZeroNormError(error)) {
+    return { kind: 'failure', errorClass: 'invalid_input' };
+  }
   // Pre-existing bug fix: normalizeAIError (ai/errors.ts) wraps EVERY non-429
   // 4xx into AIConfigError, including request-shaped ones (400/408/413/422 —
   // bad content, too long, timeout) that are per-item, not a whole-batch

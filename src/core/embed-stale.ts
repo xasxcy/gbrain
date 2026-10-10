@@ -170,9 +170,20 @@ export async function stampIfPageProvenanceComplete(
   slug: string,
   sourceId: string,
   { signature, column }: ProvenanceStamp,
+  opts: { prepared?: Awaited<ReturnType<typeof readProjectionSnapshot>>; assertOwned?: (tx: BrainEngine) => Promise<void> } = {},
 ): Promise<boolean> {
   return engine.transaction(async tx => {
     await tx.lockPageKeys([{ sourceId, slug }]);
+    await opts.assertOwned?.(tx);
+    if (opts.prepared) {
+      const current = await tx.readPageSnapshot(slug, { sourceId });
+      if (!current || current.page.deleted_at || current.revision !== opts.prepared.snapshot.revision
+        || current.sourceIncarnation !== opts.prepared.snapshot.sourceIncarnation || current.page.id !== opts.prepared.snapshot.page.id
+        || current.page.text_projection_revision !== current.revision) return false;
+      // The checked column descriptor of the prepared snapshot must be the
+      // column this drain judges; it was resolved once for the drain.
+      if (opts.prepared.embeddingColumn.name !== column) return false;
+    }
     // Signature is `<provider:model>:<dims>`; the model part is what
     // upsertChunks records in content_chunks.model.
     const { model, dims } = splitEmbeddingSignature(signature);
@@ -467,7 +478,8 @@ export async function embedStaleForSource(
       const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
       if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
-      const remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
+      // Eligibility skips backed-off/quarantined rows; completion must not.
+      const remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }), ignoreBackoff: true });
       if (remaining || result.chunksProcessed || result.blocked) {
         result.remaining = remaining;
         result.complete = remaining === 0 && !result.blocked;
@@ -558,6 +570,8 @@ export async function embedStaleForSource(
           signatureInvalidationFailed,
           activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
           expectedCorpusGeneration: observedCorpusGeneration,
+          prepared,
+          assertOwned: opts.assertOwned,
           embedFn,
           signal,
           slice: { index: (offset / subBatchSize) + 1, total: slices },
@@ -604,9 +618,24 @@ export async function embedStaleForSource(
         // this page's last chunk stamps it; preserved chunks of other
         // provenance keep it unstamped.
         if (stamp) {
-          await observed(pacer, () =>
-            stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp),
-          );
+          let ownershipFailure: { error: unknown } | undefined;
+          try {
+            await observed(pacer, () =>
+              stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp, {
+                prepared,
+                assertOwned: opts.assertOwned && (async tx => {
+                  try { await opts.assertOwned!(tx); } catch (error) { ownershipFailure = { error }; throw error; }
+                }),
+              }),
+            );
+          } catch (error) {
+            // Lease loss/cancellation is control flow; a signature write
+            // failure leaves committed vectors in place and is only reported.
+            if (ownershipFailure) throw ownershipFailure.error;
+            if (stopped() || signal?.aborted) return;
+            result.failures = (result.failures ?? 0) + 1;
+            write(`[embed-signature-fail] slug=${slug} err=${error instanceof Error ? error.message : String(error)}`);
+          }
         }
         // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
         // title tier — keep the stamped mode honest (mixed pages stay as-is).
@@ -665,7 +694,8 @@ export async function embedStaleForSource(
       const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
       if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
-      result.remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
+      // A deferred ledger row is incomplete work, never a successful drain.
+      result.remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }), ignoreBackoff: true });
       result.complete = result.remaining === 0 && !result.blocked;
       result.done = true;
       return result;

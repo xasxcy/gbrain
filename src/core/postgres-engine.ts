@@ -1545,7 +1545,7 @@ export class PostgresEngine implements BrainEngine {
   async persistEmbedOutcome(request: PersistEmbedOutcomeRequest): Promise<PersistEmbedOutcomeResult> { // engine-sql-ok: fork retry-ledger write retains Postgres's transaction-bound executeRaw seam; shared extraction is tracked with its PGLite twin.
     // The registry-active plane, not a hard-coded legacy column: stale discovery,
     // invalidation and the current-space predicate all resolve it the same way.
-    const activeColumn = await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
+    const activeColumn = request.column ?? await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
     const activeColId = quoteIdentifier(activeColumn.name);
     const guardCorpusGeneration = request.expectedCorpusGeneration !== undefined;
     return this.transaction(async (tx) => {
@@ -1578,7 +1578,9 @@ export class PostgresEngine implements BrainEngine {
                     -- v0.60 embedding_pending_since (v221): NULL once a vector lands,
                     -- exactly as engine-sql/chunks.ts upsertChunksOnce maintains it.
                     embedding_pending_since = NULL,
-                    model = COALESCE($6, cc.model)
+                    model = COALESCE($6, cc.model),
+                    -- R6: provenance of the exact input, written atomically with the vector.
+                    embedding_input_hash = $9
                FROM pages p
               WHERE cc.page_id = $2
                 AND p.id = cc.page_id
@@ -1593,7 +1595,7 @@ export class PostgresEngine implements BrainEngine {
               // current-space predicate (signature invalidation, provenance
               // stamping) recognizes chunks this path embedded.
               request.embeddingSignature && request.embeddingSignature !== 'legacy' ? splitEmbeddingSignature(request.embeddingSignature).model : null,
-              guardCorpusGeneration, request.expectedCorpusGeneration ?? null],
+              guardCorpusGeneration, request.expectedCorpusGeneration ?? null, entry.inputHash ?? null],
           );
           matched = rows.length > 0;
         } else {
@@ -1719,10 +1721,18 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getEmbedFailureSummary(opts: { sourceId?: string; signature: string }): Promise<EmbedFailureSummary> { // engine-sql-ok: summary combines the engine's stale predicate and Postgres positional adapter; extraction must preserve that shared predicate.
-    // The eligible count deliberately reuses buildListStaleChunkWhere(), which
-    // owns the active-ledger NOT EXISTS predicate used by stale pagination.
-    const total_null = await this.countStaleChunks(opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
-    const eligible = this.buildListStaleChunkWhere(opts);
+    // Every summary branch starts from the same registry-active/live-page
+    // candidate set as count/list stale. Ledger state is the only distinction.
+    const activeColumn = await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
+    const candidate = this.buildListStaleChunkWhere(activeColumn.name, opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
+    const totalRows = await this.sql.unsafe(
+      `SELECT count(*)::int AS count
+         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+        WHERE ${candidate.where}`,
+      candidate.params as Parameters<typeof this.sql.unsafe>[1],
+    );
+    const total_null = Number((totalRows[0] as { count?: number } | undefined)?.count ?? 0);
+    const eligible = this.buildListStaleChunkWhere(activeColumn.name, opts);
     const eligibleRows = await this.sql.unsafe(
       `SELECT count(*)::int AS count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
@@ -1734,7 +1744,7 @@ export class PostgresEngine implements BrainEngine {
     // The remaining branches use the same NULL/embed-skip/source candidate
     // set; only the ledger state differs. This preserves the four metrics as
     // a partition of total_null for the current embedding generation.
-    const base = this.buildListStaleChunkWhere(opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
+    const base = candidate;
     const params = [...base.params, opts.signature];
     const signatureParam = params.length;
     const ledgerJoin = `l.source_id = p.source_id
@@ -1842,10 +1852,11 @@ export class PostgresEngine implements BrainEngine {
     )`);
   }
 
-  private buildListStaleChunkWhere(opts?: { sourceId?: string; signature?: string; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
+  private buildListStaleChunkWhere(column: string, opts?: { sourceId?: string; signature?: string; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
     const params: unknown[] = [];
     const conds = [
-      'cc.embedding IS NULL',
+      `cc.${quoteIdentifier(column)} IS NULL`,
+      'p.deleted_at IS NULL',
       `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
     ];
     this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);

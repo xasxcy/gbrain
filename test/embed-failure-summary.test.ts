@@ -78,4 +78,32 @@ describe('embed failure summary', () => {
       { slug: 'summary/default', chunk_index: 2, error_class: 'provider_conn', attempt_count: 1 },
     ]);
   });
+
+  test('uses the active vector plane and excludes soft-deleted pages in every count', async () => {
+    await engine.executeRaw('ALTER TABLE content_chunks ADD COLUMN embedding_summary_test vector(1536)');
+    await engine.setConfig('embedding_columns', JSON.stringify({
+      embedding_summary_test: { type: 'vector', dimensions: 1536, provider: 'test:model' },
+    }));
+    await engine.setConfig('search_embedding_column', 'embedding_summary_test');
+    try {
+      await engine.executeRaw(
+        `UPDATE content_chunks SET embedding_summary_test='[${Array(1536).fill('0.01').join(',')}]'::vector`,
+      );
+      await engine.executeRaw(
+        `UPDATE content_chunks SET embedding_summary_test=NULL
+          WHERE page_id=(SELECT id FROM pages WHERE slug='summary/default') AND chunk_index=0`,
+      );
+      expect((await engine.getEmbedFailureSummary({ sourceId: 'default', signature: 'test:model:1536' })).counts).toEqual({
+        total_null: 1, eligible_now: 1, backoff_deferred: 0, quarantined: 0,
+      });
+
+      await engine.softDeletePage('summary/default', { sourceId: 'default' });
+      expect((await engine.getEmbedFailureSummary({ sourceId: 'default', signature: 'test:model:1536' })).counts).toEqual({
+        total_null: 0, eligible_now: 0, backoff_deferred: 0, quarantined: 0,
+      });
+    } finally {
+      await engine.executeRaw("DELETE FROM config WHERE key IN ('embedding_columns', 'search_embedding_column')");
+      await engine.executeRaw('ALTER TABLE content_chunks DROP COLUMN embedding_summary_test');
+    }
+  });
 });

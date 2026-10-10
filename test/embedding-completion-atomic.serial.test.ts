@@ -64,6 +64,12 @@ function afterVectorCommit(engine: BrainEngine, intervene: () => Promise<void>):
       get(target, key) {
         if (key === 'transaction') return <T>(run: (inner: BrainEngine) => Promise<T>) =>
           target.transaction(inner => run(observe(inner, wrote)));
+        // The stale drain's vectors land via persistEmbedOutcome called on the installer's transaction.
+        if (key === 'persistEmbedOutcome') return async (request: Parameters<BrainEngine['persistEmbedOutcome']>[0]) => {
+          const result = await target.persistEmbedOutcome(request);
+          if (result.vectorCommittedChunks > 0) wrote();
+          return result;
+        };
         if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
           const result = await target.executeRaw(sql, params);
           if (sql.startsWith('UPDATE content_chunks SET')) wrote();

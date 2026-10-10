@@ -255,7 +255,9 @@ export function installSignalHandlers(opts: { keepServingOnLogEpipe?: boolean } 
 
   const handleSignal = (signal: NodeJS.Signals) => {
     if (forwardToSignalOwner(signal)) return;
-    if (signal === 'SIGTERM' || signal === 'SIGHUP') {
+    // Cooperative only while embedding work is registered (or a cooperative pass is already
+    // draining); otherwise the plain pass keeps its original tick order and exit sequencing.
+    if ((signal === 'SIGTERM' || signal === 'SIGHUP') && (shutdownWorkRegistry.size > 0 || cooperativeShutdownInFlight)) {
       void triggerCooperativeShutdownAndExit(signal === 'SIGTERM' ? 143 : 129);
       return;
     }
@@ -264,9 +266,7 @@ export function installSignalHandlers(opts: { keepServingOnLogEpipe?: boolean } 
       // signal-terminated processes. The actual integer doesn't matter
       // much (shells generally use it as advisory); the goal is "exit
       // promptly after cleanup".
-      // Widen to string: the SIGTERM/SIGHUP early return above narrows `signal`.
-      const name: string = signal;
-      const code = name === 'SIGTERM' ? 143 : name === 'SIGHUP' ? 129 : name === 'SIGPIPE' ? 141 : 1;
+      const code = signal === 'SIGTERM' ? 143 : signal === 'SIGHUP' ? 129 : signal === 'SIGPIPE' ? 141 : 1;
       process.exit(code);
     });
   };

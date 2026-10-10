@@ -11,7 +11,8 @@ import type { Migration } from './types.ts';
 // gain `budget_key` so a command group shares one lifetime total; each
 // reservation names exactly one budget owner (an OAuth client or a group).
 // No backfill: workers stamp legacy rows at claim time.
-const MINION_QUEUE_PROTOCOL_FUNCTION_SQL = `
+/** Reused by masking repairs that must restore the current protocol after v149. */
+export const MINION_QUEUE_PROTOCOL_FUNCTION_SQL = `
 CREATE OR REPLACE FUNCTION enforce_minion_queue_protocol() RETURNS trigger SET search_path = pg_catalog, public AS $protocol$
 BEGIN
   IF TG_OP = 'INSERT' THEN

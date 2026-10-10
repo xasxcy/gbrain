@@ -36,7 +36,7 @@ mock.module('../src/core/embedding-invalidation.ts', () => ({
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
-import { embedStaleForSource } from '../src/core/embed-stale.ts';
+import { embedStaleForSource, EMBED_PROBE_TEXT } from '../src/core/embed-stale.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 import { AIConfigError } from '../src/core/ai/errors.ts';
@@ -450,9 +450,12 @@ describe('embedStaleForSource', () => {
     });
     expect(first.embedded).toBe(1);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+    // Default ruling (1), pending user confirmation: the retry ledger records retry state only. A page with a
+    // ledgered (failed/quarantined) chunk is NOT sealed with the new signature, so its signature cannot claim
+    // that failed chunk has a current vector. Completed sibling vectors are still preserved (no storm).
     expect(await engine.executeRaw<{ embedding_signature: string | null }>(
       `SELECT embedding_signature FROM pages WHERE slug = 'signature-partial' AND source_id = 'default'`,
-    )).toEqual([{ embedding_signature: 'new:model:1536' }]);
+    )).toEqual([{ embedding_signature: 'old:model:1536' }]);
 
     const secondCalls: string[][] = [];
     await embedStaleForSource(engine, 'default', {
@@ -462,12 +465,12 @@ describe('embedStaleForSource', () => {
         return [fakeVector()];
       },
     });
-    // The failed chunk is ledger-deferred; the successful sibling remains
-    // attributable to the current page signature and is not invalidated.
+    // The failed chunk is ledger-deferred and the successful sibling is not
+    // invalidated or re-embedded; the page stays unsealed until it is complete.
     expect(secondCalls).toEqual([]);
     expect(await engine.executeRaw<{ embedding_signature: string | null }>(
       `SELECT embedding_signature FROM pages WHERE slug = 'signature-partial' AND source_id = 'default'`,
-    )).toEqual([{ embedding_signature: 'new:model:1536' }]);
+    )).toEqual([{ embedding_signature: 'old:model:1536' }]);
     // The legacy no-signature count remains a raw NULL count; the active
     // signed stale pipeline is what excludes this backoff-deferred row.
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
@@ -485,7 +488,8 @@ describe('embedStaleForSource', () => {
         return [fakeVector()];
       },
     });
-    expect(retryCalls).toEqual([['chunk 1 of signature-partial']]);
+    // The unsealed (still drifted) page runs the embedder health probe first, then only the failed chunk.
+    expect(retryCalls).toEqual([[EMBED_PROBE_TEXT], ['chunk 1 of signature-partial']]);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
   });
 
@@ -531,21 +535,25 @@ describe('embedStaleForSource', () => {
     );
     expect(quarantined[0]?.attempt_count).toBe(5);
     expect(quarantined[0]?.quarantined_at).not.toBeNull();
+    // Default ruling (1), pending user confirmation: the retry ledger records retry state only. A page with a
+    // ledgered (failed/quarantined) chunk is NOT sealed with the new signature, so its signature cannot claim
+    // that failed chunk has a current vector. Completed sibling vectors are still preserved (no storm).
     expect(await engine.executeRaw<{ embedding_signature: string | null }>(
       `SELECT embedding_signature FROM pages WHERE slug = $1 AND source_id = 'default'`,
       [slug],
-    )).toEqual([{ embedding_signature: signature }]);
+    )).toEqual([{ embedding_signature: 'old:model:1536' }]);
 
-    let postQuarantineCalls = 0;
+    const postQuarantineCalls: string[][] = [];
     const afterQuarantine = await embedStaleForSource(engine, 'default', {
       embeddingSignature: signature,
       embedFn: async (texts) => {
-        postQuarantineCalls++;
+        postQuarantineCalls.push(texts);
         return fakeEmbedFn(texts);
       },
     });
     expect(afterQuarantine).toMatchObject({ embedded: 0, done: true, aborted: false });
-    expect(postQuarantineCalls).toBe(0);
+    // Exactly the embedder health probe of a still-drifted page: no chunk work, no re-embedding storm.
+    expect(postQuarantineCalls).toEqual([[EMBED_PROBE_TEXT]]);
   });
 
   test('SPEC V4: a NULL-signature page with pre-existing vectors never stamps from a partial stale slice', async () => {
@@ -895,7 +903,6 @@ describe('signature invalidation is probe-gated (#4283)', () => {
   });
 
   test('working embedder → probe fires once, drifted chunks are invalidated, re-embedded, and counted', async () => {
-    const { EMBED_PROBE_TEXT } = await import('../src/core/embed-stale.ts');
     await seedEmbeddedPage('p1', 3, 'old:model:1536');
     // The re-embed stamps only a signature naming the model the vectors were
     // actually written under (#4825), so the target names the recorded model.
@@ -922,7 +929,6 @@ describe('signature invalidation is probe-gated (#4283)', () => {
   });
 
   test('no signature drift → no probe call (no embed spend on the common path)', async () => {
-    const { EMBED_PROBE_TEXT } = await import('../src/core/embed-stale.ts');
     await seedPageWithStaleChunks('a', 2); // NULL embeddings only, no drift
     const seen: string[] = [];
     const result = await embedStaleForSource(engine, 'default', {

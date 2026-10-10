@@ -144,6 +144,7 @@ test/embed-null-signature-warning-5527.serial.test.ts	global-state	global-state:
 test/embed-oversize-heal-drain.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/embed-partial-failure-3037.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/embed-quarantine.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
+test/embed-slice-persist-cas.serial.test.ts	global-state	global-state: configureGateway()/resetGateway() mutate the process-global gateway config
 test/embed-stale-chunkless-pages.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed-stale-dry-run-restamp-5289.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed-stale.serial.test.ts	R2	R2: mock.module(../src/core/embedding-invalidation.ts) replaces modules for every file in the process

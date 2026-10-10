@@ -38,6 +38,7 @@ import type { Migration } from './migrate.ts';
 // v135 interpolates the configured FTS config name straight into DDL; this is
 // the same validated accessor migrate.ts uses for upstream's v123/v124.
 import { getFtsLanguage } from './fts-language.ts';
+import { MINION_QUEUE_PROTOCOL_FUNCTION_SQL } from './schema-migrations/v205-minion-spend-authorization.ts';
 
 export interface ForkMigrationDeps {
   /** The live MIGRATIONS registry. A getter, not the array: it is still being
@@ -51,6 +52,12 @@ function requireMaskedMigration(deps: ForkMigrationDeps, repair: string, version
   const masked = deps.allMigrations().find(m => m.version === version);
   if (!masked) throw new Error(`${repair}: upstream migration ${version} not found in the live MIGRATIONS registry`);
   return masked;
+}
+
+async function configuredEmbeddingDimensions(engine: BrainEngine): Promise<number> {
+  const rows = await engine.executeRaw<{ value: string }>("SELECT value FROM config WHERE key = 'embedding_dimensions'");
+  const configured = Number.parseInt(rows[0]?.value ?? '', 10);
+  return Number.isInteger(configured) && configured > 0 && configured <= 16000 ? configured : 1536;
 }
 
 /** Lowest version number owned by the fork. Everything below belongs to
@@ -446,7 +453,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         if (!r) return false;
         return (
           r.rollup_col > 0 &&
-          r.takes_dim === 'vector(2000)' &&
+          r.takes_dim === `vector(${await configuredEmbeddingDimensions(engine)})` &&
           r.dv_col > 0 &&
           r.open_loops === 'open_loops' &&
           r.facts_idea > 0
@@ -498,6 +505,9 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           if (!masked) continue;
           await deps.applyOneMigration(engine, masked);
         }
+        // v149 replaces this function with its pre-spend-authorization body.
+        // Restore only the current protocol body, not all unrelated v205 DDL.
+        await engine.executeRaw(MINION_QUEUE_PROTOCOL_FUNCTION_SQL);
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 146/147/148/149 masked by the 2026-09-14 fork renumber\n',
         );
@@ -512,6 +522,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           oauth_audit: string | null;
           fact_withdrawals: string | null;
           minion_col: number;
+          minion_protocol: string | null;
         }>(
           `SELECT
              to_regclass('public.extract_atoms_transcript_state')::text AS transcript_state,
@@ -520,7 +531,8 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
              to_regclass('public.oauth_grant_audit')::text AS oauth_audit,
              to_regclass('public.fact_withdrawals')::text AS fact_withdrawals,
              (SELECT count(*)::int FROM information_schema.columns
-               WHERE table_name = 'minion_jobs' AND column_name IN ('submission_authority', 'claim_generation')) AS minion_col`,
+               WHERE table_name = 'minion_jobs' AND column_name IN ('submission_authority', 'claim_generation')) AS minion_col,
+             pg_get_functiondef('public.enforce_minion_queue_protocol()'::regprocedure) AS minion_protocol`,
         );
         const r = rows[0];
         if (!r) return false;
@@ -529,7 +541,8 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           r.oauth_col > 0 &&
           r.oauth_audit === 'oauth_grant_audit' &&
           r.fact_withdrawals === 'fact_withdrawals' &&
-          r.minion_col === 2
+          r.minion_col === 2 &&
+          r.minion_protocol?.includes('spend_claim_token') === true
         );
       },
     },
@@ -570,7 +583,9 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       idempotent: true,
       sql: '',
       handler: async (engine) => {
-        for (const version of [150, 151, 152, 153, 154, 155, 156, 157, 158, 159]) {
+        // v153 activation clears all seals and is intentionally one-time.
+        // v154 replays the idempotent projection schema without activation.
+        for (const version of [150, 151, 152, 154, 155, 156, 157, 158, 159]) {
           const masked = requireMaskedMigration(deps, 'repair_masked_upstream_150_159', version);
           // Fail closed: silently skipping a missing entry would let v170 stamp
           // as repaired while part of upstream's 150-159 was never applied.

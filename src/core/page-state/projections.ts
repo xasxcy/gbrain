@@ -1,4 +1,4 @@
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, PersistEmbedOutcomeEntry, PersistEmbedOutcomeResult } from '../engine.ts';
 import type { Chunk, ChunkInput, ResolvedColumn, PageKind } from '../types.ts';
 import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { CHUNKER_VERSION } from '../chunkers/code.ts';
@@ -216,12 +216,26 @@ export async function installPageProjection(engine: BrainEngine, prepared: Proje
  * its corpus generation); it is recorded with each vector.
  */
 export async function installPageEmbeddings(engine: BrainEngine, prepared: ProjectionSnapshot, chunks: ChunkInput[], signature?: string,
-  built?: { tier: EmbeddingTier; corpusGeneration?: string | null }): Promise<boolean> {
+  built?: { tier: EmbeddingTier; corpusGeneration?: string | null }, opts: {
+    /** A lease/deadline fence which must run while this installation still owns its page lock. */
+    assertOwned?: (tx: BrainEngine) => Promise<void>;
+    /**
+     * Slice outcomes (vectors AND chunk-local failures) are written through the
+     * engine's persistEmbedOutcome inside THIS transaction, only after the page
+     * lock, ownership fence and projection CAS succeeded, and with the checked
+     * column descriptor and canonical embedding_input_hash. A displaced
+     * projection therefore gets neither stale vectors nor a retry-ledger row,
+     * and ledger/vector writes roll back together.
+     */
+    outcome?: { embeddingSignature: string; entries: PersistEmbedOutcomeEntry[]; expectedCorpusGeneration?: string | null };
+    onOutcome?: (outcome: PersistEmbedOutcomeResult) => void;
+  } = {}): Promise<boolean> {
   const { snapshot } = prepared;
   const sourceId = snapshot.page.source_id;
   const slug = snapshot.page.slug;
   return engine.transaction(async tx => {
     await tx.lockPageKeys([{ sourceId, slug }]);
+    await opts.assertOwned?.(tx);
     const current = await tx.readPageSnapshot(slug, { sourceId });
     if (!current || current.page.deleted_at || current.revision !== snapshot.revision || current.sourceIncarnation !== snapshot.sourceIncarnation || current.page.id !== snapshot.page.id
       || current.page.text_projection_revision !== current.revision) return false;
@@ -241,6 +255,24 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
     const tier = built?.tier ?? plainEmbeddingTier(current.page.contextual_retrieval_mode);
     const provenance = embeddingInputContext(context, current.page.title,
       built?.corpusGeneration !== undefined ? built.corpusGeneration : context.corpusGeneration, stored);
+    if (opts.outcome?.entries.length) {
+      const entries = opts.outcome.entries.map(entry => {
+        const original = byIndex.get(entry.chunkIndex);
+        return 'vector' in entry.outcome && original
+          ? { ...entry, inputHash: embeddingInputHash(provenance, tier, original) }
+          : entry;
+      });
+      const outcome = await tx.persistEmbedOutcome({
+        sourceId,
+        pageId: snapshot.page.id,
+        slug,
+        embeddingSignature: opts.outcome.embeddingSignature,
+        entries,
+        expectedCorpusGeneration: opts.outcome.expectedCorpusGeneration,
+        column,
+      });
+      opts.onOutcome?.(outcome);
+    }
     // This is deliberately UPDATE-only: a late embed can never replace text,
     // chunk identity, metadata, or membership in the installed projection.
     for (const chunk of chunks) {

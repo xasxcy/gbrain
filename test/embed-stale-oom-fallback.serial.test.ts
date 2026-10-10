@@ -22,6 +22,7 @@ import {
 } from '../src/core/embed-fallback.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { AITransientError } from '../src/core/ai/errors.ts';
+import { EmbeddingZeroNormError } from '../src/core/ai/embedding-guard.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
 
 let engine: PGLiteEngine;
@@ -455,6 +456,23 @@ describe('SPEC V4 fallback contracts', () => {
       expect(error).toBe(chunkZeroTimeout);
     }
     expect(calls).toEqual([['zero', 'one'], ['zero']]);
+  });
+
+  test('partial-stale ledgers a zero-norm refusal after a split and continues with later chunks', async () => {
+    const zeroNorm = new EmbeddingZeroNormError(
+      [{ index: 0, reason: 'zero_norm' }], [null], 'test:model',
+    );
+    const calls: string[][] = [];
+    const partial = await embedWithTruncationFallbackPartial(['zero', 'good'], async (texts) => {
+      calls.push(texts);
+      if (texts.length > 1) throw oomError();
+      if (texts[0] === 'zero') throw zeroNorm;
+      return [makeVec(1)];
+    }, { policy: 'partial-stale' });
+    expect(calls).toEqual([['zero', 'good'], ['zero'], ['good']]);
+    expect(partial.vectors).toEqual([null, makeVec(1)]);
+    expect(partial.failures).toEqual([{ index: 0, error: zeroNorm }]);
+    expect(partial.fatalError).toBeUndefined();
   });
 
   test('partial retains prefix vectors, reports fatal, and does not try later chunks', async () => {

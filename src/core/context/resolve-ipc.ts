@@ -378,10 +378,7 @@ export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined
   if (cfg.engine === 'pglite' && cfg.database_path) return localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
   if (cfg.engine === 'postgres' && cfg.database_url) {
     const sourceKey = kind === 'resolve' && sourceId ? `-${hash12(sourceId)}` : '';
-    // FORK: keep the configuration-derived discovery key stable. The bind/connect
-    // boundary applies localIpcSocketPath() itself, including its private
-    // fallback when a platform's Unix socket byte budget is exceeded.
-    return join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`);
+    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`));
   }
   return null;
 }

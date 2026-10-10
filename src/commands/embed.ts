@@ -2124,15 +2124,22 @@ async function embedAllStale(
         // actually verify.
         let pageStaleSkipped = 0;
         let pageCommittedAny = false;
+        // Lease loss is control flow: it must stop the drain, never become one page's counted failure.
+        let ownershipFailure: { error: unknown } | undefined;
+        const assertOwnedTracked = staleOpts?.assertOwned && (async (tx?: BrainEngine) => {
+          try { await staleOpts.assertOwned!(tx); } catch (error) { ownershipFailure = { error }; throw error; }
+        });
         for (let offset = 0; offset < stale.length; offset += subBatchSize) {
           if (effectiveSignal.aborted) return;
           const sliceRows = stale.slice(offset, offset + subBatchSize);
           let checkpoint: Awaited<ReturnType<typeof persistStaleSlice>>;
           try {
-            await staleOpts?.assertOwned?.(); // ownership re-check before each slice commit (persistStaleSlice has no tx hook)
+            await assertOwnedTracked?.(); // early re-check; the commit itself is fenced inside its transaction via `assertOwned` below
             checkpoint = await persistStaleSlice({
               engine,
               rows: sliceRows,
+              prepared,
+              assertOwned: assertOwnedTracked,
               embeddingSignature: signature,
               activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
               expectedCorpusGeneration: observedCorpusGeneration,
@@ -2152,6 +2159,7 @@ async function embedAllStale(
             // must not darken every OTHER page's chunks, so it's recorded
             // against this slice's rows and the run moves to the next
             // slice/key instead of crashing.
+            if (ownershipFailure) throw ownershipFailure.error;
             if (effectiveSignal.aborted) return;
             if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
             recordFailure(result, sliceRows.length, slug, e);
@@ -2221,7 +2229,14 @@ async function embedAllStale(
           // (persistStaleSlice already handled the chunk merge/upsert this
           // fix originally sat next to; only the stamp call itself is new).
           if (stamp) {
-            await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp));
+            try {
+              await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp, { prepared, assertOwned: assertOwnedTracked }));
+            } catch (e) {
+              // A signature-write failure leaves the committed vectors in place and is only reported.
+              if (ownershipFailure) throw ownershipFailure.error;
+              if (effectiveSignal.aborted) return;
+              recordFailure(result, 1, slug, e);
+            }
           }
           if (stale.length === existing.length) {
             // codex review round 2 finding #1: a restamp failure here is

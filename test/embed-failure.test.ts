@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { classifyEmbedFailure, fingerprintEmbedFailure } from '../src/core/embed-failure.ts';
 import { AIConfigError } from '../src/core/ai/errors.ts';
+import { EmbeddingZeroNormError } from '../src/core/ai/embedding-guard.ts';
 
 describe('batch-1 embed failure classification', () => {
   test('keeps configuration errors run-global and classifies local provider failures', () => {
     expect(classifyEmbedFailure(new AIConfigError('401 invalid key'))).toEqual({ kind: 'fatal' });
+    expect(classifyEmbedFailure(new EmbeddingZeroNormError(
+      [{ index: 0, reason: 'zero_norm' }], [null], 'test:model',
+    ))).toEqual({ kind: 'failure', errorClass: 'invalid_input' });
     expect(classifyEmbedFailure(new Error('request timed out after 30s'))).toEqual({ kind: 'failure', errorClass: 'provider_timeout' });
     expect(classifyEmbedFailure(new Error('read ECONNRESET from upstream'))).toEqual({ kind: 'failure', errorClass: 'provider_conn' });
     expect(classifyEmbedFailure(new Error('invalid input: token limit exceeded'))).toEqual({ kind: 'failure', errorClass: 'invalid_input' });
