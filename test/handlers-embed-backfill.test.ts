@@ -20,7 +20,9 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { makeEmbedBackfillHandler } from '../src/core/minions/handlers/embed-backfill.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
-import { tryAcquireDbLock } from '../src/core/db-lock.ts';
+import { tryAcquireDbLock, LockStolenError } from '../src/core/db-lock.ts';
+import { EMBED_PROBE_TEXT } from '../src/core/embed-stale.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 import { _registeredShutdownWorkCountForTests } from '../src/core/process-cleanup.ts';
@@ -155,11 +157,61 @@ describe('embed-backfill handler — D2 lock contract', () => {
         await expect(engine.transaction(tx => opts!.assertOwned!(tx))).rejects.toThrow('stolen');
         expect(opts!.signal!.aborted).toBe(true);
         checked = true;
+        // A drain that swallowed the lease loss and reports `aborted` anyway.
         return { embedded: 0, chunksProcessed: 0, pagesProcessed: 0, invalidated: 0, lastCursor: null, done: false, aborted: true };
       },
     });
-    expect((await handler(job)).status).toBe('aborted');
+    // F4a review fixes: the lease-loss reason on the drain signal wins over whatever the drain returned;
+    // lease loss is never a resumable `aborted` status.
+    await expect(handler(job)).rejects.toBeInstanceOf(LockStolenError);
     expect(checked).toBe(true);
+  });
+
+  test('F4a R4-2: ownership lost inside a fenced transaction (abort, then throw) rejects instead of status:aborted', async () => {
+    // Real drain. The content-drift invalidation transaction steals the lease from inside; its own second
+    // assertOwned(tx) then aborts the drain signal with a LockStolenError and throws. That catch used to map
+    // the stop to a quiet `aborted` return.
+    const prototype = Object.getPrototypeOf(engine) as { invalidateContentDriftEmbeddings: (...args: unknown[]) => Promise<unknown> };
+    (engine as unknown as Record<string, unknown>).invalidateContentDriftEmbeddings = async function (this: BrainEngine, ...args: unknown[]) {
+      await this.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid() WHERE id='gbrain-embed-backfill:default'");
+      return prototype.invalidateContentDriftEmbeddings.apply(this, args);
+    };
+    try {
+      const handler = makeEmbedBackfillHandler(engine, { embedFn: async texts => texts.map(() => new Float32Array(1536)) });
+      await expect(handler(fakeJob({ sourceId: 'default' }))).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).invalidateContentDriftEmbeddings;
+    }
+  });
+
+  test('F4a R4-2: ownership lost inside the signature-invalidation transaction (abort, then throw) rejects instead of status:aborted', async () => {
+    configureGateway({ embedding_model: 'openai:bge-m3', embedding_dimensions: 1536, env: {} });
+    await engine.executeRaw('DELETE FROM pages');
+    await seedStale('sig-lease', ['x']);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector`);
+    await engine.setPageEmbeddingSignature('sig-lease', { signature: 'old:model:1536' });
+    // Armed by the health probe: the very next transaction is the signature invalidation. A one-shot wrapper steals
+    // the lease at its start, so the in-transaction assertOwned aborts the drain signal and throws.
+    let armed = false;
+    const prototype = Object.getPrototypeOf(engine) as { transaction: (...args: unknown[]) => Promise<unknown> };
+    (engine as unknown as Record<string, unknown>).transaction = function (this: unknown, work: (tx: BrainEngine) => Promise<unknown>) {
+      if (!armed) return prototype.transaction.call(this, work);
+      armed = false;
+      return prototype.transaction.call(this, async (tx: BrainEngine) => {
+        await tx.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid() WHERE id='gbrain-embed-backfill:default'");
+        return work(tx);
+      });
+    };
+    try {
+      const handler = makeEmbedBackfillHandler(engine, {
+        embedFn: async texts => { if (texts[0] === EMBED_PROBE_TEXT) armed = true; return texts.map(() => new Float32Array(1536)); },
+      });
+      await expect(handler(fakeJob({ sourceId: 'default' }))).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).transaction;
+    }
+    await engine.executeRaw("DELETE FROM pages WHERE slug='sig-lease'");
   });
 
   test('IRON-RULE: second call returns already_in_progress when lock is held', async () => {
@@ -223,7 +275,7 @@ describe('embed-backfill handler — D2 lock contract', () => {
 });
 
 describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
-  test('internal final-batch abort maps to status:aborted after prefix persistence', async () => {
+  test('internal abort in a later checkpoint maps to status:aborted after prefix persistence', async () => {
     await seedStale('abort', ['good', 'abort']);
     const controller = new AbortController();
     const handler = makeEmbedBackfillHandler(engine, {
@@ -242,6 +294,26 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
     expect(result).toMatchObject({ status: 'aborted', embedded: 1, pagesProcessed: 1 });
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
     await engine.executeRaw("DELETE FROM pages WHERE slug='abort'");
+  });
+
+  test('internal abort inside the final short batch rolls the whole slice back and maps to status:aborted', async () => {
+    await seedStale('abort-slice', ['good', 'abort']);
+    const controller = new AbortController();
+    const handler = makeEmbedBackfillHandler(engine, {
+      embedFn: async (texts) => {
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'abort') {
+          controller.abort();
+          throw new Error('EOF');
+        }
+        return [new Float32Array(1536)];
+      },
+    });
+    // F4a review fixes: one slice holds both chunks, so the bisect fallback's embedded `good` is rolled back.
+    const result = await handler(fakeJob({ sourceId: 'default' }, controller));
+    expect(result).toMatchObject({ status: 'aborted', embedded: 0, pagesProcessed: 0 });
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(2);
+    await engine.executeRaw("DELETE FROM pages WHERE slug='abort-slice'");
   });
 
   test('BudgetExhausted maps to status:budget_exhausted after prefix persistence', async () => {

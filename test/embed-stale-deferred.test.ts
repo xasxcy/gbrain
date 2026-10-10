@@ -236,3 +236,83 @@ describe('control-flow fences (F3 N3/N4/N8)', () => {
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });
 });
+
+// F4a review fixes (R4-2): lease loss reaches the drain as the stop signal's reason (the owner's
+// assertOwned aborts with a LockStolenError, then throws). Every catch that used to map a stop to
+// `aborted` must re-raise it.
+describe('lease loss stays a LockStolenError on every catch path (F4a R4-2)', () => {
+  /** assertOwned that records the loss as the signal reason first, then throws, inside any transaction. */
+  const loseLeaseInTx = (controller: AbortController) => async (tx?: unknown) => {
+    if (!tx) return;
+    const error = new LockStolenError('embed-backfill:test');
+    controller.abort(error);
+    throw error;
+  };
+
+  test('signature-invalidation transaction: abort-then-throw rejects instead of returning aborted', async () => {
+    await seedPage('sig-drift', ['x']);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector`);
+    await engine.setPageEmbeddingSignature('sig-drift', { signature: 'old:model:1536' });
+    const controller = new AbortController();
+    const { embedFn } = recordingEmbed();
+    await expect(embedStaleForSource(engine, 'default', {
+      embeddingSignature: SIGNATURE, embedFn, signal: controller.signal, assertOwned: loseLeaseInTx(controller),
+    })).rejects.toBeInstanceOf(LockStolenError);
+    // The rolled-back invalidation left the old vector in place.
+    expect(await engine.countStaleChunks({ sourceId: 'default', ignoreBackoff: true })).toBe(0);
+  });
+
+  test('content-drift invalidation transaction: abort-then-throw rejects instead of returning aborted', async () => {
+    await seedPage('content-drift', ['x']);
+    const controller = new AbortController();
+    const { calls, embedFn } = recordingEmbed();
+    await expect(embedStaleForSource(engine, 'default', {
+      embedFn, signal: controller.signal, assertOwned: loseLeaseInTx(controller),
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(calls).toEqual([]);
+  });
+
+  test('signature stamp: lease recorded as the abort reason right before the stamp commits rejects and leaves the page unstamped', async () => {
+    await seedPage('stamp', ['a']);
+    const controller = new AbortController();
+    const prototype = Object.getPrototypeOf(engine) as { setPageEmbeddingSignature: (...args: unknown[]) => Promise<unknown> };
+    // Own-property override (transaction-bound engines inherit it); the stamp transaction's pre-COMMIT
+    // stop check then sees the lease loss. Removed in `finally`.
+    (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature = async function (this: unknown, ...args: unknown[]) {
+      const done = await prototype.setPageEmbeddingSignature.apply(this, args);
+      controller.abort(new LockStolenError('embed-backfill:test'));
+      return done;
+    };
+    try {
+      await expect(embedStaleForSource(engine, 'default', {
+        embeddingSignature: SIGNATURE, signal: controller.signal, embedFn: async texts => texts.map(vec),
+      })).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature;
+    }
+    const [row] = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'stamp' AND source_id = 'default'`);
+    expect(row!.embedding_signature).toBeNull();
+  });
+
+  test('a plain abort on the same stamp path is still reported as aborted (not every stop is lease loss)', async () => {
+    await seedPage('stamp-plain', ['a']);
+    const controller = new AbortController();
+    const prototype = Object.getPrototypeOf(engine) as { setPageEmbeddingSignature: (...args: unknown[]) => Promise<unknown> };
+    (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature = async function (this: unknown, ...args: unknown[]) {
+      const done = await prototype.setPageEmbeddingSignature.apply(this, args);
+      controller.abort();
+      return done;
+    };
+    try {
+      const result = await embedStaleForSource(engine, 'default', {
+        embeddingSignature: SIGNATURE, signal: controller.signal, embedFn: async texts => texts.map(vec),
+      });
+      expect(result.aborted).toBe(true);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature;
+    }
+  });
+});
+

@@ -268,7 +268,7 @@ describe('embedStaleForSource', () => {
     ]);
   });
 
-  test('SPEC V4: abort inside final short batch persists prefix and returns done:false', async () => {
+  test('SPEC V4: abort in a later checkpoint keeps the earlier committed prefix and returns done:false', async () => {
     await engine.putPage('final-batch', { type: 'note', title: 'final-batch', compiled_truth: '# final' });
     await installFixtureChunks(engine, 'final-batch', [
       { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
@@ -292,6 +292,34 @@ describe('embedStaleForSource', () => {
     });
     expect(result).toMatchObject({ embedded: 1, pagesProcessed: 1, aborted: true, done: false });
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('SPEC V4: abort inside the final short batch (bisect fallback) rolls the whole slice back', async () => {
+    await engine.putPage('final-batch-slice', { type: 'note', title: 'final-batch-slice', compiled_truth: '# final' });
+    await installFixtureChunks(engine, 'final-batch-slice', [
+      { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+      { chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+    const controller = new AbortController();
+    const calls: string[][] = [];
+    // F4a review fixes: the original scenario. Both chunks sit in ONE short slice (default batchSize), the
+    // multi-text call fails so the fallback bisects, `good` embeds, then `abort` fires the signal. The slice is
+    // the atomic checkpoint, so the already-embedded `good` is discarded with it: nothing was committed.
+    const result = await embedStaleForSource(engine, 'default', {
+      signal: controller.signal,
+      embedFn: async (texts) => {
+        calls.push(texts);
+        if (texts.length > 1) throw new Error('EOF');
+        if (texts[0] === 'abort') {
+          controller.abort();
+          throw new Error('EOF');
+        }
+        return [fakeVector()];
+      },
+    });
+    expect(calls).toEqual([['good', 'abort'], ['good'], ['abort']]); // the bisect branch really ran
+    expect(result).toMatchObject({ embedded: 0, pagesProcessed: 0, aborted: true, done: false });
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(2);
   });
 
   test('SPEC V4: must-abort is rethrown after prefix partial persistence', async () => {

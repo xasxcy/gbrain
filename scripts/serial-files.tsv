@@ -146,8 +146,10 @@ test/embed-partial-failure-3037.serial.test.ts	R2	R2: mock.module(../src/core/em
 test/embed-quarantine.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/embed-slice-persist-cas.serial.test.ts	global-state	global-state: configureGateway()/resetGateway() mutate the process-global gateway config
 test/embed-stale-chunkless-pages.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
+test/embed-stale-cli-fallback.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/embed-stale-dry-run-restamp-5289.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed-stale.serial.test.ts	R2	R2: mock.module(../src/core/embedding-invalidation.ts) replaces modules for every file in the process
+test/embed-stale-oom-fallback.serial.test.ts	R1	R1: mutates process.env (GBRAIN_EMBED_SUBBATCH_SIZE)
 test/embed-stale-signature-pagination.serial.test.ts	R1	R1: mutates process.env (GBRAIN_EMBED_CONCURRENCY)
 test/embed-stale-unavailable-snapshot.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/embed.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
@@ -215,6 +217,7 @@ test/hybrid-types-cache-skip.serial.test.ts	R2	R2: mock.module(../src/core/embed
 test/import-cancellation.serial.test.ts	R2	R2: mock.module(../src/core/postgres-engine.ts) replaces modules for every file in the process
 test/import-configured-root-guard.serial.test.ts	global-state	global-state: spyOn engine.executeRaw
 test/import-connection-budget.serial.test.ts	R2	R2: mock.module(../src/core/postgres-engine.ts) replaces modules for every file in the process
+test/import-file-embed-seam.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
 test/import-signature-stamp.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/import-source-cr-mode.serial.test.ts	global-state	global-state: process-wide test seams __setEmbedTransportForTests; configureGateway changes the process-wide AI gateway
 test/internal-breadth-callers.serial.test.ts	R2	R2: mock.module(../src/core/search/hybrid.ts) replaces modules for every file in the process

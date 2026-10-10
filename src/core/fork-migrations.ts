@@ -69,8 +69,15 @@ async function configuredEmbeddingDimensions(engine: BrainEngine): Promise<numbe
  * GBRAIN_MIGRATE_BACKOFF_MS) retried only on statement_timeout or
  * connection-reset errors. A failed attempt rolls the whole transaction back,
  * so no partial statement set is ever committed.
+ *
+ * Like the original helper, every retry announces itself (attempt count, the
+ * error, the delay) and, on Postgres, names the idle-in-transaction
+ * connections it may be racing against, so an operator can see what the
+ * migration is waiting on. Notices go through `deps.migrationNotice`.
  */
-async function runStatementsAtomically(engine: BrainEngine, version: number, statements: string[]): Promise<void> {
+async function runStatementsAtomically(
+  engine: BrainEngine, deps: ForkMigrationDeps, version: number, statements: string[],
+): Promise<void> {
   const fast = process.env.GBRAIN_MIGRATE_BACKOFF_MS;
   const backoffs = fast !== undefined ? [0, 1, 2].map(() => parseInt(fast, 10) || 0) : [5000, 15000, 45000];
   for (let attempt = 0; ; attempt++) {
@@ -85,8 +92,38 @@ async function runStatementsAtomically(engine: BrainEngine, version: number, sta
     } catch (error) {
       const retryable = isStatementTimeoutError(error) || isRetryableConnError(error);
       if (!retryable || attempt >= 2) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      deps.migrationNotice(`  [retry ${attempt + 1}/3] v${version} hit ${reason.slice(0, 80)}; retrying in ${backoffs[attempt]}ms\n`);
+      await noticeIdleBlockers(engine, deps);
       await new Promise(resolve => setTimeout(resolve, backoffs[attempt]));
     }
+  }
+}
+
+/**
+ * Best-effort: name the idle-in-transaction connections. Same query as the
+ * migration runner's `getIdleBlockers` in migrate.ts, kept local because this
+ * module takes its migrate.ts dependencies by injection and must neither
+ * import it statically (cycle) nor lazily (engine-live path). Postgres-only;
+ * any failure only costs the diagnostic.
+ */
+async function noticeIdleBlockers(engine: BrainEngine, deps: ForkMigrationDeps): Promise<void> {
+  if (engine.kind !== 'postgres') return;
+  try {
+    const blockers = await engine.executeRaw<{ pid: number; query_start: string; query: string }>(
+      `SELECT pid, state, query_start::text, substring(query, 1, 120) as query
+       FROM pg_stat_activity
+       WHERE state = 'idle in transaction'
+         AND query_start < NOW() - INTERVAL '5 minutes'
+         AND pid != pg_backend_pid()`,
+    );
+    if (blockers.length === 0) return;
+    deps.migrationNotice(`    ${blockers.length} idle-in-transaction blocker(s):\n`);
+    for (const blocker of blockers) {
+      deps.migrationNotice(`      PID ${blocker.pid} idle since ${blocker.query_start} — ${blocker.query.slice(0, 80)}\n`);
+    }
+  } catch {
+    // Diagnostic only.
   }
 }
 
@@ -542,7 +579,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         // interrupt. Keep both statements in this explicit transaction.
         const v149 = requireMaskedMigration(deps, 'repair_masked_upstream_146_149', 149);
         const v149Sql = v149.sqlFor?.[engine.kind] ?? v149.sql;
-        await runStatementsAtomically(engine, v149.version, [v149Sql, MINION_QUEUE_PROTOCOL_FUNCTION_SQL]);
+        await runStatementsAtomically(engine, deps, v149.version, [v149Sql, MINION_QUEUE_PROTOCOL_FUNCTION_SQL]);
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 146/147/148/149 masked by the 2026-09-14 fork renumber\n',
         );

@@ -39,7 +39,7 @@ import {
   readPaceEnv,
   type PaceKeyOverrides,
 } from '../core/pace-mode.ts';
-import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
+import { tryAcquireDbLock, LockStolenError, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
 import { embedWithTruncationFallback } from '../core/embed-fallback.ts';
 import { registerShutdownWork } from '../core/process-cleanup.ts';
@@ -1664,6 +1664,9 @@ async function embedAllStale(
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
   if (isAborted(externalSignal)) return;
+  // Lease loss is the stop signal's reason (the owner's assertOwned aborts with LockStolenError before
+  // throwing): every catch that would map a stop to a quiet return re-raises it first.
+  const throwIfLeaseLost = (): void => { if (externalSignal?.reason instanceof LockStolenError) throw externalSignal.reason; };
   const includeNullSig = !!staleOpts?.includeNullSignature;
   const ignoreBackoff = !!staleOpts?.ignoreBackoff;
   const noteBudgetStop = () => noteEmbedBudgetStop(engine, result, { sourceId, signature, includeNullSignature: includeNullSig, skip: dryRun || BUDGET_MS === null || isAborted(externalSignal) });
@@ -1817,6 +1820,7 @@ async function embedAllStale(
         slog(`[embed] invalidated ${drifted} chunk(s) whose text changed after embedding (content drift)`);
       }
     } catch {
+      throwIfLeaseLost();
       // Best-effort (pre-v133 schema mid-upgrade); the NULL-only loop still runs.
     }
   }
@@ -2098,6 +2102,7 @@ async function embedAllStale(
           }
         } catch (e: unknown) {
           if (healOwnershipFailure) throw healOwnershipFailure.error;
+          throwIfLeaseLost();
           if (effectiveSignal.aborted) return;
           if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
           recordFailure(result, stale.length, slug, e);
@@ -2164,6 +2169,7 @@ async function embedAllStale(
             // against this slice's rows and the run moves to the next
             // slice/key instead of crashing.
             if (ownershipFailure) throw ownershipFailure.error;
+            throwIfLeaseLost();
             if (effectiveSignal.aborted) return;
             if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
             recordFailure(result, sliceRows.length, slug, e);
@@ -2238,6 +2244,7 @@ async function embedAllStale(
             } catch (e) {
               // A signature-write failure leaves the committed vectors in place and is only reported.
               if (ownershipFailure) throw ownershipFailure.error;
+              throwIfLeaseLost();
               if (effectiveSignal.aborted) return;
               recordFailure(result, 1, slug, e);
             }
@@ -2253,6 +2260,7 @@ async function embedAllStale(
             try {
               await observed(pacer, () => restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId, observedCorpusGeneration));
             } catch (e) {
+              throwIfLeaseLost();
               if (effectiveSignal.aborted) return;
               recordFailure(result, 1, slug, e);
             }
@@ -2295,9 +2303,10 @@ async function embedAllStale(
         signal: effectiveSignal,
         onItem: (key) => embedOneKey(key),
         failureLabel: (key) => key,
-        onError: (err) => (err instanceof AIConfigError ? 'abort' : 'continue'),
+        // Lease loss (F4a R4-2) is run-global like a config fault: the pool would otherwise absorb it as one key's failure.
+        onError: (err) => (err instanceof AIConfigError || err instanceof LockStolenError ? 'abort' : 'continue'),
       });
-      const configFailure = poolResult.failures.find((f) => f.error instanceof AIConfigError);
+      const configFailure = poolResult.failures.find((f) => f.error instanceof AIConfigError || f.error instanceof LockStolenError);
       if (configFailure) throw configFailure.error;
 
       // E-4: extend the work budget by any paced-sleep time accrued this batch.

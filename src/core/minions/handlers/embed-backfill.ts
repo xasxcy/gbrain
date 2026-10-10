@@ -349,6 +349,9 @@ export function makeEmbedBackfillHandler(
         );
       }
       if (result.aborted) {
+        // Lease loss aborts the drain signal with a LockStolenError before the
+        // fence throws; whatever swallowed that throw on the way, it is never an abort.
+        if (drainAbort.signal.reason instanceof LockStolenError) throw drainAbort.signal.reason;
         return {
           status: 'aborted',
           sourceId,

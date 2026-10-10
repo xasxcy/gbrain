@@ -26,6 +26,7 @@ import { runEmbedCore } from '../src/commands/embed.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { listPendingProjectionPages, prepareEmbeddingProjections } from '../src/core/embedding-readiness.ts';
 import { embedStaleForSource } from '../src/core/embed-stale.ts';
+import { LockStolenError } from '../src/core/db-lock.ts';
 
 const DIMS = 1536;
 let engine: PGLiteEngine;
@@ -186,5 +187,57 @@ describe('embed --stale with a projection snapshot that becomes unavailable mid-
     expect(result.failures).toBe(1);
     expect(result.failure_samples.join('\n')).toContain('1 archived page(s) have blocked embedding work');
     expect(result.failure_samples.join('\n')).not.toContain('not embedded');
+  });
+});
+
+// F4a review fixes (R4-2/R4-5): the CLI stale drain (commands/embed.ts) keeps lease loss a
+// LockStolenError instead of counting it as one page's failure or quietly stopping.
+describe('embed --stale lease loss stays a LockStolenError (F4a)', () => {
+  test('lease loss while healing a page rejects the run instead of becoming a page failure', async () => {
+    await stalePage('notes/heal-lease');
+    // The content-drift invalidation swallows its own transactional fence error by design; the heal
+    // transaction is the next transactional ownership check, and its failure must propagate.
+    await expect(runEmbedCore(engine, {
+      stale: true, quiet: true,
+      assertOwned: async tx => { if (tx) throw new LockStolenError('embed-backfill:test'); },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(await nullVectors('notes/heal-lease')).toBe(1);
+  });
+
+  test('lease loss recorded as the abort reason inside the content-drift invalidation transaction rejects instead of ending the run quietly', async () => {
+    await stalePage('notes/drift-lease');
+    const controller = new AbortController();
+    await expect(runEmbedCore(engine, {
+      stale: true, quiet: true, signal: controller.signal,
+      // The first transactional ownership check of a clean stale run is the content-drift invalidation.
+      assertOwned: async tx => {
+        if (!tx) return;
+        const error = new LockStolenError('embed-backfill:test');
+        controller.abort(error);
+        throw error;
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(await nullVectors('notes/drift-lease')).toBe(1);
+  });
+
+  test('lease loss recorded as the abort reason right before the signature stamp commits rejects, leaving the page unstamped', async () => {
+    await stalePage('notes/stamp-lease');
+    const controller = new AbortController();
+    const prototype = Object.getPrototypeOf(engine) as { setPageEmbeddingSignature: (...args: unknown[]) => Promise<unknown> };
+    // Own-property override (transaction-bound engines inherit it): the stamp transaction's pre-COMMIT stop check
+    // then sees the lease loss. Removed in `finally`.
+    (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature = async function (this: unknown, ...args: unknown[]) {
+      const done = await prototype.setPageEmbeddingSignature.apply(this, args);
+      controller.abort(new LockStolenError('embed-backfill:test'));
+      return done;
+    };
+    try {
+      await expect(runEmbedCore(engine, { stale: true, quiet: true, signal: controller.signal })).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).setPageEmbeddingSignature;
+    }
+    const [row] = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'notes/stamp-lease' AND source_id = 'default'`);
+    expect(row!.embedding_signature).toBeNull();
   });
 });
