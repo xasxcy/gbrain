@@ -29,6 +29,7 @@ import { buildForkMigrations, FORK_MIGRATION_FLOOR } from '../src/core/fork-migr
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { Migration } from '../src/core/migrate.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { FACT_WITHDRAWAL_NORMALIZED_SQL } from '../src/core/facts/withdrawal-schema.ts';
 
 describe('fork migration registry seam', () => {
@@ -100,6 +101,51 @@ describe('fork migration registry seam', () => {
 
     await expect(repair.handler!(engine)).rejects.toThrow('interrupted before canonical protocol can commit');
     expect(committedProtocol).toBe('canonical protocol');
+  });
+
+  test('v240 keeps the migration runner envelope: SET LOCAL statement_timeout first, retry on statement_timeout, fail loud otherwise', async () => {
+    const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
+    const attempts: string[][] = [];
+    let failuresLeft = 1;
+    const engine = {
+      kind: 'postgres',
+      transaction: async (work: (tx: Pick<BrainEngine, 'runMigration'>) => Promise<void>) => {
+        const statements: string[] = [];
+        attempts.push(statements);
+        await work({ runMigration: async (_version: number, sql: string) => {
+          statements.push(sql);
+          if (sql === 'old protocol' && failuresLeft-- > 0) {
+            throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+          }
+        } });
+      },
+    } as unknown as BrainEngine;
+    const repair = buildForkMigrations({
+      allMigrations: () => [v149],
+      applyOneMigration: async () => {},
+      migrationNotice: () => {},
+    }).find(migration => migration.version === 240)!;
+    await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => {
+      await repair.handler!(engine);
+      expect(attempts.length).toBe(2); // one retried statement_timeout, then success
+      for (const statements of attempts) {
+        expect(statements[0]).toBe("SET LOCAL statement_timeout = '600000'");
+        expect(statements[1]).toBe('old protocol');
+      }
+      expect(attempts[1]!.length).toBe(3); // SET LOCAL + v149 + canonical protocol in the one transaction
+
+      // A non-retryable failure is not retried.
+      attempts.length = 0;
+      const failing = {
+        kind: 'postgres',
+        transaction: async (work: (tx: Pick<BrainEngine, 'runMigration'>) => Promise<void>) => {
+          attempts.push([]);
+          await work({ runMigration: async (_version: number, sql: string) => { if (sql === 'old protocol') throw new Error('syntax error'); } });
+        },
+      } as unknown as BrainEngine;
+      await expect(repair.handler!(failing)).rejects.toThrow('syntax error');
+      expect(attempts.length).toBe(1);
+    });
   });
 });
 

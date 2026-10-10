@@ -275,7 +275,11 @@ describe('embedStaleForSource', () => {
       { chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);
     const controller = new AbortController();
+    // F3 review fixes: a cancelled slice is rolled back as a whole (accepted
+    // slice-level semantics), so the durable prefix must sit in an earlier
+    // checkpoint: batchSize 1 puts 'good' and 'abort' in separate slices.
     const result = await embedStaleForSource(engine, 'default', {
+      batchSize: 1,
       signal: controller.signal,
       embedFn: async (texts) => {
         if (texts.length > 1) throw new Error('EOF');

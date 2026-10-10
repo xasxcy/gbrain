@@ -200,8 +200,12 @@ function mergeZeroNormPartial(
   failures: { index: number; error: unknown }[],
   offset: number,
 ): void {
+  // Never throws (the partial entry point is documented never-throwing): a
+  // malformed provider response becomes per-item failures instead.
   if (error.vectors.length !== expectedCount) {
-    throw new EmbeddingOutputValidationError(`embedding provider returned ${error.vectors.length} partial result(s) for ${expectedCount} input(s)`);
+    const mismatch = new EmbeddingOutputValidationError(`embedding provider returned ${error.vectors.length} partial result(s) for ${expectedCount} input(s)`);
+    for (let index = 0; index < expectedCount; index++) failures.push({ index: offset + index, error: mismatch });
+    return;
   }
   const rejected = new Set(error.failures.map(failure => failure.index));
   for (const [index, vector] of error.vectors.entries()) {
@@ -209,7 +213,8 @@ function mergeZeroNormPartial(
     // The structured failure is authoritative; never validate or preserve it.
     if (rejected.has(index)) continue;
     if (vector === null) {
-      throw new EmbeddingOutputValidationError(`embedding provider returned a null partial vector at index ${index} without a failure`);
+      failures.push({ index: offset + index, error: new EmbeddingOutputValidationError(`embedding provider returned a null partial vector at index ${index} without a failure`) });
+      continue;
     }
     try { vectors[offset + index] = validateEmbeddingOutput([vector], 1, expectedDimensions)[0]!; }
     catch (validationError) { failures.push({ index: offset + index, error: validationError }); }

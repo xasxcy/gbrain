@@ -261,7 +261,9 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
 
   test('BudgetExhausted still maps correctly when its slice checkpoint rolls back', async () => {
     await seedStale('budget-persist-fail', ['good', 'budget']);
-    const originalPersist = engine.persistEmbedOutcome.bind(engine);
+    // Restore by deleting the own-property override: re-assigning a `.bind(engine)`
+    // copy would pin transaction-bound callers to the OUTER connection and deadlock
+    // every later persist in this file (F3 review fixes).
     engine.persistEmbedOutcome = async () => { throw new Error('write failed'); };
     const exhausted = new BudgetExhausted('budget exhausted', { reason: 'cost', spent: 1, cap: 1 });
     try {
@@ -274,7 +276,7 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
       });
       expect((await handler(fakeJob({ sourceId: 'default' }))).status).toBe('budget_exhausted');
     } finally {
-      engine.persistEmbedOutcome = originalPersist;
+      delete (engine as unknown as Record<string, unknown>).persistEmbedOutcome;
     }
   });
 });
@@ -336,6 +338,53 @@ describe('embed-backfill handler — #4283 honesty gates', () => {
     const result = await handler(fakeJob({ sourceId: 'default' }));
     expect(result).toMatchObject({ status: 'deferred', sourceId: 'default', embedded: 0 });
     expect(result.reason).toContain(retryAt.toISOString());
+  });
+
+  test('F3 N7: real drain with only ledger-deferred chunks returns deferred, with no provider call', async () => {
+    configureGateway({ embedding_model: 'openai:bge-m3', embedding_dimensions: 1536, env: {} });
+    const signature = 'openai:bge-m3:1536';
+    await engine.executeRaw('DELETE FROM pages'); // earlier tests leave stale fixtures behind
+    await seedStale('ledger-deferred', ['backoff', 'quarantined']);
+    const retryAt = new Date(Date.now() + 3_600_000);
+    const rows = await engine.executeRaw<{ page_id: number; chunk_index: number; chunk_hash: string }>(
+      `SELECT cc.page_id, cc.chunk_index, md5(cc.chunk_text) AS chunk_hash FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'ledger-deferred' AND p.source_id = 'default' ORDER BY cc.chunk_index`);
+    for (const row of rows) {
+      const quarantined = row.chunk_index === 1;
+      await engine.executeRaw(
+        `INSERT INTO embed_failures
+          (source_id, page_id, slug, chunk_index, embedding_signature, chunk_hash, error_class, error_fingerprint, first_seen, last_seen, next_retry_at, quarantined_at, quarantine_reason)
+         VALUES ('default', $1, 'ledger-deferred', $2, $3, $4, 'provider_timeout', 'fp', now(), now(), $5, $6, $7)`,
+        [row.page_id, row.chunk_index, signature, row.chunk_hash, retryAt.toISOString(),
+          quarantined ? new Date().toISOString() : null, quarantined ? 'provider_timeout' : null]);
+    }
+    const calls: string[][] = [];
+    const handler = makeEmbedBackfillHandler(engine, {
+      embedFn: async (texts) => { calls.push(texts); return texts.map(() => new Float32Array(1536)); },
+    });
+    const result = await handler(fakeJob({ sourceId: 'default' }));
+    expect(result).toMatchObject({ status: 'deferred', sourceId: 'default', embedded: 0 });
+    expect(result.reason).toContain('quarantined');
+    expect(calls).toEqual([]);
+    // Backoff-only: the reason carries the earliest retry time.
+    await engine.executeRaw(`UPDATE embed_failures SET quarantined_at = NULL, quarantine_reason = NULL`);
+    const backoffOnly = await handler(fakeJob({ sourceId: 'default' }));
+    expect(backoffOnly).toMatchObject({ status: 'deferred' });
+    expect(backoffOnly.reason).toContain(retryAt.toISOString());
+    expect(calls).toEqual([]);
+    await engine.executeRaw("DELETE FROM pages WHERE slug='ledger-deferred'");
+  });
+
+  test('F3 N6: a failed drift probe with only drifted vectors still fails as incomplete (not success)', async () => {
+    configureGateway({ embedding_model: 'openai:bge-m3', embedding_dimensions: 1536, env: {} });
+    await engine.executeRaw('DELETE FROM pages');
+    await seedStale('drifted-only', ['x']);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector`);
+    await engine.setPageEmbeddingSignature('drifted-only', { signature: 'old:model:1536' });
+    const handler = makeEmbedBackfillHandler(engine, { embedFn: async () => { throw new Error('provider down'); } });
+    await expect(handler(fakeJob({ sourceId: 'default' }))).rejects.toThrow(/incomplete; 1 chunks remain/);
+    await engine.executeRaw("DELETE FROM pages WHERE slug='drifted-only'");
   });
 
   test('success carries invalidated + invalidationSkipped counts in the job result row', async () => {

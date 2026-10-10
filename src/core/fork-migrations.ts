@@ -38,6 +38,7 @@ import type { Migration } from './migrate.ts';
 // v135 interpolates the configured FTS config name straight into DDL; this is
 // the same validated accessor migrate.ts uses for upstream's v123/v124.
 import { getFtsLanguage } from './fts-language.ts';
+import { isRetryableConnError, isStatementTimeoutError } from './retry-matcher.ts';
 import { MINION_QUEUE_PROTOCOL_FUNCTION_SQL } from './schema-migrations/v205-minion-spend-authorization.ts';
 
 export interface ForkMigrationDeps {
@@ -58,6 +59,35 @@ async function configuredEmbeddingDimensions(engine: BrainEngine): Promise<numbe
   const rows = await engine.executeRaw<{ value: string }>("SELECT value FROM config WHERE key = 'embedding_dimensions'");
   const configured = Number.parseInt(rows[0]?.value ?? '', 10);
   return Number.isInteger(configured) && configured > 0 && configured <= 16000 ? configured : 1536;
+}
+
+/**
+ * Run `statements` in ONE explicit transaction with the same envelope as the
+ * regular migration runner (`runMigrationSQL` + `runMigrationSQLWithRetry` in
+ * migrate.ts, which cannot be imported here): `SET LOCAL statement_timeout`
+ * on Postgres, and three attempts with 5s/15s/45s backoff (shortened by
+ * GBRAIN_MIGRATE_BACKOFF_MS) retried only on statement_timeout or
+ * connection-reset errors. A failed attempt rolls the whole transaction back,
+ * so no partial statement set is ever committed.
+ */
+async function runStatementsAtomically(engine: BrainEngine, version: number, statements: string[]): Promise<void> {
+  const fast = process.env.GBRAIN_MIGRATE_BACKOFF_MS;
+  const backoffs = fast !== undefined ? [0, 1, 2].map(() => parseInt(fast, 10) || 0) : [5000, 15000, 45000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await engine.transaction(async (tx) => {
+        if (engine.kind === 'postgres') {
+          try { await tx.runMigration(version, "SET LOCAL statement_timeout = '600000'"); } catch { /* non-fatal */ }
+        }
+        for (const statement of statements) await tx.runMigration(version, statement);
+      });
+      return;
+    } catch (error) {
+      const retryable = isStatementTimeoutError(error) || isRetryableConnError(error);
+      if (!retryable || attempt >= 2) throw error;
+      await new Promise(resolve => setTimeout(resolve, backoffs[attempt]));
+    }
+  }
 }
 
 /** Lowest version number owned by the fork. Everything below belongs to
@@ -512,10 +542,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         // interrupt. Keep both statements in this explicit transaction.
         const v149 = requireMaskedMigration(deps, 'repair_masked_upstream_146_149', 149);
         const v149Sql = v149.sqlFor?.[engine.kind] ?? v149.sql;
-        await engine.transaction(async (tx) => {
-          await tx.runMigration(v149.version, v149Sql);
-          await tx.runMigration(v149.version, MINION_QUEUE_PROTOCOL_FUNCTION_SQL);
-        });
+        await runStatementsAtomically(engine, v149.version, [v149Sql, MINION_QUEUE_PROTOCOL_FUNCTION_SQL]);
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 146/147/148/149 masked by the 2026-09-14 fork renumber\n',
         );

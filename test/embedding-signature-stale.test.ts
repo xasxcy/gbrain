@@ -122,6 +122,29 @@ describe('embedding_signature stale semantics', () => {
     expect(await stampIfPageProvenanceComplete(engine, slug, 'default', { signature, column: 'embedding' })).toBe(true);
   });
 
+  test('completion stamps follow the projection rule for unrecorded input hashes (F3 N2)', async () => {
+    const signature = `target:model:${colDim}`;
+    const slug = 'null-hash-stamp';
+    const readSignature = async () => (await engine.executeRaw<{ embedding_signature: string | null }>(
+      'SELECT embedding_signature FROM pages WHERE source_id=$1 AND slug=$2', ['default', slug]))[0].embedding_signature;
+    // Plain page (no contextual mode): a legacy/unknown-provenance vector is a legitimate current input.
+    await seedEmbedded(slug, 'text', 'old:model:1');
+    await sealPageTextProjection(engine, slug, 'default');
+    await engine.executeRaw(`UPDATE content_chunks SET model = 'target:model', embedded_text_hash = md5(chunk_text), embedding_input_hash = NULL`);
+    expect(await stampIfPageProvenanceComplete(engine, slug, 'default', { signature, column: 'embedding' })).toBe(true);
+    expect(await readSignature()).toBe(signature);
+
+    // Contextual page: the same missing proof cannot authorize a whole-page claim ...
+    await engine.setPageEmbeddingSignature(slug, { signature: 'old:model:1' });
+    await engine.executeRaw(`UPDATE pages SET contextual_retrieval_mode = 'per_chunk_synopsis' WHERE source_id='default' AND slug=$1`, [slug]);
+    await sealPageTextProjection(engine, slug, 'default');
+    expect(await stampIfPageProvenanceComplete(engine, slug, 'default', { signature, column: 'embedding' })).toBe(false);
+    expect(await readSignature()).toBe('old:model:1');
+    // ... while a recorded hash does.
+    await engine.executeRaw(`UPDATE content_chunks SET embedding_input_hash = 'recorded'`);
+    expect(await stampIfPageProvenanceComplete(engine, slug, 'default', { signature, column: 'embedding' })).toBe(true);
+  });
+
   test('completion stamps require matching vector width (#5051)', async () => {
     await seedEmbedded('wrong-width-stamp', 'text', 'old:model:1');
     await sealPageTextProjection(engine, 'wrong-width-stamp', 'default');

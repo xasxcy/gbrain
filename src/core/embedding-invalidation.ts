@@ -180,6 +180,34 @@ export async function countRestampOnlyChunks(
   return Number(rows[0]?.count ?? 0);
 }
 
+/**
+ * Read-only twin of the guarded invalidation's row selection: how many embedded
+ * chunks the invalidation would NULL right now. Lets the drain decide whether
+ * the drift probe is needed without depending on the backoff-sensitive
+ * signature-wide minus NULL-only difference, which retry-ledger rows can offset.
+ */
+export async function countSignatureDriftedEmbeddings(
+  engine: Pick<BrainEngine, 'executeRaw'>,
+  opts: { signature: string; sourceId?: string },
+): Promise<number> {
+  const colId = await activeColId(engine);
+  const { model, dims } = splitEmbeddingSignature(opts.signature);
+  const rows = await engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n
+       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+      WHERE EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
+        AND cc.${colId} IS NOT NULL
+        AND NOT ${currentSpaceChunkPredicate(colId, 2, 3)}
+        AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+        AND p.deleted_at IS NULL
+        AND p.text_projection_revision = p.knowledge_revision
+        AND p.embedding_signature IS NOT NULL AND p.embedding_signature <> $1
+        AND ($4::text IS NULL OR p.source_id = $4)`,
+    [opts.signature, model, dims, opts.sourceId ?? null],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
 export async function invalidateStaleSignatureEmbeddingsGuarded(
   engine: BrainEngine,
   opts: { signature: string; sourceId?: string; includeNullSignature?: boolean },

@@ -2073,10 +2073,12 @@ async function embedAllStale(
         // Generation BEFORE the page row / projection snapshot: a contextual run committing in between then shows up as
         // a generation change at restamp/persist time instead of being absorbed into the baseline.
         const observedCorpusGeneration = await observed(pacer, () => readCorpusGeneration(engine, slug, keySourceId));
+        // Lease loss during the heal is control flow, never one page's counted failure.
+        let healOwnershipFailure: { error: unknown } | undefined;
         try {
           // SUP-3874: split legacy oversized chunk_text BEFORE the embed call.
           const healed = await observed(pacer, () => engine.transaction(async tx => {
-            await staleOpts?.assertOwned?.(tx);
+            try { await staleOpts?.assertOwned?.(tx); } catch (error) { healOwnershipFailure = { error }; throw error; }
             return healOversizedPageChunks(tx, slug, {
               sourceId: keySourceId,
               onSplit: (n) => {
@@ -2095,6 +2097,7 @@ async function embedAllStale(
             }
           }
         } catch (e: unknown) {
+          if (healOwnershipFailure) throw healOwnershipFailure.error;
           if (effectiveSignal.aborted) return;
           if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
           recordFailure(result, stale.length, slug, e);
@@ -2231,7 +2234,7 @@ async function embedAllStale(
           // fix originally sat next to; only the stamp call itself is new).
           if (stamp) {
             try {
-              await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp, { prepared, assertOwned: assertOwnedTracked }));
+              await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp, { prepared, assertOwned: assertOwnedTracked, signal: effectiveSignal }));
             } catch (e) {
               // A signature-write failure leaves the committed vectors in place and is only reported.
               if (ownershipFailure) throw ownershipFailure.error;

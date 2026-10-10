@@ -499,6 +499,17 @@ describe('SPEC V4 fallback contracts', () => {
     expect(partial.aborted).toBe(false);
   });
 
+  test('partial-stale never throws on a malformed zero-norm response (null vector without a failure)', async () => {
+    // A null slot the provider did not declare as a failure used to throw out of the never-throwing entry point.
+    const malformed = new EmbeddingZeroNormError([{ index: 1, reason: 'zero_norm' }], [null, null, makeVec(3)], 'test:model');
+    const partial = await embedWithTruncationFallbackPartial(['undeclared-null', 'declared-bad', 'good'], async () => { throw malformed; },
+      { policy: 'partial-stale', expectedDimensions: DIM });
+    expect(partial.vectors).toEqual([null, null, makeVec(3)]);
+    expect(partial.failures.map(failure => failure.index).sort()).toEqual([0, 1]);
+    expect(partial.fatalError).toBeUndefined();
+    expect(partial.aborted).toBe(false);
+  });
+
   test('partial retains prefix vectors, reports fatal, and does not try later chunks', async () => {
     const calls: string[][] = [];
     const fatal = new Error('rate_limit_exceeded: 429');

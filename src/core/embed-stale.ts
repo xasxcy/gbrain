@@ -19,7 +19,7 @@ import type { Chunk, ChunkInput } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier, readCorpusGeneration } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
+import { invalidateStaleSignatureEmbeddingsGuarded, countSignatureDriftedEmbeddings, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
   quoteIdentifier,
@@ -27,7 +27,8 @@ import {
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
 import { AbortError } from './abort-check.ts';
-import { persistStaleSlice } from './embed-slice-persist.ts';
+import { persistStaleSlice, throwIfPersistenceStopped } from './embed-slice-persist.ts';
+import { LockStolenError } from './db-lock.ts';
 import { resolveEmbedSubBatchSize } from './embed-slices.ts';
 
 /**
@@ -173,11 +174,18 @@ export async function stampIfPageProvenanceComplete(
   slug: string,
   sourceId: string,
   { signature, column }: ProvenanceStamp,
-  opts: { prepared?: Awaited<ReturnType<typeof readProjectionSnapshot>>; assertOwned?: (tx: BrainEngine) => Promise<void> } = {},
+  opts: {
+    prepared?: Awaited<ReturnType<typeof readProjectionSnapshot>>;
+    assertOwned?: (tx: BrainEngine) => Promise<void>;
+    /** Stop fence (checked after ownership, and again right before the stamp commits). */
+    signal?: AbortSignal;
+    deadline?: number;
+  } = {},
 ): Promise<boolean> {
   return engine.transaction(async tx => {
     await tx.lockPageKeys([{ sourceId, slug }]);
     await opts.assertOwned?.(tx);
+    throwIfPersistenceStopped(opts.signal, opts.deadline, 'embedding stamp fence aborted');
     if (opts.prepared) {
       const current = await tx.readPageSnapshot(slug, { sourceId });
       if (!current || current.page.deleted_at || current.revision !== opts.prepared.snapshot.revision
@@ -198,8 +206,12 @@ export async function stampIfPageProvenanceComplete(
     const { model, dims } = splitEmbeddingSignature(signature);
     const colId = quoteIdentifier(column);
     const rows = await tx.executeRaw<{ complete: boolean }>(
+      // Input provenance follows page-state/projections.ts: a NULL hash (legacy
+      // vector or an honest "unknown" truncated vector) is a legitimate current
+      // input only on a page without a contextual-retrieval mode.
       `SELECT count(*) > 0
-              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)} AND cc.embedding_input_hash IS NOT NULL) AS complete
+              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}
+                AND (cc.embedding_input_hash IS NOT NULL OR p.contextual_retrieval_mode IS NULL)) AS complete
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
         WHERE p.slug = $2 AND p.source_id = $3 AND p.text_projection_revision=p.knowledge_revision
           AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,
@@ -207,8 +219,37 @@ export async function stampIfPageProvenanceComplete(
     );
     if (rows[0]?.complete !== true) return false;
     await tx.setPageEmbeddingSignature(slug, { sourceId, signature });
+    throwIfPersistenceStopped(opts.signal, opts.deadline, 'embedding stamp fence expired before commit');
     return true;
   });
+}
+
+/**
+ * Settle the drain's remaining-work verdict from the chunk gap only (NULL
+ * vectors in the active column), split into eligible / backoff-deferred /
+ * quarantined by the retry ledger. Completed sibling chunks of a page whose
+ * signature is not stamped yet are never counted. When the only gap left is
+ * deferred or quarantined (and nothing is blocked) the drain is `deferred`:
+ * neither success nor an ordinary failure to retry.
+ *
+ * `driftUnresolved` (the drift probe failed or the invalidation threw) keeps
+ * the signature-wide count: un-invalidated drifted vectors are unfinished work,
+ * so such a run is never complete and never deferred (#4283 honesty gate).
+ */
+async function settleRemaining(
+  engine: BrainEngine, sourceId: string, signature: string | undefined,
+  result: EmbedStaleResult, always: boolean, driftUnresolved: boolean,
+): Promise<void> {
+  const summary = signature && !driftUnresolved ? await engine.getEmbedFailureSummary({ sourceId, signature }) : undefined;
+  const remaining = summary ? summary.counts.total_null
+    : await engine.countStaleChunks({ sourceId, ...(signature && { signature }), ignoreBackoff: true });
+  if (!(always || remaining || result.chunksProcessed || result.blocked)) return;
+  result.remaining = remaining;
+  result.complete = remaining === 0 && !result.blocked;
+  if (summary && remaining > 0 && summary.counts.eligible_now === 0 && !result.blocked) {
+    result.deferred = true;
+    result.failureSummary = summary;
+  }
 }
 
 /** Probe input for `probeEmbedder`. Exported so tests can detect probe calls. */
@@ -373,22 +414,6 @@ export async function embedStaleForSource(
   if (stopped()) return { ...result, aborted: true };
   await opts.assertOwned?.();
   if (stopped()) return { ...result, aborted: true };
-  // Deferred/quarantined chunks are still incomplete, but are not runnable
-  // work. Exit before readiness or provider probing so a deferred-only source
-  // neither spends a health probe nor enters a normal failure loop.
-  if (signature) {
-    const failureSummary = await engine.getEmbedFailureSummary({ sourceId, signature });
-    if (failureSummary.counts.total_null > 0 && failureSummary.counts.eligible_now === 0) {
-      return {
-        ...result,
-        done: true,
-        complete: false,
-        remaining: failureSummary.counts.total_null,
-        deferred: true,
-        failureSummary,
-      };
-    }
-  }
   const archivedWork = await countArchivedEmbeddingWork(engine, { sourceId, signature });
   if (archivedWork) return { ...result, blocked: archivedWork, failures: archivedWork, complete: false, done: true,
     remaining: await engine.countStaleChunks({ sourceId, ...(signature && { signature }) }) };
@@ -430,7 +455,10 @@ export async function embedStaleForSource(
     try {
       const wide = await engine.countStaleChunks({ sourceId, signature });
       const nullOnly = await engine.countStaleChunks({ sourceId });
-      if (wide - nullOnly > 0) {
+      // Ledgered NULL chunks lower `wide` (anti-join) but not `nullOnly`, so they can offset real
+      // drift of equal or smaller size in the difference; the exact count closes that gap.
+      const drifted = Math.max(wide - nullOnly, await countSignatureDriftedEmbeddings(engine, { signature, sourceId }));
+      if (drifted > 0) {
         await opts.assertOwned?.();
         if (stopped()) return { ...result, aborted: true };
         const probeOk = await probeEmbedder(embedFn, signature, signal);
@@ -450,7 +478,7 @@ export async function embedStaleForSource(
         } else {
           result.invalidationSkipped = 'embedder_probe_failed';
           process.stderr.write(
-            `\n  [embed-stale] ${wide - nullOnly} chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
+            `\n  [embed-stale] ${drifted} chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
             `SKIPPING invalidation (existing vectors preserved). Check embedding provider config/credentials.\n`,
           );
         }
@@ -504,11 +532,8 @@ export async function embedStaleForSource(
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
       if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
       // Eligibility skips backed-off/quarantined rows; completion must not.
-      const remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }), ignoreBackoff: true });
-      if (remaining || result.chunksProcessed || result.blocked) {
-        result.remaining = remaining;
-        result.complete = remaining === 0 && !result.blocked;
-      }
+      // Deferred-only is decided here, after every maintenance step ran.
+      await settleRemaining(engine, sourceId, signature, result, false, !!result.invalidationSkipped || signatureInvalidationFailed);
       result.done = true;
       return result;
     }
@@ -533,15 +558,21 @@ export async function embedStaleForSource(
       let stale = byKey.get(key)!;
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
+      // Lease loss is control flow: it must reject the drain, never be counted
+      // as this page's failure.
+      let healOwnershipFailure: { error: unknown } | undefined;
+      const assertHealOwned = async (tx?: BrainEngine): Promise<void> => {
+        try { await opts.assertOwned?.(tx); } catch (error) { healOwnershipFailure = { error }; throw error; }
+      };
       try {
-        await opts.assertOwned?.();
+        await assertHealOwned();
         if (stopped()) return;
         // SUP-3874: split legacy oversized chunk_text before embedding.
         const healed = await observed(pacer, () => engine.transaction(async tx => {
-          await opts.assertOwned?.(tx);
+          await assertHealOwned(tx);
           if (stopped()) throw new AbortError();
           const healed = await healOversizedPageChunks(tx, slug, { sourceId: keySourceId });
-          await opts.assertOwned?.(tx);
+          await assertHealOwned(tx);
           if (stopped()) throw new AbortError();
           return healed;
         }));
@@ -553,6 +584,7 @@ export async function embedStaleForSource(
           }
         }
       } catch (e: unknown) {
+        if (healOwnershipFailure) throw healOwnershipFailure.error;
         result.failures = (result.failures ?? 0) + stale.length;
         if (stopped()) return;
         process.stderr.write(
@@ -609,7 +641,10 @@ export async function embedStaleForSource(
           // The transaction fence deliberately throws cancellation rather
           // than recording it as a page failure. Preserve earlier slices and
           // surface the drain's resumable aborted state to its caller.
-          if (error instanceof Error && error.name === 'AbortError') {
+          // Only a genuine stop (signal fired or deadline reached) maps to
+          // aborted; lease loss recorded as the signal reason stays an error.
+          if (signal?.reason instanceof LockStolenError) throw signal.reason;
+          if (error instanceof Error && error.name === 'AbortError' && stopped()) {
             result.aborted = true;
             return;
           }
@@ -661,6 +696,8 @@ export async function embedStaleForSource(
             await observed(pacer, () =>
               stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp, {
                 prepared,
+                signal,
+                deadline: opts.deadline,
                 assertOwned: opts.assertOwned && (async tx => {
                   try { await opts.assertOwned!(tx); } catch (error) { ownershipFailure = { error }; throw error; }
                 }),
@@ -733,8 +770,7 @@ export async function embedStaleForSource(
       if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
       if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
       // A deferred ledger row is incomplete work, never a successful drain.
-      result.remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }), ignoreBackoff: true });
-      result.complete = result.remaining === 0 && !result.blocked;
+      await settleRemaining(engine, sourceId, signature, result, true, !!result.invalidationSkipped || signatureInvalidationFailed);
       result.done = true;
       return result;
     }

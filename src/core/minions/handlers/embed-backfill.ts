@@ -419,7 +419,11 @@ export function makeEmbedBackfillHandler(
       // be counted as a page-level failure.  At this outer job boundary an
       // operator/shutdown cancellation is still a resumable terminal state,
       // while ownership loss (LockStolenError) must continue to reject.
-      if (!stalled && err instanceof Error && err.name === 'AbortError') {
+      // Lease loss reaches here as the drain signal's reason; it is never an abort.
+      if (drainAbort.signal.reason instanceof LockStolenError) throw drainAbort.signal.reason;
+      const stopRequested = signal.aborted || drainAbort.signal.aborted
+        || (job.deadlineAtMs != null && Date.now() >= job.deadlineAtMs);
+      if (!stalled && stopRequested && err instanceof Error && err.name === 'AbortError') {
         return {
           status: 'aborted',
           sourceId,

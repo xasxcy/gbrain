@@ -4,6 +4,7 @@ import type { StaleChunkRow } from './types.ts';
 import { embedWithTruncationFallbackPartial, type EmbedFn } from './embed-fallback.ts';
 import { classifyEmbedFailure, fingerprintEmbedFailure } from './embed-failure.ts';
 import { splitEmbeddingSignature } from './embedding-invalidation.ts';
+import { LockStolenError } from './db-lock.ts';
 import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot } from './page-state/projections.ts';
 
 export interface PersistStaleSliceOptions {
@@ -76,6 +77,19 @@ function expectedVectorDimensions(prepared: ProjectionSnapshot | undefined, sign
   if (!prepared) return undefined;
   if (prepared.embeddingColumn.name !== 'embedding') return prepared.embeddingColumn.dimensions;
   return signature && signature !== 'legacy' ? splitEmbeddingSignature(signature).dims ?? undefined : undefined;
+}
+
+/**
+ * Stop fence for a persistence transaction. Lease loss that was recorded as the
+ * signal's reason stays a LockStolenError (it must reject the drain); only a
+ * real signal abort or deadline expiry becomes an AbortError.
+ */
+export function throwIfPersistenceStopped(signal: AbortSignal | undefined, deadline: number | undefined, message: string): void {
+  if (!signal?.aborted && Date.now() < (deadline ?? Infinity)) return;
+  if (signal?.reason instanceof LockStolenError) throw signal.reason;
+  const abort = new Error(message);
+  abort.name = 'AbortError';
+  throw abort;
 }
 
 const hashChunk = (text: string): string => createHash('md5').update(text).digest('hex');
@@ -177,27 +191,23 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     try {
       if (!prepared) throw preparedError ?? new Error('projection unavailable before embedding slice persistence');
       let engineOutcome: PersistEmbedOutcomeResult | undefined;
+      // Ownership first, then signal/deadline: lease loss must never be
+      // reported as an ordinary abort.
       const assertFence = async (tx: BrainEngine): Promise<void> => {
-        if (signal?.aborted || Date.now() >= (opts.deadline ?? Infinity)) {
-          const abort = new Error('embedding persistence fence aborted');
-          abort.name = 'AbortError';
-          throw abort;
-        }
         try { await opts.assertOwned?.(tx); } catch (error) { ownershipFailure = { error }; throw error; }
-        // Ownership may involve I/O; re-check stop state before the transaction
-        // gets to its write/commit boundary.
-        if (signal?.aborted || Date.now() >= (opts.deadline ?? Infinity)) {
-          const abort = new Error('embedding persistence fence expired');
-          abort.name = 'AbortError';
-          throw abort;
-        }
+        throwIfPersistenceStopped(signal, opts.deadline, 'embedding persistence fence aborted');
       };
       const installed = await installPageEmbeddings(engine, prepared, [], undefined, undefined, {
         assertOwned: async tx => {
           await assertFence(tx);
         },
         outcome: { embeddingSignature: embeddingSignature ?? 'legacy', entries, expectedCorpusGeneration },
-        onOutcome: value => { engineOutcome = value; },
+        // Runs inside the transaction after the writes and right before COMMIT:
+        // a throw here rolls the whole slice back.
+        onOutcome: value => {
+          engineOutcome = value;
+          throwIfPersistenceStopped(signal, opts.deadline, 'embedding persistence fence expired before commit');
+        },
       });
       outcome = installed && engineOutcome
         ? engineOutcome
@@ -206,7 +216,7 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     } catch (error) {
       // Ownership loss and cancellation are control flow, not persistence
       // failures.  The caller owns their propagation and must stop its drain.
-      if (ownershipFailure || (error instanceof Error && error.name === 'AbortError')) throw error;
+      if (ownershipFailure || error instanceof LockStolenError || (error instanceof Error && error.name === 'AbortError')) throw error;
       write(`[embed-persist-fail] slug=${first.slug} slice=${slice.index}/${slice.total} err=${error instanceof Error ? error.message : String(error)}`);
       persistFailed = true;
       persistError = error;
