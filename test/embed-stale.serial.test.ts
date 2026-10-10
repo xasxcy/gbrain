@@ -356,6 +356,23 @@ describe('embedStaleForSource', () => {
     expect(await engine.executeRaw(`SELECT 1 FROM embed_failures`)).toHaveLength(0);
   });
 
+  test('F4c CI fixes: a budget stop is run-global, never enters the ledger, and the next run embeds the chunks', async () => {
+    await seedPageWithStaleChunks('budget-ledger', 2);
+    const exhausted = new BudgetExhausted('budget exhausted', { reason: 'cost', spent: 1, cap: 1 });
+    await expect(embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: async () => { throw exhausted; },
+    })).rejects.toBe(exhausted);
+    // A ledger row would put both chunks into retry backoff and hide them from the next run.
+    expect(await engine.executeRaw(`SELECT 1 FROM embed_failures`)).toHaveLength(0);
+    const second = await embedStaleForSource(engine, 'default', {
+      embeddingSignature: 'test:model:1536',
+      embedFn: fakeEmbedFn,
+    });
+    expect(second.embedded).toBe(2);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+
   test('partial stale: batch invalid-input is bisected to one ledger row', async () => {
     await seedPageWithStaleChunks('invalid-batch', 4);
     await embedStaleForSource(engine, 'default', {

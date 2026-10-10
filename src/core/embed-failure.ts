@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { AIConfigError, AITransientError, PER_ITEM_HTTP_STATUSES } from './ai/errors.ts';
 import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
+import { isMustAbortError } from './worker-pool.ts';
 
 export type EmbedFailureClass =
   | 'provider_timeout'
@@ -36,6 +37,11 @@ export function isTransientEmbedError(error: unknown): boolean {
 }
 
 export function classifyEmbedFailure(error: unknown): EmbedFailureClassification {
+  // F4c CI fixes: a must-abort stop (budget cap / spend-group refusal) is a
+  // run-global stop condition, not a fact about the chunk. Ledgering it as a
+  // provider failure would put every in-flight chunk into retry backoff, so a
+  // later run with a raised cap would skip them until the backoff expired.
+  if (isMustAbortError(error)) return { kind: 'fatal' };
   // A zero-norm response is an aligned, terminal refusal for individual
   // inputs. Although its public error extends AIConfigError for callers that
   // cannot preserve partial vectors, stale embedding can: it must ledger the

@@ -21,6 +21,7 @@ import { loadRecommendationContext } from './context.ts';
 import { computeRemediationPlan } from './plan.ts';
 import { planRepairStepsReport, previewFailureField, runRepairSteps, type RepairPlanStep, type RepairPreviewFailure, type RepairStepResult } from './repairs.ts';
 import { OperationError } from '../ops/contract.ts';
+import { AIServiceError } from '../ai/errors.ts';
 import { isManualOnlyStep, manualOnlyFix } from './manual-only.ts';
 import type { RemediationCheckpoint } from '../remediation-checkpoint.ts';
 import type {
@@ -30,6 +31,14 @@ import type {
   RemediationResult,
   StepResult,
 } from './types.ts';
+
+/**
+ * F4c CI fixes: embedStaleForSource rejects with a provider-wide fault (missing key, config, sustained outage; the
+ * fork's SPEC V4 run-global contract) or a budget stop. The remediation embedding pass reports that gap instead of
+ * aborting the whole run: the source stays pending and the step ends 'stopped' with the check-the-provider hint.
+ */
+const embedPassMayContinue = (error: unknown, budgetExhausted: abstract new (...args: never[]) => Error): boolean =>
+  error instanceof budgetExhausted || error instanceof AIServiceError;
 
 /**
  * Submit ordered Remediation jobs sequentially per D3, with D5 cascade
@@ -356,7 +365,7 @@ export async function runRemediation(
       for (const sourceId of status === 'completed' ? [...pendingEmbedSources] : []) {
         if (trackerExhausted) break;
         let result: Awaited<ReturnType<typeof embedStaleForSource>> | undefined;
-        try { result = await embedStaleForSource(engine, sourceId); } catch (error) { if (!(error instanceof BudgetExhausted)) throw error; }
+        try { result = await embedStaleForSource(engine, sourceId); } catch (error) { if (!embedPassMayContinue(error, BudgetExhausted)) throw error; }
         embedded += result?.embedded ?? 0;
         // A source is done only when the pass finished without leaving chunks behind.
         if (!trackerExhausted && result && !result.failures && result.complete !== false && !result.remaining) {

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { classifyEmbedFailure, fingerprintEmbedFailure } from '../src/core/embed-failure.ts';
 import { AIConfigError } from '../src/core/ai/errors.ts';
 import { EmbeddingZeroNormError } from '../src/core/ai/embedding-guard.ts';
+import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
 
 describe('batch-1 embed failure classification', () => {
   test('keeps configuration errors run-global and classifies local provider failures', () => {
@@ -13,6 +14,12 @@ describe('batch-1 embed failure classification', () => {
     expect(classifyEmbedFailure(new Error('read ECONNRESET from upstream'))).toEqual({ kind: 'failure', errorClass: 'provider_conn' });
     expect(classifyEmbedFailure(new Error('invalid input: token limit exceeded'))).toEqual({ kind: 'failure', errorClass: 'invalid_input' });
     expect(classifyEmbedFailure(new Error('provider returned 502'))).toEqual({ kind: 'failure', errorClass: 'provider_other' });
+  });
+
+  test('F4c CI fixes: must-abort stops (budget, spend-group refusal) are run-global, never a chunk failure', () => {
+    expect(classifyEmbedFailure(new BudgetExhausted('cap reached', { reason: 'cost', spent: 1, cap: 1 }))).toEqual({ kind: 'fatal' });
+    expect(classifyEmbedFailure(Object.assign(new Error('refused'), { tag: 'SPEND_GROUP_REFUSED' }))).toEqual({ kind: 'fatal' });
+    expect(classifyEmbedFailure(Object.assign(new Error('refused'), { tag: 'OTHER' }))).toEqual({ kind: 'failure', errorClass: 'provider_other' });
   });
 
   test('normalizes volatile network locations before fingerprinting', () => {

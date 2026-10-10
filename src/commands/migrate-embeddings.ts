@@ -43,6 +43,7 @@ import { countStaleFactEmbeddings } from '../core/facts/embedding-identity.ts';
 import { authorizeMigrationBudget, assertMigrationLeases, ceilCents, MigrationBudgetRefusal, type MigrationBudgetRefusalDetails, type MigrationWorstCase } from '../core/embedding-migration-budget.ts';
 import { planMigrationWorstCase, MIGRATION_PROBE_TEXT, RERANKER_PROBE } from '../core/embedding-migration-worst-case.ts';
 import { withAIInvocationGuard } from '../core/ai/invocation-guard.ts';
+import { AIConfigError } from '../core/ai/errors.ts';
 
 /**
  * Brain-wide migration lock (round-2 #4): serializes whole migrations so two
@@ -467,6 +468,8 @@ export type MigrationFlowResult =
       schema_transitioned: boolean; pinned_repaired: string[];
       reranker: RerankerOutcome;
       lock_skipped?: boolean; lock_lost?: boolean;
+      /** The re-embed drain stopped on a provider/config fault (message only); the migration stays resumable. */
+      stopped_reason?: string;
     };
 
 /**
@@ -736,7 +739,12 @@ export async function executeMigrationFlow(
 
     // Re-embed drain. heldLocks: the drain must not re-acquire (and fail
     // against) our own locks; it heartbeats them instead (lock-loss aborts).
-    const embedResult: EmbedResult = await runEmbedCore(engine, {
+    // F4c CI fixes: runEmbedCore keeps the fork's run-global contract (a provider/config fault such as a malformed
+    // provider response stops the whole drain instead of failing every page). The migration is resumable by design,
+    // so that stop is an `incomplete` outcome that carries the reason, not an `apply_failed`; nothing malformed was
+    // installed, and the facts pass below plus the stale census still run on what the stop left.
+    const drainStop: { reason?: string } = {};
+    const embedResult: EmbedResult | undefined = await runEmbedCore(engine, {
       stale: true,
       catchUp: true,
       singleFlight: true,
@@ -750,6 +758,10 @@ export async function executeMigrationFlow(
       ...(opts.batchSize !== undefined && { batchSize: opts.batchSize }),
       ...(opts.pace && { pace: opts.pace }),
       ...(opts.onProgress && { onProgress: opts.onProgress }),
+    }).catch((error: unknown) => {
+      if (!(error instanceof AIConfigError)) throw error;
+      drainStop.reason = error.message;
+      return undefined;
     });
 
     await assertOwned();
@@ -783,10 +795,10 @@ export async function executeMigrationFlow(
     const remaining = remainingChunks + remainingFacts.count + remainingTakes + finalReadiness.blocked + chunkless + (sourceChanged || configChanged ? 1 : 0);
 
     const base = {
-      embedded: embedResult.embedded + embeddedFacts,
+      embedded: (embedResult?.embedded ?? 0) + embeddedFacts,
       facts_embedded: embeddedFacts,
       facts_remaining: remainingFacts.count,
-      takes_embedded: embedResult.takes?.embedded ?? 0,
+      takes_embedded: embedResult?.takes?.embedded ?? 0,
       takes_remaining: remainingTakes,
       blocked_projection_pages: finalReadiness.blocked,
       signatures_reconciled: reconciled,
@@ -796,7 +808,7 @@ export async function executeMigrationFlow(
       pinned_repaired: applied.pinned_repaired,
       reranker,
     };
-    if (remaining === 0 && !embedResult.lock_lost) {
+    if (remaining === 0 && !embedResult?.lock_lost && drainStop.reason === undefined) {
       // #5088: ANN indexes are built only now, after the drain, and before the marker clears.
       await buildMigrationAnnIndexes(engine, plan.to_dims, assertOwned);
       // Completion smoke check (D11): warn-don't-block self-retrieval. The
@@ -838,8 +850,9 @@ export async function executeMigrationFlow(
       status: 'incomplete',
       remaining,
       ...base,
-      ...(embedResult.lock_skipped && { lock_skipped: true }),
-      ...(embedResult.lock_lost && { lock_lost: true }),
+      ...(embedResult?.lock_skipped && { lock_skipped: true }),
+      ...(embedResult?.lock_lost && { lock_lost: true }),
+      ...(drainStop.reason !== undefined && { stopped_reason: drainStop.reason }),
     };
     });
   } catch (error) {
@@ -1219,7 +1232,7 @@ export async function runMigrateEmbeddings(
         serr('`gbrain jobs list`), let it finish. If a previous migration was killed hard, its lock');
         serr(`expires after at most ${EMBED_BACKFILL_LOCK_TTL_MIN} minutes — re-run the same command then.`);
       } else {
-        serr(`Migration incomplete: ${result.remaining} chunk(s) still stale (embed failures or an interrupted run).`);
+        serr(`Migration incomplete: ${result.remaining} chunk(s) still stale (${result.stopped_reason ? `stopped by an embedding provider fault: ${result.stopped_reason}` : 'embed failures or an interrupted run'}).`);
         serr('Re-run the same command to resume — completed chunks are never re-embedded.');
       }
       exit(1);
