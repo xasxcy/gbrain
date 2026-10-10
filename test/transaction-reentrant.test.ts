@@ -65,8 +65,10 @@ describe('transaction() re-entrancy (PGLite)', () => {
         entries: [],
       } as never);
     });
-    // Reaching here without a thrown TypeError is the assertion.
-    expect(true).toBe(true);
+    const rows = await engine.executeRaw<{ chunk_text: string }>(
+      `SELECT chunk_text FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = 'reentrant'`,
+    );
+    expect(rows.map(r => r.chunk_text)).toEqual(['to-embed']);
   });
 
   test('writes inside a re-entered transaction roll back with the outer transaction', async () => {

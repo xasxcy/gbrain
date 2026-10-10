@@ -20,9 +20,8 @@
  * adapter in `extract-conversation-facts.ts` (T5 retrofit).
  *
  * Pure-function inner core: no I/O, no LLM calls except via the
- * polish/fallback wrappers in `llm-polish.ts` + `llm-fallback.ts`
- * (T4). Those wrappers are passed in via opts so this file stays
- * test-isolatable.
+ * fallback wrapper in `llm-fallback.ts` (T4). That wrapper is passed
+ * in via opts so this file stays test-isolatable.
  */
 
 import {
@@ -347,10 +346,14 @@ export function applyPattern(
   // is diagnostic-only (zero behavior change here): collect the folded
   // labels so ParseResult can surface them. Fence-aware so a transcript
   // whose answers paste markdown/shell inside code fences is not flagged.
+  // A heading anchor that carries its own inline date (email-thread-heading)
+  // cannot be mistaken for a section title, so its other headings are body
+  // text, not lost speakers.
   const headingAnchored =
     diag !== undefined &&
     entry.multi_line === true &&
     entry.score_continuations_as_body === true &&
+    entry.captures.date_group === undefined &&
     (entry.test_positive ?? []).some((s) => /^#{2,3}\s/.test(s));
   let fenceMarker: '```' | '~~~' | null = null;
   const collectFoldedHeading = (line: string): void => {
@@ -759,6 +762,24 @@ export function parseConversation(
 
   const diag = { unrecognized_headings: [] as string[], date_fallback_count: 0 };
   const messages = applyPattern(body, top.entry, dateCtx, diag);
+
+  // Structure gate (N12-1): enough turns with every speaker distinct is a
+  // list of labels, not a conversation.
+  const minTurns = top.entry.repeat_speaker_min_turns;
+  if (
+    minTurns !== undefined &&
+    messages.length >= minTurns &&
+    new Set(messages.map((m) => m.speaker)).size === messages.length
+  ) {
+    return {
+      messages: [],
+      phase: 'no_match',
+      patterns_scored: patternsScored,
+      unmatched_line_count: opts.diagnostic
+        ? body.split(/\r?\n/).filter((l) => l.trim().length > 0).length
+        : undefined,
+    };
+  }
 
   // Timezone warning surface (D19).
   let timezone_warning: string | undefined;

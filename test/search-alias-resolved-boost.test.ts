@@ -81,7 +81,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 30 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= ranker-wave fold; 29→30 reranker document truncation rrc= (fork, re-sequenced past upstream v=29 collision))', () => {
+  it('is 30 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold; 29→30 exact-title order #5889)', () => {
     // mw2: 21→22 result-stamp/injection epoch (#1663 #3995 #3783 #4220).
     // #4352 follow-up: 22→23 private-visibility posture fold (xp=).
     // #4358 residual: 23→24 negative-offset cache-skip gap.
@@ -94,8 +94,8 @@ describe('KNOBS_HASH_VERSION', () => {
     // version-only invalidation.
     // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
     // variant fusion reorders rows for identical knobs; null hashes as legacy.
-    // 29→30 (fork, 2026-09-14 upstream sync): reranker_max_document_chars
-    // (rrc=) re-sequenced past the upstream v=29 collision — same D8 convention.
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
     expect(KNOBS_HASH_VERSION).toBe(30);
   });
 });

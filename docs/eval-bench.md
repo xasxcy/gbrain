@@ -109,7 +109,8 @@ check:eval-canary` is the on-demand package script (it is deliberately not
 in the `verify` battery — the unit-matrix twin already gates it). Honest
 scope: semantic-embedding regressions remain the keyed eval suites' job.
 Reproduce locally with `bun run scripts/run-eval-canary.ts` (`--record`
-appends to the `.gbrain-evals/eval-results.jsonl` ledger).
+appends to the `.gbrain-evals/eval-results.jsonl` ledger, a local file that is
+gitignored; `gbrain eval compare` reads it).
 
 ### `.qrels.json` shape
 
@@ -767,8 +768,12 @@ the per-miss rows, `--all` diagnoses every scored question. It is not a
 
 ### Architecture (read this if you're touching the harness)
 
-- One in-memory PGLite per benchmark run via `createBenchmarkBrain` +
-  `withBenchmarkBrain`. Your `~/.gbrain` is never opened.
+- In-memory PGLite brains via `createBenchmarkBrain`. Your `~/.gbrain` is
+  never opened. `TRUNCATE` never returns PGLite's WASM memory, which grows
+  with each question's vectors, so a harness-owned brain is replaced with a
+  fresh, re-configured one every `LME_BRAIN_RECYCLE_EVERY` (40) questions
+  (`brainRecycler` in `src/eval/longmemeval/harness.ts`); without it a long
+  single-process run stalls at 100% CPU around question 90-120.
 - Between questions: `TRUNCATE` over runtime-enumerated `pg_tables`, NOT a
   hardcoded list — schema migrations don't silently leak data across
   questions. Infrastructure tables (`sources`, `config`,
@@ -800,7 +805,7 @@ Unknown flags exit 1 before any work starts.
 | Flag | Default | Purpose |
 |---|---|---|
 | `--limit N` | run all | Run only the first N questions (after `--question-ids` filtering) |
-| `--model M` | resolved | Answer-generation model; default resolves through `resolveModel()` (`models.eval.longmemeval` config key) |
+| `--model M` | `GBRAIN_MODEL`, else `sonnet` | Answer-generation model. A standalone run opens no brain, so it never reads `models.eval.longmemeval` or `models.tier.*`; the nightly probe resolves those against the brain and passes the result here |
 | `--retrieval-only` | off | Skip LLM answer generation; emit the retrieved sessions as the hypothesis |
 | `--keyword-only` | off | Skip vector embedding: pure keyword retrieval (no reranker, no embed cache) |
 | `--expansion` | **off** | LLM multi-query expansion. Off for EVERY mode — the per-call setting beats the bundle, so `--mode tokenmax` alone does not expand. One Haiku call per question, non-deterministic; each row records `expansion_variants` |
@@ -824,7 +829,14 @@ Unknown flags exit 1 before any work starts.
 | `--include-abstention` | off | Count `_abs` (abstention) questions in the recall denominators (default: emitted with `abstention: true`, excluded; the count lands in `excluded_abstention`) |
 | `--embed-cache FILE` | `~/.cache/gbrain-eval/longmemeval-embed.sqlite` | Content-addressed embedding cache (bun:sqlite); hits/misses land in `run_config.cache`, and misses must be 0 for a like-for-like arm |
 | `--no-embed-cache` | — | Disable the embedding cache for this run |
-| `--capture-pool` | off | Record `rerank_pool` per row: the post-rerank candidate pool BEFORE autocut / the limit slice (`slug`, `chunk_id`, `session_id`, `rrf_rank`, `rerank_score`, `alias_hit`, `est_tokens`) for `scripts/replay-autocut-floor.ts` |
+| `--capture-pool` | off | Record `rerank_pool` per row: the post-rerank candidate pool BEFORE autocut / the limit slice (`slug`, `chunk_id`, `session_id`, `rrf_rank`, `rerank_score`, `alias_hit`, `est_tokens`) for `scripts/replay-autocut-floor.ts`. Rows with answer sessions also get `pool_recall`: the fused (pre-rerank) pool size, each answer session's first rank in it (`gold_rank`, null when absent) and, at fused depths 30/50/100/300, how many answer sessions are present plus `all` / `any` |
+| `--eval-pool-depth N` | off | Eval-only recall experiment: every retrieval arm fetches N candidates (N ≤ 300; production caps each arm at 100, unchanged) and `search.reranker.top_n_in` is pinned to N unless a `--search-pin` sets it. Folds into `retrieval_config_hash` and `run_config.eval_pool_depth` |
+| `--decide SLOT=MODE` | all off | System One arm (repeatable; `off`, `on`, `shadow`). See "System One arms" below |
+| `--decide-provider ID` | `typesafe:jev-1.13.0` | Decide provider written into the benchmark brain |
+| `--decide-calibration FILE\|ref:ID` | none | Calibration row(s) for `on` slots: `gbrain decide calibrate --slot X --json` or `decide calibrations list --json` output (object, array or JSONL), or a reference id; inserted and adopted in each benchmark brain |
+| `--decide-threshold SLOT=X` | none | Operator threshold override (the action-precision gate still applies) |
+| `--decide-force-on SLOT` | off | Bypass the action-precision gate for SLOT (loud stderr WARN, recorded in `run_config.decide.force_on`) |
+| `--decide-dataset JSONL` | none | The frozen labelled dataset (`gbrain decide dataset`): the run keeps only question ids in its eval half, and refuses (exit 1, `split_mismatch`) a calibration whose `split_hash` differs or whose `calibrate_only` is false |
 | `--record` | off | Append an `EvalRunRecord` (suite `longmemeval`, params = `run_config`, error text secret-redacted) to `.gbrain-evals/eval-results.jsonl` |
 | `--judge` | off | LLM-judge each reader answer against the gold with the official LongMemEval `evaluate_qa.py` prompts (temperature 0, max_tokens 16 — the official 10 is below the OpenAI API minimum; a one-token verdict is unaffected). Implies `--by-type` (the summary gains `qa_accuracy`, whose headline scores judge errors as incorrect); incompatible with `--retrieval-only`. With `--resume-from FILE`: judge-only backfill of rows lacking a settled verdict (no reader call; `judge_error` rows are re-judged), then `qa_accuracy` is rebuilt from ALL rows and FILE is rewritten with the judged rows |
 | `--judge-model M` | `openai:gpt-4o` | Judge model (the official scorer's model); a bare id is read as an `openai` model |
@@ -842,6 +854,108 @@ of `recall_any_hit`, kept for v1 readers), `abstention`,
 `reader_config_hash`, `reader_finish_reason` (`--retrieval-only` rows carry `retrieval_only: true`
 instead); with `--judge`, the `judge_*` fields listed under "Judged answer
 accuracy".
+
+### Fact-key and time-scope arms (`--fact-keys`, `--time-scope`)
+
+Eval-only arms for time-aware retrieval (`src/eval/longmemeval/retrieval-arms.ts`);
+nothing in production search calls them. Mechanism choices are made on the
+frozen development split only.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--fact-keys chunk\|page` | off | Merge each session's extracted facts into its chunks' embedding input and re-embed (chunk = each fact on its best-matching chunk; page = all facts on every chunk). Retrieval still returns raw sessions; rows carry `fact_keys` |
+| `--fact-extractor paper\|production` | paper | `paper` = the benchmark's published user-turn fact prompt; `production` = gbrain's facts extractor as shipped (8,000-character input) |
+| `--fact-keys-model M` | utility tier (haiku); production extractor: `facts.extraction_model` | Extraction model |
+| `--fact-keys-max-usd N` | 20 | Cap on uncached extraction spend; extractions are cached by content hash under `~/.cache/gbrain-eval/fact-keys-*.jsonl` |
+| `--time-scope reserved\|partition` | off | Re-order a widened pool by the question's explicit time range (resolved against `question_date`) using each session's date and the dates it mentions. `reserved` keeps the top half of k in place; `partition` moves every in-range session first |
+| `--time-scope-pool N` | 50 | Pool depth for `--time-scope`; rows carry `time_scope` and the same pool's unscoped top-k (`unscoped_recall_all_hit`), a paired control inside one run |
+
+Active arms fold into `retrieval_config_hash` as `retrieval_arms`.
+
+`--mode tokenmax` builds the vectors production builds for that mode
+(`src/eval/longmemeval/synopsis-tier.ts`): after import, every session is
+re-embedded at the per-chunk synopsis tier through the production
+contextual-retrieval service with the backfill's synopsis model. Rows carry
+`contextual_synopsis`; the model, prompt version, document cap and output cap
+fold into `retrieval_config_hash` and `run_config.contextual_synopsis`.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--synopsis-max-usd N` | 20 | Cap on uncached synopsis spend; at the cap the run stops after the current question and exits 1 |
+| `--synopsis-concurrency N` | 8 | Sessions synopsized in parallel per question (chunks within a session follow `GBRAIN_CONTEXTUAL_CHUNK_CONCURRENCY`) |
+| `--synopsis-cache FILE` | `~/.cache/gbrain-eval/synopsis-<model>.jsonl` | Synopsis cache keyed by the service's cache-key shape |
+
+LoCoMo runs through the same harness after
+`bun scripts/locomo-to-longmemeval.ts --input locomo10.json --conversations <ids> --output <file>`
+(`src/eval/longmemeval/locomo.ts`): one question per non-adversarial QA, the
+conversation's sessions as the haystack, evidence dialog ids mapped to gold
+sessions. There is no default conversation list, and the sealed split is
+converted only with `--custodian`.
+
+Kill gates, sealed bars and budgets are fixed in
+[`docs/eval/TIME_AWARE_RETRIEVAL_PREREG.md`](eval/TIME_AWARE_RETRIEVAL_PREREG.md).
+
+### System One arms (`--decide`)
+
+`gbrain eval longmemeval`, `gbrain eval brainbench` and `gbrain eval
+retrieval-quality` accept the same flags, so matched runs differ only in the
+slot under test:
+
+```bash
+# Baseline and S3 arm (same commit, data and pins; both --no-trajectory, see below)
+gbrain eval longmemeval data.jsonl --retrieval-only --no-trajectory --reranker off --by-type --output base.jsonl
+gbrain eval longmemeval data.jsonl --retrieval-only --no-trajectory --reranker off --by-type --output s3.jsonl \
+  --decide evidence=on --decide-calibration evidence-cal.json --decide-dataset evidence.jsonl
+
+# S1: --decide rerank=on also pins search.reranker.model typesafe:jev-1.13.0 and enables the reranker
+gbrain eval longmemeval data.jsonl --retrieval-only --no-trajectory --decide rerank=on --by-type --output s1.jsonl
+
+# Recall experiment: a fused pool of 300, reranked with top_n_in 300, with pool_recall per row
+gbrain eval longmemeval data.jsonl --retrieval-only --no-trajectory --decide rerank=on --eval-pool-depth 300 --capture-pool --output deep.jsonl
+
+# S4: the harness reader abstains when the S4 verdict is abstain (scored by --judge on the _abs questions)
+gbrain eval longmemeval data.jsonl --no-trajectory --judge --decide answerable=on --decide-calibration answerable-cal.json
+
+gbrain eval brainbench --suite know-to-ask --decide recall_needed=on --decide-calibration s6-cal.json --out bb.json
+gbrain eval retrieval-quality fixture.jsonl --json --decide evidence=on
+```
+
+- The flags merge over an inherited `GBRAIN_DECIDE_SLOTS` (flags win), set it
+  for the process and opt the command in; the effective value lands in
+  `run_config.decide.gbrain_decide_slots` and every receipt. With no slot on
+  or shadow, output is byte-identical to a run without the flags.
+- LongMemEval and BrainBench build throwaway in-memory brains, so the command
+  writes what the slot needs there: `decide.provider`, consent for the
+  slot's data classes, `decide.egress.private allow` (public benchmark data),
+  thresholds, `force_on`, awaited shadow (`shadow_wait on`, `shadow_sample
+  1`) and the supplied calibrations. `retrieval-quality` runs on your
+  connected brain and never writes its config: it refuses with the
+  catalogued line when the provider, key or consent is missing, and refuses
+  `--decide-calibration` / `--decide-threshold` / `--decide-force-on`.
+- A LongMemEval `--decide` arm refuses trajectory routing, which reads the
+  dataset's `question_type` labels; run both arms with `--no-trajectory` so
+  routing uses text-only classifiers and the labels only score.
+- Per-row receipts: each LongMemEval row gains `decide.<slot>` (mode,
+  effective, skipped reason — `not_reached` when the slot's call site never
+  ran — threshold, outcome tally, latency, resolved model, judged count,
+  decide input tokens and cost from the benchmark brain's `decide_spend`
+  for that question; S1 `on` reports the Jev reranker's latency and tokens;
+  S2 adds `late` when the answer missed `decide.slots.intent.wait_ms`;
+  S4 adds `answerability` and `reader_abstained`). The summary's `run_config`
+  gains `decide` (flags, provider, calibration ids, thresholds, force_on,
+  dataset split hashes; folded into `retrieval_config_hash`) and
+  `decide_summary` (per slot: rows, acted, outcomes, skips, latency p50/p95,
+  tokens, cost, S2 `late_rate`). BrainBench adds `turn_rows[].decide` (S6
+  `recall_needed` at the claude-code turn-context seam) and a result-level
+  `decide` block, and refuses `--update-baseline`; retrieval-quality `--json`
+  adds `decide` with per-query receipts.
+- Judge agreement (eval-only, no brain needed): `gbrain decide
+  judge-agreement --suite longmemeval --input judged.jsonl` (a `--judge`
+  output) or `--suite grounding --input grounding-labels.jsonl` asks Jev one
+  question per item and reports n, raw agreement, Cohen's kappa with a 95%
+  CI, the confusion matrix, per `question_type` slices, Jev cost and latency
+  p50/p95. The reference labels are LLM verdicts: this is judge-vs-judge
+  agreement. `--dry-run` estimates tokens and cost without sending anything.
 
 ### Numbers
 
@@ -861,12 +975,23 @@ brain surfaces conflicting answers.
 
 ### Recommended nightly cadence
 
+The probe is not part of the dream cycle or autopilot (the cycle only reads
+the latest run), so schedule it yourself (cron, launchd or a systemd timer).
+It needs queries: either write your own list (`--queries-file`, JSONL or one
+query per line; nothing creates `~/.gbrain/queries.jsonl` for you), or turn
+on query capture (`gbrain config set eval.capture true`; capture is off by
+default) and use `--from-capture` once real queries have been recorded.
+
 ```bash
-# Once a day, against your top 50 most-frequent queries:
+# Once a day, against queries you maintain:
 gbrain eval suspected-contradictions \
   --queries-file ~/.gbrain/queries.jsonl \
   --top-k 5 \
   --budget-usd 5 \
+  --output ~/.gbrain/probe-runs/$(date +%Y-%m-%d).json
+
+# Or, with eval.capture on, against captured queries:
+gbrain eval suspected-contradictions --from-capture --top-k 5 --budget-usd 5 \
   --output ~/.gbrain/probe-runs/$(date +%Y-%m-%d).json
 ```
 
@@ -1047,6 +1172,16 @@ echo "exit=$?"  # 0=all-pass, 1=any-fail, 2=any-error-or-inconclusive
 - Exit precedence (fail-loud): ERROR > FAIL > INCONCLUSIVE > PASS.
 - Per-question receipts land in a tempdir and are deleted at end of batch; the
   summary inlines per-question verdicts so the audit trail is self-contained.
+  Each scored question also carries `slot_scores`: per dimension, one score
+  per slot in slot order, `null` for a slot that gave none.
+- The summary's `panel` counts the distinct judge models and providers
+  among the slots that scored at least one question, and records per slot
+  (`slot_scored_questions`, slot order) how many questions it scored. The
+  stderr verdict line prints both counts. Stderr also names a model that
+  holds two or more of those slots (its votes count more than once), a slot
+  that scored no question (it did not judge), and says when fewer than
+  three providers judged (the panel is then not cross-modal). None of this
+  changes the verdict or the exit code.
 
 ### Nightly cross-modal quality probe (opt-in, autopilot)
 
@@ -1056,7 +1191,6 @@ API spend. Enable per-host:
 
 ```bash
 gbrain config set autopilot.nightly_quality_probe.enabled true
-gbrain config set autopilot.nightly_quality_probe.max_usd 5.00   # optional override
 ```
 
 The autopilot scheduler invokes the probe on its tick cadence when the
@@ -1069,19 +1203,192 @@ callable in isolation, and the test harness exercises it via DI stubs.
 bun test test/nightly-quality-probe.test.ts
 ```
 
+**What it measures.** The probe is a synthetic smoke test, not a health
+score for your brain. It answers the 10 committed questions in
+`test/fixtures/longmemeval-nightly.jsonl` from an isolated in-memory
+benchmark brain, with your search mode, reranker and model routes, and has
+three judges grade the answers. A PASS says the retrieval-plus-answer
+pipeline and the judges work end to end tonight; it says nothing about the
+pages in your own brain. The fixture is embedded in the gbrain binary, so
+source checkouts and compiled installs run the same probe.
+
+#### Model routes
+
+The probe runs inside the autopilot daemon, which holds your brain. Right
+before each run it refreshes the daemon's AI gateway from the brain (the way
+queued jobs do), resolves every model against the brain, and passes the
+result to the two eval commands, which open no brain of their own.
+`gbrain models` prints the same routes under "Nightly quality probe", each
+with its source. It judges provider keys from the shell you run it in: a key
+that only `~/.gbrain/env` holds (the daemon's launcher sources that file)
+reads there as missing, so a slot default it serves shows as a substitute and
+a key-aware default can differ from the daemon's.
+
+| Route | Resolution (first one set wins) | Reaches |
+|---|---|---|
+| Reader | `models.eval.longmemeval` → `models.tier.reasoning` → `models.default` → `GBRAIN_MODEL` → key-aware reasoning default | `gbrain eval longmemeval --model` |
+| Trajectory extractor | `models.tier.utility` → `models.default` → `GBRAIN_MODEL` → key-aware utility default | the claim extractor; the rows' `methodology_note` names it |
+| Judge slot A / B / C | `models.eval.cross_modal.slot_a` / `slot_b` / `slot_c` (aliases expand), else the panel default `openai:gpt-5.2` / `anthropic:claude-opus-4-7` / `deepseek:deepseek-v4-pro` | `gbrain eval cross-modal --slot-<x>-model` |
+
+A slot key always wins, even when its provider has no key here (that slot
+then errors at call time). An unset slot whose default provider has no key on
+this install takes the brain's chat model instead (#4636). Slots A and C share
+that substitute: on a brain with no OpenAI or DeepSeek key, two of the three
+judges are one model, and setting only `slot_b` to the chat model makes all
+three judges one model. When `models.tier.reasoning` is set and neither
+`models.chat` nor `models.eval.longmemeval` is, the chat model and the reader
+both resolve to that tier, so the substitute is also the reader: those judges
+grade their own answers.
+
+**No metered chat calls on a subscription-only brain.** Route the reader and
+the extractor through tiers on `claude-cli`, and set the three slot keys to
+three *different* models, none of them the reader (`gbrain models` shows it),
+so no judge grades its own answers. One provider is enough, for example three
+claude-cli models from different families:
+
+```bash
+gbrain config set models.tier.reasoning claude-cli:claude-opus-5-5
+gbrain config set models.tier.utility claude-cli:claude-sonnet-5
+gbrain config set models.eval.cross_modal.slot_a claude-cli:claude-fable-5-1
+gbrain config set models.eval.cross_modal.slot_b claude-cli:claude-sonnet-5-5
+gbrain config set models.eval.cross_modal.slot_c claude-cli:claude-haiku-4-5-20251001
+gbrain models   # the "Nightly quality probe" block shows every route and its source
+```
+
+Query embeddings still go to your embedding provider.
+
+**Say to your agent:** *"Make the nightly quality probe judge with three
+different Claude subscription models, none of them the model that answers the
+questions, so it stops spending on API keys."* (the
+agent runs `gbrain config set models.eval.cross_modal.slot_<a|b|c> <model>`
+and checks the result with `gbrain models`).
+
 Observability:
 - `~/.gbrain/audit/quality-probe-YYYY-Www.jsonl` — one event per run with
   outcome (pass / fail / inconclusive / error / budget_exceeded /
-  rate_limited / no_embedding_key), pass/fail/inconclusive/error counts,
+  no_embedding_key / skipped), pass/fail/inconclusive/error counts,
   est_cost_usd, fixture_sha8. ISO-week rotation (mirrors slug-fallback
-  audit).
+  audit). The row also carries the evidence behind its verdict, in the
+  optional fields below (rows written by older releases lack them and
+  still read).
 - `gbrain doctor` surfaces `nightly_quality_probe_health`:
   - SKIPPED (disabled) — with paste-ready enable command.
   - OK (enabled, no events yet) — autopilot hasn't fired its first run.
   - OK (last 7d all PASS) — with timestamp of latest run.
-  - WARN — any FAIL / ERROR / BUDGET_EXCEEDED in the window, with outcome
-    counts and the latest run's reason.
+  - WARN — any run that did not pass in the window (FAIL, ERROR,
+    INCONCLUSIVE, BUDGET_EXCEEDED, NO_EMBEDDING_KEY or SKIPPED), with
+    outcome counts and the latest run's reason (the digest in `detail`).
+    SKIPPED means the probe could not run (its fixture was unreadable), so
+    it gave no quality signal; it is never reported as OK.
+  - The OK and WARN messages name the latest run's judge panel and any
+    slot that scored no question (it did not judge). When one model holds
+    two or more of the slots that judged, its votes count more than once:
+    doctor names that model and the next step, three different models in
+    `models.eval.cross_modal.slot_a`, `slot_b` and `slot_c` (one provider
+    is enough, for example three claude-cli models). Judges from fewer
+    than three providers are reported as not cross-modal, as information;
+    the check's status does not change.
+- **Collapsed panel → inconclusive.** When one model holds two or more of
+  the slots that judged (for example the sonnet/opus/sonnet panel an
+  Anthropic-only brain gets from the #4636 substitute), or fewer than two
+  models judged, the run is `inconclusive` with `reason: panel_collapsed`,
+  whatever the batch's verdict was: one model voting twice is not a cross
+  check. The `detail` names the model and slots, keeps the batch verdict,
+  and gives the next step (`gbrain config set
+  models.eval.cross_modal.slot_a <model>`, and `slot_b`, `slot_c`).
+- **Receipts.** A run that did not pass keeps its batch summary and
+  LongMemEval output under `~/.gbrain/audit/nightly-probe/<timestamp>/`
+  (newest 7 runs) and names the directory in `receipt_dir`. The fixture is
+  synthetic, so receipts hold no user data.
 
-Real expected cost: ~$0.35 per nightly run (5 questions x 3 slots x 1 cycle
-x ~$0.02/call) ≈ $10.50/month. Worst-case under the default budget cap:
-$150/month. Opt-in default prevents discovering this in your card statement.
+| Audit field | Written on | Meaning |
+|---|---|---|
+| `reader_model`, `extractor_model` | rows written after the model routes resolved | The reader and the trajectory extractor the run used. |
+| `judge_models` | rows from a completed batch | The configured judge models in slot order (A, B, C). |
+| `judge_scored_questions` | rows from a completed batch | Per slot in slot order, the questions that judge scored; `0` names a slot that did not judge. |
+| `distinct_judge_models`, `distinct_judge_providers` | rows from a completed batch | How many different models and providers judged, counted over the slots that scored at least one question. The batch's stderr verdict line prints both. |
+| `failures` | fail, inconclusive and error rows from a batch | Up to 10 non-passing questions in summary order: `question_id`, `verdict`, then either `dimensions` (each failing dimension with its `mean`, its per-slot `scores` in slot order, `null` for a slot that gave no score, and its `fail_reason`, `mean_below_7` or `min_below_5`; a dimension name the probe does not ask for reads `unrecognized`) or the `error` text, cut before any raw model output, redacted and cut to 200 characters. An inconclusive question lists the `slot_errors` of the judges that did not score. |
+| `detail` | the same rows | A one-line digest, for example `6/10 questions did not pass (directness mean_below_7 x6); judges: 2 distinct models from 1 provider`. It counts every question that did not pass, also past the 10 listed, and malformed batch rows (`malformed xN`), and names a slot that scored no question. |
+| `chat_calls`, `chat_cost_usd`, `unpriced_chat_calls` | rows of a run that reached its model calls, including a run that failed part-way | The run's metered chat spend: successful chat calls (reader, extractor, judges), their USD cost from canonical pricing, and the calls with no price on file, whose cost is unknown and never counted as 0. |
+| `cap_usd`, `cap_source` | rows of a run that reached its model calls | The run-level cap and where it came from: `user` (a configured `max_usd`) or `default` ($5). |
+| `reason` | skipped, collapsed-panel inconclusive and budget_exceeded rows | `fixture_unavailable`, `panel_collapsed`, or the budget's `cost` / `runtime` / `no_pricing`. |
+| `receipt_dir` | rows of a run that did not pass and got as far as writing output | Where its `summary.json` and `lme-output.jsonl` were kept. |
+
+**Say to your agent:** *"Why did last night's quality probe fail?"* (the
+agent reads the `detail` and `failures` of the latest
+`quality-probe-*.jsonl` row and runs `gbrain doctor`).
+
+Cost: two numbers that cover different calls, so neither bounds the other.
+- `est_cost_usd` is the batch's pre-flight estimate for its judge calls
+  only (an assumed 5,000 input and 4,000 output tokens per judge call). At
+  the fixture's 10 questions it depends on the panel: about $1.80 on the
+  default three-provider panel and $2.80 on a sonnet/opus/sonnet panel (the
+  #4636 substitute on an Anthropic-only brain). Unpriced judges such as
+  `claude-cli:*` add nothing, and a row written without a batch summary (a
+  run that failed part-way) records 0.
+- `chat_cost_usd` is what every chat call of the run cost (reader,
+  extractor and judges), metered as they succeed and recorded also on a row
+  of a run that failed part-way. Calls with no price on file are counted
+  in `unpriced_chat_calls`, not here. Query embeddings are priced
+  separately and not included. On an Anthropic-keyed brain with the
+  sonnet/opus/sonnet panel, one run metered about $0.38 where the batch
+  estimated $2.80; with unpriced judges and a priced reader the metered
+  cost can exceed the estimate.
+
+**Run cap.** `autopilot.nightly_quality_probe.max_usd` (default $5) caps
+every paid call of a run as one budget: the LongMemEval reader, extractor
+and query embeddings, then the judges. Each call is reserved against the cap
+before it is sent. When the cap runs out the run stops, makes no further
+paid call (no judging when LongMemEval used it up), and records
+`budget_exceeded` with the reason, never `fail`. Pricing follows the
+spend-control rule: under the default cap a model with no price on file
+warns and runs (counted in `unpriced_chat_calls`); once you set `max_usd`
+yourself, an unpriced model is refused with the `no_pricing` guidance, which
+names the `gbrain pricing set` command that registers its rate (or add it to
+`pricing.overrides`). A typical run on priced API models costs well under a
+dollar of metered chat (`chat_cost_usd`), plus query embeddings.
+
+## Local benchmark scripts
+
+Three deterministic, keyless benchmarks run an in-process PGLite brain and
+print a report (`--json` for machine-readable output). They are not collected
+by any test runner; run them when touching the code they measure.
+
+### Graph quality benchmark (`scripts/bench-graph-quality.ts`)
+
+80 fictional pages (people, companies, meetings, concepts) seeded with the
+current extraction contract: meeting attendance from the meeting's
+frontmatter `attendees:` (edges person -> meeting, type `attended`), founders
+from the person's frontmatter `founded:`, and employment, advising and
+investment from prose links. After `gbrain extract links --source db
+--include-frontmatter` and `extract timeline`, it scores link recall and
+precision, type accuracy, timeline recall and precision, typed and relational
+traversal, idempotent re-extraction, multi-hop traversal, a top-N aggregate,
+a two-type intersection, and keyword ranking with the backlink boost, each
+against a grep-over-page-text baseline (A). It exits 1 when a threshold fails
+(link recall 0.85, link precision 0.95, timeline recall 0.85 and precision
+0.95, type accuracy 0.80, relational recall 0.80, both idempotency checks).
+
+Last recorded run (2026-10-04, v0.60.48.0): every threshold passes at 100%
+(90 links, 95 timeline rows); the grep baseline reaches the same relational
+recall with 45.5% precision; multi-hop recall is 10/10 against 0/10 for grep.
+In the ranking section the boost leaves unlinked pages where they were (avg
+rank 27.5) and does not lift the four most-linked startups above the other
+linked startups (avg rank 12.5 without, 13.25 with); the order of equal
+keyword scores is not stable between runs.
+
+### Knowledge runtime benchmark (`scripts/bench-knowledge-runtime.ts`)
+
+Three checks with mocked resolvers: timeline rows are queryable right after
+`put_page` with `auto_timeline` on and off (they are a canonical projection
+that commits with the page, so both arms read 100%); the bare-tweet repair
+buckets under a 70/20/10 resolver confidence mix (35 repaired, 10 to review, 5
+skipped of 50); and doctor's integrity scan surfacing planted issues (last
+run: 5 of 6, with 2 of 3 bare tweets caught).
+
+### put_page latency (`scripts/bench-put-page-latency.ts`)
+
+200 `put_page` operation calls against 10 target pages, half carrying three
+timeline bullets. Reports mean, p50, p95, p99 and max latency and the timeline
+rows committed (300 expected). Last run on one Capy cloud machine: p50 21 ms,
+p95 42 ms, p99 142 ms.

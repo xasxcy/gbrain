@@ -31,10 +31,11 @@
 
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { WindowTurn } from './entity-salience.ts';
 import { toCorpusText, type ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { mapOpenclawLine } from '../transcripts/openclaw.ts';
+import { stripPastedContent, stripPastedContentFromCorpus } from '../transcripts/pasted-content.ts';
 
 /** Length of the hex content-hash slice in segment filenames. */
 /**
@@ -76,10 +77,32 @@ export function ledgerFileName(sessionId: string): string {
   return `${safeIdComponent(sessionId)}.ledger.json`;
 }
 
+/** #4618 per-session seat sidecar (context/seat.ts owns its content). One
+ * per SESSION, not per corpus file: the session-end `.txt`, its checkpoint
+ * segments and its writeback turns all share it. */
+export const SEAT_SIDECAR_SUFFIX = '.seat.json';
+
+export function seatFileName(sessionId: string): string {
+  return `${safeIdComponent(sessionId)}${SEAT_SIDECAR_SUFFIX}`;
+}
+
+/** A seat sidecar written ahead of its corpus file is never reaped inside
+ * this window (the writer renames the corpus file within seconds). */
+const SEAT_ORPHAN_GRACE_MS = 10 * 60 * 1000;
+
 /** Receipt sidecar suffix (harvest link candidates persisted before manifest
  * publish). Lives HERE so the engine-free hook lane can GC orphaned receipts
  * without importing the engine-typed harvest module. */
 export const HARVEST_RECEIPT_SUFFIX = '.receipt.json';
+/** #6091: capture-time consent record (capture-consent.ts); reaped with its corpus file after a grace period.
+ * `<file>.capture-off.json` is the pre-wave-12 single record; W4.2 records are `<file>.capture-off.<brain>.json`. */
+export const CAPTURE_OFF_SUFFIX = '.capture-off.json';
+export const CAPTURE_OFF_INFIX = '.capture-off.';
+/** #5887 window-progress sidecar (context/corpus-windows.ts) and its CAS
+ * lock. Engine-free home so the hook's GC reaps both with the `.txt`; the
+ * hook's resume rewrite never deletes them. */
+export const CORPUS_PROGRESS_SUFFIX = '.progress';
+export const CORPUS_PROGRESS_LOCK_SUFFIX = '.progress.lock';
 
 /**
  * Inverse of `segmentFileName`: `{sessionId, hash}` when `name` is a corpus
@@ -325,12 +348,38 @@ export function parseWbFileName(name: string): { sessionId: string; hash: string
   return m ? { sessionId: m[1], hash: m[2], ...(m[3] ? { sourceId: m[3] } : {}) } : null;
 }
 
+/**
+ * The harness session a `.txt` corpus file belongs to: the session-end
+ * `<sessionId>.txt`, a checkpoint segment or a writeback turn file. Used to
+ * classify gbrain's own claude-cli sessions (#5413) across every form.
+ */
+export function corpusFileSessionId(name: string): string {
+  return parseSegmentFileName(name)?.sessionId ?? parseWbFileName(name)?.sessionId ?? name.replace(/\.txt$/, '');
+}
+
+/**
+ * #5812 — the text a fact extractor may see from a session-corpus file: paste
+ * blocks removed (someone else's words), the file itself unchanged. A
+ * writeback turn file is one user turn; every other corpus file is
+ * `toCorpusText` blocks, stripped per `[user]` block.
+ */
+export function corpusTextForExtraction(path: string, text: string): string {
+  return parseWbFileName(basename(path)) ? stripPastedContent(text).text : stripPastedContentFromCorpus(text);
+}
+
 /** The TERMINAL writeback_off `.ingested` sidecar payload — the wb state
  * machine's one terminal skip, written identically by the serve harvest and
  * the sweep backstop (shape drift between the two writers would be invisible
  * until a consumer disagrees). */
 export function writebackOffSidecarJson(): string {
   return JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'writeback_off' }) + '\n';
+}
+
+/** The TERMINAL self_capture `.ingested` sidecar payload (#5413/#5820) —
+ * written identically by the serve harvest and the sweep, so neither retries
+ * a corpus file captured from gbrain's own claude-cli session. */
+export function selfCaptureSidecarJson(): string {
+  return JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'self_capture' }) + '\n';
 }
 
 /**
@@ -383,7 +432,11 @@ export async function bankCompactSegment(
   sessionId: string,
   allTurns: WindowTurn[],
   boundaryTurnIndexes: number[],
-  opts: { remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number },
+  opts: {
+    remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number;
+    /** #6091: runs before the segment is renamed into place (capture-time consent record); a throw banks nothing. */
+    beforeWrite?: (file: string, text: string) => void;
+  },
 ): Promise<{ segment: string; flushCorpusFile?: string; hash?: string; ordinal?: number }> {
   try {
     const windowTurns = sliceBoundaryWindow(allTurns, boundaryTurnIndexes, {
@@ -395,6 +448,7 @@ export async function bankCompactSegment(
     if (!rendered) return { segment: 'scan_unavailable' };
     if (!rendered.text.trim()) return { segment: 'empty_window' };
     if (opts.remainingMs() < opts.minWriteMs) return { segment: 'deadline_write' };
+    opts.beforeWrite?.(join(dir, segmentFileName(sessionId, segmentHash(rendered.text))), rendered.text);
     const w = writeSegment(dir, sessionId, rendered.text);
     const ordinal = appendSegmentLedger(dir, sessionId, w.hash);
     return {
@@ -442,10 +496,80 @@ export async function decideCorpusMode(
 }
 
 /**
+ * E-N1: a corpus `.txt` with no `.ingested` sidecar holds turns nothing has
+ * extracted yet (an HTTP serve with no sweep, a refused harvest). Retention
+ * removes it only at this multiple of the configured retention, and doctor
+ * `memory_writeback` warns while it waits.
+ */
+export const CORPUS_UNINGESTED_RETENTION_FACTOR = 3;
+/** Completion sidecar suffix (sweep.ts CORPUS_INGESTED_SUFFIX; duplicated to stay engine-free). */
+const INGESTED_SUFFIX = '.ingested';
+
+export interface CorpusBacklog {
+  /** `.txt` files with no `.ingested` sidecar. */
+  pending: number;
+  /** mtime of the oldest pending file, or null with none pending. */
+  oldestPendingMtimeMs: number | null;
+  /** Pending files older than retention: kept only by the un-ingested rule, deleted at the ceiling. */
+  pastRetention: number;
+}
+
+/** Count corpus turn files still waiting for extraction. Missing dir = empty backlog; never throws. */
+export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()): CorpusBacklog {
+  const backlog: CorpusBacklog = { pending: 0, oldestPendingMtimeMs: null, pastRetention: 0 };
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return backlog;
+  }
+  const present = new Set(names);
+  for (const name of names) {
+    if (!name.endsWith('.txt') || present.has(name + INGESTED_SUFFIX)) continue;
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(join(dir, name)).mtimeMs;
+    } catch {
+      continue;
+    }
+    backlog.pending++;
+    if (backlog.oldestPendingMtimeMs === null || mtimeMs < backlog.oldestPendingMtimeMs) backlog.oldestPendingMtimeMs = mtimeMs;
+    if (mtimeMs < now - retentionMs) backlog.pastRetention++;
+  }
+  return backlog;
+}
+
+/**
+ * Retention GC for corpus turn files: an extracted file (`.ingested`
+ * sidecar present) goes at `retentionMs`; one nothing has extracted stays
+ * until `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
+ * Best-effort per file; never throws.
+ */
+export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.now()): void {
+  try {
+    const names = readdirSync(dir);
+    const present = new Set(names);
+    for (const name of names) {
+      if (!name.endsWith('.txt')) continue;
+      const ageLimit = present.has(name + INGESTED_SUFFIX) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
+      const p = join(dir, name);
+      try {
+        if (statSync(p).mtimeMs < now - ageLimit) rmSync(p, { force: true });
+      } catch {
+        /* per-file best effort */
+      }
+    }
+  } catch {
+    /* GC never breaks the caller */
+  }
+}
+
+/**
  * GC companion for the corpus dir (extends the hook's `.txt`-only GC): remove
- * ledgers past the retention window, and remove ORPHANED sidecars whose base
- * `.txt` is gone (previously they lived forever). Best-effort per file; never
- * throws.
+ * ledgers past the retention window, ORPHANED sidecars whose base `.txt` is
+ * gone (previously they lived forever), and a session's seat sidecar once no
+ * `.txt` of that session remains (after a grace window, so a sidecar written
+ * just ahead of its corpus file survives). Best-effort per file; never throws.
  */
 export function gcCorpusArtifacts(
   dir: string,
@@ -454,9 +578,23 @@ export function gcCorpusArtifacts(
 ): void {
   try {
     const cutoff = Date.now() - maxAgeMs;
-    for (const name of readdirSync(dir)) {
+    const names = readdirSync(dir);
+    const liveSessions = new Set(names.filter((n) => n.endsWith('.txt')).map(corpusFileSessionId));
+    for (const name of names) {
       const p = join(dir, name);
       try {
+        if (name.endsWith(SEAT_SIDECAR_SUFFIX)) {
+          if (!liveSessions.has(name.slice(0, -SEAT_SIDECAR_SUFFIX.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
+            rmSync(p, { force: true });
+          }
+          continue;
+        }
+        const offAt = name.endsWith('.json') ? name.lastIndexOf(CAPTURE_OFF_INFIX) : -1;
+        if (offAt > 0) {
+          // Written BEFORE its corpus file lands: only an orphan past the grace period is reaped (every brain's record alike).
+          if (!existsSync(join(dir, name.slice(0, offAt))) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) rmSync(p, { force: true });
+          continue;
+        }
         if (name.endsWith('.ledger.json')) {
           if (statSync(p).mtimeMs < cutoff) rmSync(p, { force: true });
           continue;

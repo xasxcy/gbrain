@@ -45,7 +45,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 30 (…; 23→24 negative-offset cache-skip gap #4358 residual; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256/#3695; 28→29 evb=/rrp=/kacf=/mbg= ranker-wave fold; 29→30 reranker document truncation rrc= (fork, re-sequenced past upstream v=29 collision))', () => {
+  test('version is 30 (…; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256/#3695; 28→29 evb= expansion variant budget fold; 29→30 exact-title order #5889)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -100,11 +100,8 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
-    // 29→30 (fork, 2026-09-14 upstream sync): reranker_max_document_chars
-    // (rrc=) changes the text the cross-encoder scores, so a different
-    // truncation threshold must not reuse cached rankings. Re-sequenced from
-    // the fork's own v=29 (2026-09-07 merge) because upstream independently
-    // claimed 29 for the ranker-wave knobs above — same D8 convention.
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
     expect(KNOBS_HASH_VERSION).toBe(30);
   });
 

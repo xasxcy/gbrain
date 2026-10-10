@@ -1,15 +1,16 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { chat, configureGateway, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
+import { chat, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
 import { withAIInvocationGuard, type AIInvocationUsage } from '../src/core/ai/invocation-guard.ts';
 import { BudgetTracker } from '../src/core/budget/budget-tracker.ts';
 import { canonicalLookup } from '../src/core/model-pricing.ts';
-import { normalizeSessions, haystackToPages, type LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
+import { normalizeSessions, haystackToPages, opaqueSessionId, type LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
 import { buildEvidencePacket, renderFullSessions, type EvidenceSession } from '../src/eval/longmemeval/evidence-packet.ts';
 import { buildReaderUserText, READER_SYSTEM_TEXT, READER_MAX_TOKENS, READER_MAX_SESSION_CHARS } from '../src/eval/longmemeval/reader.ts';
 import { sanitizeChatContent } from '../src/eval/longmemeval/sanitize.ts';
 import { buildJudgePrompt, classifyJudgeResponse, DEFAULT_JUDGE_MODEL, JUDGE_MAX_TOKENS, JUDGE_TEMPERATURE } from '../src/eval/longmemeval/judge.ts';
 import { runJudge } from '../src/eval/shared/judge-runner.ts';
+import { configureEvalGateway } from '../src/eval/shared/gateway-bootstrap.ts';
 import { bootstrapMeanCi } from '../src/eval/shared/bootstrap.ts';
 import { redactSecrets, sha256Hex, stableStringify } from '../src/eval/longmemeval/run-config.ts';
 
@@ -52,7 +53,8 @@ export function freezeEvidence(q: Question, row: Receipt): EvidenceSession[] {
     const i = sessions.findIndex(s => s.session_id === id);
     if (i < 0) throw new Error(`Missing saved session: ${id}`);
     if (sessions.filter(s => s.session_id === id).length !== 1 || pages.filter(p => p.slug === pages[i].slug).length !== 1) throw new Error('Missing or ambiguous saved session');
-    return { source_id: 'longmemeval-public', session_id: id, date: q.haystack_dates?.[i], body: pages[i].content, turns: sessions[i].turns.map(t => ({ role: t.role, content: t.content })) };
+    // Reader-visible id is opaque (gold ids start with `answer_`); scoring uses the receipt's raw ids.
+    return { source_id: 'longmemeval-public', session_id: opaqueSessionId(q.question_id, id), date: q.haystack_dates?.[i], body: pages[i].content, turns: sessions[i].turns.map(t => ({ role: t.role, content: t.content })) };
   });
 }
 
@@ -299,7 +301,7 @@ async function main(args: string[]) {
       if (frozen.variant !== variant || frozen.manifest_sha !== sha256Hex(stableStringify(pins))) throw new Error('Holdout differs from frozen algorithm');
     }
     if (!process.env.ANTHROPIC_API_KEY || !process.env.OPENAI_API_KEY) throw new Error('Both reader and judge credentials are required');
-    configureGateway({ env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY } });
+    configureEvalGateway();
     appendRecord(journal, { event: 'phase_start', phase, variant, timestamp: new Date().toISOString() });
     for (const [index, id] of cohorts[phase].entries()) {
       if (readRecords(pairsPath).some(r => r.phase === phase && r.variant === variant && r.question_id === id)) continue;
@@ -342,7 +344,7 @@ async function main(args: string[]) {
         outcomes[`${arm}_correct`] = judge.verdict === 'correct';
       }
       const row = { phase, variant, question_id: id, category: q.question_type, abstention: id.endsWith('_abs'),
-        retrieval_complete: q.answer_session_ids.length > 0 && q.answer_session_ids.every(id => sources.some(s => s.session_id === id)),
+        retrieval_complete: q.answer_session_ids.length > 0 && q.answer_session_ids.every(gold => receipts.find(r => r.question_id === id)!.retrieved_session_ids.includes(gold)),
         ...outcomes, arm_order: order, budget_fallback: packet.budget_fallback, provider_count_fallback: providerCountFallback,
         baseline_input_count: countBaseline, candidate_input_count: countCandidate };
       appendRecord(pairsPath, row);

@@ -27,17 +27,17 @@
  * per-session id would make parts 2..N skip as cross-slug duplicates.
  */
 
-import { safeDump } from 'js-yaml';
+import { dumpFrontmatterYaml } from '../data-frontmatter.ts';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_BYTES_BLOCK } from '../content-sanity.ts';
+import { DEFAULT_BYTES_WARN } from '../content-sanity.ts';
 import { applyRedaction, planRedaction, type EchoDictionary, type RedactionPlan } from '../secret-scan.ts';
 import { loadPatterns } from '../skillpack/harvest-lint.ts';
 import { sanitizeForJsonb } from '../batch-rows.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
 import { BUILTIN_PATTERNS } from '../conversation-parser/builtins.ts';
 import type { ParsedSession, TranscriptMessage } from './types.ts';
-import { buildTranscriptSlug, transcriptFullId } from './types.ts';
+import { buildTranscriptSlug, transcriptFullId, utcTimestamp } from './types.ts';
 
 // ── Shared line format (imessage-slack builtin) ─────────────────────────────
 
@@ -60,8 +60,18 @@ export const MESSAGE_CHAR_CAP = 4000;
  * would import as a zero-chunk, unsearchable page, defeating the split.
  * (Operators can lower the threshold via config; the 0.6 factor leaves
  * headroom for frontmatter overhead and modest overrides.)
+ *
+ * #5427: with the prior `min(300KB, floor(BLOCK * 0.6))` shape, the target
+ * landed at 300KB — six times the content-sanity WARN line (50KB). Every
+ * transcript-import part between 50KB and 300KB therefore took the
+ * content-sanity warn branch (`oversize_warn` audit row + stderr
+ * `exceeds warn threshold, consider splitting` — pointing at the very
+ * splitter that produced the page) on every re-ingest, drowning the doctor
+ * recent-events signal. The block tier stays untouched (the hard floor for
+ * the no-zero-chunk invariant). The 0.9 headroom against WARN gives the
+ * part header + OVERLAP_MESSAGES duplicates room to breathe.
  */
-export const PART_TARGET_BYTES = Math.min(300 * 1024, Math.floor(DEFAULT_BYTES_BLOCK * 0.6));
+export const PART_TARGET_BYTES = Math.floor(DEFAULT_BYTES_WARN * 0.9);
 /** Messages repeated at each part boundary for cross-part fact grounding. */
 export const OVERLAP_MESSAGES = 2;
 
@@ -79,9 +89,10 @@ export function defaultUserPatternsPath(): string {
  * Agent-directed imperative shapes. Detection only STAMPS A COUNT into the
  * page's transcript_import frontmatter (hash-covered, idempotent) so readers
  * and future triage can see the page carries instruction-shaped content —
- * it never hides or rewrites the text.
+ * it never hides or rewrites the text. The write gate
+ * (`src/core/write-gate-patterns.ts`) reuses them as `override` patterns.
  */
-const IMPERATIVE_RES: readonly RegExp[] = [
+export const IMPERATIVE_RES: readonly RegExp[] = [
   /\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|context|rules)\b/i,
   /\byou\s+(must|should)\s+now\s+(act|behave|respond)\b/i,
   /\bnew\s+system\s+prompt\b/i,
@@ -123,6 +134,11 @@ export function loadImportRedactionPatterns(userPatternsPath?: string): ImportRe
  * carry a digit and clear the entropy gate). Transcripts are the corpus where
  * a pasted `.env` line is most likely, so recall wins over the false-positive
  * cost here; the push gate and compiled-context scan keep the heuristic off.
+ * Also opted in for this lane only: the `labeled_credential` detector
+ * (`secret-scan-labeled.ts`), which claims a low-entropy value typed after a
+ * password / login / credentials label (`password: hunter2`, `login alice /
+ * hunter2`); a claimed value of 8+ characters that is not a stoplisted word
+ * joins the echo dictionary below.
  * Every match becomes `<REDACTED:pattern>`; user patterns become
  * `<REDACTED:user-pattern>`.
  *
@@ -151,9 +167,10 @@ export function redactSession(
     // sanitizeForJsonb (NUL-strip + well-form): transcripts capture raw tool
     // output that legitimately carries U+0000, which Postgres text/jsonb
     // reject at the write boundary (#4392).
-    // highEntropy: transcripts opt into the assignment heuristic (see doc
-    // comment above) — the shared scanner keeps it off by default.
-    planRedaction(sanitizeForJsonb(text), { highEntropy: true, echoValues });
+    // highEntropy + labeledCredentials: transcripts opt into the assignment
+    // heuristic and the labeled-credential detector (see doc comment above);
+    // the shared scanner keeps both off by default.
+    planRedaction(sanitizeForJsonb(text), { highEntropy: true, labeledCredentials: true, echoValues });
 
   const apply = (p: RedactionPlan): string => {
     redactionCount += p.redactions.length;
@@ -217,7 +234,7 @@ export function redactSession(
 /** `2026-08-01T10:00:05.000Z` → `(2026-08-01 10:00 AM)` (UTC), matching the builtin. */
 function anchorTimestamp(iso: string): string {
   const d = new Date(iso);
-  const day = iso.slice(0, 10);
+  const day = Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toISOString().slice(0, 10);
   let h = d.getUTCHours();
   const ampm = h >= 12 ? 'PM' : 'AM';
   h = h % 12 || 12;
@@ -262,6 +279,13 @@ export interface RenderedPart {
   frontmatterId: string;
   part: number;
   of: number;
+  /** The keys this collector renders (and so owns on re-ingest), and the body. */
+  frontmatter: Record<string, unknown>;
+  body: string;
+}
+
+export function renderPartContent(frontmatter: Record<string, unknown>, body: string): string {
+  return `---\n${dumpFrontmatterYaml(frontmatter, { lineWidth: 1000 })}---\n\n${body}\n`;
 }
 
 export interface RenderSessionResult {
@@ -293,8 +317,9 @@ function speakerLabel(m: TranscriptMessage): string {
  */
 export function renderSessionParts(
   redacted: RedactedSession,
-  opts: { sourcePath: string } = { sourcePath: '' },
+  opts: { sourcePath: string; partTargetBytes?: number } = { sourcePath: '' },
 ): RenderSessionResult {
+  const partTargetBytes = opts.partTargetBytes ?? PART_TARGET_BYTES;
   const { session, imperativesFlagged } = redacted;
   const { meta, messages } = session;
   if (!messages.length) throw new Error('renderSessionParts: session has no messages');
@@ -305,7 +330,7 @@ export function renderSessionParts(
       `session ${meta.sessionId} carries no timestamps — refusing to fabricate provenance`,
     );
   }
-  const dateIso = firstTs;
+  const dateIso = utcTimestamp(firstTs);
   const baseSlug = buildTranscriptSlug(meta.harness, dateIso, {
     sessionId: meta.sessionId,
     title: meta.title,
@@ -333,7 +358,7 @@ export function renderSessionParts(
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
     const bytes = Buffer.byteLength(b, 'utf8') + 2;
-    if (current.length > 0 && currentBytes + bytes > PART_TARGET_BYTES) {
+    if (current.length > 0 && currentBytes + bytes > partTargetBytes) {
       groups.push(current);
       const overlap = current.slice(-OVERLAP_MESSAGES);
       current = [...overlap];
@@ -366,8 +391,7 @@ export function renderSessionParts(
       },
     };
     const body = group.join('\n\n');
-    const content = `---\n${safeDump(fm, { lineWidth: 1000 })}---\n\n${body}\n`;
-    return { slug, content, frontmatterId, part, of };
+    return { slug, content: renderPartContent(fm, body), frontmatterId, part, of, frontmatter: fm, body };
   });
 
   return { parts, baseSlug, dateIso };

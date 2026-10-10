@@ -14,7 +14,13 @@ export const WRITE_ERROR_CODES = [
   'writer_registration_required', 'writer_identity_invalid', 'writer_not_initialized',
   'writer_coordinator_required', 'fact_already_expired', 'source_writeback_required',
   'unsupported_mutation_protocol', 'writer_upgrade_required', 'writer_not_quiesced',
-  'skill_bundle_required',
+  'skill_bundle_required', 'take_row_collision', 'invalid_source_uri', 'writer_admin_locked',
+  'connector_account_changed', 'connector_intent_outdated', 'checkpoint_validation_timeout',
+  'invalid_connector_text', 'connector_holds_exhausted', 'connector_fence_below_timeline',
+  'core_budget_exceeded', 'core_mark_owner_only', 'core_remote_edit_refused', 'core_delete_owner_only',
+  'timeline_rows_would_be_removed', 'purged_content', 'preparation_stalled',
+  'fence_unrenderable',
+  'write_outcome_unknown',
 ] as const;
 
 export type WriteErrorCode = typeof WRITE_ERROR_CODES[number];
@@ -109,6 +115,18 @@ export function isWriteReceipt(value: unknown): value is WriteReceipt {
     if (value.persistence.git_state !== undefined && typeof value.persistence.git_state !== 'string') return false;
   }
   return true;
+}
+
+/**
+ * #5249/#5232: the receipt of an admitted write still in flight. Keyed on the
+ * receipt's non-terminal state, never on an error code alone: a pre-admission
+ * refusal carries no receipt and is a failure (O-ENG-1).
+ */
+export function admittedPendingReceipt(envelope: unknown): WriteReceipt | null {
+  // Frozen memory verbs carry `error: 'unavailable'` with `write_error: 'write_pending'`.
+  if (!isRecord(envelope) || (envelope.error !== 'write_pending' && envelope.write_error !== 'write_pending')
+    || !isWriteReceipt(envelope.write_request)) return null;
+  return isTerminalWriteState(envelope.write_request.state) ? null : envelope.write_request;
 }
 
 /** Select public fields explicitly so internal journal columns cannot ride error envelopes. */

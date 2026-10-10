@@ -47,14 +47,20 @@ export interface ForkMigrationDeps {
   migrationNotice: (line: string) => void;
 }
 
+function requireMaskedMigration(deps: ForkMigrationDeps, repair: string, version: number): Migration {
+  const masked = deps.allMigrations().find(m => m.version === version);
+  if (!masked) throw new Error(`${repair}: upstream migration ${version} not found in the live MIGRATIONS registry`);
+  return masked;
+}
+
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 166;
+export const FORK_MIGRATION_FLOOR = 231;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 166,
+      version: 231,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +78,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 167,
+      version: 232,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +105,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 168,
+      version: 233,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +134,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 169,
+      version: 234,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +169,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 170,
+      version: 235,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -228,7 +234,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 171,
+      version: 236,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -256,7 +262,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 172,
+      version: 237,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -297,7 +303,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 173,
+      version: 238,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -368,7 +374,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 174,
+      version: 239,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -448,7 +454,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 175,
+      version: 240,
       name: 'repair_masked_upstream_146_149',
       // Fifth instance of the masking class this file's header describes, from
       // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
@@ -528,7 +534,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 176,
+      version: 241,
       name: 'repair_masked_upstream_150_159',
       // Sixth instance of the masking class this file's header describes, from
       // the 2026-09-20 upstream sync (v0.50.0.0 → v0.51.0.0).
@@ -565,10 +571,9 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       sql: '',
       handler: async (engine) => {
         for (const version of [150, 151, 152, 153, 154, 155, 156, 157, 158, 159]) {
-          const masked = deps.allMigrations().find(m => m.version === version);
+          const masked = requireMaskedMigration(deps, 'repair_masked_upstream_150_159', version);
           // Fail closed: silently skipping a missing entry would let v170 stamp
           // as repaired while part of upstream's 150-159 was never applied.
-          if (!masked) throw new Error(`repair_masked_upstream_150_159: upstream migration ${version} not found in the live MIGRATIONS registry`);
           await deps.applyOneMigration(engine, masked);
         }
         deps.migrationNotice(
@@ -620,7 +625,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 177,
+      version: 242,
       name: 'repair_masked_upstream_160_165',
       // The 2026-09-27 upstream merge extended the upstream range through
       // v165 after this fork had already used 160-165. Renumbering the fork
@@ -641,8 +646,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       sql: '',
       handler: async (engine) => {
         for (const version of [160, 161, 162, 163, 164, 165]) {
-          const masked = deps.allMigrations().find(m => m.version === version);
-          if (!masked) throw new Error(`repair_masked_upstream_160_165: upstream migration ${version} not found in the live MIGRATIONS registry`);
+          const masked = requireMaskedMigration(deps, 'repair_masked_upstream_160_165', version);
           await deps.applyOneMigration(engine, masked);
         }
         deps.migrationNotice(
@@ -690,5 +694,55 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         );
       },
     },
+    {
+      version: 243,
+      name: 'repair_masked_upstream_166_177',
+      // Eighth instance of the masking class this file's header describes, from
+      // the upstream v0.60.139.0 sync. Upstream's range now runs through 230;
+      // the fork previously occupied 166-177 (renumbered to 231+ above).
+      // Renumbering moves only the fork's DEFINITIONS: a brain stamped 177 by
+      // the old fork numbering has `m.version > current` false for upstream's
+      // real 166-177 and skips them forever.
+      //
+      // Look the upstream entries up in the live registry at execution time
+      // instead of copying their SQL, so this can never drift from what it
+      // repairs. All twelve declare `idempotent: true`. 170, 172 and 173 create
+      // their Postgres indexes CONCURRENTLY inside a handler, so this outer
+      // migration must not be transaction-wrapped (same shape as the 160-165
+      // repair above).
+      //
+      // ORDERING CAVEAT: this repair necessarily runs AFTER upstream 178-230 on
+      // a brain stamped 177 (one integer high-water). Upstream 178+ must not
+      // depend on objects created by 166-177 at apply time; S2 must replay a
+      // 177-stamped database to prove it (test/e2e/schema-migrations-replay).
+      idempotent: true,
+      transaction: false,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177]) {
+          const masked = requireMaskedMigration(deps, 'repair_masked_upstream_166_177', version);
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 166-177 masked by the upstream v0.60.139.0 fork renumber\n',
+        );
+      },
+    },
   ];
 }
+
+/**
+ * Highest version this fork owns. Upstream's generated LATEST_SCHEMA_VERSION
+ * (schema-migrations/latest.generated.ts) only counts upstream's own files, so
+ * the cheap `hasPendingMigrations` probe must also consult this value or a brain
+ * stamped at upstream's max would never run the fork migrations above it.
+ * Derived from the migration list itself (bodies are closures; nothing runs here),
+ * so the sync script's renumber keeps it correct without a second edit.
+ */
+export const FORK_LATEST_VERSION: number = Math.max(
+  ...buildForkMigrations({
+    allMigrations: () => [],
+    applyOneMigration: async () => {},
+    migrationNotice: () => {},
+  }).map(m => m.version),
+);

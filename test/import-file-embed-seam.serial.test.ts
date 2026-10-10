@@ -2,11 +2,10 @@
  * P2B — markdown import inline-embed seam.
  *
  * Hermetic: the embedding module is mocked before importing import-file.ts;
- * the engine is an in-memory Proxy recorder (getPage/config default to
- * "nothing on file"). No gateway, network, or DB is used. The first case
- * overrides that default with a minimal write-then-read page store, because
- * importFromContent's closing verifyPageReadable would otherwise fail before
- * the embedding assertions are reached — see the comment there.
+ * the engine is an in-memory PGLite brain. Upstream's import path runs through
+ * revision-bound projections and transaction settings (executeRaw row reads), which a
+ * null-returning Proxy recorder can no longer model, so the seam is exercised against
+ * the real engine. No gateway or network is used.
  *
  * Locks two behaviours production checkpoint-drain evidence showed missing:
  *   1. `importFromContent`'s inline embed call at import-file.ts:707 must
@@ -15,7 +14,9 @@
  *   2. `isOllamaOomLikeError` must classify the production
  *      "socket connection was closed" error text as fallback-eligible.
  */
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let embedCalls: string[][] = [];
 let embedImpl = async (texts: string[]): Promise<Float32Array[]> => {
@@ -37,22 +38,21 @@ mock.module('../src/core/embedding.ts', () => ({
 const { importFromContent } = await import('../src/core/import-file.ts');
 const { isOllamaOomLikeError } = await import('../src/core/embed-fallback.ts');
 
-function mockEngine(overrides: Partial<Record<string, any>>): any {
-  const engine: any = new Proxy(
-    {},
-    {
-      get(_target, prop: string) {
-        if (prop === 'transaction') {
-          // tx === the same recorder, so overrides (putPage/upsertChunks/...)
-          // apply whether called on the outer engine or the tx handle.
-          return async (fn: (e: any) => Promise<unknown>) => fn(engine);
-        }
-        return overrides[prop] ?? (async () => null);
-      },
-    },
-  );
-  return engine;
-}
+let engine: PGLiteEngine;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 60_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
+});
 
 // >300 words so the real recursive chunker (300-word target) splits this
 // into 2 chunks — required to reproduce the batch-of-2 EOF failure.
@@ -66,29 +66,6 @@ describe('markdown import inline-embed fallback (import-file.ts:707 seam)', () =
       return texts.map(() => new Float32Array(1536));
     };
 
-    const stored: any[][] = [];
-    // Minimal write-then-read store. importFromContent ends with
-    // verifyPageReadable, which re-reads the page it just wrote and throws if
-    // getPage returns null — a real guard against the silent-desync class, and
-    // unconditional since long before this test existed. The default recorder
-    // ("putPage writes nothing, getPage always null") models a database that
-    // lost the write, so this test could never reach its own assertions.
-    //
-    // That negative case is not this test's job: it is covered explicitly, both
-    // branches, in test/write-verify-guard.test.ts. The SUT here is the inline
-    // embedding seam. Same in-memory-page-store shape as test/import-file.ts.
-    const pages = new Map<string, any>();
-    const engine = mockEngine({
-      getPage: async (slug: string) => pages.get(slug) ?? null,
-      putPage: async (slug: string, page: any) => { pages.set(slug, { slug, ...page }); },
-      updatePageContextualRetrievalState: async () => {},
-      upsertChunks: async (_slug: string, chunks: any[]) => {
-        stored.push(chunks);
-      },
-      setPageEmbeddingSignature: async () => {},
-      setPageAliases: async () => {},
-    });
-
     // Required P2B behaviour: a batch EOF at the import seam must not
     // propagate and abort the import — it must fall back to per-chunk
     // embedding and still land the page with all chunks embedded.
@@ -96,9 +73,11 @@ describe('markdown import inline-embed fallback (import-file.ts:707 seam)', () =
 
     expect(result.status).toBe('imported');
     expect(result.chunks).toBe(2);
-    expect(stored).toHaveLength(1);
-    expect(stored[0]).toHaveLength(2);
-    expect(stored[0].every((c: any) => c.embedding instanceof Float32Array)).toBe(true);
+    const rows = await engine.executeRaw<{ has_embedding: boolean }>(
+      `SELECT embedding IS NOT NULL AS has_embedding FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = 'seam-test-page' AND p.source_id = 'default' ORDER BY cc.chunk_index`,
+    );
+    expect(rows).toEqual([{ has_embedding: true }, { has_embedding: true }]);
     // Batch-of-2 failed, then two individual retries succeeded.
     expect(embedCalls.map((call) => call.length)).toEqual([2, 1, 1]);
   });
@@ -117,14 +96,6 @@ describe('markdown import inline-embed fallback (import-file.ts:707 seam)', () =
       if (texts.length > 1) throw new Error('EOF');
       throw abortError;
     };
-    const engine = mockEngine({
-      getPage: async () => null,
-      putPage: async () => {},
-      updatePageContextualRetrievalState: async () => {},
-      upsertChunks: async () => {},
-      setPageEmbeddingSignature: async () => {},
-      setPageAliases: async () => {},
-    });
     try {
       await importFromContent(engine, 'seam-abort', LOREM, { sourceId: 'default' });
       throw new Error('expected import to throw');

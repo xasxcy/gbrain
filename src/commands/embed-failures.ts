@@ -5,7 +5,7 @@
  *   gbrain embed-failures release <slug> [--chunk N] [--source X]
  */
 import type { BrainEngine } from '../core/engine.ts';
-import { bigintToStringReplacer } from '../cli.ts';
+import { bigintToStringReplacer } from '../core/utils.ts';
 
 const HELP = `Usage:
   gbrain embed-failures list [--source X]

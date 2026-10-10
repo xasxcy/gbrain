@@ -65,7 +65,50 @@ function carryStatusFields(from: unknown, to: AIServiceError): AIServiceError {
   return to;
 }
 
-export function normalizeAIError(err: unknown, context?: string): AIServiceError {
+/**
+ * Scrub upstream text in place along a wrapped error's cause chain (message,
+ * stack, the SDK's responseBody and parsed data), keeping status, headers and
+ * shape, so `.cause` walkers still classify it and nothing serialized or
+ * printed later carries what `redact` removes.
+ */
+function scrubErrorChain(err: unknown, redact: (text: string) => string): void {
+  let cur = err;
+  for (let depth = 0; depth < 4 && cur && typeof cur === 'object'; depth++) {
+    const node = cur as Record<string, unknown>;
+    for (const key of ['message', 'stack', 'responseBody']) {
+      if (typeof node[key] === 'string') try { node[key] = redact(node[key] as string); } catch { /* read-only field */ }
+    }
+    if (node.data && typeof node.data === 'object') try { node.data = JSON.parse(redact(JSON.stringify(node.data))); } catch { /* not plain data */ }
+    cur = node.cause;
+  }
+}
+
+/** Model ids a provider renamed, mapped to the current id (B-N7: suggested on a 404). */
+const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
+  'deepseek:deepseek-v4-flash': 'deepseek:deepseek-flash',
+};
+
+/**
+ * Recovery text for a provider 404 (`model_not_found`): the model id and
+ * provider from the call context (`chat(provider:model)`), the command that
+ * lists the configured routes, and a known rename when there is one.
+ */
+export function modelNotFoundFix(context: string | undefined): string {
+  const model = context?.match(/\(([^()\s]+:[^()\s]+)\)\s*$/)?.[1];
+  const provider = model?.slice(0, model.indexOf(':'));
+  const rename = model ? KNOWN_MODEL_RENAMES[model] : undefined;
+  return `Check the model id: ${model ? `the ${provider} provider does not serve ${model}` : 'the provider does not serve this model'}, or this key has no access to it. ` +
+    'Run `gbrain models` to see the configured model routes, then set a model the provider lists.' +
+    (rename ? ` ${model} was renamed: use ${rename}.` : '');
+}
+
+/**
+ * `redact` scrubs upstream text before it becomes the message, and in the
+ * wrapped error (#5137: the gateway passes its provider-key redactor, since
+ * auth errors echo keys).
+ */
+export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string): AIServiceError {
+  if (redact) scrubErrorChain(err, redact);
   if (err instanceof AIServiceError) return err;
 
   const anyErr = err as {
@@ -84,7 +127,8 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
     anyErr?.statusCode ??
     (typeof anyErr?.apiErrorStatus === 'number' ? anyErr.apiErrorStatus : undefined);
   const name = anyErr?.name ?? '';
-  const msg = anyErr?.message ?? String(err);
+  const raw = anyErr?.message ?? String(err);
+  const msg = redact ? redact(raw) : raw;
   const ctxPrefix = context ? `[${context}] ` : '';
 
   // 4xx (except 429) = config-level, non-retryable
@@ -93,6 +137,7 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
       `${ctxPrefix}${msg}`,
       status === 401 || status === 403
         ? 'Check your API key is valid and has access to this model.'
+        : status === 404 ? modelNotFoundFix(context)
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
@@ -107,8 +152,56 @@ export function normalizeAIError(err: unknown, context?: string): AIServiceError
   return carryStatusFields(err, new AITransientError(`${ctxPrefix}${msg}`, err));
 }
 
+/**
+ * HTTP 400 bodies that are a content-policy refusal of the prompt rather than
+ * a malformed request: OpenAI's `invalid_prompt` usage-policy flag, OpenAI and
+ * Azure OpenAI `content_policy_violation` / `content_filter` (Azure's
+ * `ResponsibleAIPolicyViolation`), and DeepSeek's "Content Exists Risk".
+ */
+const CONTENT_POLICY_400_CODES = new Set(['invalid_prompt', 'content_policy_violation', 'content_filter', 'ResponsibleAIPolicyViolation']);
+
+function contentPolicy400Reason(responseBody: string): string | undefined {
+  let error: { code?: unknown; message?: unknown; innererror?: { code?: unknown } } | undefined;
+  try { error = JSON.parse(responseBody)?.error; } catch { return undefined; }
+  for (const code of [error?.innererror?.code, error?.code]) {
+    if (typeof code === 'string' && CONTENT_POLICY_400_CODES.has(code)) return code;
+  }
+  return error?.message === 'Content Exists Risk' ? 'content_exists_risk' : undefined;
+}
+
+/** A provider refusal tied to the prompt, even when the SDK wraps its response. */
+export function providerContentBlockReason(err: unknown): string | undefined {
+  for (let depth = 0; depth < 8 && err != null; depth++) {
+    try {
+      if (typeof err !== 'object') break;
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      if (typeof value.responseBody === 'string' && (value.statusCode === 400 || value.status === 400)) {
+        const reason = contentPolicy400Reason(value.responseBody);
+        if (reason) return reason;
+      }
+      if (typeof value.responseBody === 'string' &&
+          (value.statusCode == null || value.statusCode === 200) &&
+          (value.status == null || value.status === 200)) {
+        const body = JSON.parse(value.responseBody);
+        const reason = body?.promptFeedback?.blockReason;
+        if (typeof reason === 'string' && reason.trim()) return reason;
+        const candidate = body?.candidates?.[0];
+        if (['PROHIBITED_CONTENT', 'SAFETY', 'BLOCKLIST', 'SPII'].includes(candidate?.finishReason) &&
+            (!Array.isArray(candidate?.content?.parts) || candidate.content.parts.length === 0)) {
+          return candidate.finishReason;
+        }
+      }
+      err = value.cause;
+    } catch {
+      // Malformed provider bodies and hostile error objects are not content blocks.
+      break;
+    }
+  }
+  return undefined;
+}
+
 /** Whole-run LLM failure classes — see classifyGlobalLlmError. */
-export type GlobalLlmErrorClass = 'auth' | 'billing' | 'rate_limit';
+export type GlobalLlmErrorClass = 'auth' | 'billing' | 'rate_limit' | 'model_not_found';
 
 /**
  * Consecutive rate_limit-classified failures a cycle phase tolerates before
@@ -140,6 +233,10 @@ const BILLING_MESSAGE_RE =
 const AUTH_MESSAGE_RE =
   /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized/i;
 const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
+// Provider 404 phrasings for an unknown or inaccessible model (OpenAI
+// `model_not_found` / "does not exist or you do not have access", Anthropic
+// `not_found_error`), for errors that carry no numeric 404.
+const MODEL_NOT_FOUND_MESSAGE_RE = /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access/i;
 // Structured status forms only; a bare number in prose ("processed 429
 // pages") never matches either shape. The quoted-JSON form
 // (`"api_error_status":429`, the claude-cli result blob) cannot occur as free
@@ -161,6 +258,48 @@ function numericStatusOf(e: unknown): number | undefined {
 }
 
 /**
+ * The layers of a thrown provider error, outermost first. chat() throws the
+ * gateway's normalized error with the provider's own error on `cause`; the AI
+ * SDK's RetryError keeps the final attempt on `lastError` instead. Objects
+ * only, and the walk stops after `limit` layers or at a layer already seen,
+ * so a self-referencing chain cannot loop.
+ */
+function* wrappedErrorLayers(err: unknown, limit = 5): Generator<Record<string, unknown>> {
+  const seen = new Set<object>();
+  let layer = err;
+  while (layer !== null && typeof layer === 'object' && seen.size < limit && !seen.has(layer)) {
+    seen.add(layer);
+    const fields = layer as Record<string, unknown>;
+    yield fields;
+    layer = fields.cause ?? fields.lastError;
+  }
+}
+
+/** What a thrown provider error reports about itself once its wrappers are opened (#5964). */
+export interface ProviderFailureSignals {
+  /** The first finite numeric HTTP status on any layer (see numericStatusOf), outermost first. */
+  status: number | undefined;
+  /** String `name` values on the layers, outermost first (e.g. `TimeoutError`). */
+  names: string[];
+  /** String `code` values on the layers, outermost first (e.g. `ECONNRESET`). */
+  codes: string[];
+}
+
+export function readProviderFailureSignals(err: unknown): ProviderFailureSignals {
+  const signals: ProviderFailureSignals = { status: undefined, names: [], codes: [] };
+  try {
+    for (const layer of wrappedErrorLayers(err)) {
+      signals.status ??= numericStatusOf(layer);
+      if (typeof layer.name === 'string') signals.names.push(layer.name);
+      if (typeof layer.code === 'string') signals.codes.push(layer.code);
+    }
+  } catch {
+    // A throwing getter on a wrapped error ends the walk; what was read stands.
+  }
+  return signals;
+}
+
+/**
  * Did the provider refuse the request BECAUSE of its `response_format:
  * json_schema` (an Ollama build predating structured outputs, a strict proxy
  * rejecting the schema shape) — as opposed to failing for any other reason?
@@ -176,12 +315,9 @@ const STRUCTURED_OUTPUT_REJECTION_RE = /response_format|json_schema|structured[ 
 export function isStructuredOutputRejection(err: unknown): boolean {
   let status: number | undefined;
   let named = false;
-  let cur: unknown = err;
-  for (let depth = 0; cur && typeof cur === 'object' && depth < 5; depth++) {
-    const e = cur as { message?: unknown; responseBody?: unknown; cause?: unknown; lastError?: unknown };
-    status ??= numericStatusOf(e);
-    named ||= [e.message, e.responseBody].some(t => typeof t === 'string' && STRUCTURED_OUTPUT_REJECTION_RE.test(t));
-    cur = e.cause ?? e.lastError;
+  for (const layer of wrappedErrorLayers(err)) {
+    status ??= numericStatusOf(layer);
+    named ||= [layer.message, layer.responseBody].some(t => typeof t === 'string' && STRUCTURED_OUTPUT_REJECTION_RE.test(t));
   }
   if (status !== undefined && (status < 400 || status >= 500 || status === 429)) return false;
   return named;
@@ -190,20 +326,25 @@ export function isStructuredOutputRejection(err: unknown): boolean {
 function statusToClass(status: number): GlobalLlmErrorClass | null {
   if (status === 401 || status === 403) return 'auth';
   if (status === 402) return 'billing';
+  if (status === 404) return 'model_not_found';
   if (status === 429) return 'rate_limit';
   return null;
 }
 
 /**
- * Detect whole-run LLM failure conditions — auth, billing, rate limit — that
+ * Detect whole-run LLM failure conditions — auth, billing, rate limit, an
+ * unknown or inaccessible model (a 404, `model_not_found`, B-N7: labelled
+ * apart from auth so an operator does not debug a valid key) — that
  * make retrying the SAME call on the next item pointless: every remaining
  * page/take in a cycle phase would fail identically (#3044). Callers halt
- * their per-item loop on 'auth'/'billing' immediately and on 'rate_limit'
+ * their per-item loop on 'auth'/'billing'/'model_not_found' immediately and on 'rate_limit'
  * after RATE_LIMIT_HALT_STREAK consecutive hits, surfacing a phase-level
  * halt instead of accumulating one swallowed warning per item.
  *
  * Matching is conservative by design: numeric status properties on the error
- * (or its `cause` chain), STRUCTURED status forms in the message, or specific
+ * (or its `cause` chain, falling back to RetryError's `lastError`, where the
+ * AI SDK keeps the final attempt's status once its retries are spent:
+ * #5473), STRUCTURED status forms in the message, or specific
  * provider phrases. Plain 400s (context length, malformed request) stay
  * per-item — they can genuinely differ page to page. Billing phrases outrank
  * a 429 status because a monthly spend limit surfaces as 429 but is a billing
@@ -219,7 +360,8 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
     else if (typeof (cur as { message?: unknown }).message === 'string') {
       messages.push((cur as { message: string }).message);
     }
-    cur = (cur as { cause?: unknown }).cause;
+    const next = cur as { cause?: unknown; lastError?: unknown };
+    cur = next.cause ?? next.lastError;
   }
   const message = messages.join('\n');
   // Phrase regexes (and the prose-shaped status forms) only see text BEFORE
@@ -238,6 +380,7 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
     const byStatus = statusToClass(status);
     if (byStatus) return byStatus;
   }
+  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   // Config-level errors are whole-run by construction — a missing/invalid
   // key or an unknown model id fails identically on every call. The gateway
   // throws AIConfigError directly for missing keys ("OpenAI chat requires
@@ -264,6 +407,7 @@ export type GlobalLlmHaltDecision =
   | 'halt-auth'
   | 'halt-billing'
   | 'halt-rate_limit'
+  | 'halt-model_not_found'
   | 'continue';
 
 /** Map a halt decision back to its GlobalLlmErrorClass ('continue' → null). */
@@ -289,7 +433,7 @@ export interface GlobalLlmHaltTracker {
 
 /**
  * The one halt policy every cycle phase's per-item LLM loop applies (#3044):
- * auth/billing halt on the FIRST hit (a revoked key or exhausted spend limit
+ * auth/billing/model_not_found halt on the FIRST hit (a revoked key, a missing model or exhausted spend limit
  * is deterministic — every remaining item would fail identically); a bare
  * rate_limit halts only after RATE_LIMIT_HALT_STREAK consecutive hits (a
  * burst 429 can clear between items); everything else stays per-item.
@@ -303,7 +447,7 @@ export function createGlobalLlmHaltTracker(): GlobalLlmHaltTracker {
     observe(err, opts) {
       const cls = classifyGlobalLlmError(err);
       lastCls = cls;
-      if (cls === 'auth' || cls === 'billing') {
+      if (cls === 'auth' || cls === 'billing' || cls === 'model_not_found') {
         lastNote = `${cls} error is a whole-run condition`;
         return `halt-${cls}`;
       }
@@ -322,4 +466,24 @@ export function createGlobalLlmHaltTracker(): GlobalLlmHaltTracker {
     },
     note: () => lastNote,
   };
+}
+
+/**
+ * Embedding providers whose own documentation says a rejected request is not
+ * billed. Only for these does a permanent request-shaped rejection (HTTP 400,
+ * 413 or 422; never 401/403/429) release its invocation reservation instead of
+ * keeping the maximum debit. Verified per provider:
+ *   - google: "If your request fails with a 400 or 500 error, you won't be
+ *     charged for the tokens used." (ai.google.dev/gemini-api/docs/billing,
+ *     "Am I charged for failed requests?", checked 2026-10-01)
+ * OpenAI, Voyage and the other embedding recipes publish no such statement, so
+ * their rejections keep the debit (token-limit rejections are handled above).
+ */
+const UNBILLED_REJECTION_PROVIDERS: ReadonlySet<string> = new Set(['google']);
+
+export function isUnbilledEmbeddingRejection(recipeId: string, err: unknown): boolean {
+  if (!UNBILLED_REJECTION_PROVIDERS.has(recipeId)) return false;
+  const e = err as { statusCode?: unknown; status?: unknown } | null;
+  const status = typeof e?.statusCode === 'number' ? e.statusCode : typeof e?.status === 'number' ? e.status : undefined;
+  return status === 400 || status === 413 || status === 422;
 }

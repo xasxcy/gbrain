@@ -30,6 +30,8 @@ import type { CapabilityReport } from '../src/core/capability.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
 import { loadCorpusPages, loadCorpusQueries } from './helpers/bootstrap-corpus.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 const KEYLESS: CapabilityReport = {
   embeddings: { available: false },
@@ -273,6 +275,8 @@ describe('verifyWorkspace — keyless pass', () => {
       const scan = check(res.checks, 'secret_scan')[0];
       expect(scan.ok).toBe(false);
       expect(scan.detail).toContain('openai');
+      expect(scan.detail).toContain(`allowlist only a reviewed false positive by appending its fingerprint to ${join(ws, '.gbrain-scan-allow')}`);
+      expect(scan.detail).toContain('write-refusals.md#secret-scan-refusals-and-redaction');
       // Redaction discipline: the finding detail NEVER carries the secret value.
       expect(scan.detail).not.toContain('sk-AAAAAAAAAAAAAAAAAAAAAAAA');
 
@@ -352,6 +356,10 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       expect(check.detail).toContain('world');
       expect(check.detail).toContain('facts.default_visibility');
       expect(check.detail).toContain('gbrain config set');
+      // The key governs extraction-path writes only; `remember` hard-defaults
+      // to 'world' — the message must disclose that carve-out (#5605).
+      expect(check.detail).toContain('`remember`');
+      expect(check.detail).toContain('extraction-path');
 
       // Pre-set explicit value survives verify (set-if-unset, never override).
       await e2.setConfig('facts.default_visibility', 'private');
@@ -366,6 +374,7 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       const check2 = res2.checks.find((c) => c.id === 'facts_visibility')!;
       expect(check2.detail).toContain('private');
       expect(check2.detail).toContain('untouched');
+      expect(check2.detail).toContain('`remember`');
     } finally {
       await e2.disconnect();
       rmSync(ws2, { recursive: true, force: true });
@@ -608,5 +617,34 @@ describe('verifyWorkspace — real corpus graph floor + qrels recall', () => {
       }
     }
     expect(misses).toEqual([]);
+  }, 240_000);
+});
+
+describe('verifyWorkspace — managed brain (#5280)', () => {
+  test('verify runs on a managed brain and purges its probes through the coordinator', async () => {
+    await claimWorktree(engine, 'workspace', join(ws, 'brain'));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      const res = await verifyWorkspace(engine, ws, { sourceId: 'workspace', gbrainHomeDir: home, capabilities: KEYLESS, skipHooksSmoke: true });
+      for (const c of check(res.checks, 'roundtrip')) expect(c.ok).toBe(true);
+      expect(res.checks.filter((c) => c.id === 'probe_cleanup')).toEqual([]);
+      const probeRows = await engine.executeRaw<{ n: string }>(
+        `SELECT count(*)::text AS n FROM pages WHERE source_id = 'workspace' AND slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(probeRows[0].n).toBe('0');
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
+      const purged = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM persistence_requests WHERE source_id = 'workspace' AND operation = 'delete_page' AND state = 'committed'
+            AND outcome->>'status' = 'purged' AND slug = ANY($1::text[]) ORDER BY slug`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(new Set(purged.map((r) => r.slug))).toEqual(new Set([VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]));
+      expect(await engine.executeRaw(`SELECT id FROM facts WHERE source_id = 'workspace' AND source_markdown_slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]])).toEqual([]);
+    } finally {
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
   }, 240_000);
 });

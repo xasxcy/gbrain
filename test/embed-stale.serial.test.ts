@@ -242,7 +242,7 @@ describe('embedStaleForSource', () => {
 
   test('SPEC V4: good/bad chunks on one page persist the good vector only', async () => {
     await engine.putPage('mixed', { type: 'note', title: 'mixed', compiled_truth: '# mixed' });
-    await engine.upsertChunks('mixed', [
+    await installFixtureChunks(engine, 'mixed', [
       { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
       { chunk_index: 1, chunk_text: 'bad', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);
@@ -270,7 +270,7 @@ describe('embedStaleForSource', () => {
 
   test('SPEC V4: abort inside final short batch persists prefix and returns done:false', async () => {
     await engine.putPage('final-batch', { type: 'note', title: 'final-batch', compiled_truth: '# final' });
-    await engine.upsertChunks('final-batch', [
+    await installFixtureChunks(engine, 'final-batch', [
       { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
       { chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);
@@ -292,7 +292,7 @@ describe('embedStaleForSource', () => {
 
   test('SPEC V4: must-abort is rethrown after prefix partial persistence', async () => {
     await engine.putPage('budget', { type: 'note', title: 'budget', compiled_truth: '# budget' });
-    await engine.upsertChunks('budget', [
+    await installFixtureChunks(engine, 'budget', [
       { chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
       { chunk_index: 1, chunk_text: 'budget', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);
@@ -655,7 +655,7 @@ describe('embedStaleForSource', () => {
 
   test('SPEC V4: Minion logs the actual chunk_index for a fatal after a prefix', async () => {
     await engine.putPage('fatal-index', { type: 'note', title: 'fatal-index', compiled_truth: '# fatal-index' });
-    await engine.upsertChunks('fatal-index', [
+    await installFixtureChunks(engine, 'fatal-index', [
       { chunk_index: 3, chunk_text: 'good', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
       { chunk_index: 9, chunk_text: 'fatal', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);

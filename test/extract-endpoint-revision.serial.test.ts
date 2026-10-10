@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { BrainEngine, LinkBatchInput } from '../src/core/engine.ts';
-import type { DerivedLinkReplacementOptions } from '../src/core/derived-links.ts';
+import type { DerivedLinkOrigin, DerivedLinkReplacementOptions } from '../src/core/derived-links.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtract, extractStaleFromDB } from '../src/commands/extract.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -36,10 +36,10 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
     afterAll(async () => { await close?.(); });
 
     async function graph() {
-      return engine.executeRaw<{ id: number; link_type: string; link_source: string; to_source: string }>(
-        `SELECT l.id,l.link_type,l.link_source,t.source_id AS to_source FROM links l
-         JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
-         WHERE f.source_id=$1 AND f.slug=$2 ORDER BY l.id`, [sourceId, originSlug]);
+      return engine.executeRaw<{ id: number; link_type: string; link_source: string; peer_source: string }>(
+        `SELECT l.id,l.link_type,l.link_source,CASE WHEN f.source_id=$1 AND f.slug=$2 THEN t.source_id ELSE f.source_id END AS peer_source
+         FROM links l JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
+         WHERE (f.source_id=$1 AND f.slug=$2) OR (t.source_id=$1 AND t.slug=$2) ORDER BY l.id`, [sourceId, originSlug]);
     }
     async function stamp() {
       const rows = await engine.executeRaw<{ links_extracted_at: string | null }>(
@@ -64,22 +64,30 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
             : runExtract(engine, [mode, '--source', 'db', '--source-id', sourceId, '--json']);
           await run();
           const before = await graph();
-          expect(before.filter(row => row.link_source === 'markdown').map(row => [row.link_type, row.to_source]))
+          expect(before.filter(row => row.link_source === 'markdown').map(row => [row.link_type, row.peer_source]))
             .toEqual([['attended', targetSourceId]]);
           await engine.executeRaw('UPDATE pages SET links_extracted_at=NULL WHERE source_id=$1 AND slug=$2', [sourceId, originSlug]);
           const targetSnapshot = (await engine.readPageSnapshot(targetSlug, { sourceId: targetSourceId }))!;
           const original = engine.replaceDerivedLinks;
+          const originalBatch = engine.replaceDerivedLinksBatch;
           let retyped = false;
           let captured: LinkBatchInput[] = [];
           let fences: DerivedLinkReplacementOptions['expectedEndpoints'];
-          engine.replaceDerivedLinks = async (origin, links, opts) => {
+          const retypeBeforePublishing = async (origin: DerivedLinkOrigin, links: LinkBatchInput[], opts?: DerivedLinkReplacementOptions) => {
             if (!retyped && origin.sourceId === sourceId && origin.slug === originSlug) {
               retyped = true;
               captured = links;
               fences = opts?.expectedEndpoints;
               await engine.putPage(targetSlug, { type: 'decision', title: 'Decision Example', compiled_truth: 'Retyped after inference.' }, { sourceId: targetSourceId });
             }
+          };
+          engine.replaceDerivedLinks = async (origin, links, opts) => {
+            await retypeBeforePublishing(origin, links, opts);
             return original.call(engine, origin, links, opts);
+          };
+          engine.replaceDerivedLinksBatch = async items => {
+            for (const item of items) await retypeBeforePublishing(item.origin, item.links, item.opts);
+            return originalBatch.call(engine, items);
           };
           const errors: string[] = [];
           const errorSpy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
@@ -92,11 +100,12 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
             }
           } finally {
             engine.replaceDerivedLinks = original;
+            engine.replaceDerivedLinksBatch = originalBatch;
             errorSpy.mockRestore();
             exitSpy.mockRestore();
           }
           expect(retyped).toBe(true);
-          expect(captured.some(link => link.link_type === 'attended' && link.to_source_id === targetSourceId)).toBe(true);
+          expect(captured.some(link => link.link_type === 'attended' && link.from_slug === targetSlug && link.from_source_id === targetSourceId)).toBe(true);
           expect(fences).toContainEqual({ slug: targetSlug, sourceId: targetSourceId, revision: targetSnapshot.revision });
           expect(await graph()).toEqual(before);
           expect(await stamp()).toBeNull();

@@ -14,7 +14,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import {
   hasDatabase, setupDB, setupLegacyEmbeddingDB, teardownDB, getEngine, getConn,
-  importFixtures, importFixture, time, dumpDBState, FIXTURES_PATH,
+  importFixtures, importFixture, dumpDBState, FIXTURES_PATH,
 } from './helpers.ts';
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
@@ -1106,7 +1106,42 @@ describeE2E('E2E: RLS Verification', () => {
     }
   });
 
-  test('gbrain doctor fails with exit 1 when a public table is missing RLS', async () => {
+  // #4939: doctor fails a missing-RLS table only when the public schema may be
+  // reachable with the anon key (PostgREST roles or a Supabase URL). The
+  // fail-path tests below create the PostgREST `anon` role for their duration.
+  async function withPostgrestRole<T>(fn: () => Promise<T>): Promise<T> {
+    const conn = getConn();
+    const existed = (await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname = 'anon'`)).length > 0;
+    if (!existed) await conn.unsafe(`CREATE ROLE anon NOLOGIN`);
+    try { return await fn(); } finally { if (!existed) await conn.unsafe(`DROP ROLE IF EXISTS anon`); }
+  }
+
+  test('gbrain doctor warns, not fails, on a missing-RLS table when nothing exposes the public schema (#4939)', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_plain_pg_${suffix}`;
+    try {
+      Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+      expect((await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname IN ('anon','authenticated','authenticator','service_role')`)).length).toBe(0);
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const rls = JSON.parse(new TextDecoder().decode(result.stdout)).checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('warn');
+      expect(rls.message).toContain(tbl);
+      expect(rls.message).toContain('No PostgREST exposure detected');
+      expect(rls.message).toContain('ENABLE ROW LEVEL SECURITY');
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  test('gbrain doctor fails with exit 1 when a public table is missing RLS', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_regression_${suffix}`;
     try {
@@ -1149,7 +1184,7 @@ describeE2E('E2E: RLS Verification', () => {
       const v35sql = (MIGRATIONS.find(m => m.version === 35)?.sqlFor as any)?.postgres;
       if (v35sql) await conn.unsafe(v35sql);
     }
-  }, 60_000);
+  }), 60_000);
 
   test('GBRAIN:RLS_EXEMPT comment with valid reason exempts a non-RLS public table', async () => {
     const conn = getConn();
@@ -1178,7 +1213,7 @@ describeE2E('E2E: RLS Verification', () => {
     }
   }, 60_000);
 
-  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', async () => {
+  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_exempt_bad_${suffix}`;
     try {
@@ -1204,9 +1239,9 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
-  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', async () => {
+  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_comment_${suffix}`;
     try {
@@ -1230,7 +1265,7 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
   // Regression test for the v24 self-healing guard. If an operator manually
   // drops budget_ledger and/or budget_reservations (they are migration-only
@@ -1561,40 +1596,4 @@ describeE2E('E2E: Parallel Import', () => {
     expect(stats.page_count).toBe(seqPageCount);
     expect(stats.chunk_count).toBe(seqChunkCount);
   }, 60_000);
-});
-
-// ─────────────────────────────────────────────────────────────────
-// Performance Baselines
-// ─────────────────────────────────────────────────────────────────
-
-describeE2E('E2E: Performance Baselines', () => {
-  beforeAll(async () => {
-    await setupDB();
-  }, 30_000);
-  afterAll(teardownDB);
-
-  test('import + search + link performance', async () => {
-    const [_, importMs] = await time(importFixtures);
-
-    const searchTimes: number[] = [];
-    for (const q of ['NovaMind', 'hybrid search', 'Stanford', 'investor', 'compiled truth']) {
-      const [__, ms] = await time(() => callOp('search', { query: q }));
-      searchTimes.push(ms);
-    }
-
-    const [___, linkMs] = await time(async () => {
-      await callOp('add_link', { from: 'people/sarah-chen', to: 'companies/novamind' });
-      await callOp('get_backlinks', { slug: 'companies/novamind' });
-    });
-
-    searchTimes.sort((a, b) => a - b);
-    const p50 = searchTimes[Math.floor(searchTimes.length * 0.5)];
-    const p99 = searchTimes[searchTimes.length - 1];
-
-    console.log('\n  Performance Baselines:');
-    console.log(`    Import 13 fixtures: ${importMs.toFixed(0)}ms`);
-    console.log(`    Search p50: ${p50.toFixed(0)}ms`);
-    console.log(`    Search p99: ${p99.toFixed(0)}ms`);
-    console.log(`    Link + backlink: ${linkMs.toFixed(0)}ms`);
-  }, 30_000);
 });

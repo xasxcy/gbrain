@@ -20,25 +20,40 @@
  * facts respect visibility for remote callers (world-only).
  */
 
+import { annotateTemporalRow, temporalLinkJoinSql, TEMPORAL_LINK_SELECT_SQL, type TemporalAnnotation } from '../link-validity.ts';
 import type { BrainEngine, FactRow } from '../engine.ts';
+import type { TrustTier } from '../trust/tier.ts';
+import type { ReadEligibility } from '../eligibility/policy.ts';
+import { trustFields } from '../eligibility/labels.ts';
+import { isQuarantined } from '../quarantine.ts';
+import { loadPageTrust } from '../eligibility/stamp.ts';
+import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { slugify } from '../entities/resolve.ts';
 import { safeSynopsis } from '../context/retrieval-reflex.ts';
 import { stampEvidence, markKeywordHits } from '../search/evidence.ts';
-import type { SearchResult } from '../types.ts';
+import type { Link, SearchResult } from '../types.ts';
+import type { NewerMentions } from '../mentions/newer-mentions.ts';
+import { loadLinkableTypes } from '../mentions/policy.ts';
+import { readMentionCoverage, type MentionCoverage } from '../mentions/coverage.ts';
+import { encodeCursor, readReferrerGroups, PAGE_DEFAULT_LIMIT, type ReferenceRow } from '../mentions/referrers.ts';
 
 const EDGE_CAP = 10;
 const OPEN_THREADS_CAP = 3;
 const OPEN_THREAD_TIMELINE_WINDOW_DAYS = 90;
 const SUGGESTION_CAP = 3;
 const FACT_FETCH_CAP = 100;
-const ENTITY_PAGE_TYPES = new Set(['person', 'company', 'organization', 'entity']);
 
 export interface EntityCardEdge {
   type: string;
   direction: 'out' | 'in';
   slug: string;
   context: string | null;
+  /** Relationship status today: live, ended, ended_unknown_date, event, reference, … */
+  status?: string;
+  /** Latest stint bounds (YYYY-MM-DD) when the relationship has dated evidence. */
+  since?: string | null;
+  until?: string | null;
 }
 
 export interface EntityOpenThread {
@@ -55,6 +70,9 @@ export interface EntityOpenThread {
   counterparty?: string | null;
   status?: string;
   loop_id?: number;
+  /** #5575 A6 (additive): the trust tier and short origin of the fact or timeline row behind the thread. */
+  trust_tier?: TrustTier;
+  origin?: string;
 }
 
 export interface EntityCard {
@@ -75,6 +93,36 @@ export interface EntityCard {
   backlink_count: number;
   /** Exact active-fact count (indexed COUNT, not payload length); visibility-filtered for remote. */
   active_fact_count: number;
+  /**
+   * Current and ended state relationships of this entity, rendered for agents
+   * ("now: works_at widget-co (since 2025-03-01); ended: works_at acme-example
+   * (2025-03-01)"), plus a stale-summary warning when the summary still names
+   * a relationship that ended. Absent when there is nothing to say.
+   */
+  relationship_note?: string;
+  /** Pages dated after this page that mention it, newest first, bounded. `context_pack` cards only (mentions/newer-mentions.ts). */
+  newer_mentions?: NewerMentions;
+  /** Distinct pages with any inbound link (every link source, mentions included). `entity` verb only. */
+  referenced_by_count?: number;
+  /** Those pages grouped by pack-canonical type, newest first; capped per group and per card. `entity` verb only. */
+  referenced_by?: ReferenceGroupView[];
+  /** Whether every page in this source has been scanned for this entity's names. `entity` verb only. */
+  coverage?: MentionCoverage;
+  /** #5575 A6 (additive): the entity page's trust tier and short write origin. */
+  trust_tier?: TrustTier;
+  origin?: string;
+  /** #5575 ENG-15 (additive): the page is quarantined; renderers wrap its summary as external data. */
+  quarantined?: true;
+  /** #5575 CEO-20 (additive): the entity page carries an unconfirmed instruction-family write-gate flag. */
+  unconfirmed?: true;
+}
+
+export interface ReferenceGroupView {
+  canonical_type: string;
+  total: number;
+  rows: Array<Omit<ReferenceRow, 'source_id'>>;
+  /** The call that returns the rest of a truncated group (`requires_surface` when this connection cannot call it). */
+  next?: { tool: 'get_backlinks'; arguments: Record<string, unknown>; requires_surface?: 'starter' };
 }
 
 export interface EntitySuggestion {
@@ -87,6 +135,33 @@ export interface EntityCardResult {
   found: boolean;
   card?: EntityCard;
   suggestions?: EntitySuggestion[];
+  /** On a miss with `includeReferences`: the source's mention coverage (a miss may be a not-yet-indexed name). */
+  coverage?: MentionCoverage;
+}
+
+export interface EntityCardOpts {
+  remote: boolean;
+  /**
+   * Compute `referenced_by`, `referenced_by_count` and `coverage` (the `entity`
+   * verb). Ambient callers (context_pack, delta) leave it off.
+   */
+  includeReferences?: boolean;
+  /** The serving surface ceiling; on `verbs` a continuation names the starter surface. */
+  surfaceCeiling?: 'verbs' | 'starter' | 'full';
+  /**
+   * #5575 (ENG-8, CEO-20): the eligibility for the card's facts and timeline
+   * rows. Always hides quarantined-page projections and rows awaiting
+   * re-derivation; a proactive caller (context_pack, delta) passes its floor
+   * and activation control.
+   */
+  eligibility?: ReadEligibility;
+  /**
+   * #5575 (ENG-8, ENG-15): leave out a page the content-quality gate
+   * quarantined, as if it did not exist (no suggestion names it). Proactive
+   * callers always pass it unless an authorized `include_quarantined` asked;
+   * the entity verb passes it for remote callers, like get_page.
+   */
+  omitQuarantined?: boolean;
 }
 
 interface CardPageRow {
@@ -112,7 +187,7 @@ export async function buildEntityCard(
   engine: BrainEngine,
   sourceId: string,
   name: string,
-  opts: { remote: boolean },
+  opts: EntityCardOpts,
 ): Promise<EntityCardResult> {
   const trimmed = (name ?? '').trim();
   if (!trimmed) return { found: false, suggestions: [] };
@@ -158,7 +233,8 @@ export async function buildEntityCard(
   let rows: CardPageRow[] = [];
   try {
     rows = await engine.executeRaw<CardPageRow>(
-      `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
+      `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at,
+              GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at
          FROM pages
         WHERE deleted_at IS NULL
           AND source_id = $1
@@ -182,7 +258,8 @@ export async function buildEntityCard(
   if (missing.length) {
     try {
       const extra = await engine.executeRaw<CardPageRow>(
-        `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at, last_retrieved_at
+        `SELECT slug, source_id, title, type, frontmatter, compiled_truth, updated_at,
+              GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at
            FROM pages
           WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])${privatePredicate}`,
         [sourceId, missing],
@@ -195,20 +272,31 @@ export async function buildEntityCard(
 
   // Rank candidates: arm rank asc. Inside the precision arm an explicit slug
   // stays stronger than title inference; otherwise exact-title collisions
-  // prefer an entity page over transcript/note containers. Recency remains
-  // the final tie-break within the same match shape.
+  // prefer a linkable entity page (the source pack's entity types) over
+  // transcript/note containers. Recency remains the final tie-break within
+  // the same match shape.
+  const { types: linkable } = await loadLinkableTypes(engine, sourceId).catch(() => ({ types: [] as string[], pack: null }));
+  const entityTypes = new Set(linkable);
   const candidates = [...rankBySlug.entries()]
     .map(([s, rank]) => ({ slug: s, rank, row: rowBySlug.get(s) }))
     .filter((c): c is { slug: string; rank: number; row: CardPageRow } => c.row !== undefined)
     .sort((a, b) =>
       a.rank - b.rank
       || (a.rank === ARM_EXACT
-        ? exactMatchPreference(a.row, exactSlugs) - exactMatchPreference(b.row, exactSlugs)
+        ? exactMatchPreference(a.row, exactSlugs, entityTypes) - exactMatchPreference(b.row, exactSlugs, entityTypes)
         : 0)
       || lastTouchedMs(b.row) - lastTouchedMs(a.row));
 
+  if (opts.omitQuarantined && candidates.some(c => isQuarantined(c.row.frontmatter))) {
+    const live = candidates.filter(c => !isQuarantined(c.row.frontmatter));
+    if (live.length === 0) return { found: false, suggestions: [] };
+    candidates.splice(0, candidates.length, ...live);
+  }
   if (candidates.length === 0) {
-    return { found: false, suggestions: await nearMissSuggestions(engine, sourceId, trimmed, excludePrivate) };
+    return {
+      found: false, suggestions: await nearMissSuggestions(engine, sourceId, trimmed, excludePrivate),
+      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [sourceId]).catch(() => undefined) } : {}),
+    };
   }
 
   const best = candidates[0];
@@ -219,7 +307,8 @@ export async function buildEntityCard(
     create_safety: 'exists',
   }));
 
-  const card = await assembleCard(engine, sourceId, best.row, opts.remote);
+  const card = await assembleCard(engine, sourceId, best.row, opts.remote, excludePrivate, opts.eligibility ?? {});
+  if (opts.includeReferences) Object.assign(card, await cardReferences(engine, sourceId, best.row, opts, excludePrivate, entityTypes));
   return {
     found: true,
     card,
@@ -227,9 +316,37 @@ export async function buildEntityCard(
   };
 }
 
-function exactMatchPreference(row: CardPageRow, exactSlugs: string[]): number {
+function exactMatchPreference(row: CardPageRow, exactSlugs: string[], entityTypes: ReadonlySet<string>): number {
   if (exactSlugs.includes(row.slug)) return 0;
-  return ENTITY_PAGE_TYPES.has(row.type ?? '') ? 1 : 2;
+  return entityTypes.has(row.type ?? '') ? 1 : 2;
+}
+
+/**
+ * The `entity` verb's reference fields: every page linking here (mentions
+ * included), grouped by pack-canonical type with the continuation for a
+ * truncated group, and the source's mention coverage. Fail-soft: a failed
+ * read leaves the card without them rather than failing the lookup.
+ */
+async function cardReferences(engine: BrainEngine, sourceId: string, row: CardPageRow, opts: EntityCardOpts, excludePrivate: boolean,
+  entityTypes: ReadonlySet<string>): Promise<Pick<EntityCard, 'referenced_by_count' | 'referenced_by' | 'coverage'>> {
+  try {
+    const { pack } = await loadLinkableTypes(engine, sourceId);
+    const { total, groups } = await readReferrerGroups(engine, { slug: row.slug, sourceId, referrerSources: [sourceId], excludePrivate, pack,
+      keepVisibility: opts.remote ? ['world'] : ['private', 'world'], eligibility: opts.eligibility });
+    let coverage = await readMentionCoverage(engine, [sourceId]);
+    if (coverage.state !== 'disabled' && !entityTypes.has(row.type ?? '')) coverage = { ...coverage, state: 'type_not_linkable', degraded: true };
+    const referenced_by = groups.map((g): ReferenceGroupView => {
+      const rows = g.rows.map(({ source_id: _s, ...rest }) => rest);
+      if (g.rows.length >= g.total) return { canonical_type: g.canonical_type, total: g.total, rows };
+      const last = g.rows[g.rows.length - 1];
+      return { canonical_type: g.canonical_type, total: g.total, rows, next: { tool: 'get_backlinks', arguments: {
+        slug: row.slug, source_id: sourceId, type: g.canonical_type, group: 'page', limit: PAGE_DEFAULT_LIMIT,
+        ...(last ? { cursor: encodeCursor(last) } : {}) }, ...(opts.surfaceCeiling === 'verbs' ? { requires_surface: 'starter' as const } : {}) } };
+    });
+    return { referenced_by_count: total, referenced_by, coverage };
+  } catch {
+    return {};
+  }
 }
 
 async function assembleCard(
@@ -237,9 +354,15 @@ async function assembleCard(
   sourceId: string,
   row: CardPageRow,
   remote: boolean,
+  excludePrivate: boolean,
+  eligibility: ReadEligibility,
 ): Promise<EntityCard> {
   const pageSlug = row.slug;
   const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
+  const { privatePagesFilterFragment, privateLinkOriginFilterFragment } = await import('../search/private-visibility.ts');
+  const inboundPrivacy = excludePrivate
+    ? ` AND ${privatePagesFilterFragment('f')} AND ${privateLinkOriginFilterFragment('l')}`
+    : '';
 
   // Parallel depth-1 reads — every arm individually fail-soft so a partial
   // brain (no aliases, no timeline) still returns a card.
@@ -251,7 +374,10 @@ async function assembleCard(
   // a both-sides-scoped query here (f.source_id = t.source_id = this source),
   // mentions excluded (matching the backlink-count convention). Outgoing edges
   // (getLinks) are the entity's OWN declared links — from-side scoped — so they
-  // stay as-is.
+  // stay as-is. The referrer must also be live and, for an untrusted caller,
+  // readable: the same private-page and private-origin predicates get_backlinks
+  // applies, so a private or derived page never surfaces its slug, its
+  // links.context sentence, or a count.
   const [aka, outLinks, inEdges, backlinkCount, timeline, facts, activeFactCount] = await Promise.all([
     engine
       .executeRaw<{ alias_norm: string }>(
@@ -260,36 +386,39 @@ async function assembleCard(
       )
       .then(rs => rs.map(r => r.alias_norm))
       .catch(() => [] as string[]),
-    engine.getLinks(pageSlug, { sourceId }).catch(() => []),
+    engine.getLinks(pageSlug, { sourceId, excludePrivate, temporal: { status: 'all' } }).catch(() => []),
     engine
       .executeRaw<{ from_slug: string; link_type: string; context: string | null }>(
-        `SELECT f.slug AS from_slug, l.link_type, l.context
+        `SELECT f.slug AS from_slug, l.link_type, l.context${TEMPORAL_LINK_SELECT_SQL}
            FROM links l
            JOIN pages f ON f.id = l.from_page_id
            JOIN pages t ON t.id = l.to_page_id
-          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2
-            AND COALESCE(l.link_source, '') <> 'mentions'`,
+           ${temporalLinkJoinSql('l', excludePrivate)}
+          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2 AND f.deleted_at IS NULL
+            AND COALESCE(l.link_source, '') <> 'mentions'${inboundPrivacy}`,
         [pageSlug, sourceId],
       )
-      .catch(() => [] as Array<{ from_slug: string; link_type: string; context: string | null }>),
+      .then(rs => rs.map(r => annotateTemporalRow(r)))
+      .catch(() => [] as Array<{ from_slug: string; link_type: string; context: string | null } & TemporalAnnotation>),
     engine
       .executeRaw<{ n: string | number }>(
         `SELECT COUNT(*) AS n
            FROM links l
            JOIN pages f ON f.id = l.from_page_id
            JOIN pages t ON t.id = l.to_page_id
-          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2
-            AND COALESCE(l.link_source, '') <> 'mentions'`,
+          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2 AND f.deleted_at IS NULL
+            AND COALESCE(l.link_source, '') <> 'mentions'${inboundPrivacy}`,
         [pageSlug, sourceId],
       )
       .then(rs => Number(rs[0]?.n ?? 0))
       .catch(() => 0),
-    engine.getTimeline(pageSlug, { limit: 5, sourceId }).catch(() => []),
+    engine.getTimeline(pageSlug, { limit: 5, sourceId, excludePrivate, eligibility }).catch(() => []),
     engine
       .listFactsByEntity(sourceId, pageSlug, {
         activeOnly: true,
         limit: FACT_FETCH_CAP,
         ...(visibility ? { visibility } : {}),
+        eligibility,
       })
       .catch(() => [] as FactRow[]),
     // Exact active-fact count: the payload fetch above is capped at
@@ -309,18 +438,27 @@ async function assembleCard(
       .catch(() => null),
   ]);
 
-  const edges: EntityCardEdge[] = [];
-  for (const l of outLinks) {
-    if (l.link_source === 'mentions') continue;
-    edges.push({ type: l.link_type, direction: 'out', slug: l.to_slug, context: l.context || null });
-    if (edges.length >= EDGE_CAP) break;
-  }
-  if (edges.length < EDGE_CAP) {
-    for (const l of inEdges) {
-      edges.push({ type: l.link_type, direction: 'in', slug: l.from_slug, context: l.context || null });
-      if (edges.length >= EDGE_CAP) break;
-    }
-  }
+  // Live relationships first so ended ones never push a current edge past the cap.
+  const rank = (status?: string) => (status === 'live' || status === 'disputed' ? 0 : status === 'event' || status === 'reference' || !status ? 1 : 2);
+  const edgeOf = (l: { link_type: string; context?: string | null } & Partial<TemporalAnnotation>, direction: 'out' | 'in', slug: string): EntityCardEdge => {
+    const last = l.stints?.[l.stints.length - 1];
+    return {
+      type: l.link_type, direction, slug, context: l.context || null,
+      ...(l.status ? { status: l.status } : {}),
+      ...(last ? { since: last.from, until: last.until } : {}),
+    };
+  };
+  const outCandidates = (outLinks as Array<Link & Partial<TemporalAnnotation>>)
+    .filter(l => l.link_source !== 'mentions')
+    .map(l => edgeOf(l, 'out', l.to_slug));
+  const inCandidates = inEdges.map(l => edgeOf(l as typeof l & Partial<TemporalAnnotation>, 'in', l.from_slug));
+  const edges: EntityCardEdge[] = [
+    ...[...outCandidates].sort((a, b) => rank(a.status) - rank(b.status)),
+    ...[...inCandidates].sort((a, b) => rank(a.status) - rank(b.status)),
+  ].slice(0, EDGE_CAP);
+  const summary = safeSynopsis(row, { keepVisibility: remote ? ['world'] : ['private', 'world'] });
+  const relationshipNote = await loadRelationshipNotes(engine, [{ slug: pageSlug, source_id: sourceId, summary }], { excludePrivate })
+    .then(m => m.get(relationshipNoteKey(sourceId, pageSlug))).catch(() => undefined);
 
   // Open threads (best-effort v1): open-loop rows first (v0.47 — richest:
   // direction, due, loop_id), then active commitment facts NOT already
@@ -373,7 +511,7 @@ async function assembleCard(
     if (openThreads.length >= OPEN_THREADS_CAP) break;
     if (f.kind !== 'commitment') continue;
     if (f.id !== undefined && loopFactIds.has(f.id)) continue; // already surfaced via its loop
-    openThreads.push({ kind: 'commitment', text: f.fact, date: f.valid_from?.toISOString() ?? null });
+    openThreads.push({ kind: 'commitment', text: f.fact, date: f.valid_from?.toISOString() ?? null, ...trustFields(f.trust_tier, f.write_origin) });
   }
   if (openThreads.length < OPEN_THREADS_CAP) {
     const cutoff = Date.now() - OPEN_THREAD_TIMELINE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
@@ -384,17 +522,21 @@ async function assembleCard(
       const date = toIso(t.date);
       const ts = date === null ? NaN : Date.parse(date);
       if (!Number.isFinite(ts) || ts < cutoff) continue;
-      openThreads.push({ kind: 'recent_event', text: t.summary, date });
+      const raw = t as unknown as { trust_tier?: unknown; write_origin?: unknown };
+      openThreads.push({ kind: 'recent_event', text: t.summary, date, ...trustFields(raw.trust_tier, raw.write_origin) });
       if (openThreads.length >= OPEN_THREADS_CAP) break;
     }
   }
 
+  const pageTrust = (await loadPageTrust(engine, [{ source_id: sourceId, slug: pageSlug }]).catch(() => null))?.byKey.get(`${sourceId}\u0000${pageSlug}`);
   return {
     entity: { slug: pageSlug, title: row.title ?? pageSlug, type: row.type ?? null },
+    ...(pageTrust ?? { trust_tier: 'unknown' as const, origin: 'unrecorded' }),
+    ...(isQuarantined(row.frontmatter) ? { quarantined: true as const } : {}),
     aka,
     // v0.45.7: summary widens in lockstep with the card's fact visibility —
     // remote (world-only) keeps ['world']; a local include_private card widens.
-    summary: safeSynopsis(row, { keepVisibility: remote ? ['world'] : ['private', 'world'] }),
+    summary,
     last_touched: {
       updated_at: toIso(row.updated_at),
       last_retrieved_at: toIso(row.last_retrieved_at),
@@ -404,6 +546,7 @@ async function assembleCard(
     edges,
     backlink_count: backlinkCount,
     active_fact_count: activeFactCount ?? facts.length,
+    ...(relationshipNote ? { relationship_note: relationshipNote } : {}),
   };
 }
 

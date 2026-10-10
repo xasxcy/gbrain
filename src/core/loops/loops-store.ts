@@ -46,6 +46,12 @@ export interface OpenLoopUpsert {
   factId?: number | null;
   /** Loop activity time (newest evidence message), ISO. Defaults to now(). */
   lastActivityAt?: string | null;
+  /**
+   * When the obligation began (the oldest unanswered message), ISO. Defaults
+   * to now(). An open row keeps the earlier of its stored and the incoming
+   * value; a reopened row takes the incoming one.
+   */
+  openedAt?: string | null;
 }
 
 export interface OpenLoopRow {
@@ -111,12 +117,15 @@ export async function upsertOpenLoop(
     `INSERT INTO open_loops (
        source_id, dedup_key, loop_type, counterparty_slug, counterparty_email,
        summary, evidence, thread_id, page_slug, due_at, detector, confidence,
-       fact_id, last_activity_at
+       fact_id, last_activity_at, opened_at
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10::timestamptz, $11, $12,
-       $13, COALESCE($14::timestamptz, now())
+       $13, COALESCE($14::timestamptz, now()), COALESCE($15::timestamptz, now())
      )
      ON CONFLICT (source_id, dedup_key) DO UPDATE SET
+       opened_at = CASE WHEN open_loops.status = 'open'
+                        THEN LEAST(open_loops.opened_at, EXCLUDED.opened_at)
+                        ELSE EXCLUDED.opened_at END,
        status = 'open',
        loop_type = EXCLUDED.loop_type,
        counterparty_slug = COALESCE(EXCLUDED.counterparty_slug, open_loops.counterparty_slug),
@@ -149,6 +158,7 @@ export async function upsertOpenLoop(
       loop.confidence ?? 1.0,
       loop.factId ?? null,
       loop.lastActivityAt ?? null,
+      loop.openedAt ?? null,
     ],
   );
   // The DO UPDATE's WHERE is the manual-close guard: a closed (done/dropped/
@@ -208,6 +218,11 @@ export interface ListLoopsOpts {
   status?: LoopStatus;
   loopType?: LoopType;
   counterparty?: string;
+  /**
+   * Restrict the read to the loop with this primary key. It is ANDed with
+   * every other filter, so the source scope above still bounds the result.
+   */
+  loopId?: number;
   limit?: number;
 }
 
@@ -222,6 +237,7 @@ export async function listOpenLoops(
        AND ($2::text IS NULL OR status = $2)
        AND ($3::text IS NULL OR loop_type = $3)
        AND ($4::text IS NULL OR counterparty_slug = $4 OR counterparty_email = $4)
+       AND ($5::bigint IS NULL OR id = $5::bigint)
      ORDER BY last_activity_at DESC, id DESC
      LIMIT ${limit}`,
     [
@@ -229,6 +245,7 @@ export async function listOpenLoops(
       opts.status ?? null,
       opts.loopType ?? null,
       opts.counterparty ?? null,
+      opts.loopId === undefined ? null : opts.loopId,
     ],
   );
   return rows.map(normalizeRow);

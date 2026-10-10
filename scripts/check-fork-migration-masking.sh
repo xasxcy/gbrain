@@ -59,11 +59,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-MIGRATE='src/core/migrate.ts'
+LATEST='src/core/schema-migrations/latest.generated.ts'
 FORK='src/core/fork-migrations.ts'
 LABEL='[check-fork-migration-masking]'
 
-for f in "$MIGRATE" "$FORK"; do
+for f in "$LATEST" "$FORK"; do
   if [ ! -f "$f" ]; then
     echo "$LABEL ERROR: $f not found (run from a gbrain checkout)" >&2
     exit 1
@@ -92,7 +92,7 @@ if [ -n "$BASELINE" ]; then
   git show "$BASELINE":"$FORK" > "$BASELINE_FILE" 2>/dev/null || : > "$BASELINE_FILE"
 fi
 
-python3 - "$MIGRATE" "$FORK" "${BASELINE:-<none>}" "$BASELINE_FILE" <<'PYEOF'
+python3 - "$LATEST" "$FORK" "${BASELINE:-<none>}" "$BASELINE_FILE" <<'PYEOF'
 import re, sys
 
 migrate_path, fork_path, baseline_ref, baseline_file = sys.argv[1:5]
@@ -107,10 +107,11 @@ def fail(msg):
 def versions(text):
     return [int(v) for v in re.findall(r'^\s*(?:\{\s*)?version:\s*(\d+),', text, re.M)]
 
-upstream = versions(migrate)
+latest = re.search(r'LATEST_SCHEMA_VERSION\s*=\s*(\d+)', migrate)
+upstream = list(range(1, int(latest.group(1)) + 1)) if latest else []
 fork_versions = versions(fork)
 if not upstream:
-    fail(f'ERROR: no version numbers found in {migrate_path}')
+    fail(f'ERROR: LATEST_SCHEMA_VERSION not found in {migrate_path}')
     raise SystemExit(1)
 if not fork_versions:
     fail(f'ERROR: no fork migrations found in {fork_path} — refusing to pass a '

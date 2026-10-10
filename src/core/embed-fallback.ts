@@ -1,6 +1,7 @@
 import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from './embed-failure.ts';
 import { detectGatewayErrorFromCause } from './embed-retry.ts';
 import { isMustAbortError } from './worker-pool.ts';
+import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
 
 /**
  * Shared Ollama fallback for foreground and Minion embedding callers.
@@ -202,6 +203,16 @@ export async function embedWithTruncationFallbackPartial(
     return { vectors: embedded, failures, aborted: false };
   } catch (error) {
     if (opts.abortSignal?.aborted) return terminalResult(vectors, failures, opts.abortSignal);
+    // #4616: the gateway refused some or all items (zero-norm / non-finite / empty). Keep every
+    // usable vector; each refused item is a terminal per-chunk failure (never retried, never
+    // fanned out, and not a run-global AIConfigError even though the error class extends it).
+    if (isEmbeddingZeroNormError(error) && error.vectors.length === texts.length) {
+      return terminalResult(
+        error.vectors.slice(),
+        error.failures.map((failure) => ({ index: failure.index, error })),
+        opts.abortSignal,
+      );
+    }
     if (texts.length === 1) {
       if (!isOllamaOomLikeError(error)) {
         if (isSplitWorthy(error, opts.policy ?? 'legacy')) failures.push({ index: 0, error });

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { LATEST_VERSION, MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { DEFAULT_EMBEDDING_MODEL } from '../src/core/ai/defaults.ts';
 
 let engine: PGLiteEngine;
 
@@ -85,7 +86,10 @@ describe('persistEmbedOutcome', () => {
     const ledger = MIGRATIONS.find((migration) => migration.name === 'embed_failures_ledger');
     expect(ledger).toBeDefined();
     const priorVersion = String(ledger!.version - 1);
-    // Fresh schema includes the canonical objects.
+    // Fresh schema includes the canonical objects. resetPgliteState wipes `config`, and a
+    // re-run initSchema refuses a stored vector column whose model identity is unknown
+    // (upstream guard) — restore the identity a real brain always carries.
+    await engine.setConfig('embedding_model', DEFAULT_EMBEDDING_MODEL);
     await engine.initSchema();
     expect(await engine.executeRaw(`SELECT 1 FROM information_schema.tables WHERE table_name = 'embed_failures'`)).toHaveLength(1);
     expect(await engine.executeRaw(`SELECT 1 FROM pg_indexes WHERE indexname = 'embed_failures_active_idx'`)).toHaveLength(1);

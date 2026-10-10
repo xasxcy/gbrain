@@ -22,13 +22,12 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
-const SRC = readFileSync(
-  join(import.meta.dir, '..', 'src', 'core', 'postgres-engine.ts'),
-  'utf-8',
-);
+const SRC = surfaceFileSource('postgres-engine', 'src/core/postgres-engine.ts');
+// #5824: the vector statement (SQL text, date bounds, timeout constant) is
+// built in search/vector-statement.ts, shared with PGLite and doctor.
+const VECTOR_STATEMENT_SRC = surfaceFileSource('postgres-engine', 'src/core/search/vector-statement.ts');
 
 describe('postgres-engine / search path timeout isolation', () => {
   test('no bare `SET statement_timeout` statement survives', () => {
@@ -81,11 +80,13 @@ describe('postgres-engine / search path timeout isolation', () => {
 
   test('keyword uses its static timeout and vector preserves its pooled budget', () => {
     const keyword = extractMethod(SRC, 'searchKeyword');
+    const attempt = stripComments(SRC).split('private runVectorAttempt(')[1]!.split('async getEmbeddingsByChunkIds(')[0]!;
     const vector = extractMethod(SRC, 'searchVector');
     expect(keyword).toMatch(/SET\s+LOCAL\s+statement_timeout\s*=\s*'8s'/);
     expect(vector).toMatch(/searchVectorPool\([\s\S]*?opts\?\.onVectorPoolMeta,\s*[\s\S]*?15_000,/);
-    expect(vector).toMatch(/set_config\('statement_timeout', \$\{String\(remainingVectorBudget\(deadline\)\)\}, true\)/);
-    expect(vector).toContain('withVectorSettings');
+    expect(VECTOR_STATEMENT_SRC).toContain("export const SET_STATEMENT_TIMEOUT_SQL = `SELECT set_config('statement_timeout', $1, true)`;");
+    expect(attempt).toMatch(/tx\.unsafe\(SET_STATEMENT_TIMEOUT_SQL, \[String\(remainingVectorBudget\(deadline\)\)\]\)/);
+    expect(attempt).toContain('withVectorSettings');
   });
 
   test('connect() with poolSize honors resolvePrepare (PgBouncer regression guard)', () => {
@@ -122,12 +123,21 @@ describe('postgres-engine / search date filtering', () => {
     const expectedDateExpr = 'COALESCE(p.effective_date, p.updated_at, p.created_at)';
     const staleDatePredicate = /COALESCE\(p\.updated_at,\s*p\.created_at\)\s*[<>]\s*\$/;
 
-    for (const methodName of ['searchKeyword', 'searchKeywordChunks', 'searchVector']) {
+    for (const methodName of ['searchKeyword', 'searchKeywordChunks']) {
       const fn = stripComments(extractMethod(SRC, methodName));
 
       expect(countOccurrences(fn, expectedDateExpr)).toBe(2);
       expect(fn).not.toMatch(staleDatePredicate);
     }
+  });
+
+  test('vector search spells the same effective_date-first fallback per column (#5824)', () => {
+    const builder = stripComments(VECTOR_STATEMENT_SRC);
+    expect(builder).toContain('`AND (p.effective_date ${op} ${bound} OR (p.effective_date IS NULL AND (p.updated_at ${op} ${bound} OR (p.updated_at IS NULL AND p.created_at ${op} ${bound}))))`');
+    expect(builder).toMatch(/opts\?\.afterDate\) filters\.push\(dateBound\(/);
+    expect(builder).toMatch(/opts\?\.beforeDate\) filters\.push\(dateBound\(/);
+    expect(builder).not.toMatch(/COALESCE\(p\.updated_at,\s*p\.created_at\)/);
+    expect(stripComments(extractMethod(SRC, 'searchVector'))).toContain('buildVectorSearchStatement(');
   });
 });
 

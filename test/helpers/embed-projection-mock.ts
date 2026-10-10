@@ -9,7 +9,8 @@ export function mockEmbedProjectionEngine(overrides: Partial<Record<string, any>
   const pages = new Map<string, number>();
   const pageKinds = new Map<number, string>();
   overrides = {
-    executeRaw: async () => [],
+    executeRaw: async (sql: string) => sql.startsWith('SELECT count(*)::int AS n FROM pages p')
+      && sql.includes('p.text_projection_revision IS DISTINCT FROM p.knowledge_revision') ? [{ n: 0 }] : [],
     getConfigKeys: async () => [],
     transaction: async (run: (tx: BrainEngine) => Promise<unknown>) => run(engine),
     readPageSnapshot: async (slug: string, opts?: { sourceId?: string }) => {
@@ -22,11 +23,22 @@ export function mockEmbedProjectionEngine(overrides: Partial<Record<string, any>
         knowledge_revision: revision, text_projection_revision: revision, ...page,
       } };
     },
+    // Coherent default for the projection snapshot's chunk read: a test that models a stale
+    // set through `listStaleChunks` but not `getChunks` (the pre-projection --stale path
+    // needed no chunk read) sees those rows as the page's stored chunks, so the
+    // snapshot-vs-stale text match in the drain holds. An explicit `getChunks` still wins.
+    getChunks: async (slug: string, opts?: { sourceId?: string }) => {
+      const rows: any[] = overrides.listStaleChunks ? (await overrides.listStaleChunks({ afterPageId: 0 })) ?? [] : [];
+      return rows
+        .filter(row => row.slug === slug && (row.source_id ?? 'default') === (opts?.sourceId ?? 'default'))
+        .map(row => ({ ...row, embedded_at: null }));
+    },
     ...overrides,
   };
   const executeRaw = overrides.executeRaw;
   overrides.executeRaw = async (sql: string, params?: unknown[]) => sql.startsWith('SELECT page_kind FROM pages WHERE id=')
     ? [{ page_kind: pageKinds.get(Number(params?.[0])) ?? 'markdown' }]
+    : sql === 'SELECT archived FROM sources WHERE id=$1' ? [{ archived: false }]
     : executeRaw(sql, params);
   const calls: { method: string; args: any[] }[] = [];
   const track = (method: string) => (...args: any[]) => {

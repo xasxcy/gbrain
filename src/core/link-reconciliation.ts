@@ -5,6 +5,9 @@ import { fetchSource, isSourceFederated } from './sources-load.ts';
 import { parseMarkdown } from './markdown.ts';
 import { isValidSourceId } from './source-id.ts';
 import { buildSourceLocalReferenceIndex } from './source-local-reference-index.ts';
+import { collectWantedLinks, isWantedPagesEnabled } from './wanted-links.ts';
+import { readLineGrammarSettings } from './line-grammar.ts';
+import { DerivedLinkSettingsChangedError } from './derived-links.ts';
 
 export interface LinkPageMetadata {
   slug: string;
@@ -72,6 +75,9 @@ export async function reconcileSourceLinks(
     const pages = await loadLinkPageMetadata(engine, sourceId);
     const index = new Map(pages.map(page => [page.slug, page]));
     const resolver = makeIndexedLinkResolver(pages, sourceId);
+    const wantedEnabled = await isWantedPagesEnabled(engine);
+    const grammar = await readLineGrammarSettings(engine);
+    const lineGrammar = { enabled: grammar.enabled, allowUndeclaredTypes: grammar.allowUndeclaredTypes };
     const remaining = pages.filter(page => !opts.afterSlug || page.slug > opts.afterSlug)
       .sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
     for (const metadata of remaining.slice(0, limit)) {
@@ -83,7 +89,7 @@ export async function reconcileSourceLinks(
       }
       const page = snapshot.page;
       const extracted = await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter,
-        page.type, resolver, { pack: opts.pack, globalBasename: opts.globalBasename,
+        page.type, resolver, { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,
           targetType: (slug, source) => !source || source === sourceId ? index.get(slug)?.type : undefined });
       for (const ref of extracted.unresolved) {
         const target = unwrapWikilink(ref.name);
@@ -110,10 +116,21 @@ export async function reconcileSourceLinks(
         rows.push(resolvedLinkCandidate(candidate, page.slug, sourceId,
           { fromSlug: from, fromSourceId: sourceId, toSourceId: sourceId }));
       }
-      const written = await engine.replaceDerivedLinks({ slug: page.slug, sourceId,
-        expectedRevision: snapshot.revision, sourceIncarnation }, rows, { expectedEndpoints:
-          [...new Set(rows.flatMap(row => [row.from_slug, row.to_slug]))].map(slug => ({ slug, sourceId,
-            revision: index.get(slug)!.knowledge_revision })) });
+      const wanted = wantedEnabled ? collectWantedLinks({ candidates: extracted.candidates, frontmatterUnresolved: extracted.unresolved,
+        originSourceId: sourceId, crossSourceAllowed: false, resolve: candidate =>
+          candidate.targetSourceId && candidate.targetSourceId !== sourceId ? { ok: false, reason: 'cross_source' }
+            : !index.has(candidate.targetSlug) ? { ok: false, reason: 'missing_target' } : { ok: true } }) : [];
+      let written: { created: number; removed: number };
+      try {
+        written = await engine.replaceDerivedLinks({ slug: page.slug, sourceId,
+          expectedRevision: snapshot.revision, sourceIncarnation }, rows, { lineGrammar: grammar, wanted: { producers: ['body', 'frontmatter'], rows: wanted }, expectedEndpoints:
+            [...new Set(rows.flatMap(row => [row.from_slug, row.to_slug]))].map(slug => ({ slug, sourceId,
+              revision: index.get(slug)!.knowledge_revision })) });
+      } catch (error) {
+        if (!(error instanceof DerivedLinkSettingsChangedError)) throw error;
+        result.failures.push({ originSlug, code: 'revision_conflict' });
+        return result;
+      }
       result.pagesProcessed++;
       result.linksCreated += written.created;
       result.linksRemoved += written.removed;
@@ -163,8 +180,39 @@ export async function replaceFileLinks(engine: BrainEngine, slug: string, source
   return result.created;
 }
 
-export async function fileLinkOwnership(engine: BrainEngine, sourceId: string) {
-  const pages = await loadLinkPageMetadata(engine);
+/**
+ * Replace one file page's own markdown-derived links with what its current
+ * text produces, the put_page contract: an edge the text no longer supports
+ * is removed, other producers' edges stay. Returns the number of new edges,
+ * or null when the page row is missing. Links whose endpoints are not live
+ * pages in the source are dropped, as the add-only path's failed inserts were.
+ */
+export async function replacePageFileLinks(engine: BrainEngine, slug: string, sourceId: string,
+  links: LinkBatchInput[], includeFrontmatter: boolean,
+  ownership: Awaited<ReturnType<typeof fileLinkOwnership>>): Promise<number | null> {
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+  if (!snapshot) return null;
+  const rows = links.filter(link => ownership.metadata.has(`${sourceId}\0${link.from_slug}`)
+    && ownership.metadata.has(`${sourceId}\0${link.to_slug}`)).map(link => ({ ...link,
+    from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }));
+  const result = await engine.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,
+    sourceIncarnation: snapshot.sourceIncarnation }, rows, { includeFrontmatter, preserveExisting: true,
+    includeLegacyNullProducer: false });
+  return result.created;
+}
+
+/**
+ * Page metadata, resolver and attendance origins for replacing file links.
+ * With `slugs`, only those pages of the source are loaded (a sync hook passes
+ * its changed pages plus their link endpoints) — enough for
+ * `replacePageFileLinks`; the resolver then only knows those pages, so
+ * attendance reconciliation (`replaceFileLinks`) needs the unscoped form.
+ */
+export async function fileLinkOwnership(engine: BrainEngine, sourceId: string, scope?: { slugs: readonly string[] }) {
+  const pages = scope
+    ? await engine.executeRaw<LinkPageMetadata>(`SELECT slug, source_id, type, title, frontmatter->'aliases' AS aliases, knowledge_revision
+        FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[]) ORDER BY slug`, [sourceId, [...scope.slugs]])
+    : await loadLinkPageMetadata(engine);
   const metadata = new Map(pages.map(row => [`${row.source_id}\0${row.slug}`, row]));
   const resolver = makeIndexedLinkResolver(pages, sourceId);
   const { allSlugs, slugToSources } = indexLinkSources(pages);
@@ -173,7 +221,8 @@ export async function fileLinkOwnership(engine: BrainEngine, sourceId: string) {
     allSlugs, slugToSources, policy.allowCrossSource, policy);
   const origins = await engine.executeRaw<{ slug: string }>(`SELECT DISTINCT o.slug FROM links l
     JOIN pages o ON o.id=l.origin_page_id WHERE o.source_id=$1 AND l.link_source IN ('markdown','wikilink-resolved','frontmatter')
-      AND l.link_type='attended' AND l.to_page_id=l.origin_page_id`, [sourceId]);
+      AND l.link_type='attended' AND l.to_page_id=l.origin_page_id${scope ? ' AND o.slug = ANY($2::text[])' : ''}`,
+    scope ? [sourceId, [...scope.slugs]] : [sourceId]);
   return { metadata, resolver, resolve, origins: new Set(origins.map(row => row.slug)) };
 }
 

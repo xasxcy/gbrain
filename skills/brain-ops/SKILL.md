@@ -77,6 +77,17 @@ suppresses writes for that turn, including when standing capture is enabled.
 > connection test, use only a harmless synthetic `visibility: "world"` fixture
 > with the user's test authorization, retain its ID, and withdraw it afterward.
 >
+> **`<REDACTED:pattern>` in a result** (for example `<REDACTED:url_credentials>`
+> or `<REDACTED:high_entropy_assignment>`) means the brain holds a
+> credential-shaped value there and withheld it from this response; the stored
+> page is unchanged. Tell the user which kind of value was withheld and that it
+> is readable on the brain host. Do not retry other operations to recover it,
+> and do not echo a guess. A credential the user asked you to `remember` is
+> withheld from remote recall by design: every MCP caller, including stdio, and
+> a thin CLI connected to MCP is remote, so only `gbrain recall` run on the
+> brain host shows it as written. Docs:
+> `docs/guides/write-refusals.md#secret-scan-refusals-and-redaction`.
+>
 > **Keyless brains:** when `extract_facts` returns `skipped:
 > extraction_unavailable`, YOU are the extractor — pull the facts from the turn
 > yourself and write each one via `remember` with `kind` set (event | preference
@@ -170,15 +181,25 @@ the write path:
   `auto_links: { created, removed, errors }`.
 - **MCP callers (stdio AND HTTP)** return `auto_links: { skipped: "remote", hint }`
   and `auto_timeline: { skipped: "remote" }`. Body wikilinks are saved as text.
-  A stdio `gbrain serve` reconciles the edges asynchronously with its
-  maintenance sweep (startup + 10-minute idle ticks).
+  A post-commit effect then adds plain `mentions` edges to pages that already
+  exist in the same source (`auto_links.mention_links: "queued"`;
+  `gbrain config set mcp.remote_auto_links off` turns it off). Typed,
+  frontmatter and timeline edges are not part of it: a stdio `gbrain serve`
+  reconciles those asynchronously with its maintenance sweep (startup +
+  10-minute idle ticks).
   `gbrain serve --http` does not self-sweep — reconcile on demand with
   `gbrain sweep --once` (delegates to the live serve over IPC) or
   `gbrain extract links --source db`.
-  Use `add_link` for relationships you need immediately. Untrusted body text can plant
+  Use `add_link` for relationships you need immediately, except meeting
+  attendance, which auto-link derives from the meeting page. Untrusted body text can plant
   ranking-boosting edges, which is why the inline path is local-only.
-- Inferred link types: `attended` (meeting -> person), `works_at`, `invested_in`,
-  `founded`, `advises`, `source` (frontmatter), `mentions` (default).
+- Inferred link types: `attended`, `works_at`, `invested_in`, `founded`,
+  `advises`, `source` (frontmatter), `mentions` (default). Where the active
+  schema pack does not override attendance (gbrain-base-v2, which `gbrain init`
+  sets), `attended` comes only from a meeting page's explicit attendee list
+  (its `Attendees:` line or `attendees:` frontmatter) and points
+  `person -> meeting`; a pack that overrides it, such as the older
+  `gbrain-base`, sets its own rule and direction.
 - To disable: `gbrain config set auto_link false`. Default is on.
 - Timeline entries with specific dates still need explicit `gbrain timeline-add`
   (or batch via `gbrain extract timeline --source db`).
@@ -228,6 +249,15 @@ Rules:
 
 If a search result has `source_id: "gstack"` and `slug: "plans/foo"`,
 the citation is `[gstack:plans/foo]`. That's the whole rule.
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `put_page` returns `revision_conflict`: re-read the page, merge your change into the new text, and save with the new revision. `write_pending` (exit 10): poll `get_write_request` (`gbrain write-request <request_id>`) before claiming the write landed.
+- A write is refused by the secret scan or a slug fence (`permission_denied`): do not strip or rename to dodge it; tell the user what was refused and why (see `docs/guides/write-refusals.md`).
+- `recall` / `search` returns nothing with a degraded notice or `search_degraded`: say the brain is searching keywords only right now, not that nothing is saved.
+- `insufficient_scope` / `scope_denied` over MCP: the connection lacks that scope. Tell the user; never ask for a broader token just to make a write pass.
 
 ## Anti-Patterns
 

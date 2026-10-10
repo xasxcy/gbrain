@@ -9,7 +9,6 @@
  * preventing a later page from embedding.
  */
 import { describe, expect, mock, test } from 'bun:test';
-import type { BrainEngine } from '../src/core/engine.ts';
 import { mockEmbedProjectionEngine, embeddingUpdates } from './helpers/embed-projection-mock.ts';
 
 let embedCalls: string[][] = [];
@@ -30,27 +29,6 @@ const { runEmbedCore } = await import('../src/commands/embed.ts');
 const { __setEmbedTransportForTests } = await import('../src/core/ai/gateway.ts');
 __setEmbedTransportForTests(async () => ({ embeddings: [], usage: { tokens: 0 } } as any));
 
-function mockEngine(overrides: Partial<Record<string, any>>): BrainEngine {
-  return new Proxy({} as BrainEngine, {
-    get(_, prop: string) {
-      if (overrides[prop]) return overrides[prop];
-      if (prop === 'persistEmbedOutcome') {
-        return async (request: any) => {
-          const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
-          return {
-            committedChunks: vectors,
-            vectorCommittedChunks: vectors,
-            staleSkippedChunks: 0,
-            ledgerUpserts: request.entries.length - vectors,
-            ledgerDeletes: 0,
-          };
-        };
-      }
-      return async () => null;
-    },
-  });
-}
-
 describe('foreground stale embed fallback', () => {
   test('stale CLI splits an EOF-failed page batch before retry', async () => {
     embedCalls = [];
@@ -63,7 +41,7 @@ describe('foreground stale embed fallback', () => {
       { slug: 'mixed', chunk_index: 1, chunk_text: 'long'.repeat(2000), chunk_source: 'compiled_truth' as const, token_count: 2000, source_id: 'default', page_id: 1 },
     ];
     const stored: any[] = [];
-    const engine = mockEngine({
+    const engine = mockEmbedProjectionEngine({
       invalidateStaleSignatureEmbeddings: async () => 0,
       countStaleChunks: async () => stale.length,
       listStaleChunks: async ({ afterPageId }: { afterPageId: number }) => afterPageId === 0 ? stale : [],

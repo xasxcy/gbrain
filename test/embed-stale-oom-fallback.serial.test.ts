@@ -22,6 +22,7 @@ import {
 } from '../src/core/embed-fallback.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 import { AITransientError } from '../src/core/ai/errors.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 
 let engine: PGLiteEngine;
 
@@ -61,7 +62,7 @@ async function seedChunk(slug: string, chunkText: string): Promise<void> {
     token_count: Math.ceil(chunkText.length / 4),
     embedding: undefined,
   };
-  await engine.upsertChunks(slug, [chunk]);
+  await installFixtureChunks(engine, slug, [chunk]);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -70,7 +71,7 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
 
   test('stale caller checkpoints outer slices independently and counts one page once', async () => {
     await engine.putPage('sliced', { type: 'note', title: 'sliced', compiled_truth: '# sliced' });
-    await engine.upsertChunks('sliced', Array.from({ length: 9 }, (_, chunk_index) => ({
+    await installFixtureChunks(engine, 'sliced', Array.from({ length: 9 }, (_, chunk_index) => ({
       chunk_index,
       chunk_text: `slice-${chunk_index}`,
       chunk_source: 'compiled_truth' as const,
@@ -207,7 +208,9 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
     // The test used to assert the opposite (that the call returns normally with
     // done: true). It had contradicted the implementation since it was written;
     // it is not a regression from any particular merge.
-    const text = 'z'.repeat(6000);
+    // Fixture: 'z'/'l' runs tokenize above the chunk-token cap, so upstream's oversize heal
+    // (healOversizedPageChunks) would split them before embedding; 'x' runs stay one chunk.
+    const text = 'x'.repeat(6000);
     await seedChunk('non-oom', text);
 
     const fatal = new Error('rate_limit_exceeded: 429'); // NOT an OOM-like error
@@ -250,9 +253,9 @@ describe('embedWithTruncationFallback — injected embedFn', () => {
   test('mixed batch: long chunk succeeds via truncation while short chunk passes unchanged', async () => {
     // Put two chunks under the same slug so they land in the same embedFn call.
     const shortText = 's'.repeat(500);
-    const longText = 'l'.repeat(6000);
+    const longText = 'x'.repeat(6000); // 'x' run stays under the oversize-heal token cap (an 'l' run would be split)
     await engine.putPage('mixed', { type: 'note', title: 'mixed', compiled_truth: '# mixed' });
-    await engine.upsertChunks('mixed', [
+    await installFixtureChunks(engine, 'mixed', [
       { chunk_index: 0, chunk_text: shortText, chunk_source: 'compiled_truth', token_count: 125, embedding: undefined },
       { chunk_index: 1, chunk_text: longText, chunk_source: 'compiled_truth', token_count: 1500, embedding: undefined },
     ]);

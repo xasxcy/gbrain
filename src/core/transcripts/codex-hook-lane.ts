@@ -38,7 +38,7 @@ import { isPathContained } from '../path-confine.ts';
 import type { ConfineTranscriptResult, ParsedTranscript, ToolCallRecord } from './claude-code-jsonl.ts';
 import { capToolCallInput, TRANSCRIPT_HARD_CAP_BYTES, TRANSCRIPT_MAX_BYTES_DEFAULT } from './claude-code-jsonl.ts';
 import type { WindowTurn } from '../context/entity-salience.ts';
-import { mapCodexLine } from './codex.ts';
+import { isRepeatedCodexUserTurn, mapCodexLine } from './codex.ts';
 
 /** Head window kept on over-budget reads: session_meta is byte 0 of a rollout
  * and carries the identity a pure tail read would lose (codex.ts rationale). */
@@ -52,7 +52,7 @@ const HOOK_HEAD_WINDOW_BYTES = 256 * 1024;
  */
 export function confineCodexTranscriptPath(
   p: unknown,
-  opts: { root?: string; archivedRoot?: string; maxBytes?: number } = {},
+  opts: { root?: string; archivedRoot?: string; maxBytes?: number; allowOversize?: boolean } = {},
 ): ConfineTranscriptResult {
   if (typeof p !== 'string' || p.length === 0) return { ok: false, reason: 'missing_path' };
   if (!p.endsWith('.jsonl')) return { ok: false, reason: 'not_jsonl' };
@@ -73,8 +73,11 @@ export function confineCodexTranscriptPath(
   }
   if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
   if (!st.isFile()) return { ok: false, reason: 'not_file' };
+  // #5701: same split as the claude lane — this parser reads a bounded
+  // HEAD+TAIL window, so the size gate belongs to the caller that opts out of
+  // it, not to the confinement.
   const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
-  if (st.size > cap) return { ok: false, reason: 'too_large' };
+  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
   const [root, archivedRoot] = codexRootsFor(opts);
   const contained =
     isPathContained(p, root) || (archivedRoot !== undefined && isPathContained(p, archivedRoot));
@@ -171,6 +174,7 @@ export function parseCodexHookTranscript(
         if (!cwd && mapped.cwd) cwd = mapped.cwd;
         break;
       case 'user':
+        if (isRepeatedCodexUserTurn(turns.at(-1), mapped.message.text)) break;
         genuineUserTurnIndexes.push(turns.length);
         turns.push({ role: mapped.message.role, text: mapped.message.text });
         break;
