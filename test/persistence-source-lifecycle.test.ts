@@ -19,6 +19,7 @@ import { addSource, removeSource } from '../src/core/sources-ops.ts';
 import { softDeleteSource, restoreSource } from '../src/core/destructive-guard.ts';
 import { topologyDirectoryBytes } from '../src/core/persistence/topology-filesystem.ts';
 import { topologyPrincipal } from '../src/core/persistence/topology-locks.ts';
+import { canonicalFilesystemPath } from '../src/core/persistence/root-registry.ts';
 
 import type { BrainEngine } from '../src/core/engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -93,7 +94,7 @@ test('rebind requires exact manifest including deletion and old path remains fen
   await expect(runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:candidate})).rejects.toMatchObject({code:'writer_manifest_mismatch'});
   rmSync(join(candidate,'extra.md'));
   await runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:candidate});
-  expect((await getWorktreeBinding(engine,source))!.local_path).toBe(candidate);
+  expect((await getWorktreeBinding(engine,source))!.local_path).toBe(canonicalFilesystemPath(candidate));
   const {assertManagedFilesystemWrite}=await import('../src/core/persistence/filesystem-guard.ts');
   expect(()=>assertManagedFilesystemWrite(join(root,'example.md'))).toThrow('managed canonical worktree');
 }),60_000);
@@ -249,10 +250,10 @@ test('a substituted partial staging directory is retained instead of being clean
 test('trusted source constructors and archive/remove facades use managed topology and replay IDs',()=>fixture(async(home)=>{
   const id='core-source',path=join(home,id);mkdirSync(path);writeFileSync(join(path,'note.md'),'Core source');
   const created=await addSource(engine,{id,localPath:path,force:true,requestId:randomUUID()});
-  expect(created.local_path).toBe(path);expect(await getWorktreeBinding(engine,id)).not.toBeNull();
+  expect(created.local_path).toBe(canonicalFilesystemPath(path));expect(await getWorktreeBinding(engine,id)).not.toBeNull();
   expect(await softDeleteSource(engine,id)).not.toBeNull();expect(await restoreSource(engine,id)).toBe(true);
   const opts={id,confirmDestructive:true,requestId:randomUUID()};const removed=await removeSource(engine,opts);
-  expect(removed).toMatchObject({id,clone_removed:false,clone_path:path});
+  expect(removed).toMatchObject({id,clone_removed:false,clone_path:canonicalFilesystemPath(path)});
   expect(await removeSource(engine,opts)).toEqual(removed);
   const databaseOnly=await addSource(engine,{id:'db-only-source',requestId:randomUUID()});
   expect(databaseOnly.local_path).toBeNull();expect(await getWorktreeBinding(engine,'db-only-source')).toBeNull();

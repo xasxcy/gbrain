@@ -17,6 +17,8 @@ import { createPersistenceIpcProvider } from '../src/core/persistence/provider.t
 import { persistenceSocketPathForConfig, startPersistenceIpcServer } from '../src/core/persistence/ipc.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
+import { canonicalFilesystemPath } from '../src/core/persistence/root-registry.ts';
 
 let memoryEngine: PGLiteEngine;
 let diskEngine: PGLiteEngine;
@@ -78,20 +80,20 @@ test('activation fsyncs source and selected datastore refusal records before bec
   const selected = join(home, 'selected-datastore'); mkdirSync(selected);
   await registerManagedFilesystemEngine(engine, selected);
   await registerLocalWriter(engine, 'cli');
-  expect(await runPersistenceAdministration(engine, 'writer_activate', { confirm_quiesced: true })).toMatchObject({ enabled: true, activated: true });
-  expect(registeredManagedRoots()).toContain(root);
-  expect(registeredManagedRoots()).toContain(selected);
+  expect(await runPersistenceAdministration(engine, 'writer_activate', { confirm_quiesced: true, ...await reviewedWriterIntent(engine, 'writer_activate') })).toMatchObject({ enabled: true, activated: true });
+  expect(registeredManagedRoots()).toContain(canonicalFilesystemPath(root));
+  expect(registeredManagedRoots()).toContain(canonicalFilesystemPath(selected));
   expect(JSON.parse(readFileSync(join(root, '.gbrain-managed'), 'utf8'))).toMatchObject({ managed: true, version: 1 });
   expect(await managedPersistenceEnabled(engine)).toBe(true);
   await expect(engine.putPage('legacy', { type: 'note', title: 'Example', compiled_truth: 'Unsupported legacy write', timeline: '', frontmatter: {} }, { sourceId })).rejects.toThrow('writer_coordinator_required');
   expect(await activatePersistence(engine, { confirmQuiesced: true })).toMatchObject({ enabled: true, activated: false });
   const later = join(home, 'later-canonical'); mkdirSync(later);
   await claimWorktree(engine, `${sourceId}-later`, later);
-  expect(registeredManagedRoots()).toContain(later);
+  expect(registeredManagedRoots()).toContain(canonicalFilesystemPath(later));
   const successor = join(home, 'successor'); cpSync(root, successor, { recursive: true });
   const transfer = await prepareWriterTransfer(engine, sourceId);
   await acceptWriterTransfer(engine, sourceId, successor, transfer.owner_epoch, transfer.manifest.digest);
-  expect(registeredManagedRoots()).toContain(successor);
+  expect(registeredManagedRoots()).toContain(canonicalFilesystemPath(successor));
 }), 60_000);
 
 test('a refusal-registry write failure rolls back activation and releases native roots', () => fixture(async (engine, root, home, sourceId) => {
@@ -123,7 +125,8 @@ test('actual CLI activation delegates through the verified owner while disk PGLi
   const provider = await createPersistenceIpcProvider(engine, config);
   const ipc = (await startPersistenceIpcServer(persistenceSocketPathForConfig(config)!, provider))!;
   try {
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), 'sources', 'writer', 'activate', '--confirm-quiesced', '--json'], {
+    const intent = await reviewedWriterIntent(engine, 'writer_activate');
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), 'sources', 'writer', 'activate', '--confirm-quiesced', '--admin-intent', intent.admin_intent, '--expected-state', String(intent.expected_state), '--json'], {
       cwd: home, env: { ...process.env, GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0' }, stdout: 'pipe', stderr: 'pipe',
     });
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);

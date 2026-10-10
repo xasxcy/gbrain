@@ -41,7 +41,10 @@ Three ways to actually gate on types:
 1. `bun run verify` — runs the shell guard checks (privacy, jsonb, source-id,
    progress-to-stdout, …) plus `bun run typecheck` in parallel
    (`scripts/run-verify-parallel.sh`). Use this mid-branch.
-2. `bun run typecheck` — `tsc --noEmit` standalone. Fast (~5s on this repo).
+2. `bun run typecheck` — standalone TypeScript checking with native incremental
+   analysis in ignored `node_modules/.cache/gbrain-typecheck.tsbuildinfo`. Cold
+   checks still analyze the whole project; repeated checks reuse compiler state
+   while retaining input invalidation and diagnostics. See [Testing](TESTING.md).
 3. `bun run ci:local` — the full local CI gate from Path A.
 
 The trap is: writing a new test, running `bun test test/foo.test.ts`,
@@ -375,6 +378,12 @@ single source of truth), mints tag `v<VERSION>` at the pushed commit, titles
 the release the same, uses that version's `CHANGELOG.md` entry as the notes
 (`scripts/changelog-entry.sh`; falls back to a CHANGELOG link if the entry is
 missing), and attaches the compiled binaries.
+
+The executable build job pins Bun 1.4.2 and verifies the Darwin artifact with
+strict native `codesign` before publishing it. A source merge does not repair
+already-published bad binaries; an affected release needs its own explicitly
+approved recovery and asset verification. The unrelated publishing jobs retain
+their own Bun pins.
 
 ### The `latest-stable` tag
 

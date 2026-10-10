@@ -52,7 +52,7 @@ import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts'
  */
 
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { dirname, join } from 'path';
 import { createHash, randomBytes } from 'crypto';
@@ -153,7 +153,19 @@ export type PushLockResult =
   | { acquired: false; holderPid: number | null };
 
 export function pushLockDir(repoRoot: string): string {
-  const hash = createHash('sha256').update(repoRoot).digest('hex').slice(0, 16);
+  // Pre-existing bug fix: hash the realpath, not the raw string. git's own
+  // `rev-parse --show-toplevel` (used by resolveWorkspaceRoot) resolves
+  // symlinks, so a caller holding the pre-resolution path (e.g. a tmp dir
+  // that is itself a symlink on macOS) would otherwise hash to a DIFFERENT
+  // lock dir than workspacePush's internal acquirePushLock(root) call,
+  // silently defeating the in-flight lock check. Falls back to the raw
+  // string when the path doesn't exist yet (can't realpath a nonexistent
+  // dir), which preserves prior behavior for that edge case.
+  let canonical = repoRoot;
+  try {
+    canonical = realpathSync(repoRoot);
+  } catch { /* path doesn't exist — hash the raw string as before */ }
+  const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
   return join(ensureGbrainHome(), 'locks', `push-${hash}.lock`);
 }
 

@@ -49,12 +49,12 @@ export interface ForkMigrationDeps {
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 160;
+export const FORK_MIGRATION_FLOOR = 166;
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 160,
+      version: 166,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -72,7 +72,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 161,
+      version: 167,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -99,7 +99,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 162,
+      version: 168,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -128,7 +128,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 163,
+      version: 169,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -163,7 +163,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 164,
+      version: 170,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -203,7 +203,13 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         let totalBackfilled = 0;
         for (;;) {
           const rows = await engine.executeRaw<{ id: number }>(
-            `UPDATE pages SET id = id
+            // trg_pages_search_vector is declared UPDATE OF title,timeline.
+            // Updating id would rewrite the row but *not* invoke the trigger,
+            // leaving its old compiled_truth-derived vector intact. Assigning
+            // title to itself is deliberately value-preserving while naming a
+            // watched column, so every selected row is rebuilt by the final
+            // trigger function.
+            `UPDATE pages SET title = title
                WHERE id IN (
                  SELECT id FROM pages
                   WHERE id > $1 AND search_vector IS NOT NULL
@@ -222,7 +228,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 165,
+      version: 171,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -250,7 +256,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 166,
+      version: 172,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -291,7 +297,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 167,
+      version: 173,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -362,7 +368,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 168,
+      version: 174,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -442,7 +448,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 169,
+      version: 175,
       name: 'repair_masked_upstream_146_149',
       // Fifth instance of the masking class this file's header describes, from
       // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
@@ -522,7 +528,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 170,
+      version: 176,
       name: 'repair_masked_upstream_150_159',
       // Sixth instance of the masking class this file's header describes, from
       // the 2026-09-20 upstream sync (v0.50.0.0 → v0.51.0.0).
@@ -610,6 +616,77 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           r.deletion_col === 1 &&
           r.incarnation_idx === 1 &&
           r.revision_trigger === 1
+        );
+      },
+    },
+    {
+      version: 177,
+      name: 'repair_masked_upstream_160_165',
+      // The 2026-09-27 upstream merge extended the upstream range through
+      // v165 after this fork had already used 160-165. Renumbering the fork
+      // to 166+ preserves upstream definitions, but cannot make an existing
+      // brain stamped by the old fork re-enter those now-masked versions:
+      // runMigrations advances one integer high-water, not an applied-set.
+      //
+      // Look up the upstream entries at execution time rather than copying
+      // their SQL. That preserves exact parity if their idempotent bodies are
+      // tightened before this repair is released.
+      //
+      // v165 creates its Postgres index CONCURRENTLY, so this outer migration
+      // must not cause its SQL path to be transaction-wrapped. Handlers run
+      // outside that wrapper, but keeping the repair itself transaction:false
+      // documents and preserves the constraint if a SQL body is later added.
+      idempotent: true,
+      transaction: false,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [160, 161, 162, 163, 164, 165]) {
+          const masked = deps.allMigrations().find(m => m.version === version);
+          if (!masked) throw new Error(`repair_masked_upstream_160_165: upstream migration ${version} not found in the live MIGRATIONS registry`);
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 160-165 masked by the 2026-09-27 fork renumber\n',
+        );
+      },
+      // Each re-applied migration runs its own verify hook where it has one.
+      // Keep a compact catalog check here as a final all-target postcondition
+      // for Postgres; PGLite schema inspection differs, so its successful
+      // idempotent replays are the portable proof.
+      verify: async (engine) => {
+        if (engine.kind !== 'postgres') return true;
+        const rows = await engine.executeRaw<{
+          projection_stats: number;
+          projection_pending_idx: number;
+          receipts: string | null;
+          atom_state: string | null;
+          skill_heads: string | null;
+          skill_members: string | null;
+          database_pending_idx: number;
+        }>(
+          `SELECT
+             (SELECT count(*)::int FROM pg_statistic_ext e
+               WHERE e.stxname = 'pages_text_projection_current_stats'
+                 AND e.stxrelid = 'pages'::regclass) AS projection_stats,
+             (SELECT count(*)::int FROM pg_indexes
+               WHERE indexname = 'idx_pages_projection_pending') AS projection_pending_idx,
+             to_regclass('public.source_ingestion_receipts')::text AS receipts,
+             to_regclass('public.extract_atoms_page_state')::text AS atom_state,
+             to_regclass('public.shared_skill_heads')::text AS skill_heads,
+             to_regclass('public.shared_skill_members')::text AS skill_members,
+             (SELECT count(*)::int FROM pg_indexes
+               WHERE indexname = 'persistence_requests_database_pending') AS database_pending_idx`,
+        );
+        const r = rows[0];
+        return Boolean(
+          r &&
+          r.projection_stats === 1 &&
+          r.projection_pending_idx === 1 &&
+          r.receipts === 'source_ingestion_receipts' &&
+          r.atom_state === 'extract_atoms_page_state' &&
+          r.skill_heads === 'shared_skill_heads' &&
+          r.skill_members === 'shared_skill_members' &&
+          r.database_pending_idx === 1,
         );
       },
     },

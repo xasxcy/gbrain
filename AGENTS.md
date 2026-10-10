@@ -6,9 +6,9 @@ start here.
 
 > **Default: add memory to the existing agent.** Preserve its identity and unrelated instructions. Start keyless; automatic capture and paid enrichment are opt-in. No bootstrap interview or private repository is required.
 >
-> **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md), using the isolated [in-agent setup](docs/guides/in-agent-setup.md) entry point. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
+> **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md). The recommended path connects an isolated thin CLI to a brain on the user's own computer, published with `gbrain mcp expose --funnel` when needed; use the isolated [in-agent setup](docs/guides/in-agent-setup.md) when no machine stays online. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
 >
-> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Provision on the host; install the private handoff inside the intended harness. A URL or ordinary OAuth token is not administration authority.
+> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Choose native OAuth/PKCE or a private machine handoff for the intended harness. For login links, clients, permissions, or token lifecycle, follow [MCP administration](docs/mcp/ADMIN.md) or `skills/mcp-access/SKILL.md`. A URL or ordinary OAuth token is not owner administration authority.
 >
 > **Creating a new personal agent, explicitly requested by the user:** follow [BOOTSTRAP_FOR_AGENTS.md](BOOTSTRAP_FOR_AGENTS.md), then return here for the operating protocol.
 
@@ -23,9 +23,9 @@ start here.
    ```
    If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`,
    the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218).
-   Run `gbrain apply-migrations --yes` to recover, or fall back to the
+   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services, or fall back to the
    deterministic install: `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
-2. Init the brain: `gbrain init` (defaults to PGLite, zero-config). For 1000+ files or
+2. Init keyless memory: `gbrain init --pglite --no-embedding` (zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
 3. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
    default but printed a 9-cell cost matrix (mode × downstream model)
@@ -40,38 +40,35 @@ start here.
 
 ## Memory operating protocol
 
-Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
+Recall relevant saved context before answering. Save explicit requests to remember
+with provenance; confirm corrections against the stored record. Verify changes with
+actual GBrain calls and distinguish a local test from a new-conversation test in the
+harness. For memory boundaries and all other memory behavior, follow
+[CLAUDE.md's Memory operating protocol](./CLAUDE.md#memory-operating-protocol).
 
 ## Read this order
 
 1. `./AGENTS.md` (this file) — install + operating protocol.
-2. [`./CLAUDE.md`](./CLAUDE.md) — orientation + resolver: architecture, cross-cutting
-   invariants, the reference map, inline ship rules. It routes to on-demand detail docs:
-   [`./docs/architecture/KEY_FILES.md`](./docs/architecture/KEY_FILES.md) (per-file index —
-   read a file's entry before editing it), [`./docs/TESTING.md`](./docs/TESTING.md) (test
-   tiers + isolation lint + E2E lifecycle), and
-   [`./docs/architecture/thin-client.md`](./docs/architecture/thin-client.md) (remote-MCP seam).
-3. [`./docs/architecture/brains-and-sources.md`](./docs/architecture/brains-and-sources.md)
-   — the two-axis mental model (brain = which DB, source = which repo in the DB). Every
-   query routes on both axes. Read before writing anything that touches brain ops.
-4. [`./skills/conventions/brain-routing.md`](./skills/conventions/brain-routing.md) —
-   agent-facing decision table: when to switch brain, when to switch source, how
-   cross-brain federation works (latent-space only; the agent decides).
-5. [`./skills/RESOLVER.md`](./skills/RESOLVER.md) — skill dispatcher. Read before any task.
+2. [`./CLAUDE.md`](./CLAUDE.md) — the authoritative orientation, architecture,
+   cross-cutting invariants, reference map, ship rules, and skill dispatcher. Follow
+   its Reference map for on-demand detail, including
+   [`docs/architecture/KEY_FILES.md`](./docs/architecture/KEY_FILES.md) before editing
+   `src/` and [`docs/TESTING.md`](./docs/TESTING.md) before running or changing tests;
+   before brain operations, read its linked brain/source routing material and
+   `skills/RESOLVER.md`.
 
 ## Trust boundary (critical)
 
-GBrain distinguishes **trusted local CLI callers** (`OperationContext.remote = false`,
-set by `src/cli.ts`) from **untrusted agent-facing callers** (`remote = true`, set by
-`src/mcp/server.ts`). Security-sensitive operations like `file_upload` tighten filesystem
-confinement when `remote = true` and default to strict behavior when unset. If you are
-writing or reviewing an operation, consult `src/core/operations.ts` for the contract.
+Follow [CLAUDE.md's Architecture section](./CLAUDE.md#architecture), especially its
+Trust boundary and Cross-cutting invariants. When writing or reviewing an operation,
+consult `src/core/operations.ts` for the contract.
 
 ## Common tasks
 
 - **Configure:** [`docs/ENGINES.md`](./docs/ENGINES.md),
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
-  [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md).
+  [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md),
+  [`docs/guides/remote-mcp.md`](./docs/guides/remote-mcp.md) (`gbrain mcp expose`).
 - **Bring in your chat history:** `gbrain transcripts ingest` imports a
   downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
   connects the account and syncs new conversations live, incrementally and on an
@@ -87,7 +84,7 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
-  [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes` (manual schema-only).
+  [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).
 - **Eval retrieval changes:** capture is off by default. To benchmark a
   retrieval change against real captured queries, set
   `GBRAIN_CONTRIBUTOR_MODE=1`, then `gbrain eval export --since 7d > base.ndjson`
@@ -147,15 +144,14 @@ diff-aware subset during fast iteration on a focused branch. Requires Docker
 Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
 up the test Postgres container, run `bun run test:e2e`, tear it down).
 
-Ship via the `/ship` skill, not by hand. The full release + contributor process
-(CHANGELOG voice, version-locations sync, PR conventions, community-PR-wave) lives in
-[`./docs/RELEASING.md`](./docs/RELEASING.md); read it before shipping.
+For release, post-ship, and skill-routing requirements, follow
+[CLAUDE.md's Releasing section](./CLAUDE.md#releasing) and
+[Skill routing section](./CLAUDE.md#skill-routing).
 
 ## Privacy
 
-Never commit real names of people, companies, or funds into public artifacts. See the
-Privacy rule in `./CLAUDE.md`. GBrain pages reference real contacts; public docs must
-use generic placeholders (`alice-example`, `acme-example`, `fund-a`).
+For public artifacts, follow
+[CLAUDE.md's Privacy rule](./CLAUDE.md#privacy-rule-scrub-real-names-from-public-docs).
 
 ## Forks
 

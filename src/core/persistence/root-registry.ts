@@ -36,8 +36,21 @@ function syncDirectory(directory: string): void {
     if (!(process.platform === 'win32' && ['EISDIR', 'EPERM', 'EINVAL', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))) throw error;
   } finally { if (fd !== undefined) closeSync(fd); }
 }
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
 function writePrivateRecord(file: string, value: string): void {
-  if (existsSync(file) && readFileSync(file, 'utf8') === value) { chmodSync(file, 0o600); return; }
+  if (existsSync(file)) {
+    const existing = readFileSync(file, 'utf8');
+    try {
+      if (existing === value || stableJson(JSON.parse(existing)) === stableJson(JSON.parse(value))) { chmodSync(file, 0o600); return; }
+    } catch { /* unreadable records must be atomically replaced by the current trusted writer */ }
+  }
   const temporary = `${file}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, 'wx', 0o600);
   try { writeFileSync(fd, value); fsyncSync(fd); } finally { closeSync(fd); }
@@ -71,10 +84,16 @@ export function hasManagedRootMarker(path: string): boolean {
 }
 /** Resolve existing ancestors too, so an alias to a managed tree cannot bypass the fence. */
 export function canonicalFilesystemPath(path: string): string {
+  return resolveFilesystemPath(path, realpathSync);
+}
+export function nativeFilesystemPath(path: string): string {
+  return resolveFilesystemPath(path, realpathSync.native);
+}
+function resolveFilesystemPath(path: string, realpath: (path: string) => string): string {
   let current = resolve(path);
   const missing: string[] = [];
   for (;;) {
-    try { return resolve(realpathSync(current), ...missing.reverse()); }
+    try { return resolve(realpath(current), ...missing.reverse()); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       const parent = dirname(current);
@@ -92,11 +111,26 @@ export function recordManagedRoots(brainId: string, records: ManagedRootRecord[]
   if (!/^[a-f0-9-]{36}$/i.test(brainId)) throw new OperationError('storage_error', 'Invalid managed-root brain identity.');
   if (!records.length) return;
   const directory = registryDirectory(); mkdirSync(directory, { recursive: true, mode: 0o700 }); chmodSync(directory, 0o700);
+  // SQL path text can carry both /var and /private/var for the same macOS
+  // directory. Collapse by physical root before writing, preferring a complete
+  // worktree binding over the source-only fallback row.
+  const canonicalRecords = new Map<string, ManagedRootRecord>();
+  const score = (record: ManagedRootRecord) => Number(record.worktree_id != null) * 4
+    + Number(record.source_id != null) * 2 + Number(record.source_incarnation != null);
   for (const record of records) {
     const root = canonicalFilesystemPath(record.local_path);
+    const existing = canonicalRecords.get(root);
+    if (!existing || score(record) > score(existing)) canonicalRecords.set(root, record);
+  }
+  for (const [root, record] of canonicalRecords) {
     const key = createHash('sha256').update(root).digest('hex');
     const file = join(directory, `${brainId}.${key}.json`);
-    const value = JSON.stringify({ version: 1, brain_id: brainId, root, ...record, local_path: root,
+    // Keep the record byte-stable: database UNION result key order must not
+    // turn an unchanged physical root into an inode-replacing rewrite.
+    const value = JSON.stringify({ version: 1, brain_id: brainId, root, local_path: root,
+      ...(record.source_id !== undefined ? { source_id: record.source_id } : {}),
+      ...(record.source_incarnation !== undefined ? { source_incarnation: record.source_incarnation } : {}),
+      ...(record.worktree_id !== undefined ? { worktree_id: record.worktree_id } : {}),
       ...(record.topology_generation != null ? { topology_generation: String(record.topology_generation) } : {}) });
     writePrivateRecord(file, value);
     if (existsSync(root) && statSync(root).isDirectory()) {

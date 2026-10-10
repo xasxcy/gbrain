@@ -14,6 +14,7 @@ import { readSourceFileSync, writeSourceFileSync, withSourceFilesystemLock } fro
 import { APPLICATION_AUTHORITY, assertNoUnreviewedJobs, assertRemoteJobControl, authorizeJobExecution, prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { canonicalFilesystemPath } from '../src/core/persistence/root-registry.ts';
 
 const sandbox = mkdtempSync(join(tmpdir(), 'gbrain-job-authority-'));
 const root = join(sandbox, 'repo');
@@ -60,10 +61,10 @@ describe('generic remote job authority', () => {
   }));
   test('exactly four jobs normalize source, paths and no paid descendants', () => isolated(async () => {
     const sync = await prepareRemoteJob(ctx(), 'sync', {});
-    expect(sync.data).toEqual({ repoPath: root, sourceId: 'default', noPull: false, noEmbed: true, noExtract: true, auto_embed_backfill: false });
+    expect(sync.data).toEqual({ repoPath: canonicalFilesystemPath(root), sourceId: 'default', noPull: false, noEmbed: true, noExtract: true, auto_embed_backfill: false });
     expect((await prepareRemoteJob(ctx(), 'sync', { noPull: true })).data.noPull).toBe(true);
-    expect((await prepareRemoteJob(ctx(), 'import', {})).data).toEqual({ dir: root, sourceId: 'default', noEmbed: true });
-    for (const name of ['lint', 'lint-fix']) expect((await prepareRemoteJob(ctx(), name, {})).data).toEqual({ dir: root, sourceId: 'default' });
+    expect((await prepareRemoteJob(ctx(), 'import', {})).data).toEqual({ dir: canonicalFilesystemPath(root), sourceId: 'default', noEmbed: true });
+    for (const name of ['lint', 'lint-fix']) expect((await prepareRemoteJob(ctx(), name, {})).data).toEqual({ dir: canonicalFilesystemPath(root), sourceId: 'default' });
     for (const name of ['embed', 'shell', 'extract', 'subagent', 'sync-retry-failed']) await expect(prepareRemoteJob(ctx(), name, {})).rejects.toThrow('only sync');
     for (const [name, data] of [['sync', { noExtract: false }], ['sync', { github_item: {} }], ['sync', { sourceId: 'other' }], ['sync', { pull: true, noPull: false }], ['import', { dir: '/tmp' }], ['lint-fix', { fix: false }]] as const) {
       await expect(prepareRemoteJob(ctx(), name, data)).rejects.toThrow();

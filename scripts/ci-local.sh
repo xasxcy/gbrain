@@ -191,12 +191,8 @@ echo "[ci-local] Smoke OK ($SMOKE_NO_ARGS files no-arg, 1 single-arg, ${SHARD_TO
 if [ "$NO_SHARD" = "1" ]; then
   if [ "$DIFF" = "1" ]; then
     RUN_PHASES_CMD='echo "[runner] guards + typecheck"
-bash scripts/check-jsonb-pattern.sh
 bash scripts/check-bun-test-timeout.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
+bun run verify
 echo "[runner] serial tests (DATABASE_URL unset)"
 env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:serial
 echo "[runner] slow tests (DATABASE_URL unset)"
@@ -214,16 +210,12 @@ else
   GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
   GBRAIN_CI_REQUIRE_PGBOUNCER=1 \
   GBRAIN_TEST_DB=1 \
-  xargs -a /tmp/e2e-selected.txt bash scripts/run-e2e.sh
+  xargs bash scripts/run-e2e.sh < /tmp/e2e-selected.txt
 fi'
   else
     RUN_PHASES_CMD='echo "[runner] guards + typecheck"
-bash scripts/check-jsonb-pattern.sh
 bash scripts/check-bun-test-timeout.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
+bun run verify
 echo "[runner] serial tests (DATABASE_URL unset)"
 env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:serial
 echo "[runner] slow tests (DATABASE_URL unset)"
@@ -253,12 +245,8 @@ fi'
     DIFF_E2E_PREP='> /tmp/e2e-selected.txt'
   fi
   RUN_PHASES_CMD="echo \"[runner] guards + typecheck (run once before sharding)\"
-bash scripts/check-jsonb-pattern.sh
 bash scripts/check-bun-test-timeout.sh
-bash scripts/check-progress-to-stdout.sh
-bash scripts/check-trailing-newline.sh
-bash scripts/check-wasm-embedded.sh
-bun run typecheck
+bun run verify
 echo \"[runner] serial tests (DATABASE_URL unset)\"
 env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun run test:serial
 echo \"[runner] slow tests (DATABASE_URL unset)\"
@@ -298,7 +286,7 @@ printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
     GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \\
     GBRAIN_CI_REQUIRE_PGBOUNCER=1 \\
     GBRAIN_TEST_DB=1 \\
-    xargs -a /tmp/e2e-selected.txt bash scripts/run-e2e.sh >> \$log 2>&1
+    xargs bash scripts/run-e2e.sh < /tmp/e2e-selected.txt >> \$log 2>&1
   else
     SHARD=\${shard}/4 \\
     DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test \\
@@ -354,10 +342,11 @@ echo "[runner] bun version: $(bun --version)"
 if ! command -v git >/dev/null 2>&1 || \
    ! command -v python3 >/dev/null 2>&1 || \
    ! command -v ps >/dev/null 2>&1 || \
-   ! command -v psql >/dev/null 2>&1; then
+   ! command -v psql >/dev/null 2>&1 || \
+   ! command -v jq >/dev/null 2>&1; then
   echo "[runner] Installing test prerequisites (debian apt)..."
   apt-get update -qq >/dev/null
-  apt-get install -y -qq git ca-certificates python3 procps postgresql-client >/dev/null
+  apt-get install -y -qq git ca-certificates python3 procps postgresql-client jq >/dev/null
 fi
 # Container runs as root (uid 0) against a host-uid bind-mount; mark repo +
 # any worktree gitdir as safe so `git status` etc. don't refuse.

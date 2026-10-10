@@ -23,7 +23,7 @@ export async function reservePhysicalRoot(tx: SqlEngine, path: string, opts: Phy
   const root = canonicalFilesystemPath(path), brainId = await brainIdentity(tx);
   const previous = readPhysicalRootReservation(root);
   const worktreeId = opts.worktreeId ?? previous?.worktreeId ?? randomUUID();
-  const coordinationPath = opts.coordinationPath ?? previous?.coordinationPath ?? canonicalFilesystemPath(join(persistenceHome(), 'locks', `${worktreeId}.lock`));
+  const coordinationPath = canonicalFilesystemPath(opts.coordinationPath ?? previous?.coordinationPath ?? join(persistenceHome(), 'locks', `${worktreeId}.lock`));
   // A copied marker without its original sibling reservation is not a new root.
   if (!previous && existsSync(join(root, PHYSICAL_ROOT_MARKER))) throw physicalRootError();
   const reservation = previous ?? reservePhysicalRootRecord(root, { brainId, worktreeId, hostId: opts.hostId, coordinationPath });
@@ -70,9 +70,10 @@ export async function preparePhysicalRootTransfer(tx: SqlEngine, path: string,
   const [owner] = await tx.executeRaw<{ owner_epoch: string; state: string }>('SELECT owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid', [opts.worktreeId]);
   if (owner?.state !== 'draining' || String(owner.owner_epoch) !== opts.expectedEpoch) throw physicalRootError();
   const root = canonicalFilesystemPath(path), brainId = await brainIdentity(tx);
+  const coordinationPath = canonicalFilesystemPath(opts.coordinationPath);
   const reservation = readPhysicalRootReservation(root) ?? reservePhysicalRootRecord(root,
-    { brainId, worktreeId: opts.worktreeId, hostId: opts.hostId, coordinationPath: opts.coordinationPath });
-  if (reservation.brainId !== brainId || reservation.worktreeId !== opts.worktreeId || reservation.coordinationPath !== opts.coordinationPath) throw physicalRootError();
+    { brainId, worktreeId: opts.worktreeId, hostId: opts.hostId, coordinationPath });
+  if (reservation.brainId !== brainId || reservation.worktreeId !== opts.worktreeId || reservation.coordinationPath !== coordinationPath) throw physicalRootError();
   assertNoPhysicalRootOverlap(root);
   adoptTransferredRootStamp(root, reservation);
 }

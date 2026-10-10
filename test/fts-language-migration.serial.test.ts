@@ -138,6 +138,9 @@ describe('configurable_fts_language migration', () => {
     const backfills = calls.filter(sql => /UPDATE pages/.test(sql));
     expect(backfills.length).toBeGreaterThan(0);
     for (const sql of backfills) {
+      // The trigger is UPDATE OF title,timeline, so the keyset update must
+      // name a watched column. `id = id` would not fire it.
+      expect(sql).toMatch(/SET title = title/);
       expect(sql).toMatch(/WHERE id > \$1 AND search_vector IS NOT NULL/);
       expect(sql).toMatch(/LIMIT \$2/);
     }

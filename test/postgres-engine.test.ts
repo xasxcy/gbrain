@@ -79,11 +79,13 @@ describe('postgres-engine / search path timeout isolation', () => {
     );
   });
 
-  test('both search methods use SET LOCAL for the timeout', () => {
+  test('keyword uses its static timeout and vector preserves its pooled budget', () => {
     const keyword = extractMethod(SRC, 'searchKeyword');
     const vector = extractMethod(SRC, 'searchVector');
     expect(keyword).toMatch(/SET\s+LOCAL\s+statement_timeout\s*=\s*'8s'/);
-    expect(vector).toMatch(/SET\s+LOCAL\s+statement_timeout\s*=\s*'15s'/);
+    expect(vector).toMatch(/searchVectorPool\([\s\S]*?opts\?\.onVectorPoolMeta,\s*[\s\S]*?15_000,/);
+    expect(vector).toMatch(/set_config\('statement_timeout', \$\{String\(remainingVectorBudget\(deadline\)\)\}, true\)/);
+    expect(vector).toContain('withVectorSettings');
   });
 
   test('connect() with poolSize honors resolvePrepare (PgBouncer regression guard)', () => {

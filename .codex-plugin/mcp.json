@@ -79,7 +79,6 @@
         "QWEN3_VL_EMBEDDING_API_KEY",
         "TOGETHER_API_KEY",
         "VOYAGE_API_KEY",
-        "ZEROENTROPY_API_KEY",
         "ZHIPUAI_API_KEY"
       ]
     }

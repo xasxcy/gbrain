@@ -54,7 +54,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
     if(input.operation==='reclone'&&(!currentBinding||currentBinding.worktree_id!==binding!.worktree_id))throw new OperationError('source_changed','The canonical clone binding changed.');
     const reservedIdentity=readPhysicalRootReservation(target);
     const worktreeId=currentBinding?.worktree_id??reservedIdentity?.worktreeId??randomUUID();
-    const coordination=currentBinding?.coordination_path??reservedIdentity?.coordinationPath??join(persistenceHome(),'locks',`${worktreeId}.lock`);
+    const coordination=canonicalFilesystemPath(currentBinding?.coordination_path??reservedIdentity?.coordinationPath??join(persistenceHome(),'locks',`${worktreeId}.lock`));
     let newLock:NativeLockHandle|null=null;
     if(!bindings.some(binding=>binding.worktree_id===worktreeId)){newLock=await acquireNativeLock(coordination!,{timeoutMs:5000});if(!newLock)throw new OperationError('writer_lock_unavailable','The new clone coordination lock is busy.');}
     let accepted:TopologyChange|undefined;
@@ -74,7 +74,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
           const [host]=await tx.executeRaw<{local_path:string;coordination_path:string}>(
             'SELECT local_path,coordination_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[worktreeId,localHostId()]);
           if(preparedOwner.owner_host_id!==localHostId()||preparedOwner.state!=='active'||members.length
-            ||host?.local_path!==target||host.coordination_path!==coordination)
+            ||host?.local_path!==target||canonicalFilesystemPath(host.coordination_path)!==coordination)
             throw new OperationError('recovery_required','The reserved checkout is still bound, recovering, or has a different physical identity.');
         }
         const sources=await lockTopologyRows(tx,input.sourceId,bindings);

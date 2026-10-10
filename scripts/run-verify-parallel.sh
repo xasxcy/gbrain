@@ -111,6 +111,7 @@ CHECKS=(
   "check:pin-doc-privacy"
   "check:worker-lock-renewal-shape"
   "check:fork-migration-parity"
+  "check:fork-migration-masking"
   "check:bootstrap-tag"
   "check:plugin-tree"
   "check:skill-refs"

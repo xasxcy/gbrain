@@ -38,13 +38,22 @@ async function runCli(
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const { spawn } = await import('child_process');
   return new Promise((resolve) => {
-    const child = spawn('bun', ['run', join(REPO_ROOT, 'src', 'cli.ts'), ...args], {
+    const child = spawn('bun', ['--no-env-file', 'run', join(REPO_ROOT, 'src', 'cli.ts'), ...args], {
       env: {
         // Minimal env: ambient DATABASE_URL/GBRAIN_DATABASE_URL or provider
         // keys would change init's routing and detection tiers.
         PATH: process.env.PATH,
         HOME: process.env.HOME,
         GBRAIN_HOME: opts.gbrainHome,
+        // Bun loads a cwd .env into child processes. Explicit empty values
+        // keep a host application's database from outranking this fixture's
+        // on-disk postgres config.
+        DATABASE_URL: '',
+        GBRAIN_DATABASE_URL: '',
+        // config.ts also derives GBRAIN_DATABASE_URL from this repository's
+        // local Postgres convenience variables. Mark its credential as set
+        // (but empty) so loadRepoDotenv cannot synthesize a host connection.
+        PG_APP_PWD: '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,

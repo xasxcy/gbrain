@@ -59,10 +59,12 @@ const INTERFACE_METHODS: readonly string[] = [
   'upsertChunks', 'getChunks', 'countStaleChunks', 'sumStaleChunkChars', 'setPageEmbeddingSignature',
   'invalidateStaleSignatureEmbeddings', 'invalidateContentDriftEmbeddings', 'listStaleChunks',
   'countChunklessPagesWithContent', 'listChunklessPagesWithContent', 'deleteChunks',
+  // Durable embedding-failure ledger
+  'persistEmbedOutcome', 'listEmbedFailures', 'releaseEmbedFailures', 'getEmbedFailureSummary',
   // Extraction watermark
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch',
   // Links + graph
-  'addLink', 'addLinksBatch', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
+  'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
   'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
@@ -123,10 +125,15 @@ const INTERFACE_METHODS: readonly string[] = [
  */
 const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'db',
+  'connectForRestore',
   'applyForwardReferenceBootstrap',
   'getBulkRetryOpts',
   'batchRetry',
+  'deleteObsoleteEmbedFailures',
+  'appendEmbedFailureEligibility',
   'buildStaleChunkWhere',
+  'buildListStaleChunkWhere',
+  'listSignatureEligibleStaleChunks',
   'activeEmbeddingColId',
   'buildChunklessPagesWhere',
   'buildStalePagesWhere',
@@ -157,6 +164,7 @@ const UNCALLED: readonly string[] = [
   'listCorpusSample',       // called by src/core/brainstorm/domain-bank.ts (fallback arm)
   'getPageTimestamps',      // DELETION CANDIDATE: deprecated, zero src callers
   'rewriteLinks',           // documented no-op stub; callers exist (migrate.ts, cycle/phantom-redirect.ts)
+  'releaseEmbedFailures',   // operator release path has no other direct engine test
 ];
 
 function methodNames(): string[] {
@@ -233,6 +241,7 @@ describe('BrainEngine surface — mechanical enumeration (D9)', () => {
 
 let engine: PGLiteEngine;
 let fundAPageId: number;
+let fundBPageId: number;
 let fundATakeId: number;
 
 function unitEmbedding(): Float32Array {
@@ -305,6 +314,29 @@ const SMOKES: Record<string, () => Promise<void>> = {
     const after = await engine.getLinks('wiki/vc/fund-a');
     expect(after.map((l) => l.to_slug)).toEqual(before.map((l) => l.to_slug));
   },
+
+  releaseEmbedFailures: async () => {
+    // Use the production checkpoint to create a current-ledger row, then
+    // prove the operator release is scoped to that chunk and is idempotent.
+    const [{ chunk_hash }] = await engine.executeRaw<{ chunk_hash: string }>(
+      `SELECT md5(chunk_text) AS chunk_hash FROM content_chunks WHERE page_id = $1 AND chunk_index = 0`,
+      [fundBPageId],
+    );
+    const persisted = await engine.persistEmbedOutcome({
+      sourceId: 'default',
+      pageId: fundBPageId,
+      slug: 'wiki/vc/fund-b',
+      embeddingSignature: 'surface-smoke',
+      entries: [{
+        chunkIndex: 0,
+        chunkHash: chunk_hash,
+        outcome: { failure: { errorClass: 'provider_timeout', errorFingerprint: 'surface-smoke' } },
+      }],
+    });
+    expect(persisted.ledgerUpserts).toBe(1);
+    expect(await engine.releaseEmbedFailures({ slug: 'wiki/vc/fund-b', sourceId: 'default', chunkIndex: 0 })).toBe(1);
+    expect(await engine.releaseEmbedFailures({ slug: 'wiki/vc/fund-b', sourceId: 'default', chunkIndex: 0 })).toBe(0);
+  },
 };
 
 describe('uncovered-method smokes (seeded PGLite)', () => {
@@ -324,7 +356,8 @@ describe('uncovered-method smokes (seeded PGLite)', () => {
       compiled_truth: 'about fund a.',
     });
     fundAPageId = fundA.id;
-    await engine.putPage('wiki/vc/fund-b', { type: 'note', title: 'Fund B', compiled_truth: 'about fund b.' });
+    const fundB = await engine.putPage('wiki/vc/fund-b', { type: 'note', title: 'Fund B', compiled_truth: 'about fund b.' });
+    fundBPageId = fundB.id;
     await engine.putPage('wiki/biology/cells', { type: 'note', title: 'Cells', compiled_truth: 'about cells.' });
     // fund-b gets one inbound link → the prefix-sampling tiebreaker target.
     await engine.addLink('wiki/vc/fund-a', 'wiki/vc/fund-b');

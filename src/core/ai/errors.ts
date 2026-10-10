@@ -126,7 +126,10 @@ export const RATE_LIMIT_HALT_STREAK = 3;
  * (408), payload too large (413), validation (422) can genuinely differ from
  * one page/take to the next, so they never justify a whole-run halt.
  */
-const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
+// Exported (was module-private) so embed-failure.ts's classifyEmbedFailure can
+// apply the same request-shaped-4xx-is-per-item distinction — pre-existing bug
+// fix, see classifyEmbedFailure's comment for the collapse it corrects.
+export const PER_ITEM_HTTP_STATUSES = new Set([400, 408, 413, 422]);
 
 // Billing phrases are deliberately TIGHTER than sync-failure-ledger's
 // EMBEDDING_QUOTA regex (which matches bare /billing/): a global-error hit

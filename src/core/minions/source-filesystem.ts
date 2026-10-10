@@ -11,6 +11,7 @@ import { LockStolenError, LockUnavailableError, withRefreshingLock } from '../db
 import { discoverGitRoot } from '../sync-git.ts';
 import { authorityDigest, currentRemoteJobAuthority, currentJobSignal } from './submission-authority.ts';
 import { assertLegacyFilesystemWriter, assertManagedFilesystemWrite } from '../persistence/filesystem-guard.ts';
+import { canonicalFilesystemPath } from '../persistence/root-registry.ts';
 
 const heldRoots = new AsyncLocalStorage<ReadonlyArray<{ root: string; active: boolean }>>();
 const filesystemSignal = new AsyncLocalStorage<AbortSignal>();
@@ -97,16 +98,19 @@ export function assertSourceFilePath(path: string): string {
   const authority = currentRemoteJobAuthority();
   if (!authority) return path;
   const root = authority.grant.canonicalRoot;
-  if (realpathSync(root) !== root) throw new Error('Source root changed during job');
+  if (canonicalFilesystemPath(root) !== root) throw new Error('Source root changed during job');
   const absolute = resolve(path);
-  const rel = relative(root, absolute);
-  if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) throw new Error('Source file escapes registered root');
-  let component = root;
-  for (const part of rel.split(sep)) {
-    component = resolve(component, part);
-    if (lstatSync(component).isSymbolicLink()) throw new Error('Remote source jobs do not follow symlinks');
+  // The authority is intentionally stored as a physical root. A caller can
+  // still hand us the equivalent macOS /var spelling, but no arbitrary alias
+  // may enter the descriptor path below.
+  for (let component = absolute;; component = dirname(component)) {
+    if (lstatSync(component).isSymbolicLink()) {
+      const expected = new Map([['/var', '/private/var'], ['/tmp', '/private/tmp'], ['/etc', '/private/etc']]).get(component);
+      if (realpathSync(component) !== expected) throw new Error('Remote source jobs do not follow symlinks');
+    }
+    if (component === dirname(component)) break;
   }
-  const real = realpathSync(absolute);
+  const real = canonicalFilesystemPath(absolute);
   const realRel = relative(root, real);
   if (isAbsolute(realRel) || realRel === '..' || realRel.startsWith(`..${sep}`)) throw new Error('Source file escapes registered root');
   return real;

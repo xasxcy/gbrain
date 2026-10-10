@@ -1,5 +1,5 @@
 import { chmodSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
@@ -14,8 +14,11 @@ import { persistenceFileHash, publishPersistenceFile } from './coordinator.ts';
 import type { EffectRecovery, PersistenceEffect } from './effect-model.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, upgradeRecoveryStaging } from './staging.ts';
+import { declarePersistenceProtocol } from './protocol.ts';
+import { canonicalFilesystemPath } from './root-registry.ts';
 
 export async function guardEffectSource(tx: BrainEngine, effect: PersistenceEffect, hostId: string): Promise<WorktreeBinding | null> {
+  await declarePersistenceProtocol(tx);
   if (effect.worktree_id) {
     const [owner] = await tx.executeRaw<{ owner_host_id: string; state: string }>('SELECT owner_host_id,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [effect.worktree_id]);
     if (!owner || owner.owner_host_id !== hostId || owner.state !== 'active') throw new OperationError('owner_unavailable', 'The effect requires its active canonical owner.');
@@ -84,7 +87,9 @@ export async function recoverEffectPublication(engine: BrainEngine, effect: Pers
     if (!binding?.local_path || record.kind !== 'withdrawal-mirror' || record.sourceIncarnation !== current.source_incarnation
       || String(binding.owner_epoch) !== record.ownerEpoch || !isWriteTargetContained(record.path, binding.local_path)
       || !isWriteTargetContained(record.path, record.root) || !isWriteTargetContained(record.root, binding.local_path)
-      || resolve(record.root) !== resolve(join(binding.local_path, binding.relative_path))
+      // macOS exposes the same physical directory through /var and /private/var.
+      // Bind recovery to filesystem identity, not the caller's path spelling.
+      || canonicalFilesystemPath(record.root) !== canonicalFilesystemPath(join(binding.local_path, binding.relative_path))
       || sha256(Buffer.from(record.after, 'base64')) !== record.afterHash) throw new OperationError('recovery_required', 'Mirror recovery no longer belongs to this canonical binding.');
     await withFilesystemPublication([record.root], async () => cleanupRecoveryStaging(record));
     const actual = persistenceFileHash(record.path);

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { AIConfigError, AITransientError } from './ai/errors.ts';
+import { AIConfigError, AITransientError, PER_ITEM_HTTP_STATUSES } from './ai/errors.ts';
 
 export type EmbedFailureClass =
   | 'provider_timeout'
@@ -35,7 +35,21 @@ export function isTransientEmbedError(error: unknown): boolean {
 }
 
 export function classifyEmbedFailure(error: unknown): EmbedFailureClassification {
-  if (error instanceof AIConfigError) return { kind: 'fatal' };
+  // Pre-existing bug fix: normalizeAIError (ai/errors.ts) wraps EVERY non-429
+  // 4xx into AIConfigError, including request-shaped ones (400/408/413/422 —
+  // bad content, too long, timeout) that are per-item, not a whole-batch
+  // config fault. Treating instanceof AIConfigError alone as fatal collapsed
+  // a single bad chunk's 400 into a fatal verdict for the WHOLE batch,
+  // defeating the per-chunk isolation below (isInvalidInputError exists
+  // precisely to catch this case but was unreachable — this branch was
+  // checked first and always won). Mirrors PER_ITEM_HTTP_STATUSES's identical
+  // distinction in classifyGlobalLlmError. A status outside that set (401/403
+  // auth, or no status at all, e.g. a missing-API-key AIConfigError) still
+  // falls through to fatal below.
+  const status = error instanceof AIConfigError ? (error.status ?? error.apiErrorStatus) : undefined;
+  if (error instanceof AIConfigError && !(status !== undefined && PER_ITEM_HTTP_STATUSES.has(status))) {
+    return { kind: 'fatal' };
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (isInvalidInputError(error)) {
     return { kind: 'failure', errorClass: 'invalid_input' };

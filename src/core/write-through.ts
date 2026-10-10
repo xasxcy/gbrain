@@ -22,7 +22,7 @@ import { hasSourceFilesystemLock, withSourceFilesystemLock, assertSourceFilesyst
  * only does "row exists + repo is a real dir → render + atomic write".
  */
 
-import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
+import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync, realpathSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import type { BrainEngine } from './engine.ts';
@@ -158,7 +158,15 @@ export function recordedPathFromFileUri(sourceUri: string | null | undefined, pa
     }
   }
   if (abs.includes('\0') || !abs.toLowerCase().endsWith('.md')) return null;
-  const rel = relative(resolve(pageRoot), resolve(abs));
+  if (process.platform === 'win32' && /^\/[A-Za-z]:[\\/]/.test(abs)) abs = abs.slice(1);
+  // A captured URI may retain a macOS spelling such as `/var/...`, while the
+  // canonical worktree root has already been resolved to `/private/var/...`.
+  // Compare real paths when both ends exist; otherwise retain the lexical
+  // fallback so a missing file still follows the normal slug fallback path.
+  const canonical = (path: string) => {
+    try { return realpathSync(path); } catch { return resolve(path); }
+  };
+  const rel = relative(canonical(pageRoot), canonical(abs));
   if (!rel || isAbsolute(rel) || rel.split(/[\\/]/).some((segment) => segment === '..')) return null;
   return rel;
 }

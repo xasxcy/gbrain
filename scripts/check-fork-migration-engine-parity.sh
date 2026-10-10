@@ -171,6 +171,29 @@ def parse_sql_for(src: str, object_start: int, sql_for_pos: int) -> tuple[dict, 
             raise ParseError(f"sqlFor branch '{key}' lacks ':' at offset {pos}")
         pos = skip_trivia(src, pos + 1)
         value, pos = read_quoted(src, pos)
+        # Upstream may prefix a SQL constant with an engine-local statement
+        # timeout, e.g. `'SET LOCAL ...;' + PROJECTION_STATISTICS_SQL` in
+        # migration v160. The checker only needs inline SQL text for its
+        # constraint scans, but must consume this valid TypeScript expression
+        # so it can continue parsing later migrations. Consume chained string
+        # and identifier operands; a non-literal/non-identifier operand still
+        # fails closed rather than silently accepting arbitrary code.
+        while True:
+            next_pos = skip_trivia(src, pos)
+            if next_pos >= len(src) or src[next_pos] != '+':
+                pos = next_pos
+                break
+            operand_pos = skip_trivia(src, next_pos + 1)
+            if operand_pos >= len(src):
+                raise ParseError(f'unterminated sqlFor concatenation at offset {next_pos}')
+            if src[operand_pos] in "'\"`":
+                operand, pos = read_quoted(src, operand_pos)
+                value += operand
+                continue
+            if re.match(r'[A-Za-z_$]', src[operand_pos]):
+                _, pos = read_identifier(src, operand_pos)
+                continue
+            raise ParseError(f'unsupported sqlFor concatenation operand at offset {operand_pos}')
         if key in branches:
             raise ParseError(f"duplicate sqlFor branch '{key}'")
         branches[key] = value
