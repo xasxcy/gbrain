@@ -28,7 +28,14 @@ BEGIN
       AND (p.proname LIKE 'gbrain\\_%' OR p.proname = 'auto_enable_rls')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
   LOOP
-    EXECUTE format('ALTER FUNCTION %s SET search_path = pg_catalog, public', fn);
+    BEGIN
+      EXECUTE format('ALTER FUNCTION %s SET search_path = pg_catalog, public', fn);
+    EXCEPTION WHEN insufficient_privilege THEN
+      -- Fork: auto_enable_rls backs a superuser-created event trigger, so a
+      -- non-superuser runtime role cannot ALTER it. Leave it as it was and
+      -- name the one statement a superuser can run instead of aborting.
+      RAISE WARNING 'function_search_path: % is not owned by %; as a superuser run: ALTER FUNCTION % SET search_path = pg_catalog, public', fn, current_user, fn;
+    END;
   END LOOP;
 END
 $search_path$;

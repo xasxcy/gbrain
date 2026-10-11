@@ -3144,8 +3144,8 @@
         "idempotent": true,
         "name": "function_search_path",
         "sql": {
-          "length": 1861,
-          "sha256": "5370a8f6ef1ca8787e677af523927605c2fa1de61674efd5b006a5673fbb1eca"
+          "length": 2317,
+          "sha256": "f97086a3ceb46db788472af4c146b31a1877dfe6fa021f3d9cd70a4696744cf7"
         },
         "sqlFor": "absent",
         "transaction": "absent",

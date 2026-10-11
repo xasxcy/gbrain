@@ -120,6 +120,35 @@ for (const kind of testBackends()) {
       expect(await unpinned()).toEqual([]);
     }, 60_000);
 
+    // Fork: a production runtime role owns every gbrain function except the
+    // superuser-created auto_enable_rls event-trigger function. The re-pin loop
+    // must skip what it cannot ALTER instead of aborting the upgrade.
+    test.if(kind === 'postgres')('the re-pin loop skips a function the runtime role does not own', async () => {
+      const doBlock = searchPathMigration.sql!.slice(searchPathMigration.sql!.indexOf('DO $search_path$'));
+      const role = `w9_runtime_${process.pid}`;
+      await engine.executeRaw(`CREATE ROLE ${role} NOSUPERUSER`);
+      try {
+        await engine.executeRaw(`GRANT CREATE, USAGE ON SCHEMA public TO ${role}`);
+        await engine.executeRaw('CREATE FUNCTION gbrain_w9_superuser_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
+        await engine.transaction(async tx => {
+          await tx.executeRaw(`SET LOCAL ROLE ${role}`);
+          await tx.executeRaw('CREATE FUNCTION gbrain_w9_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
+          await tx.executeRaw(doBlock);
+        });
+        const rows = await engine.executeRaw<{ name: string; config: string[] | null }>(
+          `SELECT proname AS name, proconfig AS config FROM pg_proc WHERE proname IN ('gbrain_w9_owned', 'gbrain_w9_superuser_owned') ORDER BY proname`);
+        expect(rows).toEqual([
+          { name: 'gbrain_w9_owned', config: ['search_path=pg_catalog, public'] },
+          { name: 'gbrain_w9_superuser_owned', config: null },
+        ]);
+      } finally {
+        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_owned()');
+        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_superuser_owned()');
+        await engine.executeRaw(`REVOKE ALL ON SCHEMA public FROM ${role}`);
+        await engine.executeRaw(`DROP ROLE IF EXISTS ${role}`);
+      }
+    }, 60_000);
+
     test('a withdrawn fact stays withdrawn across the migration', async () => {
       const claim = 'Withdrawal example: the meeting moved to Friday.';
       const [{ fp }] = await fingerprints(claim) as Array<{ fp: string }>;
