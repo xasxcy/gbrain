@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 10
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
