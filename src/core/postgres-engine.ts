@@ -1109,8 +1109,9 @@ export class PostgresEngine implements BrainEngine {
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
     // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
-    // swamped source dampening). A PGroonga-only hit has ts_rank 0: floor it so the factor still orders it.
-    const scoreExpr = `${this._usePgroonga ? 'GREATEST(' : '('}ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))${this._usePgroonga ? ', 1e-6)' : ')'} * ${sourceFactorCase}`;
+    // swamped source dampening). A PGroonga-only hit has ts_rank 0: +1e-6 keeps it positive (order-preserving).
+    const rankExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))`;
+    const scoreExpr = `${this._usePgroonga ? `(${rankExpr} + 1e-6)` : rankExpr} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
@@ -1323,8 +1324,9 @@ export class PostgresEngine implements BrainEngine {
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
     // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
-    // swamped source dampening). A PGroonga-only hit has ts_rank 0: floor it so the factor still orders it.
-    const scoreExpr = `${this._usePgroonga ? 'GREATEST(' : '('}ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))${this._usePgroonga ? ', 1e-6)' : ')'} * ${sourceFactorCase}`;
+    // swamped source dampening). A PGroonga-only hit has ts_rank 0: +1e-6 keeps it positive (order-preserving).
+    const rankExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))`;
+    const scoreExpr = `${this._usePgroonga ? `(${rankExpr} + 1e-6)` : rankExpr} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
