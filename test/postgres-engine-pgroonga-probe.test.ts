@@ -141,4 +141,15 @@ describe('probePgroongaExtension: timeout cancel', () => {
       process.off('unhandledRejection', onUnhandled);
     }
   });
+
+  test('a cancel that never settles is not awaited: the probe still returns on its own deadline', async () => {
+    let cancels = 0;
+    const hung = Object.assign(new Promise<ArrayLike<unknown>>(() => {}), {
+      cancel: () => { cancels++; return new Promise<void>(() => {}); },
+    });
+    const started = Date.now();
+    expect(await probePgroongaExtension(() => hung, 20)).toBe('failed');
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(cancels).toBe(1);
+  });
 });

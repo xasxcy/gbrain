@@ -57,6 +57,16 @@ describe('embedWithTruncationFallbackPartial: bisection sub-request errors', () 
     expect(result.vectors.map((v, i) => (v !== null) === (i !== 37)).every(Boolean)).toBe(true);
   });
 
+  test('an empty input whose provider call fails invalid-input terminates without a fatal (no endless empty bisection)', async () => {
+    let calls = 0;
+    const embedFn: EmbedFn = async () => { calls++; if (calls > 10) throw new Error('runaway'); throw new Error('400 invalid input: rejected'); };
+    const result = await embedWithTruncationFallbackPartial([], embedFn, { policy: 'partial-stale', expectedDimensions: DIMS });
+    expect(result.fatalError).toBeUndefined();
+    expect(result.vectors).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(calls).toBe(1);
+  });
+
   test('invalid-input -> sub-request 401 stays run-fatal and names every index of the failing group', async () => {
     const { embedFn } = provider(4, () => Object.assign(new AIConfigError('401 Unauthorized: invalid api key'), { status: 401 }));
     const result = await embedWithTruncationFallbackPartial(texts, embedFn, { policy: 'partial-stale', expectedDimensions: DIMS });

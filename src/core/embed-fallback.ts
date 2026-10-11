@@ -236,6 +236,7 @@ async function bisectInvalidInputs(
   invalidError: unknown,
 ): Promise<{ fatalError?: unknown; fatalIndexes?: number[]; aborted?: boolean }> {
   if (opts.abortSignal?.aborted) return { aborted: true };
+  if (texts.length === 0) return {}; // R7b: an empty group would split into empty groups forever
   if (texts.length === 1) {
     failures.push({ index: offset, error: invalidError });
     return {};
