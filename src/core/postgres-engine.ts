@@ -179,6 +179,10 @@ export function getPostgresSchema(
 // See TODOS.md item: "err.code-based connection-error matching" for the
 // follow-up that will reintroduce a typed retry mechanism.
 
+/** FORK: Postgres vector-arm budget (upstream default 8 s): cold HNSW scans on this deployment's ~445MB
+ *  corpus need 15 s; pool escalation and the server-cancelled exact fallback keep upstream semantics. */
+export const POSTGRES_VECTOR_POOL_BUDGET_MS = 15_000;
+
 export class PostgresEngine implements BrainEngine {
   private vectorIterativeScan?: Promise<boolean>;
   private readonly vectorScope = vectorScopeLoader(() => this.executeRaw<PageSourceStats>(PAGE_SOURCE_STATS_SQL), ids => this.executeRaw<ScopeChunkCount>(SCOPE_CHUNKS_SQL, [ids]));
@@ -1104,11 +1108,10 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // pgroonga_score is only meaningful under an index scan; the planner's sequential scan (small or
-    // freshly loaded tables) yields 0 for every row, which erases the ranking. Fall back to the tsvector rank then.
-    const scoreExpr = this._usePgroonga
-      ? `COALESCE(NULLIF(pgroonga_score(cc.tableoid, cc.ctid), 0), ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))) * ${sourceFactorCase}`
-      : `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
+    // PGroonga selects matches; ranking retains the upstream tsvector scale.
+    // Mixing its index-dependent term-frequency score with ts_rank overwhelms
+    // source dampening and changes ordering when the planner chooses a scan.
+    const scoreExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
@@ -1320,11 +1323,9 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // pgroonga_score is only meaningful under an index scan; the planner's sequential scan (small or
-    // freshly loaded tables) yields 0 for every row, which erases the ranking. Fall back to the tsvector rank then.
-    const scoreExpr = this._usePgroonga
-      ? `COALESCE(NULLIF(pgroonga_score(cc.tableoid, cc.ctid), 0), ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))) * ${sourceFactorCase}`
-      : `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
+    // Keep the chunk-grain arm on the same upstream ranking scale as pages;
+    // PGroonga matching must not replace source-aware ts_rank ordering.
+    const scoreExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
@@ -1420,10 +1421,7 @@ export class PostgresEngine implements BrainEngine {
         }, { alwaysTransaction: true, jitOff: true });
       },
       opts?.onVectorPoolMeta,
-      // FORK: cold HNSW scans against this deployment's ~445MB corpus need
-      // 15 seconds. Preserve upstream's pool escalation/exact fallback while
-      // giving this vector arm its established budget.
-      15_000,
+      POSTGRES_VECTOR_POOL_BUDGET_MS,
     );
     return rows.map(rowToSearchResult);
   }

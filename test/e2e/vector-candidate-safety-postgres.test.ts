@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { PostgresEngine, POSTGRES_VECTOR_POOL_BUDGET_MS } from '../../src/core/postgres-engine.ts';
 import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
 import { candidateColumn, candidateVector, seedVectorCandidateCorpus, verifyVectorCapabilityRetry } from '../helpers/vector-candidate-corpus.ts';
 import type { SearchOpts } from '../../src/core/types.ts';
@@ -172,7 +172,8 @@ import type { SearchOpts } from '../../src/core/types.ts';
       const events: Array<{ reason?: string; exactFallback?: boolean }> = [];
       const start = performance.now();
       const hits = await engine.searchVector(candidateVector, { ...opts, onVectorPoolMeta: meta => events.push(meta) });
-      expect(performance.now() - start).toBeLessThan(15_000);
+      // FORK: the server cancels at the fork's vector budget (15 s, upstream 8 s); allow 1 s for the transaction round trips.
+      expect(performance.now() - start).toBeLessThan(POSTGRES_VECTOR_POOL_BUDGET_MS + 1_000);
       expect(hits.length).toBeGreaterThan(0);
       expect(hits.length).toBeLessThan(75);
       expect(events).toHaveLength(1);

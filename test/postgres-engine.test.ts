@@ -83,7 +83,8 @@ describe('postgres-engine / search path timeout isolation', () => {
     const attempt = stripComments(SRC).split('private runVectorAttempt(')[1]!.split('async getEmbeddingsByChunkIds(')[0]!;
     const vector = extractMethod(SRC, 'searchVector');
     expect(keyword).toMatch(/SET\s+LOCAL\s+statement_timeout\s*=\s*'8s'/);
-    expect(vector).toMatch(/searchVectorPool\([\s\S]*?opts\?\.onVectorPoolMeta,\s*[\s\S]*?15_000,/);
+    expect(vector).toMatch(/searchVectorPool\([\s\S]*?opts\?\.onVectorPoolMeta,\s*POSTGRES_VECTOR_POOL_BUDGET_MS,\s*\);/);
+    expect(SRC).toContain('export const POSTGRES_VECTOR_POOL_BUDGET_MS = 15_000;');
     expect(VECTOR_STATEMENT_SRC).toContain("export const SET_STATEMENT_TIMEOUT_SQL = `SELECT set_config('statement_timeout', $1, true)`;");
     expect(attempt).toMatch(/tx\.unsafe\(SET_STATEMENT_TIMEOUT_SQL, \[String\(remainingVectorBudget\(deadline\)\)\]\)/);
     expect(attempt).toContain('withVectorSettings');
