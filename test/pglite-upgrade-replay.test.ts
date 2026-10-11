@@ -80,7 +80,9 @@ const FRESH_GOLDEN = 'pglite-upgrade-replay/catalog-before-boot';
 const WHITESPACE_ONLY_FUNCTION_DRIFT = [
   'bump_page_generation_clock_fn()',
   'bump_page_generation_fn()',
-  'update_page_search_vector()',
+  // FORK: update_page_search_vector() is no longer drift. The fork's v235 recreates it with the exact text the schema
+  // blob replays, so a fresh install, the upgrade boot and the repeat boot all agree (a different whitespace layout
+  // would flip the body between boots: boot N leaves v235's text, boot N+1 puts the blob's back).
 ];
 /** The OID-churn list is already sorted identity keys; nothing volatile to scrub. */
 const recreatedObjectsNormalizer = defineNormalizer<string[]>('oid-churn-keys-v1', (keys) => [...keys].sort());

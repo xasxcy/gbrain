@@ -56,6 +56,8 @@
       "drift_decisions.drift_decisions_pkey": "p PRIMARY KEY (id)",
       "drift_decisions.drift_decisions_recommended_weight_check": "c CHECK (((recommended_weight >= (0)::double precision) AND (recommended_weight <= (1)::double precision)))",
       "drift_decisions.drift_decisions_take_id_fkey": "f FOREIGN KEY (take_id) REFERENCES takes(id) ON DELETE CASCADE",
+      "embed_failures.embed_failures_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "embed_failures.embed_failures_pkey": "p PRIMARY KEY (source_id, page_id, chunk_index, embedding_signature, chunk_hash)",
       "entity_identities.entity_identities_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "entity_identities.entity_identities_page_uniq": "u UNIQUE (source_id, page_id)",
       "entity_identities.entity_identities_pkey": "p PRIMARY KEY (id)",
@@ -98,7 +100,7 @@
       "files.files_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE SET NULL",
       "files.files_pkey": "p PRIMARY KEY (id)",
       "files.files_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
-      "files.files_storage_path_key": "u UNIQUE (storage_path)",
+      "files.files_source_storage_key": "u UNIQUE (source_id, storage_path)",
       "gbrain_cycle_locks.gbrain_cycle_locks_pkey": "p PRIMARY KEY (id)",
       "ingest_log.ingest_log_pkey": "p PRIMARY KEY (id)",
       "link_edge_proposals.link_edge_proposals_a_to_page_id_fkey": "f FOREIGN KEY (a_to_page_id) REFERENCES pages(id) ON DELETE CASCADE",
@@ -460,7 +462,7 @@
       "gbrain_stamp_version_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=1b28a0e5769198d86490dc20b2aee80b7e6595670428a63ac9c6825cd2a35b10",
       "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=50e9b0e5bf37eeae6555dd16c8104cb0807be6c05a79e0c82237d45162c21dc2",
       "update_chunk_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e12c37d5489202aaf708560db42e6c0c7c8886d198d412e1c5d915c3ae782559",
-      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=1ff2515e6d6626907c0a6b660e31bd13bf51fe38fc585f7380d57ed746dc3357"
+      "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=8e2e253471f22c3e70b2fa2e67ba9162ee3d2c764d175cb5b674db2b907d1e9d"
     },
     "grants": {
       "access_tokens": [
@@ -542,6 +544,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "drift_decisions": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "embed_failures": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "entity_identities": [
@@ -919,6 +924,8 @@
       "dream_verdicts_expires_idx": "CREATE INDEX dream_verdicts_expires_idx ON public.dream_verdicts USING btree (expires_at)",
       "dream_verdicts_pkey": "CREATE UNIQUE INDEX dream_verdicts_pkey ON public.dream_verdicts USING btree (file_path, content_hash)",
       "drift_decisions_pkey": "CREATE UNIQUE INDEX drift_decisions_pkey ON public.drift_decisions USING btree (id)",
+      "embed_failures_active_idx": "CREATE INDEX embed_failures_active_idx ON public.embed_failures USING btree (page_id, chunk_index, embedding_signature, chunk_hash)",
+      "embed_failures_pkey": "CREATE UNIQUE INDEX embed_failures_pkey ON public.embed_failures USING btree (source_id, page_id, chunk_index, embedding_signature, chunk_hash)",
       "entity_identities_canonical_uniq": "CREATE UNIQUE INDEX entity_identities_canonical_uniq ON public.entity_identities USING btree (entity_id) WHERE canonical",
       "entity_identities_entity_idx": "CREATE INDEX entity_identities_entity_idx ON public.entity_identities USING btree (entity_id)",
       "entity_identities_page_uniq": "CREATE UNIQUE INDEX entity_identities_page_uniq ON public.entity_identities USING btree (source_id, page_id)",
@@ -945,7 +952,7 @@
       "facts_pkey": "CREATE UNIQUE INDEX facts_pkey ON public.facts USING btree (id)",
       "facts_typed_claim_idx": "CREATE INDEX facts_typed_claim_idx ON public.facts USING btree (entity_slug, claim_metric, valid_from) WHERE (claim_metric IS NOT NULL)",
       "files_pkey": "CREATE UNIQUE INDEX files_pkey ON public.files USING btree (id)",
-      "files_storage_path_key": "CREATE UNIQUE INDEX files_storage_path_key ON public.files USING btree (storage_path)",
+      "files_source_storage_key": "CREATE UNIQUE INDEX files_source_storage_key ON public.files USING btree (source_id, storage_path)",
       "gbrain_cycle_locks_pkey": "CREATE UNIQUE INDEX gbrain_cycle_locks_pkey ON public.gbrain_cycle_locks USING btree (id)",
       "idx_access_tokens_hash": "CREATE INDEX idx_access_tokens_hash ON public.access_tokens USING btree (token_hash) WHERE (revoked_at IS NULL)",
       "idx_budget_reservations_expires": "CREATE INDEX idx_budget_reservations_expires ON public.budget_reservations USING btree (expires_at) WHERE (status = 'held'::text)",
@@ -1777,6 +1784,25 @@
           "7 decided_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
           "8 applied_at timestamp with time zone/timestamptz NULL",
           "9 applied_by text/text NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "embed_failures": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 page_id bigint/int8 NOT NULL",
+          "3 slug text/text NOT NULL",
+          "4 chunk_index integer/int4 NOT NULL",
+          "5 embedding_signature text/text NOT NULL",
+          "6 chunk_hash text/text NOT NULL",
+          "7 error_class text/text NOT NULL",
+          "8 error_fingerprint text/text NOT NULL",
+          "9 attempt_count integer/int4 NOT NULL DEFAULT 1",
+          "10 first_seen timestamp with time zone/timestamptz NOT NULL",
+          "11 last_seen timestamp with time zone/timestamptz NOT NULL",
+          "12 next_retry_at timestamp with time zone/timestamptz NOT NULL",
+          "13 quarantined_at timestamp with time zone/timestamptz NULL",
+          "14 quarantine_reason text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

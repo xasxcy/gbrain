@@ -62,6 +62,10 @@ const ROWS: readonly Row[] = [
   ['dream_synthesis_completions', 'out_of_scope', 'no_memory_text', 'source_id idempotency_key'],
   ['dream_verdicts', 'out_of_scope', 'probed_reported', 'file_path content_hash reasons content_type segments entities model', 'segments entities reasons'],
   ['drift_decisions', 'out_of_scope', 'probed_reported', 'reasoning applied_by', 'reasoning'],
+  // FORK: embed_failures retry ledger. Slug/ids, a hash of the chunk text, a sha256 of the normalised provider error
+  // (embed-failure.ts fingerprintEmbedFailure), an error-class enum and the quarantine class: no memory text. Rows
+  // are page-scoped (page_id ON DELETE CASCADE), so a purged page takes its ledger rows with it.
+  ['embed_failures', 'out_of_scope', 'no_memory_text', 'source_id slug embedding_signature chunk_hash error_class error_fingerprint quarantine_reason'],
   ['entity_identities', 'out_of_scope', 'no_memory_text', 'entity_id source_id established_by'],
   ['eval_candidates', 'out_of_scope', 'probed_reported', 'tool_name query retrieved_slugs source_ids detail detail_resolved salience_param recency_param salience_resolved recency_resolved salience_source recency_source embedding_column schema_pack_per_source', 'query'],
   ['eval_capture_failures', 'out_of_scope', 'no_memory_text', 'reason'],

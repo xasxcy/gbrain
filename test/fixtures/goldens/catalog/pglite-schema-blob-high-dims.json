@@ -32,6 +32,8 @@
       "derivation_inputs.derivation_inputs_pkey": "p PRIMARY KEY (derived_table, derived_id, input_table, input_id)",
       "derivation_inputs.derivation_inputs_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "dream_synthesis_completions.dream_synthesis_completions_pkey": "p PRIMARY KEY (source_id, idempotency_key)",
+      "embed_failures.embed_failures_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "embed_failures.embed_failures_pkey": "p PRIMARY KEY (source_id, page_id, chunk_index, embedding_signature, chunk_hash)",
       "eval_candidates.eval_candidates_detail_check": "c CHECK (((detail IS NULL) OR (detail = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))))",
       "eval_candidates.eval_candidates_detail_resolved_check": "c CHECK (((detail_resolved IS NULL) OR (detail_resolved = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))))",
       "eval_candidates.eval_candidates_pkey": "p PRIMARY KEY (id)",
@@ -59,7 +61,7 @@
       "files.files_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE SET NULL",
       "files.files_pkey": "p PRIMARY KEY (id)",
       "files.files_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
-      "files.files_storage_path_key": "u UNIQUE (storage_path)",
+      "files.files_source_storage_key": "u UNIQUE (source_id, storage_path)",
       "gbrain_cycle_locks.gbrain_cycle_locks_pkey": "p PRIMARY KEY (id)",
       "ingest_log.ingest_log_pkey": "p PRIMARY KEY (id)",
       "link_edge_proposals.link_edge_proposals_a_to_page_id_fkey": "f FOREIGN KEY (a_to_page_id) REFERENCES pages(id) ON DELETE CASCADE",
@@ -380,6 +382,9 @@
       "dream_synthesis_completions": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "embed_failures": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "eval_candidates": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -673,6 +678,8 @@
       "decision_receipts_slot_created_idx": "CREATE INDEX decision_receipts_slot_created_idx ON public.decision_receipts USING btree (slot, created_at)",
       "derivation_inputs_pkey": "CREATE UNIQUE INDEX derivation_inputs_pkey ON public.derivation_inputs USING btree (derived_table, derived_id, input_table, input_id)",
       "dream_synthesis_completions_pkey": "CREATE UNIQUE INDEX dream_synthesis_completions_pkey ON public.dream_synthesis_completions USING btree (source_id, idempotency_key)",
+      "embed_failures_active_idx": "CREATE INDEX embed_failures_active_idx ON public.embed_failures USING btree (page_id, chunk_index, embedding_signature, chunk_hash)",
+      "embed_failures_pkey": "CREATE UNIQUE INDEX embed_failures_pkey ON public.embed_failures USING btree (source_id, page_id, chunk_index, embedding_signature, chunk_hash)",
       "eval_candidates_pkey": "CREATE UNIQUE INDEX eval_candidates_pkey ON public.eval_candidates USING btree (id)",
       "eval_capture_failures_pkey": "CREATE UNIQUE INDEX eval_capture_failures_pkey ON public.eval_capture_failures USING btree (id)",
       "eval_contradictions_cache_expires_idx": "CREATE INDEX eval_contradictions_cache_expires_idx ON public.eval_contradictions_cache USING btree (expires_at)",
@@ -692,7 +699,7 @@
       "fact_relink_attempts_pkey": "CREATE UNIQUE INDEX fact_relink_attempts_pkey ON public.fact_relink_attempts USING btree (source_id, fact_id)",
       "fact_withdrawals_pkey": "CREATE UNIQUE INDEX fact_withdrawals_pkey ON public.fact_withdrawals USING btree (source_id, visibility, subject, fact_hash)",
       "files_pkey": "CREATE UNIQUE INDEX files_pkey ON public.files USING btree (id)",
-      "files_storage_path_key": "CREATE UNIQUE INDEX files_storage_path_key ON public.files USING btree (storage_path)",
+      "files_source_storage_key": "CREATE UNIQUE INDEX files_source_storage_key ON public.files USING btree (source_id, storage_path)",
       "gbrain_cycle_locks_pkey": "CREATE UNIQUE INDEX gbrain_cycle_locks_pkey ON public.gbrain_cycle_locks USING btree (id)",
       "idx_access_tokens_hash": "CREATE INDEX idx_access_tokens_hash ON public.access_tokens USING btree (token_hash) WHERE (revoked_at IS NULL)",
       "idx_chat_usage_log_created": "CREATE INDEX idx_chat_usage_log_created ON public.chat_usage_log USING btree (created_at)",
@@ -1287,6 +1294,25 @@
           "1 source_id text/text NOT NULL",
           "2 idempotency_key text/text NOT NULL",
           "3 completed_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "embed_failures": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 page_id bigint/int8 NOT NULL",
+          "3 slug text/text NOT NULL",
+          "4 chunk_index integer/int4 NOT NULL",
+          "5 embedding_signature text/text NOT NULL",
+          "6 chunk_hash text/text NOT NULL",
+          "7 error_class text/text NOT NULL",
+          "8 error_fingerprint text/text NOT NULL",
+          "9 attempt_count integer/int4 NOT NULL DEFAULT 1",
+          "10 first_seen timestamp with time zone/timestamptz NOT NULL",
+          "11 last_seen timestamp with time zone/timestamptz NOT NULL",
+          "12 next_retry_at timestamp with time zone/timestamptz NOT NULL",
+          "13 quarantined_at timestamp with time zone/timestamptz NULL",
+          "14 quarantine_reason text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

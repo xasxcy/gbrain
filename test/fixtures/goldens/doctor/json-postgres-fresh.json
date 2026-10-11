@@ -502,7 +502,7 @@
         },
         {
           "category": "ops",
-          "message": "RLS enabled on 132/132 public tables",
+          "message": "RLS enabled on 133/133 public tables",
           "name": "rls",
           "status": "ok"
         },
@@ -514,7 +514,7 @@
         },
         {
           "category": "meta",
-          "message": "1072 column(s) verified against live schema",
+          "message": "1086 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -2115,6 +2115,12 @@
           "category": "brain",
           "message": "Embeddings disabled — no active embedding width to reconcile.",
           "name": "embedding_width_consistency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "message": "gateway not configured — skipping embed_failures check.",
+          "name": "embed_failures",
           "status": "ok"
         },
         {

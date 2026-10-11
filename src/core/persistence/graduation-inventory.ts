@@ -55,6 +55,7 @@ export const GRADUATION_INVENTORY: Inventory = {
     carry('dream_synthesis_completions', 'user_data', 'Dream synthesis idempotency ledger.'),
     carry('dream_verdicts', 'operational', 'Paid dream triage verdict cache.'),
     carry('drift_decisions', 'user_data', 'Take drift decisions and when they were applied.'),
+    carry('embed_failures', 'operational', 'Embedding retry ledger (attempt counts, backoff schedule, quarantine of chunks the provider keeps rejecting); dropping it would re-send quarantined chunks to the paid provider. Keyed by page_id and chunk_index, which carry.'),
     carry('entity_identities', 'user_data', 'Established entity identities.'),
     carry('eval_candidates', 'operational', 'Captured retrieval eval candidates.'),
     carry('eval_capture_failures', 'operational', 'Eval capture failure log.'),

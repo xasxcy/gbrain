@@ -100,11 +100,13 @@ describe('isolated Bun-linked keyless installation lifecycle', () => {
     const afterUpgrade = JSON.parse(run(['search', keyword, '--source', 'default', '--json']));
     expect(afterUpgrade.some((r: { slug: string; keyword_hit: boolean }) => r.slug === slug && r.keyword_hit)).toBe(true);
     expect(JSON.parse(run(['recall', 'people/example', '--json'])).facts.some((f: { fact: string }) => f.fact === fact)).toBe(true);
-    // This lifecycle writes directly; it deliberately never performs a source
-    // sync. Doctor therefore reports the expected freshness remediation and
-    // exits nonzero, while the keyless embedding invariants must remain sound.
-    const doctor = JSON.parse(run(['doctor', '--json'], launcher, home, [0, 1]));
-    expect(doctor.checks.find((c: { name: string }) => c.name === 'sync_freshness')).toMatchObject({ status: 'fail' });
+    // This lifecycle writes directly and deliberately never performs a source sync. Its default source is a
+    // writer-owned canonical content root (shared-skills content receipt), so doctor reports upstream sync as not
+    // applicable (ok, counted under writer_owned_count) instead of a freshness remediation, and exits 0. Before
+    // the upstream v0.60.139.0 merge the fork's doctor reported sync_freshness fail here and exited 1.
+    const doctor = JSON.parse(run(['doctor', '--json']));
+    expect(doctor.checks.find((c: { name: string }) => c.name === 'sync_freshness'))
+      .toMatchObject({ status: 'ok', details: { writer_owned_count: 1, stale_count: 0 } });
     for (const name of ['embedding_width_consistency', 'embedding_column_registry']) {
       expect(doctor.checks.find((c: { name: string }) => c.name === name)?.status, name).toBe('ok');
     }

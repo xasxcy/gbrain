@@ -98,7 +98,10 @@ describe('nightly E2E scheduling', () => {
     const job = workflow.jobs['coverage-full-e2e'];
     expect(job.if).toBe(fullProfile);
     expect(job.strategy).toEqual({ 'fail-fast': false, matrix: { shard: [1, 2, 3, 4] } });
-    expect(job.services.postgres.image).toBe('pgvector/pgvector:pg16');
+    // FORK: every Postgres job in the fork's e2e workflow runs on the pgroonga-enabled image (migration v231 needs the
+    // extension, which pgvector/pgvector:pg16 lacks); the nightly job must use the same one as the PR tier.
+    expect(job.services.postgres.image).toMatch(/^ghcr\.io\/xasxcy\/gbrain-cjk-postgres:\d{8}$/);
+    expect(job.services.postgres.image).toBe(workflow.jobs.tier1.services.postgres.image);
     const run = job.steps.find((step: any) => step.run === 'bash scripts/run-e2e.sh');
     expect(run.env.SHARD).toBe('${{ matrix.shard }}/4');
     expect(run.env.DATABASE_URL).toContain('/gbrain_test');

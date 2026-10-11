@@ -58,6 +58,9 @@
       "embed": [
         "./commands/embed.ts"
       ],
+      "embed-failures": [
+        "./commands/embed-failures.ts"
+      ],
       "enrich": [
         "./commands/enrich.ts"
       ],

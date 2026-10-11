@@ -124,6 +124,34 @@ async function noticeIdleBlockers(engine: BrainEngine, deps: ForkMigrationDeps):
  *  upstream and must stay byte-identical to it. */
 export const FORK_MIGRATION_FLOOR = 231;
 
+/**
+ * The v235 trigger function. The text is deliberately byte-identical (modulo the language literal) to the one the
+ * PGLite schema blob replays on every boot (pglite-schema.generated.ts). If it differed even in whitespace, boot N
+ * would leave this body and boot N+1 would silently swap it for the blob's, so the "repeat boot is a no-op"
+ * invariant (test/pglite-upgrade-replay.test.ts) would not hold.
+ */
+function pageSearchVectorFunctionSql(lang: string): string {
+  return `
+CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
+DECLARE
+  timeline_text TEXT;
+BEGIN
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  INTO timeline_text
+  FROM timeline_entries
+  WHERE page_id = NEW.id;
+
+  NEW.search_vector :=
+    setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') ||
+    setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') ||
+    setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
+
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+        `;
+}
+
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
@@ -253,16 +281,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         // rather than as an edit to v123/v124 so the upstream half of this file
         // stays byte-identical and the automated sync stops conflicting on it.
         const lang = getFtsLanguage();
-        await engine.executeRaw(`
-          CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
-          DECLARE timeline_text TEXT;
-          BEGIN
-            SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '') INTO timeline_text FROM timeline_entries WHERE page_id = NEW.id;
-            NEW.search_vector := setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') || setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') || setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
-            RETURN NEW;
-          END;
-          $fn$ LANGUAGE plpgsql;
-        `);
+        await engine.executeRaw(pageSearchVectorFunctionSql(lang));
         // Explicit, batched backfill of every existing row whose search_vector
         // is non-null — regardless of language. Pre-fix, this step only did
         // CREATE OR REPLACE and never touched existing rows, so upgraded

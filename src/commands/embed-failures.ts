@@ -45,7 +45,10 @@ function firstPositional(args: string[]): string | undefined {
 
 export async function runEmbedFailures(engine: BrainEngine, args: string[]): Promise<void> {
   const subcommand = args[0];
-  if (subcommand === '--help' || subcommand === '-h' || subcommand === undefined) {
+  // Help is answered before the engine is read: main.ts dispatches this command
+  // through SELF_HELP_WITHOUT_ENGINE with a null engine, so `--help` (anywhere
+  // in args) must never reach a ledger query or a brain connection.
+  if (subcommand === undefined || args.includes('--help') || args.includes('-h')) {
     console.log(HELP);
     return;
   }

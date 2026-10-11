@@ -54,7 +54,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 1,
+            "paramCount": 2,
             "unsafeOptions": {
               "prepare": false,
               "simple": false
@@ -73,7 +73,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 2,
+            "paramCount": 3,
             "unsafeOptions": {
               "prepare": false,
               "simple": false
@@ -375,6 +375,15 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 1,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "sourceId+includeNullSignature": [
@@ -398,6 +407,15 @@
           },
           {
             "paramCount": 5,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -595,7 +613,7 @@
             "via": "unsafe"
           },
           {
-            "paramCount": 1,
+            "paramCount": 2,
             "unsafeOptions": {
               "prepare": false,
               "simple": false
@@ -664,6 +682,15 @@
             "paramCount": 2,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -767,6 +794,15 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "embeddingColumn": [
@@ -819,6 +855,15 @@
             "paramCount": 2,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"
@@ -904,6 +949,15 @@
               "simple": false
             },
             "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
+              "simple": false
+            },
+            "via": "unsafe"
           }
         ],
         "expectedRevision": [
@@ -973,6 +1027,15 @@
             "paramCount": 2,
             "unsafeOptions": {
               "prepare": false,
+              "simple": false
+            },
+            "via": "unsafe"
+          },
+          {
+            "paramCount": 2,
+            "unsafeOptions": {
+              "cancelFence": false,
+              "prepare": true,
               "simple": false
             },
             "via": "unsafe"

@@ -795,6 +795,10 @@
       },
       {
         "category": "brain",
+        "name": "embed_failures"
+      },
+      {
+        "category": "brain",
         "name": "facts_embedding_width_consistency"
       },
       {

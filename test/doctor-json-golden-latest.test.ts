@@ -9,8 +9,10 @@
 import { describe, expect, test } from 'bun:test';
 import { expectSchemaLatestMatchesRegistry, normalizeDoctorText, type GbrainRun } from './helpers/doctor-json-golden.ts';
 import { MIGRATIONS } from '../src/core/schema-migrations/registry.generated.ts';
+import { FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 
-const LATEST = Math.max(...MIGRATIONS.map((m) => m.version));
+// FORK: the effective latest is the upstream registry maximum or the fork's appended migrations, whichever is higher.
+const LATEST = Math.max(Math.max(...MIGRATIONS.map((m) => m.version)), FORK_LATEST_VERSION);
 
 function run(message: string): GbrainRun {
   return { args: [], exitCode: 0, stdout: '', stderr: '', roots: {}, json: { checks: [{ name: 'schema_version', message }] } };
