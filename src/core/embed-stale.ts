@@ -411,10 +411,9 @@ export async function embedStaleForSource(
   const write = (message: string): void => { process.stderr.write(`\n  ${message}\n`); };
   let signatureInvalidationFailed = false;
   const stopped = () => !!signal?.aborted || Date.now() >= (opts.deadline ?? Infinity);
-  // Lease loss is recorded as the stop signal's reason (the handler's assertOwned aborts
-  // with a LockStolenError before throwing). Every catch that would otherwise map a stop
-  // to `aborted` re-raises it first: lease loss is never reported as an abort.
-  const throwIfLeaseLost = (): void => { if (signal?.reason instanceof LockStolenError) throw signal.reason; };
+  // Lease loss is never reported as an abort: each catch re-raises it first, from the caught error itself, else from the
+  // stop signal's reason (the handler's assertOwned aborts with it). The signal alone is not trusted: an abort can lose its reason.
+  const throwIfLeaseLost = (error?: unknown): void => { if (error instanceof LockStolenError) throw error; if (signal?.reason instanceof LockStolenError) throw signal.reason; };
   if (stopped()) return { ...result, aborted: true };
   await opts.assertOwned?.();
   if (stopped()) return { ...result, aborted: true };
@@ -488,7 +487,7 @@ export async function embedStaleForSource(
         }
       }
     } catch (error) {
-      throwIfLeaseLost();
+      throwIfLeaseLost(error);
       if (stopped()) return { ...result, aborted: true };
       await opts.assertOwned?.();
       // Non-fatal: fall through to the NULL-only stale loop. FORK: the failure
@@ -514,8 +513,8 @@ export async function embedStaleForSource(
       if (stopped()) throw new AbortError();
       return invalidated;
     }) : await engine.invalidateContentDriftEmbeddings({ sourceId });
-  } catch {
-    throwIfLeaseLost();
+  } catch (error) {
+    throwIfLeaseLost(error);
     if (stopped()) return { ...result, aborted: true };
     await opts.assertOwned?.();
     // Non-fatal: fall through to the NULL-only stale loop.
@@ -591,7 +590,7 @@ export async function embedStaleForSource(
         }
       } catch (e: unknown) {
         if (healOwnershipFailure) throw healOwnershipFailure.error;
-        throwIfLeaseLost();
+        throwIfLeaseLost(e);
         result.failures = (result.failures ?? 0) + stale.length;
         if (stopped()) return;
         process.stderr.write(
@@ -650,7 +649,7 @@ export async function embedStaleForSource(
           // surface the drain's resumable aborted state to its caller.
           // Only a genuine stop (signal fired or deadline reached) maps to
           // aborted; lease loss recorded as the signal reason stays an error.
-          if (signal?.reason instanceof LockStolenError) throw signal.reason;
+          throwIfLeaseLost(error);
           if (error instanceof Error && error.name === 'AbortError' && stopped()) {
             result.aborted = true;
             return;
@@ -714,7 +713,7 @@ export async function embedStaleForSource(
             // Lease loss/cancellation is control flow; a signature write
             // failure leaves committed vectors in place and is only reported.
             if (ownershipFailure) throw ownershipFailure.error;
-            throwIfLeaseLost();
+            throwIfLeaseLost(error);
             if (stopped() || signal?.aborted) return;
             result.failures = (result.failures ?? 0) + 1;
             write(`[embed-signature-fail] slug=${slug} err=${error instanceof Error ? error.message : String(error)}`);
@@ -737,7 +736,7 @@ export async function embedStaleForSource(
               restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId, observedCorpusGeneration),
             );
           } catch (error) {
-            throwIfLeaseLost();
+            throwIfLeaseLost(error);
             if (signal?.aborted) return;
             result.persistFailures = (result.persistFailures ?? 0) + 1;
             write(`[embed-restamp-fail] slug=${slug} err=${error instanceof Error ? error.message : String(error)}`);

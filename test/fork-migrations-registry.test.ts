@@ -96,6 +96,7 @@ describe('fork migration registry seam', () => {
       allMigrations: () => [v149],
       applyOneMigration: async () => { throw new Error('v149 must not use the independently committing helper'); },
       migrationNotice: () => {},
+      getIdleBlockers: async () => [],
     });
     const repair = migrations.find(migration => migration.version === 240)!;
 
@@ -124,6 +125,7 @@ describe('fork migration registry seam', () => {
       allMigrations: () => [v149],
       applyOneMigration: async () => {},
       migrationNotice: () => {},
+      getIdleBlockers: async () => [],
     }).find(migration => migration.version === 240)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => {
       await repair.handler!(engine);
@@ -153,11 +155,45 @@ describe('fork migration registry seam', () => {
     let failuresLeft = 2;
     const engine = {
       kind: 'postgres',
-      // getIdleBlockers' pg_stat_activity query; anything else is unexpected here.
-      executeRaw: async (sql: string) => {
-        if (!sql.includes('pg_stat_activity')) throw new Error(`unexpected query: ${sql}`);
+      // The diagnostic goes through the injected getIdleBlockers; the engine itself is never queried.
+      executeRaw: async (sql: string) => { throw new Error(`unexpected query: ${sql}`); },
+      transaction: async (work: (tx: Pick<BrainEngine, 'runMigration'>) => Promise<void>) => {
+        await work({ runMigration: async (_version: number, sql: string) => {
+          if (sql === 'old protocol' && failuresLeft-- > 0) {
+            throw Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' });
+          }
+        } });
+      },
+    } as unknown as BrainEngine;
+    const notices: string[] = [];
+    const blockerLookups: BrainEngine[] = [];
+    const repair = buildForkMigrations({
+      allMigrations: () => [v149],
+      applyOneMigration: async () => {},
+      migrationNotice: line => { notices.push(line); },
+      getIdleBlockers: async lookupEngine => {
+        blockerLookups.push(lookupEngine);
         return [{ pid: 4242, state: 'idle in transaction', query_start: '2026-10-10 00:00:00+00', query: 'LOCK TABLE minion_jobs' }];
       },
+    }).find(migration => migration.version === 240)!;
+    await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
+    expect(blockerLookups).toEqual([engine, engine]); // once per retry, against the migrating engine
+
+    const output = notices.join('');
+    expect(output).toContain('[retry 1/3] v149 hit canceling statement due to statement timeout; retrying in 0ms');
+    expect(output).toContain('[retry 2/3] v149 hit canceling statement due to statement timeout; retrying in 0ms');
+    expect(output).toContain('1 idle-in-transaction blocker(s)');
+    expect(output).toContain('PID 4242 idle since 2026-10-10 00:00:00+00');
+    expect(output).toContain('LOCK TABLE minion_jobs');
+    // The final repair notice still follows the successful attempt.
+    expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
+  });
+
+  test('v240: a failing blocker diagnostic costs only the diagnostic, never the migration', async () => {
+    const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
+    let failuresLeft = 1;
+    const engine = {
+      kind: 'postgres',
       transaction: async (work: (tx: Pick<BrainEngine, 'runMigration'>) => Promise<void>) => {
         await work({ runMigration: async (_version: number, sql: string) => {
           if (sql === 'old protocol' && failuresLeft-- > 0) {
@@ -171,16 +207,11 @@ describe('fork migration registry seam', () => {
       allMigrations: () => [v149],
       applyOneMigration: async () => {},
       migrationNotice: line => { notices.push(line); },
+      getIdleBlockers: async () => { throw new Error('pg_stat_activity is restricted'); },
     }).find(migration => migration.version === 240)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
-
-    const output = notices.join('');
-    expect(output).toContain('[retry 1/3] v149 hit canceling statement due to statement timeout; retrying in 0ms');
-    expect(output).toContain('[retry 2/3] v149 hit canceling statement due to statement timeout; retrying in 0ms');
-    expect(output).toContain('1 idle-in-transaction blocker(s)');
-    expect(output).toContain('PID 4242 idle since 2026-10-10 00:00:00+00');
-    expect(output).toContain('LOCK TABLE minion_jobs');
-    // The final repair notice still follows the successful attempt.
+    expect(notices.join('')).toContain('[retry 1/3] v149');
+    expect(notices.join('')).not.toContain('idle-in-transaction blocker');
     expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
   });
 
@@ -197,6 +228,7 @@ describe('fork migration registry seam', () => {
       allMigrations: () => [v149],
       applyOneMigration: async () => {},
       migrationNotice: () => {},
+      getIdleBlockers: async () => [],
     }).find(migration => migration.version === 240)!;
     await repair.handler!(engine);
     expect(statements.length).toBe(2); // v149's body and the canonical protocol, nothing else

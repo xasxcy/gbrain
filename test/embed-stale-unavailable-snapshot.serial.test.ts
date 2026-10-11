@@ -241,3 +241,62 @@ describe('embed --stale lease loss stays a LockStolenError (F4a)', () => {
     expect(row!.embedding_signature).toBeNull();
   });
 });
+
+// F5 review fixes (R5-2/R5-3): lease loss is recognised from the caught LockStolenError itself (a runtime can
+// deliver an abort with no reason), and the slice and restamp rethrow points each have a case that aborts with
+// a LockStolenError and then fails the step.
+describe('embed --stale lease loss detection (F5)', () => {
+  test('R5-2: content-drift invalidation: abort with NO reason, then LockStolenError from the fence, still rejects', async () => {
+    await stalePage('notes/no-reason-drift');
+    const controller = new AbortController();
+    await expect(runEmbedCore(engine, {
+      stale: true, quiet: true, signal: controller.signal,
+      assertOwned: async tx => {
+        if (!tx) return;
+        controller.abort(); // reason is a plain DOMException, not the LockStolenError
+        throw new LockStolenError('embed-backfill:test');
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(controller.signal.reason).not.toBeInstanceOf(LockStolenError);
+    expect(await nullVectors('notes/no-reason-drift')).toBe(1);
+  });
+
+  test('R5-3: slice catch: lease recorded as the abort reason after the writes, before COMMIT, rejects and rolls the slice back', async () => {
+    await stalePage('notes/slice-lease');
+    const controller = new AbortController();
+    const prototype = Object.getPrototypeOf(engine) as { persistEmbedOutcome: (...args: unknown[]) => Promise<unknown> };
+    // Own-property override (transaction-bound engines inherit it); the original runs unbound so it still uses the
+    // transaction connection. The pre-COMMIT stop check then sees the lease loss. Removed in `finally`.
+    (engine as unknown as Record<string, unknown>).persistEmbedOutcome = async function (this: unknown, ...args: unknown[]) {
+      const outcome = await prototype.persistEmbedOutcome.apply(this, args);
+      controller.abort(new LockStolenError('embed-backfill:test'));
+      return outcome;
+    };
+    try {
+      await expect(runEmbedCore(engine, { stale: true, quiet: true, signal: controller.signal })).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).persistEmbedOutcome;
+    }
+    expect(await nullVectors('notes/slice-lease')).toBe(1);
+  });
+
+  test('R5-3: restamp catch: lease recorded as the abort reason, the restamp then fails; committed vectors stay', async () => {
+    await stalePage('notes/restamp-lease');
+    await engine.updatePageContextualRetrievalState('notes/restamp-lease', 'default', 'per_chunk_synopsis', 'gen-synopsis');
+    const controller = new AbortController();
+    let restamps = 0;
+    // The drain's post-slice restamp is the only caller of this method here. Own-property override, removed in `finally`.
+    (engine as unknown as Record<string, unknown>).updatePageContextualRetrievalState = async function () {
+      restamps += 1;
+      controller.abort(new LockStolenError('embed-backfill:test'));
+      throw new Error('restamp failed');
+    };
+    try {
+      await expect(runEmbedCore(engine, { stale: true, quiet: true, signal: controller.signal })).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).updatePageContextualRetrievalState;
+    }
+    expect(restamps).toBe(1);
+    expect(await nullVectors('notes/restamp-lease')).toBe(0);
+  });
+});

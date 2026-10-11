@@ -13,6 +13,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
 import { embedStaleForSource, EMBED_PROBE_TEXT } from '../src/core/embed-stale.ts';
 import { LockStolenError } from '../src/core/db-lock.ts';
+import { createNoopPacer } from '../src/core/db-pacer.ts';
 
 let engine: PGLiteEngine;
 const SIGNATURE = 'test:model:1536';
@@ -316,3 +317,111 @@ describe('lease loss stays a LockStolenError on every catch path (F4a R4-2)', ()
   });
 });
 
+
+// F5 review fixes (R5-2/R5-3): lease loss is recognised from the caught LockStolenError itself, not only
+// from the stop signal's reason (a runtime can deliver an abort with no reason), and every rethrow point
+// has a case that aborts with a LockStolenError and then fails the step.
+describe('lease loss detection does not depend on the signal reason (F5 R5-2)', () => {
+  test('content-drift invalidation: abort with NO reason, then LockStolenError from the fence, still rejects', async () => {
+    await seedPage('no-reason-drift', ['x']);
+    const controller = new AbortController();
+    const { calls, embedFn } = recordingEmbed();
+    await expect(embedStaleForSource(engine, 'default', {
+      embedFn, signal: controller.signal,
+      assertOwned: async tx => {
+        if (!tx) return;
+        controller.abort(); // reason is a plain DOMException, not the LockStolenError
+        throw new LockStolenError('embed-backfill:test');
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(controller.signal.reason).not.toBeInstanceOf(LockStolenError);
+    expect(calls).toEqual([]);
+  });
+
+  test('signature invalidation: abort with NO reason, then LockStolenError from the fence, still rejects', async () => {
+    await seedPage('no-reason-sig', ['x']);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[1536]), ',') || ']')::vector`);
+    await engine.setPageEmbeddingSignature('no-reason-sig', { signature: 'old:model:1536' });
+    const controller = new AbortController();
+    let aborted = false;
+    await expect(embedStaleForSource(engine, 'default', {
+      embeddingSignature: SIGNATURE, embedFn: async texts => texts.map(vec), signal: controller.signal,
+      assertOwned: async tx => {
+        // The first transaction of a drifted run is the signature invalidation.
+        if (!tx || aborted) return;
+        aborted = true;
+        controller.abort();
+        throw new LockStolenError('embed-backfill:test');
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(controller.signal.reason).not.toBeInstanceOf(LockStolenError);
+    // The rolled-back invalidation left the old vector in place.
+    expect(await engine.countStaleChunks({ sourceId: 'default', ignoreBackoff: true })).toBe(0);
+  });
+});
+
+describe('every rethrow point keeps lease loss a LockStolenError (F5 R5-3)', () => {
+  test('heal catch: lease recorded as the abort reason inside the heal transaction, the step then fails with an abort', async () => {
+    await seedPage('heal-abort', ['a']);
+    const controller = new AbortController();
+    let txChecks = 0;
+    const { calls, embedFn } = recordingEmbed();
+    await expect(embedStaleForSource(engine, 'default', {
+      embedFn, signal: controller.signal,
+      assertOwned: async tx => {
+        // Transactional checks: content-drift invalidation (start, end), then the heal transaction (start).
+        if (tx && ++txChecks === 3) controller.abort(new LockStolenError('embed-backfill:test'));
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(txChecks).toBe(3);
+    expect(calls).toEqual([]);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+  });
+
+  test('restamp catch: lease recorded as the abort reason, the restamp then fails; committed vectors stay', async () => {
+    await seedPage('restamp-abort', ['a', 'b']);
+    await engine.updatePageContextualRetrievalState('restamp-abort', 'default', 'per_chunk_synopsis', 'gen-synopsis');
+    const controller = new AbortController();
+    let restamps = 0;
+    // The drain's post-slice restamp is the only caller of this method here. Own-property override,
+    // removed in `finally`.
+    (engine as unknown as Record<string, unknown>).updatePageContextualRetrievalState = async function () {
+      restamps += 1;
+      controller.abort(new LockStolenError('embed-backfill:test'));
+      throw new Error('restamp failed');
+    };
+    try {
+      await expect(embedStaleForSource(engine, 'default', {
+        signal: controller.signal, embedFn: async texts => texts.map(vec),
+      })).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      delete (engine as unknown as Record<string, unknown>).updatePageContextualRetrievalState;
+    }
+    expect(restamps).toBe(1);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+
+  test('worker join: lease recorded as the abort reason after the last page, with no catch on the way, still rejects', async () => {
+    await seedPage('join-abort', ['a']);
+    const controller = new AbortController();
+    const pacer = createNoopPacer();
+    // The only code that runs between the page finishing and the workers joining.
+    pacer.pace = async () => { controller.abort(new LockStolenError('embed-backfill:test')); };
+    await expect(embedStaleForSource(engine, 'default', {
+      signal: controller.signal, pacer, embedFn: async texts => texts.map(vec),
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(0);
+  });
+
+  test('control: the same worker-join abort with an ordinary reason is still reported as aborted', async () => {
+    await seedPage('join-plain', ['a']);
+    const controller = new AbortController();
+    const pacer = createNoopPacer();
+    pacer.pace = async () => { controller.abort(); };
+    const result = await embedStaleForSource(engine, 'default', {
+      signal: controller.signal, pacer, embedFn: async texts => texts.map(vec),
+    });
+    expect(result.aborted).toBe(true);
+  });
+});

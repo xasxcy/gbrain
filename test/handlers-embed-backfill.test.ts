@@ -167,6 +167,31 @@ describe('embed-backfill handler — D2 lock contract', () => {
     expect(checked).toBe(true);
   });
 
+  test('F5 R5-2: lease loss is rejected even when the runtime drops the abort reason (aborted:true, reason not a LockStolenError)', async () => {
+    // Bun can deliver abort() with the reason lost. The handler records the loss itself instead of reading the
+    // signal back, so a drain that swallowed the fence error and reports `aborted` still rejects.
+    const abort = AbortController.prototype.abort;
+    let checked = false;
+    const handler = makeEmbedBackfillHandler(engine, {
+      runStale: async (_engine, _source, opts) => {
+        await engine.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid() WHERE id='gbrain-embed-backfill:default'");
+        // From here on abort() ignores its reason argument, as in the lost-reason case.
+        AbortController.prototype.abort = function (this: AbortController) { return abort.call(this); };
+        await expect(engine.transaction(tx => opts!.assertOwned!(tx))).rejects.toThrow('stolen');
+        expect(opts!.signal!.aborted).toBe(true);
+        expect(opts!.signal!.reason).not.toBeInstanceOf(LockStolenError);
+        checked = true;
+        return { embedded: 0, chunksProcessed: 0, pagesProcessed: 0, invalidated: 0, lastCursor: null, done: false, aborted: true };
+      },
+    });
+    try {
+      await expect(handler(fakeJob({ sourceId: 'default' }))).rejects.toBeInstanceOf(LockStolenError);
+    } finally {
+      AbortController.prototype.abort = abort;
+    }
+    expect(checked).toBe(true);
+  });
+
   test('F4a R4-2: ownership lost inside a fenced transaction (abort, then throw) rejects instead of status:aborted', async () => {
     // Real drain. The content-drift invalidation transaction steals the lease from inside; its own second
     // assertOwned(tx) then aborts the drain signal with a LockStolenError and throws. That catch used to map

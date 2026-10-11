@@ -81,6 +81,7 @@ MIGRATIONS.push(...buildForkMigrations({
   allMigrations: () => MIGRATIONS,
   applyOneMigration,
   migrationNotice,
+  getIdleBlockers,
 }));
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

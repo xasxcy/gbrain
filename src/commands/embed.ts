@@ -1664,9 +1664,9 @@ async function embedAllStale(
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
   if (isAborted(externalSignal)) return;
-  // Lease loss is the stop signal's reason (the owner's assertOwned aborts with LockStolenError before
-  // throwing): every catch that would map a stop to a quiet return re-raises it first.
-  const throwIfLeaseLost = (): void => { if (externalSignal?.reason instanceof LockStolenError) throw externalSignal.reason; };
+  // Every catch that would map a stop to a quiet return re-raises lease loss first: the caught error itself, else
+  // the stop signal's reason (a runtime can deliver an abort with no reason, so the signal alone is not trusted).
+  const throwIfLeaseLost = (error?: unknown): void => { if (error instanceof LockStolenError) throw error; if (externalSignal?.reason instanceof LockStolenError) throw externalSignal.reason; };
   const includeNullSig = !!staleOpts?.includeNullSignature;
   const ignoreBackoff = !!staleOpts?.ignoreBackoff;
   const noteBudgetStop = () => noteEmbedBudgetStop(engine, result, { sourceId, signature, includeNullSignature: includeNullSig, skip: dryRun || BUDGET_MS === null || isAborted(externalSignal) });
@@ -1819,8 +1819,8 @@ async function embedAllStale(
       if (drifted > 0 && !staleOpts?.quiet) {
         slog(`[embed] invalidated ${drifted} chunk(s) whose text changed after embedding (content drift)`);
       }
-    } catch {
-      throwIfLeaseLost();
+    } catch (error) {
+      throwIfLeaseLost(error);
       // Best-effort (pre-v133 schema mid-upgrade); the NULL-only loop still runs.
     }
   }
@@ -2102,7 +2102,7 @@ async function embedAllStale(
           }
         } catch (e: unknown) {
           if (healOwnershipFailure) throw healOwnershipFailure.error;
-          throwIfLeaseLost();
+          throwIfLeaseLost(e);
           if (effectiveSignal.aborted) return;
           if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
           recordFailure(result, stale.length, slug, e);
@@ -2169,7 +2169,7 @@ async function embedAllStale(
             // against this slice's rows and the run moves to the next
             // slice/key instead of crashing.
             if (ownershipFailure) throw ownershipFailure.error;
-            throwIfLeaseLost();
+            throwIfLeaseLost(e);
             if (effectiveSignal.aborted) return;
             if (isMustAbortError(e) || e instanceof AIConfigError) throw e;
             recordFailure(result, sliceRows.length, slug, e);
@@ -2244,7 +2244,7 @@ async function embedAllStale(
             } catch (e) {
               // A signature-write failure leaves the committed vectors in place and is only reported.
               if (ownershipFailure) throw ownershipFailure.error;
-              throwIfLeaseLost();
+              throwIfLeaseLost(e);
               if (effectiveSignal.aborted) return;
               recordFailure(result, 1, slug, e);
             }
@@ -2260,7 +2260,7 @@ async function embedAllStale(
             try {
               await observed(pacer, () => restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId, observedCorpusGeneration));
             } catch (e) {
-              throwIfLeaseLost();
+              throwIfLeaseLost(e);
               if (effectiveSignal.aborted) return;
               recordFailure(result, 1, slug, e);
             }

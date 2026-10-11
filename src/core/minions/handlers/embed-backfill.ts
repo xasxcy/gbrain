@@ -292,6 +292,8 @@ export function makeEmbedBackfillHandler(
       ? createEmbedStallWatchdog({ thresholdSeconds: stallSeconds, readProgress: () => progressCounter })
       : undefined;
     let stalled = false;
+    // Lease loss is recorded here, before the abort, not read back from the signal's reason.
+    let leaseLost: LockStolenError | undefined;
     void watchdog?.stalled.then(() => {
       stalled = true;
       drainAbort.abort();
@@ -312,6 +314,7 @@ export function makeEmbedBackfillHandler(
               : await lock.refresh({ signal: drainAbort.signal });
             if (!owned) {
               const error = new LockStolenError(lock.id);
+              leaseLost = error;
               drainAbort.abort(error);
               throw error;
             }
@@ -349,9 +352,9 @@ export function makeEmbedBackfillHandler(
         );
       }
       if (result.aborted) {
-        // Lease loss aborts the drain signal with a LockStolenError before the
-        // fence throws; whatever swallowed that throw on the way, it is never an abort.
-        if (drainAbort.signal.reason instanceof LockStolenError) throw drainAbort.signal.reason;
+        // Lease loss is recorded before the fence throws; whatever swallowed that throw
+        // on the way, it is never an abort.
+        if (leaseLost) throw leaseLost;
         return {
           status: 'aborted',
           sourceId,
@@ -422,8 +425,8 @@ export function makeEmbedBackfillHandler(
       // be counted as a page-level failure.  At this outer job boundary an
       // operator/shutdown cancellation is still a resumable terminal state,
       // while ownership loss (LockStolenError) must continue to reject.
-      // Lease loss reaches here as the drain signal's reason; it is never an abort.
-      if (drainAbort.signal.reason instanceof LockStolenError) throw drainAbort.signal.reason;
+      // Recorded lease loss is never an abort, whatever the signal's reason says.
+      if (leaseLost) throw leaseLost;
       const stopRequested = signal.aborted || drainAbort.signal.aborted
         || (job.deadlineAtMs != null && Date.now() >= job.deadlineAtMs);
       if (!stalled && stopRequested && err instanceof Error && err.name === 'AbortError') {

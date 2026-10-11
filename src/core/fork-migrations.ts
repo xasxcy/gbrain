@@ -34,7 +34,7 @@
  * `migrate.ts` (that would be a runtime cycle).
  */
 import type { BrainEngine } from './engine.ts';
-import type { Migration } from './migrate.ts';
+import type { IdleBlocker, Migration } from './migrate.ts';
 // v135 interpolates the configured FTS config name straight into DDL; this is
 // the same validated accessor migrate.ts uses for upstream's v123/v124.
 import { getFtsLanguage } from './fts-language.ts';
@@ -47,6 +47,8 @@ export interface ForkMigrationDeps {
   allMigrations: () => Migration[];
   applyOneMigration: (engine: BrainEngine, m: Migration) => Promise<void>;
   migrationNotice: (line: string) => void;
+  /** migrate.ts's `getIdleBlockers`: the single copy of the pg_stat_activity diagnostic. */
+  getIdleBlockers: (engine: BrainEngine) => Promise<IdleBlocker[]>;
 }
 
 function requireMaskedMigration(deps: ForkMigrationDeps, repair: string, version: number): Migration {
@@ -101,22 +103,13 @@ async function runStatementsAtomically(
 }
 
 /**
- * Best-effort: name the idle-in-transaction connections. Same query as the
- * migration runner's `getIdleBlockers` in migrate.ts, kept local because this
- * module takes its migrate.ts dependencies by injection and must neither
- * import it statically (cycle) nor lazily (engine-live path). Postgres-only;
- * any failure only costs the diagnostic.
+ * Best-effort: name the idle-in-transaction connections, through the injected
+ * `getIdleBlockers` (Postgres-only; it returns `[]` elsewhere). Any failure
+ * only costs the diagnostic.
  */
 async function noticeIdleBlockers(engine: BrainEngine, deps: ForkMigrationDeps): Promise<void> {
-  if (engine.kind !== 'postgres') return;
   try {
-    const blockers = await engine.executeRaw<{ pid: number; query_start: string; query: string }>(
-      `SELECT pid, state, query_start::text, substring(query, 1, 120) as query
-       FROM pg_stat_activity
-       WHERE state = 'idle in transaction'
-         AND query_start < NOW() - INTERVAL '5 minutes'
-         AND pid != pg_backend_pid()`,
-    );
+    const blockers = await deps.getIdleBlockers(engine);
     if (blockers.length === 0) return;
     deps.migrationNotice(`    ${blockers.length} idle-in-transaction blocker(s):\n`);
     for (const blocker of blockers) {
@@ -831,5 +824,6 @@ export const FORK_LATEST_VERSION: number = Math.max(
     allMigrations: () => [],
     applyOneMigration: async () => {},
     migrationNotice: () => {},
+    getIdleBlockers: async () => [],
   }).map(m => m.version),
 );
