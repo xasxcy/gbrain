@@ -294,11 +294,13 @@ or a physical projection that leaves attribution untouched):
 <!-- write-attribution-covered:end -->
 
 Unattributed (on unmanaged brains these would write with `NULL` attribution).
-The list is empty: `gbrain extract` timeline walks, enrichment and meeting
-timeline extraction run as tiered derivers since #5575 (I2). A new writer
-that cannot be attributed yet is declared here:
+`gbrain extract` timeline walks, enrichment and meeting timeline extraction run
+as tiered derivers since #5575 (I2), so they are not here. The one entry is the
+fork's migration backfill, which is not a content writer. A new writer that
+cannot be attributed yet is declared here:
 
 <!-- write-attribution-unattributed:start -->
+- `src/core/fork-migrations.ts` (1): the v235 batched search-vector backfill assigns `title` to itself so `trg_pages_search_vector` rebuilds each row's derived `search_vector`. No content column changes, so `knowledge_revision`, the row and revision attribution columns and `page_versions` stay as they were, and the managed writer guard lets the no-op update through. It runs inside the migration runner, not through a coordinator or `maintenanceTransaction`.
 <!-- write-attribution-unattributed:end -->
 
 ## The privacy boundary
