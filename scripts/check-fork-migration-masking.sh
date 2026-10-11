@@ -86,7 +86,7 @@ fi
 # its program on stdin via the heredoc below, so piping data there too silently
 # leaves the reader empty — which made an early version print OK while the
 # masking check never ran at all.
-BASELINE_FILE="$(mktemp -t gbrain-masking-baseline)"
+BASELINE_FILE="$(mktemp -t gbrain-masking-baseline.XXXXXX)"
 trap 'rm -f "$BASELINE_FILE"' EXIT
 if [ -n "$BASELINE" ]; then
   git show "$BASELINE":"$FORK" > "$BASELINE_FILE" 2>/dev/null || : > "$BASELINE_FILE"
