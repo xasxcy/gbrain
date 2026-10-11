@@ -18,7 +18,8 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { LATEST_VERSION, MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -187,21 +188,43 @@ test('a managed put_page of a tagged page with timeline lines commits on a brain
 
 test('upgrading a v196 brain with the pre-fix guard: v197 unblocks the refused write and is idempotent', async () => {
   const v197 = MIGRATIONS.find(migration => migration.version === 197)!;
+  // FORK: the fork's own migrations (v231+, see src/core/fork-migrations.ts) include repair migrations that deliberately
+  // re-apply masked upstream migrations; v243 re-applies v166, whose MANAGED_WRITER_GUARD_SQL drops and re-creates the guard
+  // triggers. The "triggers keep their OIDs" invariant is about v197 and the upstream migrations after it, so that replay
+  // runs over exactly the upstream-owned versions (the same set the upstream test covers); the fork migrations are
+  // restored afterwards and exercised by the behavioural replay below.
+  const forkOwned = MIGRATIONS.filter(migration => migration.version > LATEST_SCHEMA_VERSION);
+  expect(forkOwned.length).toBeGreaterThan(0);
   for (const engine of engines) {
     await installPre5983Guard(engine);
     const pageId = await pageIn(engine, 'default');
     await expect(guarded(engine, ['default'], INSERTS.tags, [pageId])).rejects.toThrow(REFUSED);
     const triggers = `SELECT tgrelid::regclass::text AS tbl, oid FROM pg_trigger WHERE tgname='managed_writer_guard' ORDER BY 1`;
     const before = await engine.executeRaw(triggers);
-    for (let run = 0; run < 2; run++) {
-      await engine.setConfig('version', '196');
-      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-      expect((await runMigrations(engine)).current).toBeGreaterThanOrEqual(197);
-      await guarded(engine, ['default'], INSERTS.tags.replace("'probe'", `'probe-${run}'`), [pageId]);
-      expect(await count(engine, 'tags', pageId)).toBe(run + 1);
-      await expect(guarded(engine, undefined, INSERTS.tags.replace("'probe'", "'uncoordinated'"), [pageId])).rejects.toThrow(REFUSED);
+    for (const migration of forkOwned) MIGRATIONS.splice(MIGRATIONS.indexOf(migration), 1);
+    try {
+      for (let run = 0; run < 2; run++) {
+        await engine.setConfig('version', '196');
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        expect((await runMigrations(engine)).current).toBeGreaterThanOrEqual(197);
+        await guarded(engine, ['default'], INSERTS.tags.replace("'probe'", `'probe-${run}'`), [pageId]);
+        expect(await count(engine, 'tags', pageId)).toBe(run + 1);
+        await expect(guarded(engine, undefined, INSERTS.tags.replace("'probe'", "'uncoordinated'"), [pageId])).rejects.toThrow(REFUSED);
+      }
+    } finally {
+      MIGRATIONS.push(...forkOwned);
     }
     expect(v197.sql).not.toMatch(/\b(TRIGGER|ALTER TABLE|LOCK)\b/);
     expect(await engine.executeRaw(triggers)).toEqual(before);
+
+    // The same upgrade through the fork's repair migrations: the guard triggers are re-created, and the guard still
+    // admits coordinated writes and refuses uncoordinated ones.
+    await engine.setConfig('version', '196');
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    expect((await runMigrations(engine)).current).toBe(LATEST_VERSION);
+    await guarded(engine, ['default'], INSERTS.tags.replace("'probe'", "'probe-fork'"), [pageId]);
+    expect(await count(engine, 'tags', pageId)).toBe(3);
+    await expect(guarded(engine, undefined, INSERTS.tags.replace("'probe'", "'uncoordinated-fork'"), [pageId])).rejects.toThrow(REFUSED);
+    expect((await engine.executeRaw(triggers)).length).toBe(before.length);
   }
 }, 120_000);

@@ -518,7 +518,7 @@
         },
         {
           "category": "meta",
-          "message": "1066 column(s) verified against live schema",
+          "message": "1080 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -2054,6 +2054,23 @@
           "message": "Schema width mismatch: content_chunks.embedding is vector(1024) but gateway resolved embedding_dimensions = 3072.\n\nEmbedding dimension mismatch detected.\n\n  Existing column: vector(1024)\n  Requested:       vector(3072)  (openai:text-embedding-3-large)\n\nSwitching dims re-embeds every chunk and fact;\nPGLite cannot ALTER vector column types in place (pgvector ships as WASM).\n\nKeep this brain's width (no rebuild; pages and facts kept):\n\n  gbrain init --force --embedding-model openai:text-embedding-3-large --embedding-dimensions 1024 --path <home>/.gbrain/brain.pglite\n\nChange the width (re-embeds; pages and DB-only facts kept; preview first):\n\n  gbrain migrate embeddings --to openai:text-embedding-3-large --dim 3072 --dry-run\n\nLast resort (moves the datastore aside; DB-only pages and facts are NOT carried over):\n\n  gbrain reinit-pglite --embedding-model openai:text-embedding-3-large --embedding-dimensions 3072\n\nFull guide: docs/embedding-migrations.md",
           "name": "embedding_width_consistency",
           "status": "warn"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_error_class": [],
+            "counts": {
+              "backoff_deferred": 0,
+              "eligible_now": 0,
+              "quarantined": 0,
+              "total_null": 0
+            },
+            "earliest_retry_at": null,
+            "quarantined_top": []
+          },
+          "message": "total_null=0; eligible_now=0; backoff_deferred=0; quarantined=0. error_class: none. quarantined top: none.",
+          "name": "embed_failures",
+          "status": "ok"
         },
         {
           "category": "brain",

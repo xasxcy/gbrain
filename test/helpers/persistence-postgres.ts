@@ -33,9 +33,24 @@ export async function persistencePostgresTemplate(databaseUrl:string, poolSize=4
       const url=new URL(databaseUrl);url.pathname=`/${database}`;
       const engine=new PostgresEngine();
       const close=async()=>{await engine.disconnect();await admin.unsafe(`DROP DATABASE ${database} WITH (FORCE)`);};
-      try {await engine.connect({database_url:url.toString(),poolSize});return{engine,close};}
+      try {await engine.connect({database_url:url.toString(),poolSize});await rebuildClonedPgroongaIndexes(engine);return{engine,close};}
       catch(error){await close();throw error;}
     },
     dispose:async()=>{await admin.end();await template.close();},
   };
+}
+
+/**
+ * FORK: a PGroonga index keeps its data in a per-database Groonga store that `CREATE DATABASE ... TEMPLATE` does not
+ * carry over ("pgroonga: PGrnLookupWithSize: object isn't found: <Sources...>" on the first write to the indexed
+ * table). Rebuilding the cloned index recreates the store; on a server without the extension there is nothing to do.
+ */
+async function rebuildClonedPgroongaIndexes(engine: PostgresEngine): Promise<void> {
+  const rows = await engine.executeRaw<{ index: string }>(
+    `SELECT format('%I.%I', n.nspname, c.relname) AS index
+       FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_am am ON am.oid = c.relam
+      WHERE am.amname = 'pgroonga' AND n.nspname = 'public'`,
+  );
+  for (const row of rows) await engine.executeRaw(`REINDEX INDEX ${row.index}`);
 }

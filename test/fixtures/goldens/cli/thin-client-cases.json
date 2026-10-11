@@ -90,6 +90,16 @@
       "stdout": []
     },
     {
+      "argv": "embed-failures",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain embed-failures` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain embed-failures",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "serve",
       "exitCode": 1,
       "stderr": [

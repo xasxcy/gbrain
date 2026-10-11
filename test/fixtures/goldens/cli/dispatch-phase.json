@@ -588,6 +588,13 @@
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
+      "embed-failures": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "embeddings": {
         "hasSwitchCase": false,
         "phase": "pre-connect",

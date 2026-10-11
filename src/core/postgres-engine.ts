@@ -236,6 +236,8 @@ export class PostgresEngine implements BrainEngine {
    */
   private _connectionStyle: 'instance' | 'module' | null = null;
   private _usePgroonga = false;
+  private _pgroongaProbe: Promise<void> | undefined;
+  private _pgroongaProbeArmed = false;
 
   /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
@@ -443,7 +445,19 @@ export class PostgresEngine implements BrainEngine {
         this.connectionManager.setReadPool(db.getConnection());
       }
     }
-    await this.detectPgroonga();
+    // FORK: arm the PGroonga probe instead of running it. A probe query here would make a borrower of an in-flight
+    // module-singleton create wait on (and dial a second connection beside) the owner's still-unverified pool, so
+    // connect() must issue no query of its own. The first keyword search runs it (ensurePgroongaProbed).
+    this._pgroongaProbeArmed = true;
+  }
+
+  /** Run the armed PGroonga probe once; concurrent first searches share it. detectPgroonga never rejects. */
+  private async ensurePgroongaProbed(): Promise<void> {
+    if (this._pgroongaProbeArmed) {
+      this._pgroongaProbeArmed = false;
+      this._pgroongaProbe = this.detectPgroonga();
+    }
+    await this._pgroongaProbe;
   }
 
   async disconnect(): Promise<void> {
@@ -590,6 +604,7 @@ export class PostgresEngine implements BrainEngine {
 
         // FORK: PGroonga (Chinese FTS) capability probe on the locked DDL connection.
         await this.detectPgroonga(conn);
+        this._pgroongaProbeArmed = false; // authoritative result from the DDL connection; no deferred probe needed
 
         // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
         // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
@@ -1079,8 +1094,11 @@ export class PostgresEngine implements BrainEngine {
     // the fork's `_usePgroonga` ternary below falls back to tsvector when the
     // extension is absent.
     const ftsLang = getFtsLanguage();
+    await this.ensurePgroongaProbed();
+    // pgroonga_score is only meaningful under an index scan; the planner's sequential scan (small or
+    // freshly loaded tables) yields 0 for every row, which erases the ranking. Fall back to the tsvector rank then.
     const scoreExpr = this._usePgroonga
-      ? `pgroonga_score(cc.tableoid, cc.ctid) * ${sourceFactorCase}`
+      ? `COALESCE(NULLIF(pgroonga_score(cc.tableoid, cc.ctid), 0), ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))) * ${sourceFactorCase}`
       : `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
@@ -1292,8 +1310,11 @@ export class PostgresEngine implements BrainEngine {
     // the fork's `_usePgroonga` ternary below falls back to tsvector when the
     // extension is absent.
     const ftsLang = getFtsLanguage();
+    await this.ensurePgroongaProbed();
+    // pgroonga_score is only meaningful under an index scan; the planner's sequential scan (small or
+    // freshly loaded tables) yields 0 for every row, which erases the ranking. Fall back to the tsvector rank then.
     const scoreExpr = this._usePgroonga
-      ? `pgroonga_score(cc.tableoid, cc.ctid) * ${sourceFactorCase}`
+      ? `COALESCE(NULLIF(pgroonga_score(cc.tableoid, cc.ctid), 0), ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))) * ${sourceFactorCase}`
       : `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`

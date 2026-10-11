@@ -172,11 +172,11 @@
       "tx": 1
     },
     "invalidateStaleSignatureEmbeddings#default": {
-      "raw": 3,
+      "raw": 4,
       "tx": 1
     },
     "invalidateStaleSignatureEmbeddings#sourceId+includeNullSignature": {
-      "raw": 3,
+      "raw": 4,
       "tx": 1
     },
     "listActiveTakesForPages#allowList": {},

@@ -30,6 +30,7 @@ test/e2e/doctor-silent-death-parity.test.ts
 test/e2e/embedding-recovery-parity.test.ts
 test/e2e/engine-parity-cjk.test.ts
 test/e2e/engine-parity-salience.test.ts
+test/e2e/engine-parity-stale-signature.test.ts
 test/e2e/engine-parity.test.ts
 test/e2e/fact-embedding-backfill-parity.test.ts
 test/e2e/fact-vector-repair-parity.test.ts

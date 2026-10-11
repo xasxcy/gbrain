@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { opError } from '../ops/contract.ts';
@@ -19,6 +19,18 @@ import { pageBatchChildRequestIds } from './page-batch-id.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
 import { nativeFilesystemPath } from './root-registry.ts';
 import { nativeFileTarget } from './native-file-target.ts';
+
+/**
+ * FORK: the file path with its directory resolved to the physical spelling (/var vs /private/var), the final name
+ * untouched. A path already lexically inside the registered root needs no resolution, and must not get one: the
+ * native realpath turns a POSIX file name that contains a literal backslash into a slash path and would select the
+ * slash neighbour (test/persistence-publication-native.serial.test.ts, "recorded POSIX literal backslash").
+ */
+function physicalFilePath(root: string, file: string): string {
+  const lexical = relative(root, file);
+  if (lexical && !isAbsolute(lexical) && lexical.split(sep)[0] !== '..') return file;
+  return join(nativeFilesystemPath(dirname(file)), basename(file));
+}
 
 /**
  * `snapshot` is the publication's final read of the page, including deleted rows, in this transaction.
@@ -47,7 +59,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     // /var spelling can name the same macOS checkout as the binding's
     // /private/var spelling; lexical relative() would otherwise manufacture
     // an escaping ../../ target that the effect worker must refuse.
-    const target = nativeFileTarget(binding.local_path, nativeFilesystemPath(prepared.file.path), 'source_changed');
+    const target = nativeFileTarget(binding.local_path, physicalFilePath(binding.local_path, prepared.file.path), 'source_changed');
     queue('git', { relative_path: relative(binding.local_path, target).split(sep).join('/'),
       expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content),
       ...(commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailer ? { commit_trailer: commit.trailer } : {}) } : {}) });

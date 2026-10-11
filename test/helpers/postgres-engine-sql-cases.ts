@@ -42,6 +42,9 @@ const OOS = {
   dream: 'out-of-scope:dream-verdicts',
   raw: 'out-of-scope:raw-data',
   stub: 'out-of-scope:no-sql-stub',
+  // FORK: the embed_failures retry ledger. These methods deliberately keep Postgres's raw positional executeRaw adapter
+  // (see their `engine-sql-ok` markers in postgres-engine.ts), so they are not part of the W1 conversion domains.
+  embedLedger: 'out-of-scope:fork-embed-failures-ledger (raw positional adapter; not a W1 domain)',
 } as const;
 
 export const DOMAIN_OF: Record<string, string> = {
@@ -53,6 +56,14 @@ export const DOMAIN_OF: Record<string, string> = {
   'rlsScopeBindingEnabled': OOS.helper,
   'withScopedReadTransaction': OOS.helper,
   'jitOffRead': OOS.helper,
+  'detectPgroonga': OOS.helper,
+  'ensurePgroongaProbed': OOS.helper,
+  'appendEmbedFailureEligibility': OOS.helper,
+  'buildListStaleChunkWhere': OOS.helper,
+  'persistEmbedOutcome': OOS.embedLedger,
+  'listEmbedFailures': OOS.embedLedger,
+  'releaseEmbedFailures': OOS.embedLedger,
+  'getEmbedFailureSummary': OOS.embedLedger,
   'connect': OOS.lifecycle,
   'disconnect': OOS.lifecycle,
   'disconnectInternal': OOS.helper,

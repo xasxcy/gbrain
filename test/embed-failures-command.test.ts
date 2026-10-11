@@ -52,6 +52,19 @@ function captureConsole(): { lines: string[]; restore: () => void } {
 }
 
 describe('embed-failures operator command', () => {
+  test('--help / -h (any position) prints usage without touching the engine', async () => {
+    for (const args of [['--help'], ['-h'], ['list', '--help'], ['release', 'x', '-h'], []]) {
+      const captured = captureConsole();
+      try {
+        // A null engine proves help never reaches a ledger query or a brain connection.
+        await expect(runEmbedFailures(null as never, args)).resolves.toBeUndefined();
+      } finally {
+        captured.restore();
+      }
+      expect(captured.lines.join('\n')).toContain('gbrain embed-failures list');
+    }
+  });
+
   test('serializes native BigInt page ids from Postgres ledger rows', async () => {
     const captured = captureConsole();
     const postgresShapedEngine = {

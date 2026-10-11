@@ -10,6 +10,7 @@ import type { Check } from '../../doctor.ts';
 // isn't imported from extract-conversation-facts.ts directly (#4135).
 import { ALLOWED_TYPES, conversationFactsEligibleSql, pageTypesForAllowed, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
 import { checkError } from '../check-fix.ts';
+import { isConfigStashedEnv } from '../../../core/config-env-stash.ts';
 
 /**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
@@ -141,7 +142,8 @@ export async function checkEvalDrift(engine: BrainEngine): Promise<Check> {
  */
 
 export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
-  const envModel = process.env.GBRAIN_EMBEDDING_MODEL?.trim();
+  // FORK: a model gbrain stashed from the merged config is not a user env override.
+  const envModel = isConfigStashedEnv('GBRAIN_EMBEDDING_MODEL') ? undefined : process.env.GBRAIN_EMBEDDING_MODEL?.trim();
   const envDim = process.env.GBRAIN_EMBEDDING_DIMENSIONS?.trim();
   if (!envModel && !envDim) {
     return {

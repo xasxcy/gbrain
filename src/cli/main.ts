@@ -22,6 +22,7 @@ import {
   resolveSelfUpgradeMode,
   justUpgradedPath,
 } from '../core/self-upgrade.ts';
+import { stashConfigEnv } from '../core/config-env-stash.ts';
 import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, isThinClient, getDbUrlSource, envShadowDetected } from '../core/config.ts';
 import {
   classifyPgAccessError as classifyDbAccessError,
@@ -150,7 +151,7 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, true | (() => Promise<(engine: ne
   // answered before any engine or job-queue work (cathedral-6).
   agent: async () => (await import('../commands/agent.ts')).runAgent as never,
   // D3: post-connect records whose handler answers --help before the engine; run through the table.
-  advisor: true, anomalies: true, feedback: true, backfill: true, 'book-mirror': true, 'edges-backfill': true, embed: true, features: true,
+  advisor: true, anomalies: true, feedback: true, backfill: true, 'book-mirror': true, 'edges-backfill': true, embed: true, 'embed-failures': true, features: true,
   founder: true, 'graph-query': true, orphans: true, salience: true, think: true,
   brainstorm: true, lsd: true, migrate: true, pages: true, pricing: true, 'retrieval-upgrade': true, whoknows: true, core: true, trust: true,
 };
@@ -2883,10 +2884,10 @@ async function completeEngineStartup(engine: BrainEngine): Promise<void> {
         process.env.GBRAIN_EMBEDDING_MULTIMODAL = String(merged.embedding_multimodal);
       }
       if (merged.embedding_multimodal_model !== undefined) {
-        process.env.GBRAIN_EMBEDDING_MULTIMODAL_MODEL = merged.embedding_multimodal_model;
+        stashConfigEnv('GBRAIN_EMBEDDING_MULTIMODAL_MODEL', merged.embedding_multimodal_model);
       }
       if (merged.embedding_model !== undefined) {
-        process.env.GBRAIN_EMBEDDING_MODEL = merged.embedding_model;
+        stashConfigEnv('GBRAIN_EMBEDDING_MODEL', merged.embedding_model);
       }
       if (merged.embedding_image_ocr !== undefined) {
         process.env.GBRAIN_EMBEDDING_IMAGE_OCR = String(merged.embedding_image_ocr);

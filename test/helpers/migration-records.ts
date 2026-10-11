@@ -27,6 +27,8 @@ import { sha256 } from './golden.ts';
 const REPO = resolve(import.meta.dir, '..', '..');
 const MIGRATE_TS = join(REPO, 'src/core/migrate.ts');
 const SCHEMA_MIGRATIONS_DIR = join(REPO, 'src/core/schema-migrations');
+// FORK: the fork-owned migrations (v231+) live in one file that migrate.ts appends to MIGRATIONS at load time.
+const FORK_MIGRATIONS_TS = join(REPO, 'src/core/fork-migrations.ts');
 
 export interface RuntimeMigration {
   version: number;
@@ -78,7 +80,7 @@ function textHash(s: string): TextHash {
 }
 
 export function migrationSourceFiles(): string[] {
-  const files = [MIGRATE_TS];
+  const files = [MIGRATE_TS, FORK_MIGRATIONS_TS];
   if (existsSync(SCHEMA_MIGRATIONS_DIR)) {
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
@@ -94,7 +96,7 @@ export function migrationSourceFiles(): string[] {
 
 function isInMigrationSet(fileName: string): boolean {
   const p = resolve(fileName);
-  return p === MIGRATE_TS || p.startsWith(SCHEMA_MIGRATIONS_DIR + '/');
+  return p === MIGRATE_TS || p === FORK_MIGRATIONS_TS || p.startsWith(SCHEMA_MIGRATIONS_DIR + '/');
 }
 
 function propName(p: ts.ObjectLiteralElementLike): string | undefined {

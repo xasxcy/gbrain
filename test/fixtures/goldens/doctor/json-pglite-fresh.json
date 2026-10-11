@@ -521,7 +521,7 @@
         },
         {
           "category": "meta",
-          "message": "1066 column(s) verified against live schema",
+          "message": "1080 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -2124,6 +2124,12 @@
           "category": "brain",
           "message": "Embeddings disabled — no active embedding width to reconcile.",
           "name": "embedding_width_consistency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "message": "gateway not configured — skipping embed_failures check.",
+          "name": "embed_failures",
           "status": "ok"
         },
         {
