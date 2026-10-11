@@ -17,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { noticeUnpinnedAutoEnableRls } from '../src/core/schema-migrations/v211-function-search-path.ts';
 import { FACT_WITHDRAWAL_SCHEMA_STATEMENTS } from '../src/core/facts/withdrawal-schema.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
@@ -120,34 +121,80 @@ for (const kind of testBackends()) {
       expect(await unpinned()).toEqual([]);
     }, 60_000);
 
-    // Fork: a production runtime role owns every gbrain function except the
-    // superuser-created auto_enable_rls event-trigger function. The re-pin loop
-    // must skip what it cannot ALTER instead of aborting the upgrade.
-    test.if(kind === 'postgres')('the re-pin loop skips a function the runtime role does not own', async () => {
-      const doBlock = searchPathMigration.sql!.slice(searchPathMigration.sql!.indexOf('DO $search_path$'));
+    // Fork (R6-6): a production runtime role owns every gbrain function except the superuser-created
+    // auto_enable_rls event-trigger function. Only THAT function is skipped when the role cannot ALTER it; any other
+    // gbrain function it cannot alter means the owner really drifted and still aborts the upgrade. The skipped
+    // function is reported by the migration itself (the pool drops RAISE WARNING), with the superuser statement.
+    const doBlock = () => searchPathMigration.sql!.slice(searchPathMigration.sql!.indexOf('DO $search_path$'));
+    const withRuntimeRole = async (fn: (role: string) => Promise<void>) => {
       const role = `w9_runtime_${process.pid}`;
       await engine.executeRaw(`CREATE ROLE ${role} NOSUPERUSER`);
       try {
         await engine.executeRaw(`GRANT CREATE, USAGE ON SCHEMA public TO ${role}`);
-        await engine.executeRaw('CREATE FUNCTION gbrain_w9_superuser_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
-        await engine.transaction(async tx => {
-          await tx.executeRaw(`SET LOCAL ROLE ${role}`);
-          await tx.executeRaw('CREATE FUNCTION gbrain_w9_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
-          await tx.executeRaw(doBlock);
-        });
-        const rows = await engine.executeRaw<{ name: string; config: string[] | null }>(
-          `SELECT proname AS name, proconfig AS config FROM pg_proc WHERE proname IN ('gbrain_w9_owned', 'gbrain_w9_superuser_owned') ORDER BY proname`);
-        expect(rows).toEqual([
-          { name: 'gbrain_w9_owned', config: ['search_path=pg_catalog, public'] },
-          { name: 'gbrain_w9_superuser_owned', config: null },
-        ]);
+        await fn(role);
       } finally {
-        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_owned()');
-        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_superuser_owned()');
-        await engine.executeRaw(`REVOKE ALL ON SCHEMA public FROM ${role}`);
+        await engine.executeRaw(`DROP OWNED BY ${role}`); // its functions and its schema privileges
         await engine.executeRaw(`DROP ROLE IF EXISTS ${role}`);
       }
+    };
+
+    test.if(kind === 'postgres')('a non-owned auto_enable_rls is skipped, the migration succeeds and the notice names the superuser command', async () => {
+      const [existing] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM pg_proc WHERE proname = 'auto_enable_rls' AND pronamespace = 'public'::regnamespace`);
+      const created = Number(existing!.n) === 0;
+      if (created) await engine.executeRaw('CREATE FUNCTION public.auto_enable_rls() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
+      else await engine.executeRaw('ALTER FUNCTION public.auto_enable_rls() RESET search_path');
+      try {
+        await withRuntimeRole(async role => {
+          await engine.executeRaw('CREATE FUNCTION gbrain_w9_superuser_owned_ok() RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$ BEGIN END $fn$');
+          const notices: string[] = [];
+          await engine.transaction(async tx => {
+            await tx.executeRaw(`SET LOCAL ROLE ${role}`);
+            await tx.executeRaw('CREATE FUNCTION gbrain_w9_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
+            await tx.executeRaw(doBlock()); // must not throw
+            await noticeUnpinnedAutoEnableRls(tx, line => notices.push(line));
+          });
+          const rows = await engine.executeRaw<{ name: string; config: string[] | null }>(
+            `SELECT proname AS name, proconfig AS config FROM pg_proc WHERE proname IN ('gbrain_w9_owned', 'auto_enable_rls') ORDER BY proname`);
+          expect(rows).toEqual([
+            { name: 'auto_enable_rls', config: null },
+            { name: 'gbrain_w9_owned', config: ['search_path=pg_catalog, public'] },
+          ]);
+          expect(notices).toHaveLength(1);
+          expect(notices[0]).toContain('v211:');
+          expect(notices[0]).toContain('As a superuser run: ALTER FUNCTION public.auto_enable_rls() SET search_path = pg_catalog, public;');
+        });
+      } finally {
+        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_owned()');
+        await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_superuser_owned_ok()');
+        if (created) await engine.executeRaw('DROP FUNCTION IF EXISTS public.auto_enable_rls()');
+        else await engine.executeRaw('ALTER FUNCTION public.auto_enable_rls() SET search_path = pg_catalog, public');
+      }
     }, 60_000);
+
+    test.if(kind === 'postgres')('a non-owned ordinary gbrain function still aborts the migration (the owner really drifted)', async () => {
+      await withRuntimeRole(async role => {
+        await engine.executeRaw('CREATE FUNCTION gbrain_w9_superuser_owned() RETURNS void LANGUAGE plpgsql AS $fn$ BEGIN END $fn$');
+        try {
+          await expect(engine.transaction(async tx => {
+            await tx.executeRaw(`SET LOCAL ROLE ${role}`);
+            await tx.executeRaw(doBlock());
+          })).rejects.toThrow(/must be owner of function gbrain_w9_superuser_owned/);
+          const [row] = await engine.executeRaw<{ config: string[] | null }>(`SELECT proconfig AS config FROM pg_proc WHERE proname = 'gbrain_w9_superuser_owned'`);
+          expect(row!.config).toBeNull();
+        } finally {
+          await engine.executeRaw('DROP FUNCTION IF EXISTS gbrain_w9_superuser_owned()');
+        }
+      });
+    }, 60_000);
+
+    test('nothing is reported when no auto_enable_rls needs pinning (PGLite, or pinned): the notice is silent', async () => {
+      const notices: string[] = [];
+      await noticeUnpinnedAutoEnableRls(engine, line => notices.push(line));
+      expect(notices).toEqual([]);
+      // The migration itself runs the report after its SQL (the default pool drops RAISE WARNING).
+      expect(typeof searchPathMigration.handler).toBe('function');
+      await searchPathMigration.handler!(engine);
+    });
 
     test('a withdrawn fact stays withdrawn across the migration', async () => {
       const claim = 'Withdrawal example: the meeting moved to Friday.';

@@ -104,6 +104,8 @@ export type PersistEmbedOutcomeEntry = {
    * the vector. Omitted = unknown provenance (stored as NULL).
    */
   inputHash?: string | null;
+  /** R6-1: characters actually embedded when truncated; the installer resolves it to a truncation-provenance `inputHash`. */
+  truncatedTo?: number | null;
   outcome:
     | { vector: Float32Array }
     | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string } };

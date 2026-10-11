@@ -1,8 +1,7 @@
 import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from './embed-failure.ts';
 import { detectGatewayErrorFromCause } from './embed-retry.ts';
 import { isMustAbortError } from './worker-pool.ts';
-import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
-import { TRUNCATION_FALLBACK_MAX_CHARS } from './embedding-invalidation.ts';
+import { isEmbeddingResponseShapeError, isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
 
 /**
  * Shared Ollama fallback for foreground and Minion embedding callers.
@@ -106,8 +105,12 @@ export function isOllamaOomLikeError(error: unknown): boolean {
 
 export interface PartialEmbedResult {
   vectors: (Float32Array | null)[];
-  /** True when the vector was created from a fallback-truncated input. */
-  truncated: boolean[];
+  /**
+   * Per input: the number of leading characters actually embedded when the
+   * vector was built from a fallback-truncated input, else null (R6-1: the
+   * truncation provenance recorded instead of the full input's hash).
+   */
+  truncatedTo: (number | null)[];
   failures: { index: number; error: unknown }[];
   aborted: boolean;
   fatalError?: unknown;
@@ -116,12 +119,12 @@ export interface PartialEmbedResult {
 }
 
 type SingleAttempt =
-  | { kind: 'success'; vector: Float32Array; truncated: boolean }
+  | { kind: 'success'; vector: Float32Array; truncatedTo: number | null }
   | { kind: 'ollamaFailure'; error: unknown }
   | { kind: 'fatal'; error: unknown }
   | { kind: 'aborted'; error?: unknown };
 
-const FALLBACK_LEVELS = [TRUNCATION_FALLBACK_MAX_CHARS, 5000, 4500] as const;
+const FALLBACK_LEVELS = [5500, 5000, 4500] as const;
 export type PartialFallbackPolicy = 'legacy' | 'partial-stale';
 
 function isSplitWorthy(error: unknown, policy: PartialFallbackPolicy): boolean {
@@ -161,7 +164,7 @@ async function attemptSingleChunk(
           `  [embed-fallback] chunk truncated ${text.length}→${candidate.length} chars for embedding\n`,
         );
       }
-      return { kind: 'success', vector, truncated: candidate.length < text.length };
+      return { kind: 'success', vector, truncatedTo: candidate.length < text.length ? candidate.length : null };
     } catch (error) {
       if (opts.abortSignal?.aborted) return { kind: 'aborted', error };
       // A zero-norm refusal of this one input is a terminal per-item result
@@ -181,16 +184,16 @@ async function attemptSingleChunk(
 
 function terminalResult(
   vectors: (Float32Array | null)[],
-  truncated: boolean[],
+  truncatedTo: (number | null)[],
   failures: { index: number; error: unknown }[],
   signal: AbortSignal | undefined,
   error?: unknown,
   fatalIndexes?: number[],
 ): PartialEmbedResult {
-  if (signal?.aborted) return { vectors, truncated, failures, aborted: true };
+  if (signal?.aborted) return { vectors, truncatedTo, failures, aborted: true };
   return error === undefined
-    ? { vectors, truncated, failures, aborted: false }
-    : { vectors, truncated, failures, aborted: false, fatalError: error, fatalIndexes };
+    ? { vectors, truncatedTo, failures, aborted: false }
+    : { vectors, truncatedTo, failures, aborted: false, fatalError: error, fatalIndexes };
 }
 
 function mergeZeroNormPartial(
@@ -252,7 +255,10 @@ async function bisectInvalidInputs(
         mergeZeroNormPartial(error, group.length, opts.expectedDimensions, vectors, failures, offset + start);
         continue;
       }
-      if (!isInvalidInputError(error)) return { fatalError: error, fatalIndexes: group.map((_, index) => offset + start + index) };
+      // A structurally malformed response (count/width) from a sub-request is a per-item result
+      // like the initial invalid input: keep splitting down to the single item, never run-fatal (R6-3).
+      // Real configuration faults (401, unknown model) stay fatal.
+      if (!isInvalidInputError(error) && !isEmbeddingResponseShapeError(error)) return { fatalError: error, fatalIndexes: group.map((_, index) => offset + start + index) };
       const nested = await bisectInvalidInputs(group, embedFn, opts, vectors, failures, offset + start, depth + 1, error);
       if (nested.aborted || nested.fatalError !== undefined) return nested;
     }
@@ -271,52 +277,52 @@ export async function embedWithTruncationFallbackPartial(
   opts: { abortSignal?: AbortSignal; policy?: PartialFallbackPolicy; expectedDimensions?: number },
 ): Promise<PartialEmbedResult> {
   const vectors: (Float32Array | null)[] = Array.from({ length: texts.length }, () => null);
-  const truncated: boolean[] = Array.from({ length: texts.length }, () => false);
+  const truncatedTo: (number | null)[] = Array.from({ length: texts.length }, () => null);
   const failures: { index: number; error: unknown }[] = [];
 
   try {
     const embedded = validateEmbeddingOutput(await embedFn(texts, opts), texts.length, opts.expectedDimensions);
-    return { vectors: embedded, truncated, failures, aborted: false };
+    return { vectors: embedded, truncatedTo, failures, aborted: false };
   } catch (error) {
-    if (opts.abortSignal?.aborted) return terminalResult(vectors, truncated, failures, opts.abortSignal);
+    if (opts.abortSignal?.aborted) return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
     // #4616: the gateway refused some or all items (zero-norm / non-finite / empty). Keep every
     // usable vector; each refused item is a terminal per-chunk failure (never retried, never
     // fanned out, and not a run-global AIConfigError even though the error class extends it).
     if (isEmbeddingZeroNormError(error) && error.vectors.length === texts.length) {
       mergeZeroNormPartial(error, texts.length, opts.expectedDimensions, vectors, failures, 0);
-      return terminalResult(vectors, truncated, failures, opts.abortSignal);
+      return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
     }
     if (texts.length === 1) {
       if (!isOllamaOomLikeError(error)) {
         if (isSplitWorthy(error, opts.policy ?? 'legacy')) failures.push({ index: 0, error });
-        else return terminalResult(vectors, truncated, failures, opts.abortSignal, error, [0]);
+        else return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, error, [0]);
       } else {
         const attempt = await attemptSingleChunk(texts[0]!, embedFn, opts, true, error, opts.policy ?? 'legacy');
-        if (attempt.kind === 'success') { vectors[0] = attempt.vector; truncated[0] = attempt.truncated; }
+        if (attempt.kind === 'success') { vectors[0] = attempt.vector; truncatedTo[0] = attempt.truncatedTo; }
         else if (attempt.kind === 'ollamaFailure') failures.push({ index: 0, error: attempt.error });
-        else if (attempt.kind === 'fatal') return terminalResult(vectors, truncated, failures, opts.abortSignal, attempt.error, [0]);
-        else return terminalResult(vectors, truncated, failures, opts.abortSignal);
+        else if (attempt.kind === 'fatal') return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, attempt.error, [0]);
+        else return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
       }
-      return terminalResult(vectors, truncated, failures, opts.abortSignal);
+      return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
     }
     if (opts.policy === 'partial-stale' && isInvalidInputError(error)) {
       const isolated = await bisectInvalidInputs(texts, embedFn, opts, vectors, failures, 0, 0, error);
-      return terminalResult(vectors, truncated, failures, opts.abortSignal, isolated.fatalError, isolated.fatalIndexes);
+      return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, isolated.fatalError, isolated.fatalIndexes);
     }
     if (!isSplitWorthy(error, opts.policy ?? 'legacy')) {
-      return terminalResult(vectors, truncated, failures, opts.abortSignal, error, texts.map((_, index) => index));
+      return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, error, texts.map((_, index) => index));
     }
   }
 
   for (let index = 0; index < texts.length; index++) {
-    if (opts.abortSignal?.aborted) return terminalResult(vectors, truncated, failures, opts.abortSignal);
+    if (opts.abortSignal?.aborted) return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
     const attempt = await attemptSingleChunk(texts[index]!, embedFn, opts, false, undefined, opts.policy ?? 'legacy');
-    if (attempt.kind === 'success') { vectors[index] = attempt.vector; truncated[index] = attempt.truncated; }
+    if (attempt.kind === 'success') { vectors[index] = attempt.vector; truncatedTo[index] = attempt.truncatedTo; }
     else if (attempt.kind === 'ollamaFailure') failures.push({ index, error: attempt.error });
-    else if (attempt.kind === 'fatal') return terminalResult(vectors, truncated, failures, opts.abortSignal, attempt.error, [index]);
-    else return terminalResult(vectors, truncated, failures, opts.abortSignal);
+    else if (attempt.kind === 'fatal') return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, attempt.error, [index]);
+    else return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
   }
-  return terminalResult(vectors, truncated, failures, opts.abortSignal);
+  return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
 }
 
 /**

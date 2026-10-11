@@ -162,12 +162,12 @@ for (const kind of ['pglite', 'postgres'] as const) {
       expect(again.calls).toEqual([]);
     });
 
-    test('an oversize chunk that can only be embedded truncated (unknown input hash) converges: no endless probe / re-null / re-embed', async () => {
+    test('an oversize chunk that can only be embedded truncated records its truncation provenance and converges: stamped in round 1, no probe / re-null / re-embed afterwards', async () => {
       const engine = engineOf();
       if (!engine) return;
-      // The fallback truncates inputs longer than 5500 chars and records an UNKNOWN input hash for the result, which
-      // on a mode page can never satisfy the strict stamp. Nulling it again would loop forever, so the invalidation
-      // keeps such a chunk and restamps the page (keptBySignatureInvalidationPredicate).
+      // R6-1 (supersedes the F6 5500-char exception): the fallback truncates inputs longer than 5500 chars and the
+      // installer records a distinct, non-NULL truncation hash, which the strict stamp accepts. Full closed loops per
+      // mode are in test/e2e/embed-truncated-provenance.test.ts; this keeps the original scenario under the new contract.
       const slug = 'oversize-truncated';
       await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `# ${slug}` });
       await installFixtureChunks(engine, slug, [{ chunk_index: 0, chunk_text: 'x'.repeat(6000), chunk_source: 'compiled_truth', token_count: 4, embedding: undefined }]);
@@ -185,12 +185,16 @@ for (const kind of ['pglite', 'postgres'] as const) {
         const calls: string[][] = [];
         await embedStaleForSource(engine, 'default', { embedFn: embedFn(calls), embeddingSignature: NEW_SIG });
         rounds.push(calls);
+        if (round === 0) {
+          const state = await pageState(engine, slug);
+          expect(state).toEqual({ sig: NEW_SIG, nulls: 0, hashes: 1, total: 1 });
+        }
       }
       const embeds = (calls: string[][]) => calls.flat().filter(text => text.length > 5000).length;
-      // Round 1 embeds the chunk (original attempt + one truncation). Round 2 may probe once and restamps the page.
+      // Round 1 embeds the chunk (original attempt + one truncation) and stamps the page.
       expect(embeds(rounds[0]!)).toBe(2);
-      expect(rounds[1]!.flat().some(text => text.length > 5000)).toBe(false);
       // From then on the drain does nothing at all: no probe, no re-embed.
+      expect(rounds[1]).toEqual([]);
       expect(rounds[2]).toEqual([]);
       expect(rounds[3]).toEqual([]);
       const state = await pageState(engine, slug);

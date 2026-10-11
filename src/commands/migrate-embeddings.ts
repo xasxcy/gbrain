@@ -2,6 +2,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { currentExitCode } from '../core/cli-force-exit.ts';
 import { consentGate, engineConsentEnv } from '../core/consent-cli.ts';
 import { serr, slog } from '../core/console-prefix.ts';
+import { refreshConfigStashedEnv } from '../core/config-env-stash.ts';
 import {
   planEmbeddingMigration,
   applyEmbeddingMigration,
@@ -382,6 +383,9 @@ export async function persistEmbeddingFileConfig(
   fileCfg.embedding_model = toModel;
   fileCfg.embedding_dimensions = toDims;
   saveConfig(fileCfg);
+  // FORK (R6-2): connectEngine stashed the PREVIOUS merged model into process.env, and env wins in the merge below.
+  // Refresh that stash (never a user-set variable) so the reconfigured gateway runs the model just persisted.
+  refreshConfigStashedEnv('GBRAIN_EMBEDDING_MODEL', toModel);
   // Reconfigure the in-process gateway from the MERGED view (env still wins
   // at runtime; when env is set it matches the target — the ≠ case was
   // refused before apply).

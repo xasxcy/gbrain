@@ -131,6 +131,7 @@ import * as filesImpl from './engine-sql/files.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
 import * as chunksImpl from './engine-sql/chunks.ts';
 import { hasCJK } from './cjk.ts';
+import { PGROONGA_PROBE_RETRY_MS, PGROONGA_PROBE_TIMEOUT_MS, probePgroongaExtension } from './postgres-engine/pgroonga-probe.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './engine-sql/cjk-search.ts';
 import * as titlesImpl from './engine-sql/titles.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
@@ -238,6 +239,11 @@ export class PostgresEngine implements BrainEngine {
   private _usePgroonga = false;
   private _pgroongaProbe: Promise<void> | undefined;
   private _pgroongaProbeArmed = false;
+  /** R6-4: epoch-ms before which no new probe may start after a FAILED probe (0 = none pending); definitive answers stay cached. */
+  private _pgroongaRetryAt = 0;
+  private _pgroongaRetryMs = PGROONGA_PROBE_RETRY_MS;
+  private _pgroongaProbeTimeoutMs = PGROONGA_PROBE_TIMEOUT_MS;
+  private _pgroongaNow: () => number = () => Date.now();
 
   /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
@@ -451,10 +457,14 @@ export class PostgresEngine implements BrainEngine {
     this._pgroongaProbeArmed = true;
   }
 
-  /** Run the armed PGroonga probe once; concurrent first searches share it. detectPgroonga never rejects. */
+  /** Run the armed PGroonga probe once; concurrent first searches share it. A FAILED probe re-arms after its backoff (R6-4). */
   private async ensurePgroongaProbed(): Promise<void> {
+    if (!this._pgroongaProbeArmed && this._pgroongaRetryAt !== 0 && this._pgroongaNow() >= this._pgroongaRetryAt) {
+      this._pgroongaProbeArmed = true;
+    }
     if (this._pgroongaProbeArmed) {
       this._pgroongaProbeArmed = false;
+      this._pgroongaRetryAt = 0;
       this._pgroongaProbe = this.detectPgroonga();
     }
     await this._pgroongaProbe;
@@ -632,14 +642,13 @@ export class PostgresEngine implements BrainEngine {
   private async detectPgroonga(conn: ReturnType<typeof postgres> = this.sql): Promise<void> { // engine-sql-ok: Postgres capability probe runs on the locked DDL connection and has no PGLite counterpart.
     if (process.env.GBRAIN_USE_PGROONGA === '1') {
       this._usePgroonga = true;
+      this._pgroongaRetryAt = 0;
       return;
     }
-    try {
-      const rows = await conn`SELECT 1 FROM pg_extension WHERE extname = 'pgroonga' LIMIT 1`;
-      this._usePgroonga = rows.length > 0;
-    } catch {
-      this._usePgroonga = false;
-    }
+    const result = await probePgroongaExtension(() => conn`SELECT 1 FROM pg_extension WHERE extname = 'pgroonga' LIMIT 1`, this._pgroongaProbeTimeoutMs);
+    this._usePgroonga = result === 'present';
+    // A definitive answer (present or absent) is cached; only a failed probe is retried after the backoff (R6-4).
+    this._pgroongaRetryAt = result === 'failed' ? this._pgroongaNow() + this._pgroongaRetryMs : 0;
   }
 
   /**

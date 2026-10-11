@@ -35,6 +35,7 @@
       "migrateLegacyTokens": "6e4abe3670127e7a495b56ecbf9f5789edd3a7362d45704656c2210a85b27f4c",
       "migrationNotice": "9a6607b26a9719ef1833571b137bc8ebfcd1e16d545e89ff8728cf3ccbcbb409",
       "noticeIdleBlockers": "ea8c2a5d5b14ce1df0fecd2d9f7687f751c6aed8ac717458171584cdf87cf104",
+      "noticeUnpinnedAutoEnableRls": "d8420721f63e3540780dcbf3226d5ba877cc393fa0f2ca804267bb530b378227",
       "pageSearchVectorFunctionSql": "8e85f8a556751b351ce3363fcbec66250781b217703e752bb70dad6b76a1d8c4",
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
@@ -3140,12 +3141,20 @@
         "version": 210
       },
       {
-        "handler": "absent",
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "migrationNotice",
+            "noticeUnpinnedAutoEnableRls",
+            "quietMigrationNotices"
+          ],
+          "sha256": "02d4f2ae8b9012ab514e56a51bb5554fb48c3195815550add53901d5b7deae87"
+        },
         "idempotent": true,
         "name": "function_search_path",
         "sql": {
-          "length": 2317,
-          "sha256": "f97086a3ceb46db788472af4c146b31a1877dfe6fa021f3d9cd70a4696744cf7"
+          "length": 2338,
+          "sha256": "100850471f8dfd7cc42d50394f747c86df3c8722a7caf18daa51543e502cb564"
         },
         "sqlFor": "absent",
         "transaction": "absent",

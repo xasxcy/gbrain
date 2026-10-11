@@ -50,17 +50,9 @@ export function currentSpaceChunkPredicate(colId: string, modelParam: number, di
 }
 
 /**
- * Largest text length (chars) the embed fallback truncates an input to
- * (`FALLBACK_LEVELS[0]` in embed-fallback.ts, which imports this constant). A
- * fallback-truncated vector is recorded with an UNKNOWN input hash, and only a
- * chunk longer than this can ever be truncated.
- */
-export const TRUNCATION_FALLBACK_MAX_CHARS = 5500;
-
-/**
  * `currentSpaceChunkPredicate` plus the INPUT-provenance rule of
  * page-state/projections.ts (#5553): a vector with no recorded embedding input
- * (`embedding_input_hash IS NULL`: a legacy vector or an honest "unknown") is a
+ * (`embedding_input_hash IS NULL`: a legacy vector) is a
  * legitimate current input only on a page WITHOUT a contextual-retrieval mode.
  * On a page whose mode is set (including the explicit `none`) the missing proof
  * cannot authorize keeping the vector. Requires the `cc` (content_chunks) and
@@ -70,20 +62,6 @@ export const TRUNCATION_FALLBACK_MAX_CHARS = 5500;
 export function currentInputChunkPredicate(colId: string, modelParam: number, dimsParam: number): string {
   return `(${currentSpaceChunkPredicate(colId, modelParam, dimsParam)}
               AND (cc.embedding_input_hash IS NOT NULL OR p.contextual_retrieval_mode IS NULL))`;
-}
-
-/**
- * What the signature invalidation KEEPS (R5-1): `currentInputChunkPredicate`, plus one narrow exception.
- * A current-space vector with no recorded input on a chunk longer than the largest truncation level is
- * indistinguishable from a fallback-truncated vector, and re-embedding it would truncate it the same way and
- * record the same unknown input, so nulling it never converges (every drain would re-probe, re-null and
- * re-embed it, and the page could never be stamped). Those chunks keep their vector and do not block the
- * page restamp, exactly as before R5-1; every other unproven vector on a mode page is nulled and re-embedded.
- */
-export function keptBySignatureInvalidationPredicate(colId: string, modelParam: number, dimsParam: number): string {
-  return `(${currentInputChunkPredicate(colId, modelParam, dimsParam)}
-              OR (${currentSpaceChunkPredicate(colId, modelParam, dimsParam)}
-                AND cc.embedding_input_hash IS NULL AND length(cc.chunk_text) > ${TRUNCATION_FALLBACK_MAX_CHARS}))`;
 }
 
 export async function lockEmbeddingSources(tx: Pick<BrainEngine, 'executeRaw'>, sourceId?: string): Promise<string[]> {
@@ -211,7 +189,7 @@ export async function countRestampOnlyChunks(
       WHERE p.deleted_at IS NULL AND ${sigClause}
         AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
         AND ($4::text IS NULL OR p.source_id = $4)
-        AND ${keptBySignatureInvalidationPredicate(colId, 2, 3)}`,
+        AND ${currentInputChunkPredicate(colId, 2, 3)}`,
     [opts.signature, model, dims, opts.sourceId ?? null],
   );
   return Number(rows[0]?.count ?? 0);
@@ -234,7 +212,7 @@ export async function countSignatureDriftedEmbeddings(
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
         AND cc.${colId} IS NOT NULL
-        AND NOT ${keptBySignatureInvalidationPredicate(colId, 2, 3)}
+        AND NOT ${currentInputChunkPredicate(colId, 2, 3)}
         AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
         AND p.deleted_at IS NULL
         AND p.text_projection_revision = p.knowledge_revision
@@ -256,8 +234,8 @@ export async function invalidateStaleSignatureEmbeddingsGuarded(
     const params: unknown[] = [opts.signature, model, dims, sources];
     // Current space AND a legitimate input (R5-1, follows N2 / projections.ts): a NULL-hash vector on a page with a
     // contextual mode is not kept and not stamped; it is nulled here and the ordinary drain re-embeds and stamps it.
-    // The one exception (oversize unproven chunks) is documented on keptBySignatureInvalidationPredicate.
-    const currentChunk = keptBySignatureInvalidationPredicate(colId, 2, 3);
+    // A fallback-truncated vector records a non-NULL truncation provenance (R6-1), so it is kept and stamped like any recorded input.
+    const currentChunk = currentInputChunkPredicate(colId, 2, 3);
     const srcClause = ' AND p.source_id=ANY($4::text[])';
     // Mirrors the engine method's clauses (NULL-signature grandfather lifted by
     // includeNullSignature, #3391); the embed_skip predicate matches

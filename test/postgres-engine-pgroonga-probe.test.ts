@@ -37,3 +37,87 @@ describe('deferred PGroonga probe', () => {
     expect(probes(fake)).toBe(1);
   });
 });
+
+/**
+ * R6-4: "the query succeeded and the extension is absent" is a definitive answer and is cached; "the probe itself
+ * failed" (error or timeout) is not. A failed probe falls back to tsvector, is not repeated inside the backoff, and is
+ * retried once the backoff has elapsed, so a transient outage on the first search cannot pin the instance to tsvector.
+ */
+describe('PGroonga probe failure backoff', () => {
+  const PROBE = /FROM pg_extension WHERE extname = 'pgroonga'/;
+  const usesPgroonga = (fake: { statements(): Array<{ text: string }> }) =>
+    fake.statements().filter(s => /FROM content_chunks cc/.test(s.text)).some(s => s.text.includes('&@~'));
+  const mark = (fake: { statements(): Array<{ text: string }> }) => fake.statements().length;
+
+  function armed(rule: unknown) {
+    const { engine, fake } = makeEngineWithFake([[PROBE, rule as never]]);
+    let now = 1_000_000;
+    engine._pgroongaNow = () => now;
+    engine._pgroongaProbeArmed = true;
+    return { engine, fake, advance: (ms: number) => { now += ms; }, retryMs: () => engine._pgroongaRetryMs as number };
+  }
+
+  test('a failed probe is not repeated inside the backoff; after it, a successful probe restores PGroonga', async () => {
+    let failing = true;
+    const { engine, fake, advance, retryMs } = armed(() => { if (failing) throw new Error('connection reset'); return [{ '?column?': 1 }]; });
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(1);
+    expect(usesPgroonga(fake)).toBe(false);
+    // Inside the backoff window: several searches (also concurrent ones), still one probe, still tsvector.
+    advance(retryMs() - 1);
+    await Promise.all([engine.searchKeyword('alice'), engine.searchKeywordChunks('alice'), engine.searchKeyword('bob')]);
+    expect(probes(fake)).toBe(1);
+    expect(usesPgroonga(fake)).toBe(false);
+    // The database recovers and the backoff elapses: the next search re-probes (once, shared) and uses PGroonga.
+    failing = false;
+    advance(2);
+    const before = mark(fake);
+    await Promise.all([engine.searchKeyword('alice'), engine.searchKeywordChunks('alice')]);
+    expect(probes(fake)).toBe(2);
+    expect(fake.statements().slice(before).filter(s => /FROM content_chunks cc/.test(s.text)).every(s => s.text.includes('&@~'))).toBe(true);
+    // Resolved for good: no further probes however much time passes.
+    advance(10 * retryMs());
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(2);
+  });
+
+  test('a probe that keeps failing is retried once per backoff window, not on every search', async () => {
+    const { engine, fake, advance, retryMs } = armed(() => { throw new Error('still down'); });
+    await engine.searchKeyword('alice');
+    advance(retryMs());
+    await engine.searchKeyword('alice');
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(2);
+    advance(retryMs() - 1);
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(2);
+    advance(1);
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(3);
+  });
+
+  test('an extension that is genuinely absent is cached as unavailable and never probed again', async () => {
+    const { engine, fake, advance, retryMs } = armed(() => []);
+    await engine.searchKeyword('alice');
+    advance(100 * retryMs());
+    await engine.searchKeyword('alice');
+    await engine.searchKeywordChunks('alice');
+    expect(probes(fake)).toBe(1);
+    expect(usesPgroonga(fake)).toBe(false);
+  });
+
+  test('a probe that hangs times out on its own short deadline, counts as failed and the search still completes', async () => {
+    const { engine, fake, advance, retryMs } = armed(() => new Promise(() => {}));
+    engine._pgroongaProbeTimeoutMs = 25;
+    const started = Date.now();
+    await expect(engine.searchKeyword('alice')).resolves.toBeDefined();
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(probes(fake)).toBe(1);
+    expect(usesPgroonga(fake)).toBe(false);
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(1); // inside the backoff
+    advance(retryMs());
+    await engine.searchKeyword('alice');
+    expect(probes(fake)).toBe(2);
+  });
+});

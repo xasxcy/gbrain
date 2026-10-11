@@ -14,7 +14,7 @@ import { getFtsLanguage } from '../fts-language.ts';
 import { getEmbeddingModel } from '../ai/gateway.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { belowSafeChunkFence } from '../search/safe-chunks.ts';
-import { acceptedEmbeddingInputHashes, embeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
+import { acceptedEmbeddingInputHashes, embeddingInputHash, truncatedEmbeddingInputHash, plainEmbeddingTier, synopsisBodyHash,
   type EmbeddingInputContext, type EmbeddingTier } from '../embedding-input-hash.ts';
 
 /**
@@ -258,11 +258,14 @@ export async function installPageEmbeddings(engine: BrainEngine, prepared: Proje
     if (opts.outcome?.entries.length) {
       const entries = opts.outcome.entries.map(entry => {
         const original = byIndex.get(entry.chunkIndex);
-        return 'vector' in entry.outcome && original
-          // Undefined asks the installer for canonical provenance; explicit
-          // null is an honest "unknown" marker for transformed input.
-          ? { ...entry, inputHash: entry.inputHash === undefined ? embeddingInputHash(provenance, tier, original) : entry.inputHash }
-          : entry;
+        if (!('vector' in entry.outcome) || !original) return entry;
+        const { truncatedTo, ...rest } = entry;
+        // Undefined asks the installer for canonical provenance; explicit null is
+        // an honest "unknown" marker. A fallback-truncated vector (R6-1) records
+        // the truncation provenance of the input actually embedded.
+        return { ...rest, inputHash: entry.inputHash !== undefined ? entry.inputHash
+          : truncatedTo != null ? truncatedEmbeddingInputHash(provenance, tier, original, truncatedTo)
+          : embeddingInputHash(provenance, tier, original) };
       });
       const outcome = await tx.persistEmbedOutcome({
         sourceId,

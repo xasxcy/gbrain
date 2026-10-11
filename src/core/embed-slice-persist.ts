@@ -127,9 +127,11 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
     const row = rows[index]!;
     const vector = partial.vectors[index];
     if (vector !== null) {
-      // A truncated fallback vector has no canonical input-hash representation
-      // yet. Keep it usable, but never certify it as the full chunk input.
-      entries.push({ chunkIndex: row.chunk_index, chunkHash: hashChunk(row.chunk_text), inputHash: partial.truncated[index] ? null : undefined, outcome: { vector } });
+      // R6-1: a fallback-truncated vector records a distinct, non-NULL truncation
+      // provenance (the installer computes it from the truncation length); it is
+      // never certified as the full chunk input.
+      const truncatedTo = partial.truncatedTo[index];
+      entries.push({ chunkIndex: row.chunk_index, chunkHash: hashChunk(row.chunk_text), ...(truncatedTo != null && { truncatedTo }), outcome: { vector } });
     }
   }
   for (const failure of partial.failures) {

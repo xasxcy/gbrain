@@ -1145,8 +1145,12 @@
           "private _inTransaction",
           "private _ownsModuleSingleton",
           "private _pageTransaction",
+          "private _pgroongaNow",
           "private _pgroongaProbe",
           "private _pgroongaProbeArmed",
+          "private _pgroongaProbeTimeoutMs",
+          "private _pgroongaRetryAt",
+          "private _pgroongaRetryMs",
           "private _reconnecting",
           "private _savedConfig",
           "private _searchKeywordCJK",
@@ -3769,7 +3773,7 @@
         "kind": "type",
         "name": "PersistEmbedOutcomeEntry",
         "signature": [
-          "{ chunkIndex: number; chunkHash: string; inputHash?: string | null; outcome: { vector: Float32Array; } | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string; }; }; }"
+          "{ chunkIndex: number; chunkHash: string; inputHash?: string | null; truncatedTo?: number | null; outcome: { vector: Float32Array; } | { failure: { errorClass: EmbedFailureClass; errorFingerprint: string; }; }; }"
         ]
       },
       {

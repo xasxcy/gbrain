@@ -384,7 +384,7 @@ export function isDeadlockError(err: unknown): boolean {
   return /40P01|deadlock detected/i.test(msg);
 }
 
-export async function runMigrations(engine: BrainEngine): Promise<{ applied: number; current: number }> {
+export async function runMigrations(engine: BrainEngine, opts: { migrations?: readonly Migration[] } = {}): Promise<{ applied: number; current: number }> {
   const currentStr = await engine.getConfig('version');
   const current = parseInt(currentStr || '1', 10);
 
@@ -392,7 +392,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   // correctness. Migrations MUST run in version order; if v16 accidentally
   // precedes v15 in MIGRATIONS, setConfig(version, 16) would cause v15 to
   // be skipped on the next iteration.
-  const sorted = [...MIGRATIONS].sort((a, b) => a.version - b.version);
+  const sorted = [...(opts.migrations ?? MIGRATIONS)].sort((a, b) => a.version - b.version); // opts.migrations: test injection (instance-level; the shared array is never edited)
 
   const pending = sorted.filter(m => m.version > current);
 

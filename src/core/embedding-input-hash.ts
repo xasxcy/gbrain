@@ -45,13 +45,33 @@ export function isContextualMode(mode: string | null | undefined): boolean {
   return plainEmbeddingTier(mode) !== 'none';
 }
 
-export function embeddingInputHash(ctx: EmbeddingInputContext, tier: EmbeddingTier, chunk: HashedChunk): string {
+/** The exact string the provider embeds for `chunk` under `tier` (before any fallback truncation). */
+export function embeddingInputText(ctx: EmbeddingInputContext, tier: EmbeddingTier, chunk: HashedChunk): string {
   const raw = tier === 'none' || chunk.chunk_source === 'fenced_code';
-  const input = raw ? chunk.chunk_text
+  return raw ? chunk.chunk_text
     : tier === 'title' ? wrapChunkForEmbedding(chunk.chunk_text, buildContextualPrefix(ctx.title, null), chunk.chunk_source)
     : digest([ctx.title, ctx.bodyHash, chunk.chunk_text]);
+}
+
+export function embeddingInputHash(ctx: EmbeddingInputContext, tier: EmbeddingTier, chunk: HashedChunk): string {
   return digest(['embedding-input-v1', ctx.column, ctx.model, ctx.dimensions, tier,
-    tier === 'per_chunk_synopsis' ? ctx.corpusGeneration : null, sha256(input)]);
+    tier === 'per_chunk_synopsis' ? ctx.corpusGeneration : null, sha256(embeddingInputText(ctx, tier, chunk))]);
+}
+
+/**
+ * Provenance of a vector the embed fallback built from the first `maxLength`
+ * characters of the input (R6-1, the explicit form of R2-F4's "unknown input").
+ * Same ctx, tier and wrapping as `embeddingInputHash`, but a separate domain
+ * tag plus the truncation length and the digest of the text actually embedded,
+ * so it can never equal the hash of the full input. It is non-NULL (the drain
+ * stamp and the signature invalidation accept it as a recorded input) yet is
+ * not a member of `acceptedEmbeddingInputHashes`, so a projection rebuild never
+ * mistakes the truncated vector for a vector of the complete input.
+ */
+export function truncatedEmbeddingInputHash(ctx: EmbeddingInputContext, tier: EmbeddingTier, chunk: HashedChunk, maxLength: number): string {
+  return digest(['embedding-input-v1-truncated', ctx.column, ctx.model, ctx.dimensions, tier,
+    tier === 'per_chunk_synopsis' ? ctx.corpusGeneration : null, maxLength,
+    sha256(embeddingInputText(ctx, tier, chunk).slice(0, maxLength))]);
 }
 
 /**

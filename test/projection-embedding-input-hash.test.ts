@@ -47,6 +47,34 @@ describe('#5553 embedding input hash is the exact wrapped input', () => {
   });
 });
 
+describe('R6-1 truncation provenance hash', () => {
+  const base = { column: 'embedding', model: 'openai:m', dimensions: 1536, corpusGeneration: 'gen', bodyHash: 'body', title: 'Cedar' };
+  const chunk = { chunk_text: 'Body text. '.repeat(700), chunk_source: 'compiled_truth' };
+  test('never equals the full input hash or any hash a projection rebuild accepts, for every tier and mode', async () => {
+    const { embeddingInputHash, truncatedEmbeddingInputHash, acceptedEmbeddingInputHashes } = await import('../src/core/embedding-input-hash.ts');
+    for (const tier of ['none', 'title', 'per_chunk_synopsis'] as const) {
+      for (const length of [5500, 5000, 4500]) {
+        const truncated = truncatedEmbeddingInputHash(base, tier, chunk, length);
+        expect(truncated).not.toBe(embeddingInputHash(base, tier, chunk));
+        for (const mode of [null, 'none', 'title', 'per_chunk_synopsis']) expect(acceptedEmbeddingInputHashes(base, mode, chunk)).not.toContain(truncated);
+      }
+    }
+  });
+  test('names the exact text embedded: truncation length, wrapping tier, column, model, dimensions and content all change it', async () => {
+    const { truncatedEmbeddingInputHash: hash } = await import('../src/core/embedding-input-hash.ts');
+    const ref = hash(base, 'title', chunk, 5500);
+    expect(hash(base, 'title', chunk, 5500)).toBe(ref);
+    expect(hash(base, 'title', chunk, 5000)).not.toBe(ref);
+    expect(hash(base, 'none', chunk, 5500)).not.toBe(ref);
+    expect(hash({ ...base, title: 'Other' }, 'title', chunk, 5500)).not.toBe(ref);
+    expect(hash({ ...base, column: 'embedding_alt' }, 'title', chunk, 5500)).not.toBe(ref);
+    expect(hash({ ...base, model: 'openai:n' }, 'title', chunk, 5500)).not.toBe(ref);
+    expect(hash({ ...base, dimensions: 768 }, 'title', chunk, 5500)).not.toBe(ref);
+    expect(hash(base, 'title', { ...chunk, chunk_text: `${chunk.chunk_text}!` }, 5500)).toBe(ref); // past the cut: same embedded text
+    expect(hash(base, 'title', { ...chunk, chunk_text: `!${chunk.chunk_text}` }, 5500)).not.toBe(ref);
+  });
+});
+
 for (const kind of backends) {
   describe(`#5553 embedding input provenance ${kind}`, () => {
     let engine: BrainEngine;

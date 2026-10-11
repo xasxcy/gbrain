@@ -14,6 +14,7 @@ import {
   countRestampOnlyChunks,
 } from './embedding-invalidation.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { userEnvValue } from './config-env-stash.ts';
 import { readPrimaryEmbeddingStores, readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
 import { hnswIndexExpected } from './vector-index.ts';
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
@@ -35,7 +36,7 @@ export function detectEnvOverride(
   env: NodeJS.ProcessEnv = process.env,
 ): EnvOverrideWarning {
   const vars: EnvOverrideWarning['vars'] = [];
-  const envModel = env.GBRAIN_EMBEDDING_MODEL?.trim();
+  const envModel = userEnvValue('GBRAIN_EMBEDDING_MODEL', env)?.trim();
   if (envModel && envModel !== targetModel) {
     vars.push({ name: 'GBRAIN_EMBEDDING_MODEL', current: envModel, target: targetModel });
   }
@@ -489,7 +490,7 @@ export type MigrationApplyResult =
 export function detectEnvPresence(
   env: NodeJS.ProcessEnv = process.env,
 ): { present: boolean; model: string | null; dims: string | null } {
-  const model = env.GBRAIN_EMBEDDING_MODEL?.trim() || null;
+  const model = userEnvValue('GBRAIN_EMBEDDING_MODEL', env)?.trim() || null;
   const dims = env.GBRAIN_EMBEDDING_DIMENSIONS?.trim() || null;
   return { present: Boolean(model || dims), model, dims };
 }
@@ -508,7 +509,7 @@ export function envFullyPinsTarget(
   targetDim: number,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const model = env.GBRAIN_EMBEDDING_MODEL?.trim();
+  const model = userEnvValue('GBRAIN_EMBEDDING_MODEL', env)?.trim();
   if (!model || model !== targetModel) return false;
   return !detectEnvOverride(targetModel, targetDim, env).triggered;
 }

@@ -232,6 +232,8 @@ export function makeEmbedBackfillHandler(
   testOpts: {
     runStale?: typeof embedStaleForSource;
     embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+    /** R6-5: the drain's abort controller, so a test can model a runtime that drops the abort reason without patching the global prototype. */
+    createDrainAbort?: () => AbortController;
   } = {},
 ) {
   const runStale = testOpts.runStale ?? embedStaleForSource;
@@ -288,7 +290,7 @@ export function makeEmbedBackfillHandler(
     // drain through the same signal the operator abort uses, then THROW so
     // the queue marks the job failed and the resumable cursor re-runs it.
     const stallSeconds = resolveEmbedStallAbortSeconds();
-    const drainAbort = new AbortController();
+    const drainAbort = testOpts.createDrainAbort?.() ?? new AbortController();
     const onJobAbort = () => drainAbort.abort();
     if (job.signal?.aborted) drainAbort.abort();
     job.signal?.addEventListener('abort', onJobAbort, { once: true });
