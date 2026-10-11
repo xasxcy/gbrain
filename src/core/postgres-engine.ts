@@ -1108,10 +1108,9 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // PGroonga selects matches; ranking retains the upstream tsvector scale.
-    // Mixing its index-dependent term-frequency score with ts_rank overwhelms
-    // source dampening and changes ordering when the planner chooses a scan.
-    const scoreExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
+    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
+    // swamped source dampening). A PGroonga-only hit has ts_rank 0: floor it so the factor still orders it.
+    const scoreExpr = `${this._usePgroonga ? 'GREATEST(' : '('}ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))${this._usePgroonga ? ', 1e-6)' : ')'} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
@@ -1323,9 +1322,9 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // Keep the chunk-grain arm on the same upstream ranking scale as pages;
-    // PGroonga matching must not replace source-aware ts_rank ordering.
-    const scoreExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase}`;
+    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
+    // swamped source dampening). A PGroonga-only hit has ts_rank 0: floor it so the factor still orders it.
+    const scoreExpr = `${this._usePgroonga ? 'GREATEST(' : '('}ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))${this._usePgroonga ? ', 1e-6)' : ')'} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
