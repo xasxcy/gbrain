@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { AIConfigError, AITransientError, PER_ITEM_HTTP_STATUSES } from './ai/errors.ts';
-import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
+import { isEmbeddingResponseShapeError, isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
 import { isMustAbortError } from './worker-pool.ts';
 
 export type EmbedFailureClass =
@@ -49,6 +49,14 @@ export function classifyEmbedFailure(error: unknown): EmbedFailureClassification
   // global credential/config failure.
   if (isEmbeddingZeroNormError(error)) {
     return { kind: 'failure', errorClass: 'invalid_input' };
+  }
+  // F6 (advisor ruling 3): the same holds for a response that does not line up with the request (wrong number of
+  // vectors, wrong width). It says nothing about credentials or configuration, and one bad answer must not abort
+  // the pages after it: the chunks of that call are ledgered (and bisected) like any other per-item provider
+  // failure. Upstream treats every per-page error this way. A real config fault (no key, unknown model, rejected
+  // credentials) is a different AIConfigError and still falls through to `fatal` below.
+  if (isEmbeddingResponseShapeError(error)) {
+    return { kind: 'failure', errorClass: 'provider_other' };
   }
   // Pre-existing bug fix: normalizeAIError (ai/errors.ts) wraps EVERY non-429
   // 4xx into AIConfigError, including request-shaped ones (400/408/413/422 —

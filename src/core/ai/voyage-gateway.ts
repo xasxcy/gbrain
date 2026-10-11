@@ -7,7 +7,7 @@
  * request URL's hostname is exactly the gateway host: never a substring or
  * suffix match, never for api.voyageai.com or another proxy.
  */
-import { AIConfigError } from './errors.ts';
+import { EmbeddingResponseShapeError } from './embedding-guard.ts';
 
 export const VERCEL_AI_GATEWAY_HOST = 'ai-gateway.vercel.sh';
 
@@ -37,14 +37,15 @@ export function applyVoyageOutputDimension(body: Record<string, unknown>, input:
 export function embeddingDimMismatchError(
   modelId: string, returned: number, expected: number, migrateCommand: string,
   route: { provider: string; baseUrl?: string; defaultBaseUrl?: string },
-): AIConfigError {
+): EmbeddingResponseShapeError {
   const migrate = `\`${migrateCommand}\``;
   const proxied = route.baseUrl !== undefined && route.baseUrl !== route.defaultBaseUrl;
   if (!proxied) {
-    return new AIConfigError(`Embedding dim mismatch: model ${modelId} returned ${returned} but schema expects ${expected}.`, `Run ${migrate} or change models.`);
+    return new EmbeddingResponseShapeError('width', `Embedding dim mismatch: model ${modelId} returned ${returned} but schema expects ${expected}.`, `Run ${migrate} or change models.`);
   }
   const host = requestHostname(route.baseUrl!) ?? route.baseUrl!;
-  return new AIConfigError(
+  return new EmbeddingResponseShapeError(
+    'width',
     `Embedding dim mismatch: model ${modelId} returned ${returned} but schema expects ${expected}. Requests go through ${host} (provider_base_urls.${route.provider}), not the provider's own API; a proxy that drops the requested width returns the model default. Nothing was written.`,
     `Check that the proxy forwards the requested embedding width (then \`gbrain doctor --only embedding_provider --probe --json\`); only if ${returned} dimensions is what you want, run ${migrate}.`,
   );

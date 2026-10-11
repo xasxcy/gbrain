@@ -354,6 +354,8 @@ describe('embed-backfill handler — SPEC V4 terminal mappings', () => {
     const result = await handler(fakeJob({ sourceId: 'default' }));
     expect(result.status).toBe('budget_exhausted');
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
+    // F6 fix: the result row says work is left, so a budget stop is never mistaken for a success.
+    expect(result.remaining).toBe(1);
   });
 
   test('BudgetExhausted still maps correctly when its slice checkpoint rolls back', async () => {

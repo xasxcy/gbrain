@@ -438,6 +438,17 @@ describe('(5) jobs queued before the upgrade run under the configured budget', (
     }
   }
 
+  async function embedFailureCount(): Promise<number> {
+    const engine = new PGLiteEngine();
+    await engine.connect({ engine: 'pglite', database_path: join(h.home, '.gbrain', 'brain.pglite') });
+    try {
+      const [row] = await engine.executeRaw<{ n: number | string }>('SELECT count(*)::int AS n FROM embed_failures');
+      return Number(row.n);
+    } finally {
+      await engine.disconnect();
+    }
+  }
+
   async function jobRow(id: number): Promise<{ status: string; result: Record<string, any>; error_text: string | null }> {
     const engine = new PGLiteEngine();
     await engine.connect({ engine: 'pglite', database_path: join(h.home, '.gbrain', 'brain.pglite') });
@@ -459,10 +470,26 @@ describe('(5) jobs queued before the upgrade run under the configured budget', (
     expect(worker.stderr).toContain('embed-backfill:default: projected cost');
     expect(embeddingCalls).toBe(before);
     const row = await jobRow(id);
-    expect(row.status, `${row.error_text}\n${worker.stderr.slice(-2000)}`).not.toBe('completed');
-    expect(row.error_text).toContain('embed-backfill: incomplete');
-    const cancelled = await runNet(h, ['jobs', 'cancel', String(id)], env);
-    expect(cancelled.exitCode, cancelled.stderr).toBe(0);
+    // F6 fix (terminal-state contract change, authorized by the user, advisor ruling 2): upstream expected the
+    // job to FAIL with `embed-backfill: incomplete`. The fork's SPEC V4 (drain-level BudgetExhausted is run-global
+    // and rethrown, pinned by embed-stale.serial and handlers-embed-backfill) makes the handler return
+    // `status: 'budget_exhausted'`, so the queue row is `completed`. That is only acceptable because all three
+    // conditions below hold; the half of this test that matters (no provider call past the cap) is unchanged above.
+    // (1) the row is never a plain success: the result carries the budget_exhausted marker, not `success`.
+    expect(row.status, `${row.error_text}\n${worker.stderr.slice(-2000)}`).toBe('completed');
+    expect(row.result.status).toBe('budget_exhausted');
+    expect(row.result.status).not.toBe('success');
+    expect(row.result.embedded).toBe(0);
+    expect(row.result.budgetCapUsd).toBeGreaterThan(0);
+    // (2) the result says work is left.
+    expect(row.result.remaining).toBeGreaterThan(0);
+    // (3) a budget stop is not a chunk failure: nothing enters the retry ledger, so raising the cap re-runs at once.
+    expect(await embedFailureCount()).toBe(0);
+    // The row is already terminal (`completed`): an operator cancel must not rewrite it.
+    await runNet(h, ['jobs', 'cancel', String(id)], env);
+    const afterCancel = await jobRow(id);
+    expect(afterCancel.status).toBe('completed');
+    expect(afterCancel.result.status).toBe('budget_exhausted');
   }, 240_000);
 
   test('a configured cap that covers the work runs it to completion', async () => {

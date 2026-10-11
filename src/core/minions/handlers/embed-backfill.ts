@@ -86,6 +86,11 @@ export interface EmbedBackfillResult {
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
   budgetCapUsd?: number;
+  /**
+   * Set when status === 'budget_exhausted' (best effort): chunks still waiting for a vector after the
+   * budget stopped the drain. Lets a reader tell "stopped by the cap with work left" from a success.
+   */
+  remaining?: number;
 }
 
 /**
@@ -410,6 +415,11 @@ export function makeEmbedBackfillHandler(
       if (err instanceof BudgetExhausted) {
         // Partial progress preserved: already-embedded chunks stay embedded;
         // remaining stays NULL for the next run to pick up.
+        // F6 fix: report what is left (fork SPEC V4 returns this state instead of failing the job like
+        // upstream's `embed-backfill: incomplete`, so the result row must say work remains).
+        const signature = currentEmbeddingSignature();
+        const remaining = await engine.countStaleChunks({ sourceId, ignoreBackoff: true, ...(signature !== null && { signature }) })
+          .catch(() => undefined);
         return {
           status: 'budget_exhausted',
           sourceId,
@@ -419,6 +429,7 @@ export function makeEmbedBackfillHandler(
           invalidated: 0, // Unknown — the drain's counters are lost with the throw
           spentUsd: tracker.totalSpent,
           budgetCapUsd: capUsd,
+          ...(remaining !== undefined && { remaining }),
         };
       }
       // The persistence fence deliberately rethrows AbortError so it cannot

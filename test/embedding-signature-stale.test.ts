@@ -145,6 +145,37 @@ describe('embedding_signature stale semantics', () => {
     expect(await stampIfPageProvenanceComplete(engine, slug, 'default', { signature, column: 'embedding' })).toBe(true);
   });
 
+  test('invalidation follows the projection rule for unrecorded input hashes (R5-1)', async () => {
+    const signature = `target:model:${colDim}`;
+    const stateOf = async (slug: string) => {
+      const [row] = await engine.executeRaw<{ sig: string | null; nulls: number; total: number }>(
+        `SELECT p.embedding_signature AS sig,
+                count(*) FILTER (WHERE cc.embedding IS NULL)::int AS nulls, count(*)::int AS total
+           FROM pages p JOIN content_chunks cc ON cc.page_id = p.id WHERE p.source_id='default' AND p.slug=$1
+          GROUP BY p.embedding_signature`, [slug]);
+      return { sig: row!.sig, nulls: Number(row!.nulls), total: Number(row!.total) };
+    };
+    const seed = async (slug: string, mode: string | null, hash: string | null) => {
+      await seedEmbedded(slug, 'text', 'old:model:1');
+      if (mode) {
+        await engine.executeRaw(`UPDATE pages SET contextual_retrieval_mode = $2 WHERE source_id='default' AND slug=$1`, [slug, mode]);
+        await sealPageTextProjection(engine, slug, 'default');
+      } else await sealPageTextProjection(engine, slug, 'default');
+      await engine.executeRaw(`UPDATE content_chunks SET model = 'target:model', embedded_text_hash = md5(chunk_text), embedding_input_hash = $2::text
+        WHERE page_id = (SELECT id FROM pages WHERE source_id='default' AND slug=$1)`, [slug, hash]);
+    };
+    await seed('plain-unrecorded', null, null);       // no mode: unknown input is acceptable -> kept + restamped
+    await seed('none-recorded', 'none', 'recorded');  // mode, proof recorded -> kept + restamped
+    await seed('none-unrecorded', 'none', null);      // mode, no proof -> nulled, NOT restamped (the drain re-embeds + stamps it)
+
+    expect(await invalidateStaleSignatureEmbeddingsGuarded(engine, { signature })).toBe(1);
+    expect(await stateOf('plain-unrecorded')).toEqual({ sig: signature, nulls: 0, total: 1 });
+    expect(await stateOf('none-recorded')).toEqual({ sig: signature, nulls: 0, total: 1 });
+    expect(await stateOf('none-unrecorded')).toEqual({ sig: 'old:model:1', nulls: 1, total: 1 });
+    // Idempotent: the nulled chunk is now ordinary stale work, not drift.
+    expect(await invalidateStaleSignatureEmbeddingsGuarded(engine, { signature })).toBe(0);
+  });
+
   test('completion stamps require matching vector width (#5051)', async () => {
     await seedEmbedded('wrong-width-stamp', 'text', 'old:model:1');
     await sealPageTextProjection(engine, 'wrong-width-stamp', 'default');

@@ -19,7 +19,7 @@ import type { Chunk, ChunkInput } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier, readCorpusGeneration } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded, countSignatureDriftedEmbeddings, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
+import { invalidateStaleSignatureEmbeddingsGuarded, countSignatureDriftedEmbeddings, splitEmbeddingSignature, currentInputChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
   quoteIdentifier,
@@ -210,8 +210,7 @@ export async function stampIfPageProvenanceComplete(
       // vector or an honest "unknown" truncated vector) is a legitimate current
       // input only on a page without a contextual-retrieval mode.
       `SELECT count(*) > 0
-              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}
-                AND (cc.embedding_input_hash IS NOT NULL OR p.contextual_retrieval_mode IS NULL)) AS complete
+              AND bool_and(${currentInputChunkPredicate(colId, 1, 4)}) AS complete
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
         WHERE p.slug = $2 AND p.source_id = $3 AND p.text_projection_revision=p.knowledge_revision
           AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,

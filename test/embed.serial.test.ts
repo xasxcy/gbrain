@@ -78,6 +78,7 @@ afterEach(() => {
   delete process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS;
   delete process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS;
   delete process.env.GBRAIN_EMBED_STALL_ABORT_SECONDS;
+  delete process.env.GBRAIN_EMBED_SUBBATCH_SIZE;
 });
 
 describe('runEmbed --all (parallel)', () => {
@@ -1284,13 +1285,18 @@ describe('SPEC V4 foreground stale partial persistence', () => {
   });
 
   test('abort still records a persist failure and does not count unpersisted vectors', async () => {
+    // F6 fix (fixture only, no assertion relaxed): an outer stale slice is one atomic checkpoint and an abort rolls
+    // the WHOLE in-flight slice back (user ruling N8; F3 applied the same fixture change to embed-stale.serial). So the
+    // "good" prefix must sit in an EARLIER slice than the chunk that aborts: SUBBATCH_SIZE=8 (the minimum) with 8 good
+    // chunks + the aborting one gives slice 1/2 (persist fails, recorded) and slice 2/2 (abort).
+    process.env.GBRAIN_EMBED_SUBBATCH_SIZE = '8';
     const stale = [
-      { slug: 'abort-persist', chunk_index: 0, chunk_text: 'good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
-      { slug: 'abort-persist', chunk_index: 1, chunk_text: 'abort', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      ...Array.from({ length: 8 }, (_, i) => ({ slug: 'abort-persist', chunk_index: i, chunk_text: `good-${i}`, chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 })),
+      { slug: 'abort-persist', chunk_index: 8, chunk_text: 'abort', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
     ];
     const controller = new AbortController();
     const engine = mockEngine({
-      countStaleChunks: async () => 2,
+      countStaleChunks: async () => stale.length,
       listStaleChunks: async () => stale,
       persistEmbedOutcome: async () => { throw new Error('write failed'); },
       invalidateStaleSignatureEmbeddings: async () => 0,
@@ -1313,7 +1319,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
     } finally {
       (console.error as any) = originalError;
     }
-    expect(stderr).toContain('[embed-persist-fail] slug=abort-persist slice=1/1 err=write failed');
+    expect(stderr).toContain('[embed-persist-fail] slug=abort-persist slice=1/2 err=write failed');
   });
 
   test('rethrows the original BudgetExhausted after a failed checkpoint', async () => {
@@ -1375,12 +1381,15 @@ describe('SPEC V4 foreground stale partial persistence', () => {
   });
 
   test('two in-flight stale keys persist prefixes once each after a barrier abort', async () => {
-    const stale = [
-      { slug: 'a', chunk_index: 0, chunk_text: 'a-good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
-      { slug: 'a', chunk_index: 1, chunk_text: 'a-bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
-      { slug: 'b', chunk_index: 0, chunk_text: 'b-good', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'other', page_id: 2 },
-      { slug: 'b', chunk_index: 1, chunk_text: 'b-bad', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'other', page_id: 2 },
+    // F6 fix (fixture only): a barrier abort rolls back each key's in-flight slice (user ruling N8), so each key's
+    // prefix must be a COMPLETE earlier slice: SUBBATCH_SIZE=8 (the minimum), 8 good chunks per key, then the bad one.
+    process.env.GBRAIN_EMBED_SUBBATCH_SIZE = '8';
+    const GOOD_PER_KEY = 8;
+    const keyRows = (slug: string, sourceId: string, pageId: number) => [
+      ...Array.from({ length: GOOD_PER_KEY }, (_, i) => ({ slug, chunk_index: i, chunk_text: `${slug}-${i}-good`, chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: sourceId, page_id: pageId })),
+      { slug, chunk_index: GOOD_PER_KEY, chunk_text: `${slug}-bad`, chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: sourceId, page_id: pageId },
     ];
+    const stale = [...keyRows('a', 'default', 1), ...keyRows('b', 'other', 2)];
     const controller = new AbortController();
     let releaseBarrier!: () => void;
     const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
@@ -1409,7 +1418,7 @@ describe('SPEC V4 foreground stale partial persistence', () => {
       throw new Error('EOF');
     };
     const result = await runEmbedCore(engine, { stale: true, signal: controller.signal });
-    expect(result.embedded).toBe(2);
+    expect(result.embedded).toBe(2 * GOOD_PER_KEY);
     expect(result.pages_processed).toBe(2);
     expect(Array.from(outcomes.keys()).sort()).toEqual(['a', 'b']);
     for (const outcome of outcomes.values()) {

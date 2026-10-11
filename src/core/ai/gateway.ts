@@ -61,7 +61,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
-import { isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
+import { EmbeddingResponseShapeError, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { embedMultimodalDashScope } from './dashscope-multimodal.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
@@ -1743,7 +1743,7 @@ async function embedSubBatch(
       : callTransport());
 
     if (!Array.isArray(result.embeddings) || result.embeddings.length !== texts.length) {
-      throw new AIConfigError(
+      throw new EmbeddingResponseShapeError('count',
         `Embedding provider returned ${result.embeddings?.length ?? 0} embedding(s) for ${texts.length} input(s).`,
         `Retry the import after checking provider health; partial embedding responses are not safe to index.`,
       );

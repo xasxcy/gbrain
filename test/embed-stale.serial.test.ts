@@ -1173,7 +1173,7 @@ describe('signature stamp for a page split across a cursor batch (#4825)', () =>
 // and hands the stamp helper a ProvenanceStamp.
 // ────────────────────────────────────────────────────────────────
 describe('provenance stamp resolves the active embedding column once per drain', () => {
-  test('the config lookups the signature ADDS do not grow with the page count', async () => {
+  test('the config lookups the signature ADDS grow by exactly 2 per stamped page (no per-page growth beyond the stamp re-verification)', async () => {
     // Unbound on purpose: persistEmbedOutcome runs inside a transaction whose
     // tx-bound engine is `Object.create(this)` with its OWN `db` getter
     // (pglite-engine.ts `transaction()`), so `tx.executeRaw(...)` resolves
@@ -1203,7 +1203,21 @@ describe('provenance stamp resolves the active embedding column once per drain',
       const sig = 'new:model:1536';
       const oneSigCost = (await configLookups(1, sig)) - (await configLookups(1));
       const fourSigCost = (await configLookups(4, sig)) - (await configLookups(4));
-      expect(fourSigCost).toBe(oneSigCost);
+      // F6 fix (contract change authorized by the user, advisor ruling 1): this
+      // used to pin `fourSigCost === oneSigCost` (a signature adds a CONSTANT
+      // number of config lookups). Since F2/R2-F3 the stamp transaction
+      // (`stampIfPageProvenanceComplete`, embed-stale.ts) re-reads the page with
+      // `readProjectionSnapshot(tx, ...)` under the page lock so a signature can
+      // never bridge an active-plane/config change. That re-read costs exactly
+      // two `search_embedding_column` lookups per stamped page, measured by
+      // stack: `indexingContext -> embeddingWriteTarget` (1) and
+      // `getChunks -> resolveActiveEmbeddingColumnFromEngine` (1). The
+      // re-verification is a safety requirement, so the contract is now an exact
+      // slope: each extra stamped page adds exactly 2 lookups, no more. (Batching
+      // the stamp transaction to cut this is on the backlog.) Any further
+      // per-page lookup (for example resolving the stamp column per page again)
+      // changes the slope and fails this exact equality.
+      expect(fourSigCost - oneSigCost).toBe(2 * (4 - 1));
     } finally {
       engine.executeRaw = orig;
     }

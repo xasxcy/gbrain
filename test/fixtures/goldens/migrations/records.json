@@ -34,13 +34,14 @@
       "migrateConnectorCheckpoints": "e0403022a56559556c82a9fa1e90d928f36e1d09c7db570e1d788a87d2dc9521",
       "migrateLegacyTokens": "6e4abe3670127e7a495b56ecbf9f5789edd3a7362d45704656c2210a85b27f4c",
       "migrationNotice": "9a6607b26a9719ef1833571b137bc8ebfcd1e16d545e89ff8728cf3ccbcbb409",
+      "noticeIdleBlockers": "ea8c2a5d5b14ce1df0fecd2d9f7687f751c6aed8ac717458171584cdf87cf104",
       "pageSearchVectorFunctionSql": "8e85f8a556751b351ce3363fcbec66250781b217703e752bb70dad6b76a1d8c4",
       "quietMigrationNotices": "4045c32034a8f46204dd5d89e185ff5c35e8073f560f14caa8b127f8a695957c",
       "readExistingEmbeddingShape": "16d92d7cd52d8ebd7e89982f02e1bbdd8e8d08a6712a4ce57fbcf0952b7a6ca5",
       "repairLegacyClientGrants": "c1dc6b1d0c4933c041583aa1c4eacaefc0ff0ae2a67f56cfad7534f87a5ab309",
       "repairLegacyTimelineSourceRows": "405d4ae158482c020b029b93aff1ae4ac6854e6948cafaf82dbef473e6e5552e",
       "requireMaskedMigration": "2d375c916feed25bfff1bf757bd9c180c88b1598f852f62afb620464ee610ec3",
-      "runStatementsAtomically": "7b7bc1b636e39ba36734b04f43ad37144a5466e875a5bbfc95c10670e70b992a",
+      "runStatementsAtomically": "b52a134107e1725ee0439c33c8a6ccaaa11ba4fbe5b485cca142211185806fc0",
       "seedConnectorDispatchAttempts": "2395a3995a6bf78776d37e72ce79b0dd15f6c6fa7f81c40612a744cb74ab01a5",
       "slugifyPath": "401dbca23580865d8b168dd8d84db4a6c708c6610d7cb61abafc7d0ee9809063",
       "sqlQueryForEngine": "71fb1ccec1b22cdc1662876dbd8c17ed81e9ab83485c6965cdf5caa4fc4a4ab5",
@@ -3620,10 +3621,11 @@
             "MINION_QUEUE_PROTOCOL_FUNCTION_SQL",
             "isRetryableConnError",
             "isStatementTimeoutError",
+            "noticeIdleBlockers",
             "requireMaskedMigration",
             "runStatementsAtomically"
           ],
-          "sha256": "76530baec589cd3e865939ebce77a801130416117b688935b960dcab49114881"
+          "sha256": "7b1e421d4754cf3a8d62517727350ab48939d7294c641743cfc9b1b1abb3f659"
         },
         "idempotent": true,
         "name": "repair_masked_upstream_146_149",

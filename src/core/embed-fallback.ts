@@ -2,6 +2,7 @@ import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from
 import { detectGatewayErrorFromCause } from './embed-retry.ts';
 import { isMustAbortError } from './worker-pool.ts';
 import { isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
+import { TRUNCATION_FALLBACK_MAX_CHARS } from './embedding-invalidation.ts';
 
 /**
  * Shared Ollama fallback for foreground and Minion embedding callers.
@@ -120,7 +121,7 @@ type SingleAttempt =
   | { kind: 'fatal'; error: unknown }
   | { kind: 'aborted'; error?: unknown };
 
-const FALLBACK_LEVELS = [5500, 5000, 4500] as const;
+const FALLBACK_LEVELS = [TRUNCATION_FALLBACK_MAX_CHARS, 5000, 4500] as const;
 export type PartialFallbackPolicy = 'legacy' | 'partial-stale';
 
 function isSplitWorthy(error: unknown, policy: PartialFallbackPolicy): boolean {

@@ -61,6 +61,26 @@ export function isEmbeddingZeroNormError(error: unknown): error is EmbeddingZero
 }
 
 /**
+ * F6 (advisor ruling 3): the provider answered, but the answer does not line up with the request: a different number
+ * of vectors than inputs (`count`), or a vector of another width than the schema's (`width`). Nothing was written.
+ *
+ * It stays an `AIConfigError` for every caller that cannot salvage anything (the CLI recipe, `import`), and keeps the
+ * name `AIConfigError` so agent-facing output does not change. The stale pipeline classifies it as a per-item
+ * provider failure instead (`classifyEmbedFailure`): one bad response must ledger and bisect the chunks of that call
+ * (like a zero-norm or non-finite vector does) and never abort the pages after it. A real configuration fault (no
+ * key, unknown model, rejected credentials) is a different `AIConfigError` and still stops the run.
+ */
+export class EmbeddingResponseShapeError extends AIConfigError {
+  constructor(readonly shape: 'count' | 'width', message: string, fix?: string) {
+    super(message, fix);
+  }
+}
+
+export function isEmbeddingResponseShapeError(error: unknown): error is EmbeddingResponseShapeError {
+  return error instanceof EmbeddingResponseShapeError;
+}
+
+/**
  * Merge per-slice refusals of one logical call into a single error whose
  * vectors and indices are aligned with the caller's full input.
  */
