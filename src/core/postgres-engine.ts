@@ -1108,10 +1108,10 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
-    // swamped source dampening). A PGroonga-only hit has ts_rank 0: +1e-6 keeps it positive (order-preserving).
+    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor. A PGroonga-only hit has ts_rank 0:
+    // the 1e-6 floor keeps the factor ordering it; real hits stay byte-identical (evidence-delivery-parity).
     const rankExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))`;
-    const scoreExpr = `${this._usePgroonga ? `(${rankExpr} + 1e-6)` : rankExpr} * ${sourceFactorCase}`;
+    const scoreExpr = `${this._usePgroonga ? `GREATEST(${rankExpr}, 1e-6)` : rankExpr} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
@@ -1323,10 +1323,10 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
-    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor (its index-dependent score
-    // swamped source dampening). A PGroonga-only hit has ts_rank 0: +1e-6 keeps it positive (order-preserving).
+    // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor. A PGroonga-only hit has ts_rank 0:
+    // the 1e-6 floor keeps the factor ordering it; real hits stay byte-identical (evidence-delivery-parity).
     const rankExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))`;
-    const scoreExpr = `${this._usePgroonga ? `(${rankExpr} + 1e-6)` : rankExpr} * ${sourceFactorCase}`;
+    const scoreExpr = `${this._usePgroonga ? `GREATEST(${rankExpr}, 1e-6)` : rankExpr} * ${sourceFactorCase}`;
     const keywordWhere = this._usePgroonga
       ? `cc.chunk_text &@~ $1`
       : `cc.search_vector @@ websearch_to_tsquery('${ftsLang}', $1)`;
