@@ -47,6 +47,16 @@ describe('embedWithTruncationFallbackPartial: bisection sub-request errors', () 
     });
   }
 
+  test('a 64-input slice bisects all the way down to the single offender (no fixed depth cap)', async () => {
+    const big = Array.from({ length: 64 }, (_, i) => (i === 37 ? `MALFORMED ${i}` : `fine ${i}`));
+    const { embedFn } = provider(64, () => new EmbeddingResponseShapeError('count', 'malformed count'));
+    const result = await embedWithTruncationFallbackPartial(big, embedFn, { policy: 'partial-stale', expectedDimensions: DIMS });
+    expect(result.fatalError).toBeUndefined();
+    expect(result.aborted).toBe(false);
+    expect(result.failures.map(f => f.index)).toEqual([37]);
+    expect(result.vectors.map((v, i) => (v !== null) === (i !== 37)).every(Boolean)).toBe(true);
+  });
+
   test('invalid-input -> sub-request 401 stays run-fatal and names every index of the failing group', async () => {
     const { embedFn } = provider(4, () => Object.assign(new AIConfigError('401 Unauthorized: invalid api key'), { status: 401 }));
     const result = await embedWithTruncationFallbackPartial(texts, embedFn, { policy: 'partial-stale', expectedDimensions: DIMS });

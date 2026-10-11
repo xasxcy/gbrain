@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { makeEngineWithFake } from './helpers/postgres-engine-sql-cases.ts';
+import { probePgroongaExtension } from '../src/core/postgres-engine/pgroonga-probe.ts';
 
 const probes = (fake: { statements(): Array<{ text: string }> }) =>
   fake.statements().filter(s => /FROM pg_extension WHERE extname = 'pgroonga'/.test(s.text)).length;
@@ -119,5 +120,25 @@ describe('PGroonga probe failure backoff', () => {
     advance(retryMs());
     await engine.searchKeyword('alice');
     expect(probes(fake)).toBe(2);
+  });
+});
+
+describe('probePgroongaExtension: timeout cancel', () => {
+  test('a cancel that rejects asynchronously (cancel connection failed) is swallowed; the probe still reports failed', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let cancels = 0;
+      const hung = Object.assign(new Promise<ArrayLike<unknown>>(() => {}), {
+        cancel: () => { cancels++; return Promise.reject(new Error('cancel connection refused')); },
+      });
+      expect(await probePgroongaExtension(() => hung, 20)).toBe('failed');
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(cancels).toBe(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 });

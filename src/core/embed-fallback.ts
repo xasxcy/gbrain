@@ -233,7 +233,6 @@ async function bisectInvalidInputs(
   vectors: (Float32Array | null)[],
   failures: { index: number; error: unknown }[],
   offset: number,
-  depth: number,
   invalidError: unknown,
 ): Promise<{ fatalError?: unknown; fatalIndexes?: number[]; aborted?: boolean }> {
   if (opts.abortSignal?.aborted) return { aborted: true };
@@ -241,7 +240,8 @@ async function bisectInvalidInputs(
     failures.push({ index: offset, error: invalidError });
     return {};
   }
-  if (depth >= 5) return { fatalError: new Error('invalid input could not be localized'), fatalIndexes: texts.map((_, index) => offset + index) };
+  // No fixed depth cap (R7-1): every level halves the group, so recursion ends at single items
+  // (ceil(log2(n)) levels) for any slice size; a fixed cap left 2..4-item groups run-fatal on large slices.
 
   const mid = Math.ceil(texts.length / 2);
   for (const [start, end] of [[0, mid], [mid, texts.length]] as const) {
@@ -259,7 +259,7 @@ async function bisectInvalidInputs(
       // like the initial invalid input: keep splitting down to the single item, never run-fatal (R6-3).
       // Real configuration faults (401, unknown model) stay fatal.
       if (!isInvalidInputError(error) && !isEmbeddingResponseShapeError(error)) return { fatalError: error, fatalIndexes: group.map((_, index) => offset + start + index) };
-      const nested = await bisectInvalidInputs(group, embedFn, opts, vectors, failures, offset + start, depth + 1, error);
+      const nested = await bisectInvalidInputs(group, embedFn, opts, vectors, failures, offset + start, error);
       if (nested.aborted || nested.fatalError !== undefined) return nested;
     }
   }
@@ -306,7 +306,7 @@ export async function embedWithTruncationFallbackPartial(
       return terminalResult(vectors, truncatedTo, failures, opts.abortSignal);
     }
     if (opts.policy === 'partial-stale' && isInvalidInputError(error)) {
-      const isolated = await bisectInvalidInputs(texts, embedFn, opts, vectors, failures, 0, 0, error);
+      const isolated = await bisectInvalidInputs(texts, embedFn, opts, vectors, failures, 0, error);
       return terminalResult(vectors, truncatedTo, failures, opts.abortSignal, isolated.fatalError, isolated.fatalIndexes);
     }
     if (!isSplitWorthy(error, opts.policy ?? 'legacy')) {

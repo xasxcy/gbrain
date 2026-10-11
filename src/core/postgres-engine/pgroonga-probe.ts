@@ -11,7 +11,7 @@ export const PGROONGA_PROBE_TIMEOUT_MS = 3_000;
 
 export type PgroongaProbeResult = 'present' | 'absent' | 'failed';
 
-type ProbeQuery = PromiseLike<ArrayLike<unknown>> & { cancel?: () => void };
+type ProbeQuery = PromiseLike<ArrayLike<unknown>> & { cancel?: () => void | PromiseLike<unknown> };
 
 export async function probePgroongaExtension(run: () => ProbeQuery, timeoutMs: number): Promise<PgroongaProbeResult> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -24,7 +24,9 @@ export async function probePgroongaExtension(run: () => ProbeQuery, timeoutMs: n
     const rows = await Promise.race([query, timeout]);
     return rows.length > 0 ? 'present' : 'absent';
   } catch {
-    try { query?.cancel?.(); } catch { /* best-effort: the query may already be done */ }
+    // Best-effort and never awaited (the probe deadline stays bounded); the driver's cancel can reject
+    // asynchronously when the cancel connection fails, so that rejection is swallowed too (R7-2).
+    try { Promise.resolve(query?.cancel?.()).catch(() => {}); } catch { /* the query may already be done */ }
     return 'failed';
   } finally {
     if (timer) clearTimeout(timer);
