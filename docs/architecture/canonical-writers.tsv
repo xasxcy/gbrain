@@ -203,7 +203,7 @@ src/commands/reindex.ts	1	early_refusal	Legacy direct content import. Direct imp
 src/eval/brainbench/metrics/write-back.ts	1	isolated_eval	Explicit isolated evaluation database only; never opened against the active managed brain.
 src/eval/longmemeval/diagnostics.ts	1	isolated_eval	Explicit isolated evaluation database only; never opened against the active managed brain.
 src/core/persistence/effects.ts	1	coordinator	The embedding effect clears only the page embedding signature, inside its claimed, source-guarded installation transaction, when #4616 refused a chunk, so embed --stale finds the page; no canonical content column changes.
-src/core/fork-migrations.ts	2	schema	Fork schema migration v235 batch-assigns title to itself so trg_pages_search_vector rebuilds the derived search_vector; no content column changes (the second reference is a comment).
+src/core/fork-migrations.ts	1	schema	Comment only: a repair note quotes an upstream `UPDATE takes`; no fork migration writes canonical rows (the final-trigger step installs upstream's trigger body and rebuilds nothing).
 src/core/schema-migrations/v002-slugify-existing-pages.ts	2	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
 src/core/schema-migrations/v009-timeline-dedup-index.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
 src/core/schema-migrations/v020-sources-table-additive.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
