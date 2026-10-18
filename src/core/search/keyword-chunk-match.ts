@@ -22,11 +22,12 @@
 /**
  * FORK: Groonga's query syntax only honors uppercase `OR`, while websearch_to_tsquery reads a bare `or`
  * in any case, so `acme or globex` would match nothing on the PGroonga path. Uppercase a bare `or`
- * between two terms outside double quotes (a phrase stays literal in both syntaxes). ts_rank reads the
+ * between two terms outside double quotes (a phrase stays literal in both syntaxes). An `or` next to a negation
+ * (`alpha - or beta`, `alpha or -beta`) stays as typed: Groonga would read `- OR` as a disjunction. ts_rank reads the
  * same $1 and websearch parses `OR` exactly as `or`, so the tsvector side is unchanged.
  */
 export function pgroongaWebsearchOr(query: string): string {
-  return query.replace(/("[^"]*")|(?<=\S\s+)or(?=\s+\S)/gi, (_m, quoted) => quoted ?? 'OR');
+  return query.replace(/("[^"]*")|(?<=(?:^|\s)(?!-+\s)\S+\s+)or(?=\s+[^\s-])/gi, (_m, quoted) => quoted ?? 'OR');
 }
 
 export function buildKeywordChunkMatch(ftsLang: string, excludePrivate: boolean | undefined, pgroonga = false): { from: string; match: string; modality: string } {

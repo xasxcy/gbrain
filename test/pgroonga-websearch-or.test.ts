@@ -19,6 +19,10 @@ describe('pgroongaWebsearchOr', () => {
     expect(pgroongaWebsearchOr('or acme')).toBe('or acme');
     expect(pgroongaWebsearchOr('acme or')).toBe('acme or');
     expect(pgroongaWebsearchOr('"this or that" or globex')).toBe('"this or that" OR globex');
+    // Groonga reads `alpha - OR beta` as `(alpha AND "-") OR beta`; websearch reads the original as alpha AND beta.
+    expect(pgroongaWebsearchOr('alpha - or beta')).toBe('alpha - or beta');
+    expect(pgroongaWebsearchOr('alpha or -beta')).toBe('alpha or -beta');
+    expect(pgroongaWebsearchOr('alpha or - beta')).toBe('alpha or - beta');
   });
 
   test('a query without or passes through byte-identical', () => {
