@@ -60,12 +60,18 @@ describe('keyword arm plan (postgres)', () => {
     }
   }
 
+  // FORK: on a PGroonga-equipped database the fork matches `chunk_text &@~ $1` instead of the
+  // tsvector (buildKeywordChunkMatch); the fence shape under test is the same either way.
+  const match = (alias: string) => (engine as unknown as { _usePgroonga: boolean })._usePgroonga
+    ? `${alias}chunk_text &@~ \\$1`
+    : `${alias}search_vector @@ websearch_to_tsquery\\('[a-z_]+', \\$1\\)`;
+
   for (const query of ['acme', 'globex weekly', 'acme or globex']) {
     test(`\`${query}\` with excludePrivate runs the full-text match inside the OFFSET 0 subquery`, async () => {
       const { sql, params, rows } = await capturedKeywordStatement(query, true);
       expect(rows).toBeGreaterThan(0);
-      expect(sql).toMatch(/FROM \(\s*SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type, body_generation, occurrence_id\s+FROM content_chunks\s+WHERE search_vector @@ websearch_to_tsquery\('[a-z_]+', \$1\) AND modality = 'text'\s+OFFSET 0\s*\) cc\s+JOIN pages p/);
-      expect(sql).not.toMatch(/cc\.search_vector @@/);
+      expect(sql).toMatch(new RegExp(`FROM \\(\\s*SELECT id, page_id, chunk_index, chunk_text, chunk_source, search_vector, language, symbol_type, body_generation, occurrence_id\\s+FROM content_chunks\\s+WHERE ${match('')} AND modality = 'text'\\s+OFFSET 0\\s*\\) cc\\s+JOIN pages p`));
+      expect(sql).not.toMatch(/cc\.search_vector @@|cc\.chunk_text &@~/);
       const plan = (await engine.executeRaw<{ 'QUERY PLAN': string }>(`EXPLAIN ${sql}`, params)).map((r) => r['QUERY PLAN']).join('\n');
       expect(plan).toContain('content_chunks');
     });
@@ -74,7 +80,7 @@ describe('keyword arm plan (postgres)', () => {
       const { sql, rows } = await capturedKeywordStatement(query, false);
       expect(rows).toBeGreaterThan(0);
       expect(sql).toMatch(/FROM content_chunks cc\s+JOIN pages p/);
-      expect(sql).toMatch(/WHERE cc\.search_vector @@ websearch_to_tsquery\('[a-z_]+', \$1\)/);
+      expect(sql).toMatch(new RegExp(`WHERE ${match('cc\\.')}`));
       expect(sql).toMatch(/AND cc\.modality = 'text'/);
       expect(sql).not.toContain('OFFSET 0');
     });
