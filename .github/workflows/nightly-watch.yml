@@ -82,7 +82,7 @@ jobs:
        (github.event.workflow_run.event == 'schedule' ||
         (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master' &&
          contains(fromJSON('["Test","E2E Tests"]'), github.event.workflow_run.name))))
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: read
@@ -123,7 +123,7 @@ jobs:
 
   watch:
     needs: resolve
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # One queue per repository + target workflow + track; queued, never cancelled.
     concurrency:
