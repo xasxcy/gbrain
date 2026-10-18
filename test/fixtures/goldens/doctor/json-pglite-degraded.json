@@ -3003,7 +3003,7 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
-          "message": "72 retrieval-affecting file(s) changed since HEAD: src/core/ai/recipes/anthropic.ts, src/core/ai/recipes/openai.ts, src/core/chunkers/code-module-chunks.ts, …. Re-run `gbrain eval run-all` after committing these changes.",
+          "message": "No retrieval-affecting files changed in working tree.",
           "name": "eval_drift",
           "status": "ok"
         },
