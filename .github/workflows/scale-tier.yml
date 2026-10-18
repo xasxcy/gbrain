@@ -48,7 +48,7 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -131,7 +131,7 @@ jobs:
       matrix:
         engine: [pglite, postgres]
         pages: ${{ fromJSON(needs.plan.outputs.pages) }}
-    runs-on: ubicloud-standard-8-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Backstop only: the harness's out-of-process phase watchdog
     # (scripts/scale/watchdog.ts, 1.5x the phase ceilings: 10k ~30 min,
     # 20k ~60 min) kills a stalled phase first and names it.
