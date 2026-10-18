@@ -30,6 +30,11 @@
  * row seeded bypassing that trigger (so an oversized compiled_truth can
  * exist in the table without crashing at seed time — matching how a real
  * v126 install would have accumulated the row before this fix ever ran).
+ *
+ * FORK (v0.60.299.0 sync): the fork migration no longer backfills existing
+ * rows (each fork renumber would rerun a full pages rebuild on a live brain).
+ * Upstream v124's contract applies: an existing row converges on its next
+ * write, so the body-only assertions touch the row first.
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
@@ -115,6 +120,7 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
       // A page whose title/timeline don't contain the body-only token must NOT
       // match it via search_vector after the upgrade — matches a fresh install,
       // where compiled_truth was never indexed at all.
+      await engine.executeRaw(`UPDATE pages SET title = title WHERE slug = 'normal-page'`);
       const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
         `SELECT search_vector @@ to_tsquery('english', 'zzbodyonlytokena') AS hit
            FROM pages WHERE slug = 'normal-page'`,
@@ -147,6 +153,7 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
       expect(src).not.toContain('compiled_truth');
       expect(src).toContain("'simple'");
 
+      await engine.executeRaw(`UPDATE pages SET title = title WHERE slug = 'normal-page-simple'`);
       const bodyOnlyHit = await engine.executeRaw<{ hit: boolean }>(
         `SELECT search_vector @@ to_tsquery('simple', 'zzbodyonlytokenb') AS hit
            FROM pages WHERE slug = 'normal-page-simple'`,
@@ -189,9 +196,10 @@ describe('v126 → v128 upgrade: configurable_fts_language + drop_compiled_truth
       const src = await getTriggerFunctionSource();
       expect(src).not.toContain('compiled_truth');
 
-      // The oversized row's search_vector must have been backfilled by v128
-      // (not left in its placeholder state) and must not carry compiled_truth
-      // tokens — matches a fresh install.
+      // The oversized row's next write (FORK: no migration backfill, see the
+      // header) must rebuild its search_vector without crashing and without
+      // compiled_truth tokens — matches a fresh install.
+      await engine.executeRaw(`UPDATE pages SET title = title WHERE slug = 'oversized-existing'`);
       const row = await engine.executeRaw<{ hit_body: boolean; hit_title: boolean }>(
         `SELECT
            search_vector @@ to_tsquery('simple', 'token0') AS hit_body,
