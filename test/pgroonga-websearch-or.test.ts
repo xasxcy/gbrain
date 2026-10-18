@@ -23,6 +23,9 @@ describe('pgroongaWebsearchOr', () => {
     expect(pgroongaWebsearchOr('alpha - or beta')).toBe('alpha - or beta');
     expect(pgroongaWebsearchOr('alpha or -beta')).toBe('alpha or -beta');
     expect(pgroongaWebsearchOr('alpha or - beta')).toBe('alpha or - beta');
+    expect(pgroongaWebsearchOr('alpha - ! or beta')).toBe('alpha - ! or beta');
+    expect(pgroongaWebsearchOr('beta "beta or gamma')).toBe('beta "beta or gamma');
+    expect(pgroongaWebsearchOr('- or- or OR')).toBe('- or- or OR');
   });
 
   test('a query without or passes through byte-identical', () => {
