@@ -111,4 +111,36 @@ describe('CLI embed paths meter large pages', () => {
     expect(embedded.map(t => t.slice(0, 8)).sort()).toEqual(['chunk 3 ', 'chunk 4 ']);
     expect(await vectorIndexes('chats/closure')).toEqual([3, 4]);
   });
+
+  // FORK: the grant must not widen the batch past the embed_failures retry ledger.
+  test('the shared stale sweep never sends a quarantined chunk of a metered page to the provider', async () => {
+    await engine.setConfig(PAGE_EMBED_CAP_KEY, String(chunkCost * 10));
+    const pageId = await seedLargePage('chats/ledger');
+    const signature = 'test:model:1536';
+    const now = new Date().toISOString();
+    await engine.executeRaw(
+      `INSERT INTO embed_failures
+        (source_id, page_id, slug, chunk_index, embedding_signature, chunk_hash, error_class, error_fingerprint, first_seen, last_seen, next_retry_at, quarantined_at, quarantine_reason)
+       SELECT 'default', $1::int, 'chats/ledger', 4, $2, md5(chunk_text), 'provider_timeout', 'fp', $3::timestamptz, $3::timestamptz, now() + interval '1 hour', $3::timestamptz, 'provider_timeout'
+         FROM content_chunks WHERE page_id = $1::int AND chunk_index = 4`, [pageId, signature, now]);
+    await embedStaleForSource(engine, 'default', { embeddingSignature: signature, embedFn: async (batch: string[]) => { embedded.push(...batch); return batch.map(() => new Float32Array(1536).fill(0.1)); } });
+    expect(embedded.map(t => t.slice(0, 8)).sort()).toEqual(['chunk 0 ', 'chunk 1 ', 'chunk 2 ', 'chunk 3 ']);
+    expect(await vectorIndexes('chats/ledger')).toEqual([0, 1, 2, 3]);
+  });
+
+  // FORK: the slice drain settles the grant at the provider boundary — a returned (billed) call stays booked
+  // even when the lease is lost before the slice commits.
+  test('a lease lost after the provider call returned keeps the reservation booked as spent', async () => {
+    await engine.setConfig(PAGE_EMBED_CAP_KEY, String(chunkCost * 10));
+    const pageId = await seedLargePage('chats/stolen');
+    const { LockStolenError } = await import('../src/core/db-lock.ts');
+    const assertOwned = async (tx?: unknown) => { if (tx && embedded.length > 0) throw new LockStolenError('test-lock'); };
+    await expect(embedStaleForSource(engine, 'default', { assertOwned, embedFn: async (batch: string[]) => { embedded.push(...batch); return batch.map(() => new Float32Array(1536).fill(0.1)); } }))
+      .rejects.toBeInstanceOf(LockStolenError);
+    expect(embedded).toHaveLength(5);
+    const [row] = await engine.executeRaw<{ spent_usd: number; reserved_usd: number }>(
+      'SELECT spent_usd::float8 AS spent_usd, reserved_usd::float8 AS reserved_usd FROM page_embedding_budget WHERE page_id = $1', [pageId]);
+    expect(row!.reserved_usd).toBe(0);
+    expect(row!.spent_usd).toBeGreaterThan(0);
+  });
 });

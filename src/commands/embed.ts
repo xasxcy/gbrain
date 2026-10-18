@@ -2246,7 +2246,10 @@ async function embedAllStale(
           const pageRow = prepared.snapshot.page;
           // Upstream's per-page spend cap (page-embedding-budget.ts): meter the page's vector-less chunks once and
           // narrow `stale` to the grant; the reservation settles after the slices (spent once a provider call landed).
-          const metered = await meterPageBatch(engine, pageRow, prepared.chunks.filter(c => !c.embedded_at), { signature, announceHeld: true });
+          // Only this batch's rows are metered: they passed the fork's embed_failures eligibility (backoff /
+          // quarantine), which a page-wide vector-less set would bypass (upstream's embedStalePages meters the same way).
+          const batchIdx = new Set(stale.map(c => c.chunk_index));
+          const metered = await meterPageBatch(engine, pageRow, prepared.chunks.filter(c => !c.embedded_at && batchIdx.has(c.chunk_index)), { signature, announceHeld: true });
           if (!metered) return;
           if (metered.grant) {
             const selected = new Map(stale.map(c => [c.chunk_index, c]));
@@ -2283,7 +2286,8 @@ async function embedAllStale(
                   embeddingSignature: signature,
                   activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
                   expectedCorpusGeneration: observedCorpusGeneration,
-                  embedFn: (texts, fallbackOpts) => embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }),
+                  // A provider call that returned may have been billed, even if the slice's commit then fails.
+                  embedFn: async (texts, fallbackOpts) => { const vectors = await embedBatchWithBackoff(texts, { abortSignal: fallbackOpts.abortSignal }); grantSpent = true; return vectors; },
                   signal: effectiveSignal,
                   slice: { index: (offset / subBatchSize) + 1, total: slices },
                   write: (message) => serr(`\n  ${message}`),
