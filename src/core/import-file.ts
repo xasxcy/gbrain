@@ -1674,7 +1674,7 @@ export function pLimit(concurrency: number) {
  * Windows; use ImageMagick / ffmpeg / sharp there). Throws on sips failure.
  */
 async function compressViaSips(buf: Buffer): Promise<{ buf: Buffer; mime: string }> {
-  const { execFile } = await import('child_process');
+  const { execFile } = await import('./spawn.ts'); // windowsHide seam (scripts/check-windows-hide.ts)
   const { promisify } = await import('util');
   const { tmpdir } = await import('os');
   const execFileAsync = promisify(execFile);

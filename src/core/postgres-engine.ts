@@ -86,7 +86,8 @@ import {
 } from './search/embedding-column.ts';
 import { getFtsLanguage, applyFtsLanguagePolicy } from './fts-language.ts';
 import { splitEmbeddingSignature, currentSpaceChunkPredicate, lockEmbeddingSources } from './embedding-invalidation.ts';
-import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkManifestReads, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkGenerationFilter, chunkManifestReads, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
+import { pageBudgetLimitedFilter } from './page-size-policy.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
@@ -1689,6 +1690,7 @@ export class PostgresEngine implements BrainEngine {
         } else {
           const failure = outcome.failure;
           const rows = await tx.executeRaw(
+            // chunk-visibility-ok: ledger write keyed to the chunk row this outcome just embedded (index + text hash)
             `INSERT INTO embed_failures (
                source_id, page_id, slug, chunk_index, embedding_signature, chunk_hash,
                error_class, error_fingerprint, first_seen, last_seen, next_retry_at
@@ -1814,6 +1816,7 @@ export class PostgresEngine implements BrainEngine {
     const activeColumn = await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
     const candidate = this.buildListStaleChunkWhere(activeColumn.name, opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
     const totalRows = await this.sql.unsafe(
+      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
       `SELECT count(*)::int AS count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
         WHERE ${candidate.where}`,
@@ -1822,6 +1825,7 @@ export class PostgresEngine implements BrainEngine {
     const total_null = Number((totalRows[0] as { count?: number } | undefined)?.count ?? 0);
     const eligible = this.buildListStaleChunkWhere(activeColumn.name, opts);
     const eligibleRows = await this.sql.unsafe(
+      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
       `SELECT count(*)::int AS count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
         WHERE ${eligible.where}`,
@@ -1841,6 +1845,7 @@ export class PostgresEngine implements BrainEngine {
       AND l.embedding_signature = $${signatureParam}
       AND l.chunk_hash = md5(cc.chunk_text)`;
     const stateRows = await this.sql.unsafe(
+      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
       `SELECT
          count(*) FILTER (WHERE l.quarantined_at IS NULL AND l.next_retry_at > now())::int AS backoff_deferred,
          count(*) FILTER (WHERE l.quarantined_at IS NOT NULL)::int AS quarantined,
@@ -1852,6 +1857,7 @@ export class PostgresEngine implements BrainEngine {
     );
     const state = stateRows[0] as { backoff_deferred?: number; quarantined?: number; earliest_retry_at?: Date | string | null } | undefined;
     const by_error_class = (await this.sql.unsafe(
+      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
       `SELECT l.error_class, count(*)::int AS count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
          JOIN embed_failures l ON ${ledgerJoin}
@@ -1864,6 +1870,7 @@ export class PostgresEngine implements BrainEngine {
       count: Number(row.count),
     }));
     const quarantined_top = (await this.sql.unsafe(
+      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
       `SELECT p.slug, cc.chunk_index, l.error_class, l.attempt_count
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
          JOIN embed_failures l ON ${ledgerJoin}
@@ -1957,7 +1964,11 @@ export class PostgresEngine implements BrainEngine {
     const conds = [
       `cc.${quoteIdentifier(column)} IS NULL`,
       'p.deleted_at IS NULL',
+      // The same visibility and budget gates as listStaleChunks (engine-sql/chunks.ts staleChunkWhere), so the
+      // summary counts exactly the rows the drain can list: no staged/retired generations, no held large pages.
+      chunkGenerationFilter('p', 'cc'),
       `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
+      `NOT ${pageBudgetLimitedFilter('p')}`,
     ];
     this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
     if (opts?.sourceId !== undefined) {

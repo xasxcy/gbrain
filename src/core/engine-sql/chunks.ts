@@ -93,6 +93,7 @@ function embedFailureEligibility(signature: string | undefined, ignoreBackoff?: 
  * live chunk of the page. Run after every chunk write/delete of a page.
  */
 export async function deleteObsoleteEmbedFailures(exec: SqlExecutor, pageId: number): Promise<void> {
+  // chunk-visibility-ok: a ledger row survives while ANY stored row (staged generations included) still carries its chunk
   await exec.run(sqlFragment`DELETE FROM embed_failures ef
         WHERE ef.page_id = ${pageId}::bigint
           AND NOT EXISTS (

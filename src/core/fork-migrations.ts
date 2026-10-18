@@ -189,6 +189,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       // the same idempotent DDL to preserve full gbrain call-graph functionality.
       idempotent: true,
       sql: `
+        -- chunk-visibility-ok: one-time source_id backfill of code edges, keyed by chunk id regardless of generation
         UPDATE code_edges_symbol e
            SET source_id = COALESCE(p.source_id, 'default')
           FROM content_chunks c

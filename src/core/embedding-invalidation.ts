@@ -211,12 +211,14 @@ export async function countSignatureDriftedEmbeddings(
   const colId = await activeColId(engine);
   const { model, dims } = splitEmbeddingSignature(opts.signature);
   const rows = await engine.executeRaw<{ n: number }>(
+    // chunk-visibility-ok: read-only twin of the guarded invalidation's UPDATE, which carries no generation predicate
     `SELECT count(*)::int AS n
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
         AND cc.${colId} IS NOT NULL
         AND NOT ${currentInputChunkPredicate(colId, 2, 3)}
         AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
+        AND NOT ${pageBudgetLimitedFilter('p')}
         AND p.deleted_at IS NULL
         AND p.text_projection_revision = p.knowledge_revision
         AND p.embedding_signature IS NOT NULL AND p.embedding_signature <> $1
