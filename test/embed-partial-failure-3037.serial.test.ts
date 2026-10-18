@@ -134,12 +134,21 @@ describe('#3037 — one bad chunk no longer darkens its page', () => {
       slug: 'overflow-500-page', chunk_index: c.chunk_index, chunk_text: c.chunk_text,
       chunk_source: c.chunk_source, model: null, token_count: 1, source_id: 'default', page_id: 1,
     }));
-    const engine = mockEngine({ countStaleChunks: async () => 3, listStaleChunks: async () => stale, getChunks: async () => THREE_CHUNKS, upsertChunks: async () => {} });
+    // fork: --stale persists through the persistEmbedOutcome checkpoint (see the first test in this block).
+    const persistCalls: any[] = [];
+    const engine = mockEngine({ countStaleChunks: async () => 3, listStaleChunks: async () => stale, getChunks: async () => THREE_CHUNKS,
+      persistEmbedOutcome: async (request: any) => {
+        persistCalls.push(request);
+        const vectors = request.entries.filter((entry: any) => 'vector' in entry.outcome).length;
+        return { committedChunks: vectors, vectorCommittedChunks: vectors, staleSkippedChunks: 0, ledgerUpserts: 0, ledgerDeletes: 0 };
+      },
+      upsertChunks: async () => { throw new Error('Embedding must not replace canonical chunks'); } });
     const result = await runEmbedCore(engine, { stale: true });
     expect(embedCalls.map(c => c.length)).toEqual([3, 1, 1, 1]);
     expect(result.embedded).toBe(2);
     expect(result.failures).toBe(1);
-    expect(embeddingUpdates(engine)).toHaveLength(2);
+    expect(persistCalls).toHaveLength(1);
+    expect(persistCalls[0].entries.filter((e: any) => e.outcome.vector instanceof Float32Array).map((e: any) => e.chunkIndex).sort()).toEqual([0, 2]);
   });
 
   test('--all: same isolation on the listPages path', async () => {

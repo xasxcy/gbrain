@@ -1,5 +1,6 @@
 import { classifyEmbedFailure, isInvalidInputError, isTransientEmbedError } from './embed-failure.ts';
 import { detectGatewayErrorFromCause } from './embed-retry.ts';
+import { isSingleInputOverLengthError } from './embed-overlength-classify.ts';
 import { isMustAbortError } from './worker-pool.ts';
 import { isEmbeddingResponseShapeError, isEmbeddingZeroNormError } from './ai/embedding-guard.ts';
 
@@ -93,6 +94,9 @@ export function isPartialStaleSplitWorthyError(error: unknown): boolean {
   // check separates them, and it never matches a bare "timed out", so the
   // provider_timeout ladder above and the Ollama EOF/socket-close split
   // below are untouched.
+  // Upstream #6772: one input over the model's context, even behind a 5xx or no status (llama.cpp / Ollama
+  // answer 500), fails the same way on every retry; fan out so the siblings embed and only that chunk fails.
+  if (isSingleInputOverLengthError(error)) return true;
   if (isTransientEmbedError(error) || detectGatewayErrorFromCause(error)) return false;
   return classified.kind === 'failure';
 }
