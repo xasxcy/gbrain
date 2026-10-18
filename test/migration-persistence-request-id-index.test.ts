@@ -24,7 +24,7 @@ import { PGLITE_SCHEMA_SQL } from '../src/core/pglite-schema.generated.ts';
 import { SCHEMA_SQL } from '../src/core/schema-embedded.generated.ts';
 import { MIGRATIONS } from '../src/core/schema-migrations/registry.generated.ts';
 import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
-import { runMigrations } from '../src/core/migrate.ts';
+import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
 import { runRepair, resolveRepairScope } from '../src/core/repair/core.ts';
 import { requestIndexesRepair } from '../src/core/repair/request-indexes.ts';
 import { requestIndexesCheck } from '../src/commands/doctor/checks/persistence-requests.ts';
@@ -93,7 +93,7 @@ for (const backend of testBackends()) describe(`[${backend}] #6757 the request-i
     expect(await state()).toBe('missing');
     await engine.setConfig('version', String(migration!.version - 1));
     const result = await runMigrations(engine);
-    expect(result.current).toBe(LATEST_SCHEMA_VERSION);
+    expect(result.current).toBe(LATEST_VERSION); // FORK: the registry's head includes the fork's appended migrations
     expect(await state()).toBe('valid');
   }, 120_000);
 

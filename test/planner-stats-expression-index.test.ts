@@ -13,8 +13,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { __testing, analyzePlannerTables, maybeRefreshPlannerStats, readExpressionIndexesWithoutStats, readPlannerStatsState } from '../src/core/planner-stats.ts';
 import { DOCTOR_CHECK_REGISTRY } from '../src/commands/doctor/registry.ts';
 import { plannerStatsRepair } from '../src/core/repair/planner-stats.ts';
-import { runMigrations } from '../src/core/migrate.ts';
-import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
+import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
 import { PAGES_NAME_LOOKUP_INDEXES, v240 } from '../src/core/schema-migrations/v240-pages-name-lookup-indexes.ts';
 import type { DoctorContext } from '../src/commands/doctor/context.ts';
 import type { Check } from '../src/commands/doctor.ts';
@@ -168,8 +167,9 @@ describe('buildIndexOnline analyzes after it builds', () => {
     await engine.executeRaw(`DROP INDEX IF EXISTS ${TITLE_INDEX.name}`);
     await engine.setConfig('version', String(v240.version - 1));
     const { out, text } = await captureStderr(() => runMigrations(failingAnalyze(engine)));
-    expect(out.current).toBe(LATEST_SCHEMA_VERSION);
-    expect(await engine.getConfig('version')).toBe(String(LATEST_SCHEMA_VERSION));
+    // FORK: the registry's head includes the fork's appended migrations.
+    expect(out.current).toBe(LATEST_VERSION);
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
     expect(text).toContain(`[${v240.version}] ✓ ${v240.name}`);
     expect(text).toContain(`${TITLE_INDEX.name} is built and valid, but ANALYZE pages failed (canceling statement due to lock timeout)`);
     expect(text).toContain('Run on the brain host: gbrain repair planner-stats --apply');
