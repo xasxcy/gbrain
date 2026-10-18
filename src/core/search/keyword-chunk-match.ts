@@ -22,15 +22,15 @@
 /**
  * FORK: Groonga's query syntax only honors uppercase `OR`, while websearch_to_tsquery reads a bare `or`
  * in any case, so `acme or globex` would match nothing on the PGroonga path. Uppercase a bare `or`
- * between two terms outside double quotes (a phrase stays literal in both syntaxes). Both neighbours must start with a
- * letter, digit or quote and neither may itself be an `or`; an `or` next to an operator (`alpha - or beta`, `alpha - ! or beta`, `alpha or -beta`) stays
- * as typed, since Groonga would read `- OR` as a disjunction, and so does every `or` in a query with an unbalanced
- * quote, where the two syntaxes disagree on where the phrase ends. ts_rank reads the
+ * between two terms outside double quotes (a phrase stays literal in both syntaxes), and only in a query made of
+ * letters, digits, whitespace and balanced quotes: next to any Groonga operator (`alpha - or beta`, `alpha or beta*`)
+ * the rewrite could turn a non-match into a disjunction, so such a query stays as typed. ts_rank reads the
  * same $1 and websearch parses `OR` exactly as `or`, so the tsvector side is unchanged.
  */
 export function pgroongaWebsearchOr(query: string): string {
-  if ((query.match(/"/g)?.length ?? 0) % 2 === 1) return query;
-  return query.replace(/("[^"]*")|(?<=(?:^|\s)(?!or(?![\p{L}\p{N}]))["\p{L}\p{N}]\S*\s+)or(?=\s+(?!or(?![\p{L}\p{N}]))["\p{L}\p{N}])/giu, (_m, quoted) => quoted ?? 'OR');
+  // Any Groonga operator character (- ! * + ~ : < > ( ) \ ...) or an unbalanced quote: leave the query as typed.
+  if (/[^\p{L}\p{N}\s"]/u.test(query) || (query.match(/"/g)?.length ?? 0) % 2 === 1) return query;
+  return query.replace(/("[^"]*")|(?<=(?:^|\s)(?!or(?![\p{L}\p{N}]))\S+\s+)or(?=\s+(?!or(?![\p{L}\p{N}]))\S)/giu, (_m, quoted) => quoted ?? 'OR');
 }
 
 export function buildKeywordChunkMatch(ftsLang: string, excludePrivate: boolean | undefined, pgroonga = false): { from: string; match: string; modality: string } {
