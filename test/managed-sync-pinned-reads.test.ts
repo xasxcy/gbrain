@@ -10,8 +10,15 @@
  * source below the repository root. Each arm gets a fresh brain; ids, times
  * and UUIDs are replaced by stable labels, blob ids and commits are compared
  * as they are. Runs on PGLite, and on Postgres when DATABASE_URL is set.
+ *
+ * #6586: a test that hits its deadline does not keep running behind the next
+ * one. `afterEach` aborts the running arm's sync, waits for it to unwind (so
+ * its PATH override is gone) and prints the arm's Git calls (how long each
+ * took, which never finished), so a hang says whether Git was slow or the
+ * runtime missed a finished child. Each counter wraps the Git and PATH this
+ * file loaded with, never another arm's shim.
  */
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -24,7 +31,9 @@ import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { __setPinnedWindowForTests } from '../src/core/persistence/sync-blobs.ts';
 import { syncGitTopLevel } from '../src/core/persistence/sync-prepare.ts';
+import { pinnedBlob } from '../src/core/persistence/sync-screen.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-pinned-reads-'));
 const SOURCE = 'pinned-reads';
@@ -69,7 +78,7 @@ const corpus = (): Record<string, string> => ({
   'vault/notes/crlf.md': '---\r\ntitle: Line endings\r\ntype: note\r\n---\r\nWritten with CRLF line endings.\r\n',
   'vault/notes/conflict.md': '---\ntitle: Conflict\nslug: notes/somewhere-else\n---\nDeclares a slug its path does not have.\n',
   'vault/notes/broken.md': '---\ntitle: first line of a title\nsecond line of the title\n---\nA synthetic note.\n',
-  'vault/big/oversize.md': `---\ntitle: Oversize\n---\n${'x'.repeat(10 * 1024 ** 2 + 64)}\n`,
+  'vault/big/oversize.md': `---\ntitle: Oversize\n---\n${'x'.repeat(PAGE_MAX_BYTES + 64)}\n`,
   'outside/readme.md': '# Not in the source\n',
 });
 function secondRound(root: string) {
@@ -141,15 +150,46 @@ async function dump(e: BrainEngine, root: string): Promise<Record<string, string
   };
 }
 
-/** A `git` on PATH that logs each invocation, so an arm's Git process count is known. */
-function gitCounter(dir: string): { path: string; calls: () => string[] } {
+const PATH_AT_LOAD = process.env.PATH;
+let REAL_GIT: string | undefined;
+type GitCounter = { path: string; real: string; calls: () => string[]; timings: () => string };
+/** A `git` on PATH that logs each invocation with its start and end, so an arm's Git process count and timing are known. */
+function gitCounter(dir: string): GitCounter {
   const log = join(dir, 'git.log'), bin = join(dir, 'bin');
   mkdirSync(bin, { recursive: true });
-  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
-  writeFileSync(join(bin, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexec '${real}' "$@"\n`);
+  const real = REAL_GIT ??= execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, PATH: PATH_AT_LOAD } }).trim();
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\nprintf 'S %s %s %s\\n' "$$" "$(date +%s%N)" "$*" >> '${log}'\n'${real}' "$@"\ncode=$?\n`
+    + `printf 'E %s %s %s\\n' "$$" "$(date +%s%N)" "$code" >> '${log}'\nexit $code\n`);
   chmodSync(join(bin, 'git'), 0o755);
-  return { path: `${bin}${delimiter}${process.env.PATH ?? ''}`, calls: () => existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : [] };
+  const lines = () => existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : [];
+  const ns = (value: string) => Number(value.replace(/N$/, '000000000'));
+  return {
+    path: `${bin}${delimiter}${PATH_AT_LOAD ?? ''}`, real,
+    calls: () => lines().filter(line => line.startsWith('S ')).map(line => line.split(' ').slice(3).join(' ')),
+    timings: () => {
+      const open = new Map<string, { at: number; args: string }>(), done: Array<{ ms: number; args: string; code: string }> = [];
+      for (const [kind, pid, at, ...rest] of lines().map(line => line.split(' '))) {
+        if (kind === 'S') open.set(pid!, { at: ns(at!), args: rest.join(' ') });
+        const started = kind === 'E' ? open.get(pid!) : undefined;
+        if (started) { open.delete(pid!); done.push({ ms: Math.round((ns(at!) - started.at) / 1e6), args: started.args, code: rest[0]! }); }
+      }
+      const slowest = done.sort((a, b) => b.ms - a.ms).slice(0, 5).map(call => `${call.ms} ms (exit ${call.code}) git ${call.args}`);
+      return [`${done.length} Git calls finished, ${open.size} never did (${real})`, ...slowest.map(line => `  slowest: ${line}`),
+        ...[...open.values()].slice(0, 5).map(call => `  unfinished: git ${call.args}`)].join('\n');
+    },
+  };
 }
+
+/** The arm or test in flight, so `afterEach` can stop it and say where it was when its test hit the deadline. */
+let active: { label: string; stop: AbortController; counter: GitCounter | null; done: Promise<void> } | null = null;
+afterEach(async () => {
+  const run = active;
+  if (!run) return;
+  active = null;
+  console.error(`[pinned-reads] ${run.label} was still running at the test deadline; stopping it.\n${run.counter?.timings() ?? 'no Git counter on this platform'}`);
+  run.stop.abort(new Error(`${run.label}: test deadline`));
+  await Promise.race([run.done, new Promise(resolve => setTimeout(resolve, 20_000))]);
+}, 30_000);
 
 type Arm = { name: string; window: number | null };
 const ARMS: Arm[] = [{ name: 'per-entry', window: 0 }, { name: 'window', window: null }, { name: 'window-3', window: 3 }];
@@ -162,6 +202,9 @@ async function runArm(backend: string, arm: Arm, open: () => Promise<{ engine: B
   const { engine, close } = await open();
   const counter = process.platform === 'win32' ? null : gitCounter(dir);
   const restore = __setPinnedWindowForTests(arm.window);
+  let settle = () => {};
+  const run = active = { label: `${backend} arm ${arm.name}`, stop: new AbortController(), counter, done: new Promise<void>(resolve => { settle = resolve; }) };
+  const signal = run.stop.signal;
   try {
     return await withEnv({ GBRAIN_HOME: join(dir, 'home'), ...(counter ? { PATH: counter.path } : {}) }, async () => {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
@@ -170,15 +213,24 @@ async function runArm(backend: string, arm: Arm, open: () => Promise<{ engine: B
       await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
       const outcomes: unknown[] = [], rounds: Array<Record<string, string[]>> = [];
       for (const round of [0, 1]) {
+        signal.throwIfAborted();
         if (round) secondRound(root);
-        const result = await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true });
+        const result = await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true, signal });
+        signal.throwIfAborted();
         outcomes.push({ status: result.status, added: result.added, modified: result.modified, deleted: result.deleted, renamed: result.renamed, drain: result.drain?.outcome });
         rounds.push(await dump(engine, root));
       }
       await disposePersistenceConsumer(engine);
+      signal.throwIfAborted();
       return { outcomes, rounds, calls: counter?.calls() ?? null, head: git(root, 'rev-parse', 'HEAD') };
     });
-  } finally { restore(); await close(); }
+  } catch (error) {
+    if (signal.aborted) return null;
+    throw error;
+  } finally {
+    if (active === run) active = null;
+    restore(); await close(); settle();
+  }
 }
 
 beforeAll(async () => {
@@ -198,7 +250,11 @@ for (const [backend, open] of backends) {
   test(`${backend}: windowed pinned reads leave the same rows as per-entry reads, with far fewer Git processes`, async () => {
     if (backend === 'postgres' && !process.env.DATABASE_URL) return;
     const results = [];
-    for (const arm of ARMS) results.push(await runArm(backend, arm, open));
+    for (const arm of ARMS) {
+      const result = await runArm(backend, arm, open);
+      if (!result) return;
+      results.push(result);
+    }
     const [legacy, ...windowed] = results;
     expect(legacy!.outcomes).toEqual([
       expect.objectContaining({ drain: 'synced' }), expect.objectContaining({ drain: 'synced' })]);
@@ -234,6 +290,63 @@ for (const [backend, open] of backends) {
     expect(count(windowed[0]!.calls!, / rev-parse --show-toplevel$/)).toBeLessThan(imports / 2);
   }, 600_000);
 }
+
+/**
+ * #6712 PR 1 (the forced probes for the windowed bound): the discovery prescreen's `ls-tree` seeds the run's first
+ * pinned window, so a delta round over existing pages lists its pinned tree once; and the entries of one aligned block
+ * share a window whichever of them reaches its pinned read first (concurrent follower freezes finish in any order).
+ * Before: the prescreen listed the tree and the first freeze listed it again (2), and a follower whose freeze read first
+ * started the window at its own index, so the head missed it and listed it again (2).
+ */
+for (const [backend, open] of backends) {
+  test(`${backend}: a delta round over existing pages lists its pinned tree once (the prescreen seeds the window)`, async () => {
+    if (backend === 'postgres' && !process.env.DATABASE_URL) return;
+    const dir = join(home, `${backend}-seeded`), root = join(dir, 'repo');
+    mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+    const note = (i: number, body: string) => `---\ntitle: Seeded ${i}\ntype: note\n---\n${body}\n`;
+    write(root, { ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`vault/notes/s${pad(i)}.md`, note(i, `A synthetic note ${i}.`)])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+    const sourceRoot = join(root, 'vault');
+    const { engine, close } = await open();
+    const counter = gitCounter(dir);
+    const restore = __setPinnedWindowForTests(null);
+    try {
+      await withEnv({ GBRAIN_HOME: join(dir, 'home'), PATH: counter.path }, async () => {
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+        await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [SOURCE, sourceRoot]);
+        await claimWorktree(engine, SOURCE, sourceRoot);
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        expect((await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true })).status).toBe('first_sync');
+        write(root, { ...Object.fromEntries([1, 2, 3].map(i => [`vault/notes/s${pad(i)}.md`, note(i, `An edited synthetic note ${i}.`)])), 'vault/notes/s006.md': note(6, 'A new synthetic note.') });
+        commit(root);
+        const before = counter.calls().length;
+        const delta = await performSync(engine, { sourceId: SOURCE, noPull: true, noEmbed: true, drain: true });
+        expect(delta).toMatchObject({ status: 'synced', added: 1, modified: 3 });
+        expect(counter.calls().slice(before).filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+        await disposePersistenceConsumer(engine);
+      });
+    } finally { restore(); await close(); }
+  }, 120_000);
+}
+
+test('the entries of one aligned block share a pinned window whichever of them reads first', async () => {
+  if (process.platform === 'win32') return;
+  const dir = join(home, 'block'), root = join(dir, 'repo');
+  mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
+  write(root, { ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`vault/notes/b${pad(i)}.md`, `---\ntitle: Block ${i}\n---\nBody ${i}.\n`])), 'outside/readme.md': '# Not in the source\n' }); commit(root);
+  const entries = Array.from({ length: 5 }, (_, i) => ({ path: `notes/b${pad(i)}.md`, sourcePath: `notes/b${pad(i)}.md`, action: 'import' as const, working: false }));
+  const cursor = { root: join(root, 'vault'), gitRoot: root, target: git(root, 'rev-parse', 'HEAD'), entries };
+  const counter = gitCounter(dir);
+  const restore = __setPinnedWindowForTests(null);
+  try {
+    await withEnv({ PATH: counter.path }, async () => {
+      // A follower (index 1) reaches its pinned read before the head (index 0), as concurrent follower freezes may.
+      expect(pinnedBlob({ ...cursor, index: 1 }, entries[1]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 0 }, entries[0]!.path)).not.toBeNull();
+      expect(pinnedBlob({ ...cursor, index: 4 }, entries[4]!.path)).not.toBeNull();
+    });
+    expect(counter.calls().filter(call => / ls-tree -l /.test(call))).toHaveLength(1);
+  } finally { restore(); }
+});
 
 test('the Git top level is read once per root and run, and again when the checkout\'s .git changes', async () => {
   mkdirSync(join(home, 'top-level', 'a', 'b'), { recursive: true });

@@ -28,10 +28,12 @@ import { defineNormalizer, mapStrings, scrubKeys, scrubPaths, scrubTimestamps } 
 import { PROVIDER_ENV_KEYS } from './provider-env.ts';
 import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
 import { FORK_LATEST_VERSION } from '../../src/core/fork-migrations.ts';
+import { SEGMENTED_WRITER_FLOOR } from '../../src/core/page-body/writer-floor.ts';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..');
 const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const PRELOAD = join(import.meta.dir, 'no-network-preload.ts');
+const CLOCK_PRELOAD = join(import.meta.dir, 'fixed-clock-preload.ts');
 const PACKAGE_VERSION = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as { version: string }).version;
 // FORK: migrate.ts appends the fork-owned migrations (v231+) to the generated upstream registry at load time, so the
 // version a fresh brain migrates to (and the doctor reports) is max(upstream registry, fork migrations) = LATEST_VERSION.
@@ -43,10 +45,13 @@ export interface DoctorHome {
   work: string;
   skillsDir: string;
   netLog: string;
+  /** Milliseconds every CLI process of this home adds to the real clock (fixed-clock-preload.ts); unset runs on the real clock. */
+  clockOffsetMs?: number;
   cleanup: () => void;
 }
 
-export function makeDoctorHome(prefix: string): DoctorHome {
+/** `opts.clock`: an ISO instant; the home's CLI processes share one clock that reads it now and moves forward from it. */
+export function makeDoctorHome(prefix: string, opts: { clock?: string } = {}): DoctorHome {
   const home = mkdtempSync(join(tmpdir(), `gbrain-${prefix}-`));
   const work = join(home, 'work');
   const skillsDir = join(home, 'skills');
@@ -68,6 +73,7 @@ export function makeDoctorHome(prefix: string): DoctorHome {
     work,
     skillsDir,
     netLog: join(home, 'net.log'),
+    ...(opts.clock ? { clockOffsetMs: Date.parse(opts.clock) - Date.now() } : {}),
     cleanup: () => rmSync(home, { recursive: true, force: true }),
   };
 }
@@ -101,11 +107,13 @@ export async function runGbrain(h: DoctorHome, args: string[], env: Record<strin
     NO_COLOR: '1',
     PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
   });
+  delete childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS;
+  if (h.clockOffsetMs !== undefined) childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS = String(h.clockOffsetMs);
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) delete childEnv[k];
     else childEnv[k] = v;
   }
-  const proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', PRELOAD, CLI, ...args], {
+  const proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', PRELOAD, '--preload', CLOCK_PRELOAD, CLI, ...args], {
     cwd: h.work,
     env: childEnv,
     stdin: 'ignore',
@@ -140,7 +148,7 @@ export function patchConfig(h: DoctorHome, patch: (cfg: Record<string, unknown>)
 }
 
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
-const VOLATILE_KEYS = /(^|_)(ms|pid|elapsed|duration|uptime)$|_ms$|^elapsed/i;
+const VOLATILE_KEYS = /(^|_)(ms|pid|elapsed|duration|uptime)$|_ms$|^elapsed|^table_bytes$|^oldest_age_seconds$/i;
 
 export function normalizeDoctorText(text: string, roots: Record<string, string>, extra: Array<[RegExp | string, string]> = []): string {
   let out = scrubPaths(text, roots);
@@ -176,13 +184,25 @@ export function expectSchemaLatestMatchesRegistry(run: GbrainRun): void {
 }
 
 /** `doctor-json-v1` with optional extra literal/regex replacements (e.g. a Postgres URL). */
+/**
+ * The segmented writer floor equals VERSION in the release that stamps it, so the
+ * version scrub would turn it into `<version>` there and back into a literal one
+ * release later; a stable label keeps the doctor goldens independent of VERSION.
+ */
+function maskWriterFloor(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskWriterFloor);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) =>
+    [k, k === 'floor' && v === SEGMENTED_WRITER_FLOOR ? '<segmented-writer-floor>' : maskWriterFloor(v)]));
+}
+
 export function doctorJsonNormalizer(extra: Array<[RegExp | string, string]> = [], name = 'doctor-json-v1') {
   return defineNormalizer<GbrainRun>(name, (run) => {
     const fn = (s: string) => normalizeDoctorText(s, run.roots, extra);
     return {
       args: run.args.map(fn),
       exit_code: run.exitCode,
-      report: run.json === null ? null : mapStrings(scrubKeys(run.json, VOLATILE_KEYS), fn),
+      report: run.json === null ? null : mapStrings(maskWriterFloor(scrubKeys(run.json, VOLATILE_KEYS)), fn),
       stdout: run.json === null ? fn(run.stdout).split('\n').filter(Boolean) : '<json>',
       stderr: fn(run.stderr).split('\n').filter(Boolean),
     };

@@ -91,23 +91,26 @@ const KNOWN_MODEL_RENAMES: Readonly<Record<string, string>> = {
 /**
  * Recovery text for a provider 404 (`model_not_found`): the model id and
  * provider from the call context (`chat(provider:model)`), the command that
- * lists the configured routes, and a known rename when there is one.
+ * lists the configured routes, a known rename when there is one and, #5304,
+ * `routeHint`: the sentence naming the config key that selected the model
+ * (`model-not-found-hint.ts`), appended when the caller knows it.
  */
-export function modelNotFoundFix(context: string | undefined): string {
+export function modelNotFoundFix(context: string | undefined, routeHint = ''): string {
   const model = context?.match(/\(([^()\s]+:[^()\s]+)\)\s*$/)?.[1];
   const provider = model?.slice(0, model.indexOf(':'));
   const rename = model ? KNOWN_MODEL_RENAMES[model] : undefined;
   return `Check the model id: ${model ? `the ${provider} provider does not serve ${model}` : 'the provider does not serve this model'}, or this key has no access to it. ` +
     'Run `gbrain models` to see the configured model routes, then set a model the provider lists.' +
-    (rename ? ` ${model} was renamed: use ${rename}.` : '');
+    (rename ? ` ${model} was renamed: use ${rename}.` : '') +
+    (routeHint ? ` ${routeHint}` : '');
 }
 
 /**
  * `redact` scrubs upstream text before it becomes the message, and in the
  * wrapped error (#5137: the gateway passes its provider-key redactor, since
- * auth errors echo keys).
+ * auth errors echo keys). `routeHint` (#5304) is appended to a 404's fix only.
  */
-export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string): AIServiceError {
+export function normalizeAIError(err: unknown, context?: string, redact?: (text: string) => string, routeHint = ''): AIServiceError {
   if (redact) scrubErrorChain(err, redact);
   if (err instanceof AIServiceError) return err;
 
@@ -131,13 +134,13 @@ export function normalizeAIError(err: unknown, context?: string, redact?: (text:
   const msg = redact ? redact(raw) : raw;
   const ctxPrefix = context ? `[${context}] ` : '';
 
-  // 4xx (except 429) = config-level, non-retryable
+  // 4xx (except 429) = config-level, non-retryable. A 403 whose body says the
+  // project has no access to the model is a model problem, not a key problem.
   if (typeof status === 'number' && status >= 400 && status < 500 && status !== 429) {
     return carryStatusFields(err, new AIConfigError(
       `${ctxPrefix}${msg}`,
-      status === 401 || status === 403
-        ? 'Check your API key is valid and has access to this model.'
-        : status === 404 ? modelNotFoundFix(context)
+      status === 404 || MODEL_NOT_FOUND_MESSAGE_RE.test(msg) ? modelNotFoundFix(context, routeHint)
+        : status === 401 || status === 403 ? 'Check your API key is valid and has access to this model.'
         : 'Check your model id + provider options match the provider API.',
       err,
     ));
@@ -169,12 +172,28 @@ function contentPolicy400Reason(responseBody: string): string | undefined {
   return error?.message === 'Content Exists Risk' ? 'content_exists_risk' : undefined;
 }
 
+/**
+ * #6816: Claude Code reports a usage-policy refusal as an error envelope with no API status, which the claude-cli
+ * adapter surfaces as `claude-cli reported error: API Error: ...`. The wordings it has used all link the policy:
+ * "<model> can't help with this. Start a new session to continue. ... https://www.anthropic.com/legal/aup",
+ * "<model>'s safeguards flagged this message (https://www.anthropic.com/legal/aup)" and, before 2.1.219,
+ * "Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup)".
+ * Only that adapter error counts: the anchored prefix, no API status, the policy link and one of the refusal phrases.
+ */
+const CLAUDE_CLI_REFUSAL_RE = /^claude-cli reported error: API Error: (?=[\s\S]*https:\/\/www\.anthropic\.com\/legal\/aup)[\s\S]*(?:can['\u2019]t help with this|violate our Usage Policy|safeguards flagged this)/;
+
+function claudeCliRefusal(value: { name?: unknown; message?: unknown; apiErrorStatus?: unknown }): boolean {
+  return value.name === 'ClaudeCliProcessError' && value.apiErrorStatus === undefined
+    && typeof value.message === 'string' && CLAUDE_CLI_REFUSAL_RE.test(value.message);
+}
+
 /** A provider refusal tied to the prompt, even when the SDK wraps its response. */
 export function providerContentBlockReason(err: unknown): string | undefined {
   for (let depth = 0; depth < 8 && err != null; depth++) {
     try {
       if (typeof err !== 'object') break;
-      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown };
+      const value = err as { responseBody?: unknown; statusCode?: unknown; status?: unknown; cause?: unknown; name?: unknown; message?: unknown; apiErrorStatus?: unknown };
+      if (claudeCliRefusal(value)) return 'claude_cli_usage_policy';
       if (typeof value.responseBody === 'string' && (value.statusCode === 400 || value.status === 400)) {
         const reason = contentPolicy400Reason(value.responseBody);
         if (reason) return reason;
@@ -233,10 +252,13 @@ const BILLING_MESSAGE_RE =
 const AUTH_MESSAGE_RE =
   /authentication_error|permission_error|invalid (?:x-)?api[-_ ]?key|api key (?:is )?(?:invalid|expired|missing)|unauthorized/i;
 const RATE_MESSAGE_RE = /rate[-_ ]?limit(?:ed|_error)?\b|too many requests/i;
-// Provider 404 phrasings for an unknown or inaccessible model (OpenAI
-// `model_not_found` / "does not exist or you do not have access", Anthropic
-// `not_found_error`), for errors that carry no numeric 404.
-const MODEL_NOT_FOUND_MESSAGE_RE = /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access/i;
+// Provider phrasings for an unknown or inaccessible model: OpenAI
+// `model_not_found` / "does not exist or you do not have access" (404),
+// Anthropic `not_found_error`, and the project-level access denial OpenAI
+// returns as a 403 ("Project … does not have access to model …", #5394).
+// Tested before the status map, so the denial is not reported as a bad key.
+const MODEL_NOT_FOUND_MESSAGE_RE =
+  /\bmodel_not_found\b|\bnot_found_error\b|does not exist or you do not have access|(?:does not|doesn't|do not|don't) have access to (?:the |this )?model/i;
 // Structured status forms only; a bare number in prose ("processed 429
 // pages") never matches either shape. The quoted-JSON form
 // (`"api_error_status":429`, the claude-cli result blob) cannot occur as free
@@ -376,11 +398,11 @@ export function classifyGlobalLlmError(err: unknown): GlobalLlmErrorClass | null
   const phraseText = rawIdx === -1 ? message : message.slice(0, rawIdx);
 
   if (BILLING_MESSAGE_RE.test(phraseText)) return 'billing';
+  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   if (status !== undefined) {
     const byStatus = statusToClass(status);
     if (byStatus) return byStatus;
   }
-  if (MODEL_NOT_FOUND_MESSAGE_RE.test(phraseText)) return 'model_not_found';
   // Config-level errors are whole-run by construction — a missing/invalid
   // key or an unknown model id fails identically on every call. The gateway
   // throws AIConfigError directly for missing keys ("OpenAI chat requires

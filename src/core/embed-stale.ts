@@ -15,10 +15,11 @@ import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
  * `embed.ts`.
  */
 import type { BrainEngine } from './engine.ts';
-import type { Chunk, ChunkInput } from './types.ts';
+import type { Chunk, ChunkInput, StaleChunkRow } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier, readCorpusGeneration } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
+import { healAndReportOverLength } from './embed-overlength-heal.ts';
 import { invalidateStaleSignatureEmbeddingsGuarded, countSignatureDriftedEmbeddings, splitEmbeddingSignature, currentInputChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
@@ -30,6 +31,9 @@ import { AbortError } from './abort-check.ts';
 import { persistStaleSlice, throwIfPersistenceStopped } from './embed-slice-persist.ts';
 import { LockStolenError } from './db-lock.ts';
 import { resolveEmbedSubBatchSize } from './embed-slices.ts';
+import { meterPageBatch, spendGrant } from './page-embedding-budget.ts';
+import { chunkGenerationFilter, chunkVisibleFilter } from './search/safe-chunks.ts';
+import { embedSegmentedPage, embedSegmentedRows, readSegmentedEmbedPage, type SegmentedEmbedOpts } from './page-body/segmented-embedding.ts';
 
 /**
  * W0 fix-wave (Tier-1 #3, CONFIRMED): the ONE carry-through field list for
@@ -212,7 +216,7 @@ export async function stampIfPageProvenanceComplete(
       `SELECT count(*) > 0
               AND bool_and(${currentInputChunkPredicate(colId, 1, 4)}) AS complete
          FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-        WHERE p.slug = $2 AND p.source_id = $3 AND p.text_projection_revision=p.knowledge_revision
+        WHERE p.slug = $2 AND p.source_id = $3 AND ${chunkVisibleFilter('p', 'cc')}
           AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,
       [model, slug, sourceId, dims],
     );
@@ -302,6 +306,23 @@ export async function probeEmbedder(
  * worker: stored-CR-mode wrapping, metadata carry, full-restale signature
  * stamp, title-tier restamp.
  */
+/**
+ * Wave B: when the batch's page is segmented, embed these rows by keyset
+ * (`embedSegmentedRows`, never through its body or every chunk), stamp the
+ * page's provenance when it is complete, and return true; false for an inline page.
+ */
+async function embedSegmentedStaleRows(engine: BrainEngine, stale: readonly StaleChunkRow[], result: { embedded: number; pagesProcessed: number },
+  opts: Omit<SegmentedEmbedOpts, 'beforeInstall'> & { stamp?: ProvenanceStamp; pacer: DbPacer; assertOwned?: (tx?: BrainEngine) => Promise<void>; stopped: () => boolean }): Promise<boolean> {
+  const page = await observed(opts.pacer, () => readSegmentedEmbedPage(engine, { id: stale[0]!.page_id }));
+  if (!page) return false;
+  const installed = await embedSegmentedRows(engine, page, stale, { ...opts,
+    beforeInstall: async tx => { await opts.assertOwned?.(tx); if (opts.stopped()) throw new AbortError(); } });
+  if (opts.stamp && installed) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, opts.stamp);
+  result.embedded += installed ?? 0;
+  if (installed) result.pagesProcessed += 1;
+  return true;
+}
+
 export async function embedStalePages(
   engine: BrainEngine,
   slugs: string[],
@@ -329,6 +350,15 @@ export async function embedStalePages(
       return result;
     }
     try {
+      const segmented = await readSegmentedEmbedPage(engine, { sourceId, slug });
+      if (segmented) {
+        const page = await embedSegmentedPage(engine, segmented, { embedFn, signal: opts.signal, signature: opts.embeddingSignature });
+        const stamp = page.complete ? await resolveProvenanceStamp(engine, opts.embeddingSignature) : undefined;
+        if (stamp) await stampIfPageProvenanceComplete(engine, slug, sourceId, stamp);
+        result.embedded += page.embedded;
+        if (page.embedded) result.pagesProcessed += 1;
+        continue;
+      }
       // SUP-3874: split legacy oversized rows before embedding so a single
       // pre-cap chunk cannot permanently fail the page.
       await healOversizedPageChunks(engine, slug, { sourceId });
@@ -339,18 +369,20 @@ export async function embedStalePages(
         (await engine.executeRaw<{ chunk_index: number }>(
           `SELECT cc.chunk_index
              FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-            WHERE p.slug = $1 AND p.source_id = $2 AND cc.${staleColId} IS NULL
+            WHERE p.slug = $1 AND p.source_id = $2 AND cc.${staleColId} IS NULL AND ${chunkGenerationFilter('p', 'cc')}
             ORDER BY cc.chunk_index`,
           [slug, sourceId],
         )).map(r => r.chunk_index),
       );
       if (staleIdx.size === 0) continue;
-      const stale = existing.filter(c => staleIdx.has(c.chunk_index));
       const pageRow = prepared.snapshot.page;
-      const embeddings = await embedFn(
+      const metered = await meterPageBatch(engine, pageRow, existing.filter(c => staleIdx.has(c.chunk_index)), { signature: opts.embeddingSignature ?? null });
+      if (!metered) continue;
+      const stale = metered.chunks;
+      const embeddings = await spendGrant(metered.grant, () => embedFn(
         wrapChunkTextsForStoredMode(pageRow, stale),
         { abortSignal: opts.signal },
-      );
+      ));
       const staleIdxToEmbedding = new Map<number, Float32Array>();
       for (let j = 0; j < stale.length; j++) {
         staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
@@ -362,13 +394,14 @@ export async function embedStalePages(
         embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
-      if (!await engine.transaction(async tx => {
-        if (!await installPageEmbeddings(tx, prepared, merged,
-          opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined)) return false;
-        if (stale.length === existing.length) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, sourceId);
-        return true;
-      })) continue;
-      result.embedded += stale.length;
+      const install = await engine.transaction(async tx => {
+        const installed = await installPageEmbeddings(tx, prepared, merged,
+          opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined);
+        if (stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, sourceId);
+        return installed;
+      });
+      if (!install.complete && install.installed === 0) continue;
+      result.embedded += install.installed;
       result.pagesProcessed += 1;
     } catch (e) {
       if (opts.signal?.aborted) {
@@ -570,7 +603,7 @@ export async function embedStaleForSource(
       };
       try {
         await assertHealOwned();
-        if (stopped()) return;
+        if (stopped() || await embedSegmentedStaleRows(engine, stale, result, { embedFn, signal, signature, stamp, pacer, assertOwned: opts.assertOwned, stopped })) return;
         // SUP-3874: split legacy oversized chunk_text before embedding.
         const healed = await observed(pacer, () => engine.transaction(async tx => {
           await assertHealOwned(tx);
@@ -597,6 +630,7 @@ export async function embedStaleForSource(
             e instanceof Error ? e.message : String(e)
           }\n`,
         );
+        await healAndReportOverLength(engine, slug, keySourceId, e, stale.map(c => c.chunk_text), line => process.stderr.write(`${line}\n`));
         return;
       }
       // Generation BEFORE the projection snapshot (see commands/embed.ts): a contextual run landing in between must
@@ -612,6 +646,14 @@ export async function embedStaleForSource(
         if (!stale.length) return;
       }
       const pageRow = prepared.snapshot.page;
+      // Upstream's per-page spend cap (page-embedding-budget.ts): meter the page's vector-less chunks once and
+      // narrow `stale` to the grant; the reservation settles after the slices (spent once a provider call landed).
+      const metered = await meterPageBatch(engine, pageRow, prepared.chunks.filter(c => !c.embedded_at), { signature });
+      if (!metered) return;
+      if (metered.grant) {
+        const selected = new Map(stale.map(c => [c.chunk_index, c]));
+        stale = metered.chunks.map(c => ({ ...(selected.get(c.chunk_index) ?? { source_id: keySourceId, slug, page_id: pageRow.id }), ...c }));
+      }
       const wrappedTexts = wrapChunkTextsForStoredMode(pageRow, stale);
       const slices = Math.ceil(stale.length / subBatchSize);
       let pageHadFailure = false;
@@ -620,64 +662,74 @@ export async function embedStaleForSource(
       // restamping on top of a skip would claim coverage the run didn't
       // actually verify.
       let pageStaleSkipped = 0;
-      for (let offset = 0; offset < stale.length; offset += subBatchSize) {
-        if (stopped()) return;
-        await opts.assertOwned?.(); // ownership re-check before each slice commit (persistStaleSlice has no tx hook)
-        const sliceRows = stale.slice(offset, offset + subBatchSize);
-        let checkpoint: Awaited<ReturnType<typeof persistStaleSlice>>;
-        try {
-          checkpoint = await persistStaleSlice({
-            engine,
-            embedTexts: wrappedTexts.slice(offset, offset + subBatchSize),
-            rows: sliceRows,
-            embeddingSignature: signature,
-            signatureInvalidationFailed,
-            activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
-            expectedCorpusGeneration: observedCorpusGeneration,
-            prepared,
-            assertOwned: opts.assertOwned,
-            embedFn,
-            signal,
-            deadline: opts.deadline,
-            slice: { index: (offset / subBatchSize) + 1, total: slices },
-            write,
-          });
-        } catch (error) {
-          // The transaction fence deliberately throws cancellation rather
-          // than recording it as a page failure. Preserve earlier slices and
-          // surface the drain's resumable aborted state to its caller.
-          // Only a genuine stop (signal fired or deadline reached) maps to
-          // aborted; lease loss recorded as the signal reason stays an error.
-          throwIfLeaseLost(error);
-          if (error instanceof Error && error.name === 'AbortError' && stopped()) {
+      let grantSpent = false;
+      let overLengthError: unknown;
+      try {
+        for (let offset = 0; offset < stale.length; offset += subBatchSize) {
+          if (stopped()) return;
+          await opts.assertOwned?.(); // ownership re-check before each slice commit (persistStaleSlice has no tx hook)
+          const sliceRows = stale.slice(offset, offset + subBatchSize);
+          let checkpoint: Awaited<ReturnType<typeof persistStaleSlice>>;
+          try {
+            checkpoint = await persistStaleSlice({
+              engine,
+              embedTexts: wrappedTexts.slice(offset, offset + subBatchSize),
+              rows: sliceRows,
+              embeddingSignature: signature,
+              signatureInvalidationFailed,
+              activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
+              expectedCorpusGeneration: observedCorpusGeneration,
+              prepared,
+              assertOwned: opts.assertOwned,
+              embedFn,
+              signal,
+              deadline: opts.deadline,
+              slice: { index: (offset / subBatchSize) + 1, total: slices },
+              write,
+            });
+          } catch (error) {
+            // The transaction fence deliberately throws cancellation rather
+            // than recording it as a page failure. Preserve earlier slices and
+            // surface the drain's resumable aborted state to its caller.
+            // Only a genuine stop (signal fired or deadline reached) maps to
+            // aborted; lease loss recorded as the signal reason stays an error.
+            throwIfLeaseLost(error);
+            if (error instanceof Error && error.name === 'AbortError' && stopped()) {
+              result.aborted = true;
+              return;
+            }
+            throw error;
+          }
+          result.embedded += checkpoint.embedded;
+          grantSpent = true; // a returned slice may have been billed (upstream: settled = spent, released only when the call throws)
+          if (checkpoint.failureCount > 0 && overLengthError === undefined) overLengthError = checkpoint.firstFailureError;
+          if (checkpoint.failureCount > 0) { pageHadFailure = true; result.failures = (result.failures ?? 0) + checkpoint.failureCount; } // ledgered chunk failures still count as run failures (upstream contract)
+          if (checkpoint.persistFailed) {
+            result.persistFailures = (result.persistFailures ?? 0) + 1;
+            pageHadFailure = true;
+          }
+          pageStaleSkipped += checkpoint.outcome?.staleSkippedChunks ?? 0;
+          const pageKey = `${sliceRows[0]!.source_id}:${sliceRows[0]!.page_id}`;
+          if (checkpoint.pageCommitted && !committedPages.has(pageKey)) {
+            committedPages.add(pageKey);
+            result.pagesProcessed++;
+          }
+          if (checkpoint.aborted) {
             result.aborted = true;
             return;
           }
-          throw error;
+          // SPEC V4: any run-global terminal error must still propagate and
+          // reject the whole embedStaleForSource call — persistStaleSlice
+          // RETURNS fatalError (instead of throwing) so the accounting above
+          // is never lost, but this call site's pre-existing contract has no
+          // #3037 cost-bounding carve-out: rethrow unconditionally.
+          if (checkpoint.fatalError !== undefined) throw checkpoint.fatalError;
         }
-        result.embedded += checkpoint.embedded;
-        if (checkpoint.failureCount > 0) { pageHadFailure = true; result.failures = (result.failures ?? 0) + checkpoint.failureCount; } // ledgered chunk failures still count as run failures (upstream contract)
-        if (checkpoint.persistFailed) {
-          result.persistFailures = (result.persistFailures ?? 0) + 1;
-          pageHadFailure = true;
-        }
-        pageStaleSkipped += checkpoint.outcome?.staleSkippedChunks ?? 0;
-        const pageKey = `${sliceRows[0]!.source_id}:${sliceRows[0]!.page_id}`;
-        if (checkpoint.pageCommitted && !committedPages.has(pageKey)) {
-          committedPages.add(pageKey);
-          result.pagesProcessed++;
-        }
-        if (checkpoint.aborted) {
-          result.aborted = true;
-          return;
-        }
-        // SPEC V4: any run-global terminal error must still propagate and
-        // reject the whole embedStaleForSource call — persistStaleSlice
-        // RETURNS fatalError (instead of throwing) so the accounting above
-        // is never lost, but this call site's pre-existing contract has no
-        // #3037 cost-bounding carve-out: rethrow unconditionally.
-        if (checkpoint.fatalError !== undefined) throw checkpoint.fatalError;
+      } finally {
+        await metered.grant?.settle({ ok: grantSpent }).catch(() => {});
       }
+      // Upstream [R13]: an over-length rejection splits the page's stored chunks; the pieces embed next pass.
+      if (overLengthError !== undefined) await healAndReportOverLength(engine, slug, keySourceId, overLengthError, stale.map(c => c.chunk_text), line => write(line));
       // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
       // title tier — keep the stamped mode honest (mixed pages stay as-is).
       if (!pageHadFailure && pageStaleSkipped === 0) {

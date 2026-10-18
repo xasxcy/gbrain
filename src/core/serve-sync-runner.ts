@@ -54,9 +54,12 @@
  * CLI's effective flags (the managed cursor owns processing options).
  */
 
+import { isAdmissionOrigin, withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { randomUUID } from 'node:crypto';
 import { withLegacySyncDelegation } from './persistence/sync-authority.ts';
+import { retiredWireNotice } from './wire-skew.ts';
 import { verifyLocalWriter, withVerifiedLocalRegistration } from './persistence/identity.ts';
+import { readManagedMode } from './persistence/managed-mode.ts';
 import { OperationError } from './ops/contract.ts';
 import { trustedCliRequired } from './ops/op-fix.ts';
 import { withHumanLineSink } from './console-prefix.ts';
@@ -159,6 +162,17 @@ export function startDelegatedSync(
   clientToken: string,
   opts: { boundSourceId?: string; registration?: unknown } = {},
 ): SyncStartResponse | Promise<SyncStartResponse> {
+  // #6696 (A5): the client's admission origin scopes every write of the job (validated below; a client that sends none is background).
+  const origin = (rawOptions as { origin?: unknown } | null)?.origin;
+  return withAdmissionOrigin(isAdmissionOrigin(origin) ? origin : 'background', () => startDelegatedSyncScoped(engine, rawOptions, clientToken, opts));
+}
+
+function startDelegatedSyncScoped(
+  engine: BrainEngine,
+  rawOptions: unknown,
+  clientToken: string,
+  opts: { boundSourceId?: string; registration?: unknown },
+): SyncStartResponse | Promise<SyncStartResponse> {
   if (typeof clientToken !== 'string' || clientToken.length === 0 || clientToken.length > 128) {
     return { ok: false, protocol: 2, error: 'invalid_options:clientToken' };
   }
@@ -200,6 +214,12 @@ export function startDelegatedSync(
     settled: Promise.resolve(),
   };
   current = job;
+  // An older client's retired fields (src/core/wire-skew.ts) were dropped: say so in the serve log and to that client.
+  if (v.ignored) {
+    const notice = retiredWireNotice(v.ignored);
+    log(notice);
+    job.lines.push({ seq: ++job.lineSeq, text: notice });
+  }
   ensureDrainerRegistered();
 
   // Per-job hard deadline: 0 is the single unbounded encoding (an explicit
@@ -329,8 +349,7 @@ async function startVerifiedDelegatedSync(
       await withVerifiedLocalRegistration(engine, registration, () => withHumanLineSink(push, async () => {
         const { performSync } = await import('../commands/sync.ts');
         const sourceId = await resolveJobSource(engine, job);
-        const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-        const managed = brain?.enabled === true;
+        const managed = await readManagedMode(engine);
         log(
           `start job=${job.id} source=${sourceId ?? 'default'} writer=${verified.principal.id} managed=${managed} ` +
           `opts=${JSON.stringify({ ...options, timeoutSeconds: undefined })} deadline=${options.timeoutSeconds}s`,
@@ -340,7 +359,9 @@ async function startVerifiedDelegatedSync(
           // The managed drain is the CLI's own path: the cursor owns processing options, so the CLI's effective
           // flags ride through; the classic path keeps the always-deferred embed rule of the legacy lane.
           ...(managed
-            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, explicitProcessing: options.explicitProcessing }
+            ? { drain: true, noBulk: options.noBulk, lanes: options.lanes, noEmbed: options.noEmbed, embedDeferred: options.embedDeferred,
+              // #6712 PR 1: the CLI's run follows a live drain-lease holder inside the serve, as it would in its own process.
+              followDrainLease: true, drainHolder: { kind: 'serve' as const, id: String(job.id) } }
             : { noEmbed: true }),
           signal: job.controller.signal,
           onProgress: (p) => {

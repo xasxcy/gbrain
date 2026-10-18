@@ -3,7 +3,8 @@ import { importFenceTally, type FencesNormalized } from '../core/fence-repair/re
 import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
 import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
-import { execFileSync } from 'child_process';
+import { recordFunnelEvent } from '../core/funnel.ts';
+import { execFileSync } from '../core/spawn.ts';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
@@ -24,7 +25,7 @@ import {
   matchesAnyGlob,
   pruneDir,
   isPathPruned,
-  SYNC_SKIP_FILES,
+  isSyncMetafile,
   type SyncStrategy,
 } from '../core/sync.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
@@ -44,6 +45,8 @@ import { acceptedPendingReceipt } from '../core/persistence/accepted-pending.ts'
 import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
 import { managedRootMarkerFor } from '../core/persistence/root-registry.ts';
+import { readManagedMode } from '../core/persistence/ownership.ts';
+import { readPageBodyPolicy } from '../core/page-body/limits.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -461,6 +464,7 @@ export async function runImport(
   } catch {
     importActivePack = undefined;
   }
+  const bodyPolicy = await readPageBodyPolicy(engine);
 
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
@@ -504,8 +508,7 @@ export async function runImport(
     throw new ImportAbortError(`import target not readable: ${dirArg}`);
   }
 
-  const [persistence] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  const managedImport = persistence?.enabled === true;
+  const managedImport = await readManagedMode(engine);
   if (managedImport && dir !== resolve(dirArg)) throw symlinkedRootAbort(dirArg, dir);
   const singleFile = managedImport && lstatSync(dir).isFile();
   const importRoot = singleFile ? dirname(dir) : dir;
@@ -727,7 +730,7 @@ export async function runImport(
         ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
         : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, firstCommitAt: firstCommits?.get(filePath) });
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, bodyPolicy, firstCommitAt: firstCommits?.get(filePath) });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning); fenceTally.note(importRelPath, result);
@@ -1209,6 +1212,7 @@ export async function runImport(
   }
 
   if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine, imported);
+  if (imported > 0) recordFunnelEvent('import');
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(resealSummary ? { resealed: resealSummary } : {}), ...fenceTally.fields(),
@@ -1258,7 +1262,8 @@ interface CollectOpts {
  * — preserve the walker semantic explicitly.
  *
  * Closes #345: exclude `SYNC_SKIP_FILES` metafiles
- * (`README.md` / `index.md` / `log.md` / `schema.md` / `RESOLVER.md`).
+ * (`README.md` / `index.md` / `log.md` / `schema.md` / `RESOLVER.md`) and, since
+ * #5186, the root-level `AGENTS.md` / `CLAUDE.md` (`SYNC_ROOT_SKIP_FILES`).
  * Incremental `sync` skips these via `isSyncable`, but the bulk-import
  * walker only filtered by extension — so a directory import imported every
  * directory README as a page, titled by its folder ("People", "Companies",
@@ -1293,11 +1298,10 @@ function isCollectibleForWalker(
   if (hasMalformedPathSegment(path)) return false;
 
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
-  // resolver), not typed brain pages — same exclusion `sync`'s `isSyncable`
-  // applies. Guards both the FS-walk and the git-fast-path collection routes.
-  const segments = path.split('/');
-  const basename = segments[segments.length - 1] || '';
-  if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return false;
+  // resolver, and the root AGENTS.md / CLAUDE.md harden writes), not typed
+  // brain pages — same exclusion `sync`'s `isSyncable` applies. Guards both
+  // the FS-walk and the git-fast-path collection routes.
+  if (isSyncMetafile(path)) return false;
 
   switch (strategy) {
     case 'code':

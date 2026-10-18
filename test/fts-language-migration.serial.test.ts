@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { MIGRATIONS } from '../src/core/migrate.ts';
-import { resetFtsLanguageCache } from '../src/core/fts-language.ts';
+import { pageSearchVectorTriggerFnSql, resetFtsLanguageCache } from '../src/core/fts-language.ts';
 
 const ENV_KEY = 'GBRAIN_FTS_LANGUAGE';
 const originalLang = process.env[ENV_KEY];
@@ -103,14 +103,11 @@ describe('configurable_fts_language migration', () => {
     expect(calls[3]).toMatch(/UPDATE content_chunks/);
   });
 
-  test('the fork migration installs a compiled_truth-free pages trigger and backfills in batches', async () => {
-    // The fork's standing repair for upstream's #2704 pair. Upstream's
-    // configurable_fts_language still builds pages.search_vector from
-    // compiled_truth (unbounded whole-page body, overflows Postgres's 1MB
-    // tsvector cap on large pages) and upstream's
-    // page_search_vector_drop_compiled_truth never backfills existing rows.
-    // This migration owns both halves for the fork. Looked up BY NAME: fork
-    // migrations are re-sequenced to max(upstream)+1 on every sync.
+  test('the fork final-trigger step installs upstream\'s bounded body and rebuilds nothing', async () => {
+    // Upstream v245 now owns what this fork step used to add (no compiled_truth, bounded timeline) and backfills
+    // only the rows that need it; v232 adds the CJK/Latin boundary split. The fork step installs that same body
+    // (gbrain_fts_input first, so it never depends on v232 having run) and issues no row rewrite. Looked up BY NAME:
+    // fork migrations are re-sequenced to max(upstream)+1 on every sync.
     const forkMig = MIGRATIONS.find(
       m => m.name === 'fork_page_search_vector_final_trigger_and_batched_backfill',
     );
@@ -129,21 +126,11 @@ describe('configurable_fts_language migration', () => {
 
     await forkMig!.handler!(mockEngine);
 
-    // The installed pages trigger must not index compiled_truth.
-    expect(calls[0]).toContain('update_page_search_vector');
-    expect(calls[0]).not.toContain('compiled_truth');
-    expect(calls[0]).toContain('SET search_path = pg_catalog, public');
-    // The backfill must be batched (keyset over the SERIAL PK), never a
-    // single unbounded UPDATE holding a lock over the whole pages table.
-    const backfills = calls.filter(sql => /UPDATE pages/.test(sql));
-    expect(backfills.length).toBeGreaterThan(0);
-    for (const sql of backfills) {
-      // The trigger is UPDATE OF title,timeline, so the keyset update must
-      // name a watched column. `id = id` would not fire it.
-      expect(sql).toMatch(/SET title = title/);
-      expect(sql).toMatch(/WHERE id > \$1 AND search_vector IS NOT NULL/);
-      expect(sql).toMatch(/LIMIT \$2/);
-    }
+    expect(calls.length).toBe(2);
+    expect(calls[0]).toContain('FUNCTION gbrain_fts_input');
+    expect(calls[1]).toBe(pageSearchVectorTriggerFnSql('pt_br'));
+    expect(calls[1]).not.toContain('compiled_truth');
+    expect(calls.some(sql => /UPDATE pages/.test(sql))).toBe(false);
   });
 
   test('invalid language falls back to english (no SQL injection)', async () => {

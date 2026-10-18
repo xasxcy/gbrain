@@ -37,9 +37,10 @@ export const OP_READ_TRUST: Readonly<Record<string, ReadTrustHandling>> = {
   wanted_pages: 'labeled', get_tags: 'labeled', get_ingest_log: 'labeled',
   chronicle_day: 'labeled', chronicle_on_this_day: 'labeled', chronicle_since: 'labeled', chronicle_last_seen: 'labeled',
   ontology_get: 'labeled', ontology_dimensions: 'labeled', ontology_conflicts: 'labeled', volunteer_chronicle: 'labeled',
-  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'labeled',
+  extraction_pending: 'labeled', entity_identity_list: 'labeled', find_contradictions: 'filtered',
   find_experts: 'labeled', find_trajectory: 'labeled', takes_scorecard: 'labeled', takes_calibration: 'labeled',
   open_loops: 'labeled', schema_review_orphans: 'labeled',
+  questions_list: 'labeled', questions_status: 'labeled',
   code_callers: 'labeled', code_callees: 'labeled', code_def: 'labeled', code_refs: 'labeled', code_blast: 'labeled', code_flow: 'labeled',
   // no stored memory text
   search_modes: 'text_free', list_link_sources: 'text_free', get_brain_identity: 'text_free',
@@ -49,6 +50,7 @@ export const OP_READ_TRUST: Readonly<Record<string, ReadTrustHandling>> = {
   sources_inspect: 'text_free', request_tools: 'text_free', connectors_status: 'text_free',
   get_active_schema_pack: 'text_free', list_schema_packs: 'text_free', schema_stats: 'text_free', schema_lint: 'text_free',
   schema_graph: 'text_free', schema_explain_type: 'text_free',
+  list_write_conflicts: 'text_free', get_brain_health: 'text_free',
 };
 
 /** The class an op resolves to; an unlisted read op is held to the strictest (`labeled`) rule. */

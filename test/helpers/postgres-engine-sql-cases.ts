@@ -45,6 +45,7 @@ const OOS = {
   // FORK: the embed_failures retry ledger. These methods deliberately keep Postgres's raw positional executeRaw adapter
   // (see their `engine-sql-ok` markers in postgres-engine.ts), so they are not part of the W1 conversion domains.
   embedLedger: 'out-of-scope:fork-embed-failures-ledger (raw positional adapter; not a W1 domain)',
+  pageBody: 'out-of-scope:page-body (Wave B segmented storage, born in engine-sql/page-body.ts; pinned by test/engine-sql-page-body.test.ts)',
 } as const;
 
 export const DOMAIN_OF: Record<string, string> = {
@@ -79,6 +80,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'runUnsafe': OOS.helper,
   'executeRaw': OOS.lifecycle,
   'executeRawDirect': OOS.lifecycle,
+  'keywordBoundedRead': OOS.lifecycle,
   'runMigration': OOS.lifecycle,
   'getBulkRetryOpts': OOS.helper,
   'batchRetry': OOS.helper,
@@ -89,9 +91,10 @@ export const DOMAIN_OF: Record<string, string> = {
   '_searchKeywordCJK': OOS.helper,
   'runVectorAttempt': OOS.helper,
   'vectorIterativeScanSupported': OOS.helper,
+  'keywordStatementTimeoutSetting': OOS.helper,
 
   // pages
-  'getPage': 'pages', 'readPageSnapshot': 'pages', 'lockPageKeys': 'pages', 'findDuplicatePage': 'pages',
+  'getPage': 'pages', 'readPageSnapshot': 'pages', 'readPageSnapshotsBatch': 'pages', 'lockPageKeys': 'pages', 'findDuplicatePage': 'pages', 'findDuplicatePages': 'pages',
   'putPage': 'pages', 'deletePage': 'pages', 'deletePages': 'pages', 'resolveSlugsByPaths': 'pages',
   'softDeletePage': 'pages', 'softDeletePages': 'pages', 'restorePage': 'pages', 'purgeDeletedPages': 'pages',
   'refreshPageBody': 'pages', 'updatePageContextualRetrievalState': 'pages', 'listPages': 'pages',
@@ -101,6 +104,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'resolveSlugWithAlias': 'pages', 'resolveSlugWithAliasDetailed': 'pages', 'setPageAliases': 'pages',
   'countStalePagesForExtraction': 'pages', 'listStalePagesForExtraction': 'pages', 'markPagesExtractedBatch': 'pages',
   'markPagesAttendanceBlocked': 'pages',
+  'countStaleFrontmatterKeyPages': 'pages', 'listStaleFrontmatterKeyPages': 'pages', 'stripStaleFrontmatterKeys': 'pages',
   // links
   'addLink': 'links', 'addLinksBatch': 'links', 'replaceDerivedLinks': 'links', 'replaceDerivedLinksBatch': 'links', 'removeLinksByPagesAndSource': 'links',
   'removeLink': 'links', 'getLinks': 'links', 'getBacklinks': 'links', 'listLinkSources': 'links',
@@ -117,10 +121,12 @@ export const DOMAIN_OF: Record<string, string> = {
   // files
   'upsertFile': 'files', 'getFile': 'files', 'listFilesForPage': 'files',
   // chunks
-  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
+  'upsertChunks': 'chunks', 'getChunks': 'chunks', 'getChunkPage': 'chunks', 'getChunkWindows': 'chunks', 'countStaleChunks': 'chunks', 'sumStaleChunkChars': 'chunks',
   'setPageEmbeddingSignature': 'chunks', 'invalidateStaleSignatureEmbeddings': 'chunks',
   'invalidateContentDriftEmbeddings': 'chunks', 'listStaleChunks': 'chunks',
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
+  'readEmbeddingStateCounts': 'chunks', 'listEmbeddingStateRows': 'chunks',
+  'allocateBodyOccurrenceIds': OOS.pageBody, 'stageSegmentTexts': OOS.pageBody, 'readSegmentTexts': OOS.pageBody, 'stageManifestRows': OOS.pageBody, 'readManifest': OOS.pageBody, 'stageSegmentChunks': OOS.pageBody, 'createSegmentedPageShell': OOS.pageBody, 'flipBodyGeneration': OOS.pageBody, 'openBodyStaging': OOS.pageBody, 'setBodyStagingState': OOS.pageBody, 'sweepSegments': OOS.pageBody,
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',
@@ -145,7 +151,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'searchKeyword': 'cjk-search', 'searchKeywordChunks': 'cjk-search',
 
   // out of scope
-  'searchTitles': OOS.search, 'searchVector': OOS.search, 'explainVectorSearch': OOS.search,
+  'searchTitles': OOS.search, 'countKeywordPages': OOS.search, 'searchKeywordPages': OOS.search, 'searchVector': OOS.search, 'explainVectorSearch': OOS.search,
   'relationalFanout': OOS.enrichment, 'relationalChainHop': OOS.enrichment, 'getBacklinkCounts': OOS.enrichment, 'getAdjacencyBoosts': OOS.enrichment,
   'getContentFlagsByPageIds': OOS.enrichment, 'getUnverifiedExtractionPageIds': OOS.enrichment,
   'getEffectiveDates': OOS.enrichment, 'getSalienceScores': OOS.enrichment, 'resolveAliases': OOS.enrichment,
@@ -185,6 +191,8 @@ const DEFAULT_RULES: Rule[] = [
   [/AS snapshot_withdrawals/, [{ ...PAGE_ROW, source_incarnation: INCARNATION, snapshot_tags: [], snapshot_withdrawals: [], fingerprint_body: '', fingerprint_timeline: '' }]],
   [/current_setting\('app\.scopes', true\) AS scopes/, [{ scopes: '*' }]],
   [/^SHOW enable_seqscan$/, [{ enable_seqscan: 'on' }]],
+  // The chunk-read manifest probe (safe-chunks.ts chunkManifestReads) as the owning role answers it.
+  [/chunk-visibility-ok: whether any chunk row of a segmented body exists/, [{ readable: true, segmented: false }]],
   [/^SHOW statement_timeout$/, [{ statement_timeout: '0' }]],
 ];
 
@@ -287,11 +295,17 @@ export const SQL_CASES: SqlCase[] = [
     ['default', (e) => e.readPageSnapshot(SLUG)],
     ['sourceId', (e) => e.readPageSnapshot(SLUG, { sourceId: SRC })],
   ]),
+  ...variants('readPageSnapshotsBatch', [
+    ['default', (e) => e.readPageSnapshotsBatch([{ slug: SLUG, sourceId: SRC }, { slug: SLUG2, sourceId: SRC }])],
+  ]),
   ...variants('lockPageKeys', [
     ['default', (e) => e.transaction((tx: any) => tx.lockPageKeys([{ sourceId: SRC, slug: SLUG }]))],
   ]),
   ...variants('findDuplicatePage', [
     ['default', (e) => e.findDuplicatePage(SRC, { hash: 'hash-1' }), [[/FROM pages/, [{ id: 1, slug: SLUG }]]]],
+  ]),
+  ...variants('findDuplicatePages', [
+    ['default', (e) => e.findDuplicatePages(SRC, [{ hash: 'hash-1' }, { hash: 'hash-2', frontmatterId: 'fm-1', excludeSlug: SLUG }])],
   ]),
   ...variants('putPage', [
     ['default', (e) => e.putPage(SLUG, page), [pageRet]],
@@ -373,8 +387,8 @@ export const SQL_CASES: SqlCase[] = [
     ['sourceId', (e) => e.revertToVersion(SLUG, 3, { sourceId: SRC })],
   ]),
   ...variants('updateSlug', [
-    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]]]],
-    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2')],
+    ['moved', (e) => e.updateSlug(SLUG, 'people/alice-example-2', { sourceId: SRC }), [[/^UPDATE pages SET slug = \$1/, [{ id: 1 }]], [/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
+    ['noop', (e) => e.updateSlug(SLUG, 'people/alice-example-2'), [[/page_versions/, [{ id: 1, page_id: 1, compiled_truth: 'x', frontmatter: {}, snapshot_at: EPOCH }]]]],
   ]),
   ...variants('resolveSlugWithAlias', [['default', (e) => e.resolveSlugWithAlias('alice', SRC)]]),
   ...variants('resolveSlugWithAliasDetailed', [
@@ -397,6 +411,9 @@ export const SQL_CASES: SqlCase[] = [
   ]),
   ...variants('markPagesExtractedBatch', [['default', (e) => e.markPagesExtractedBatch([{ slug: SLUG, source_id: SRC }], '2026-01-01T00:00:00Z')]]),
   ...variants('markPagesAttendanceBlocked', [['default', (e) => e.markPagesAttendanceBlocked([{ slug: SLUG, source_id: SRC, revision: '00000000-0000-4000-8000-000000000001' }])]]),
+  ...variants('countStaleFrontmatterKeyPages', [['default', (e) => e.countStaleFrontmatterKeyPages({ sourceIds: [SRC] })]]),
+  ...variants('listStaleFrontmatterKeyPages', [['default', (e) => e.listStaleFrontmatterKeyPages({ sourceId: SRC, afterId: 0, limit: 10 })]]),
+  ...variants('stripStaleFrontmatterKeys', [['default', (e) => e.stripStaleFrontmatterKeys({ sourceId: SRC, ids: [1] })]]),
 
   // ── links ──
   ...variants('addLink', [
@@ -531,6 +548,10 @@ export const SQL_CASES: SqlCase[] = [
     ['includeUnsealed', (e) => e.getChunks(SLUG, { includeUnsealed: true })],
     ['requireSafeChunks', (e) => e.getChunks(SLUG, { requireSafeChunks: true })],
   ]),
+  ...variants('getChunkPage', [
+    ['default', (e) => e.getChunkPage(SLUG, { fromIndex: 50, limit: 50 })],
+    ['sourceIds+excludePrivate', (e) => e.getChunkPage(SLUG, { sourceIds: SRCS, excludePrivate: true, fromIndex: 0, limit: 10 })],
+  ]),
   ...variants('countStaleChunks', [
     ['default', (e) => e.countStaleChunks()],
     ['signature+sourceId', (e) => e.countStaleChunks({ signature: 'model:3', sourceId: SRC })],
@@ -564,6 +585,15 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('listChunklessPagesWithContent', [
     ['default', (e) => e.listChunklessPagesWithContent()],
     ['afterPageId+sourceId', (e) => e.listChunklessPagesWithContent({ afterPageId: 3, sourceId: SRC, batchSize: 5 })],
+  ]),
+  ...variants('readEmbeddingStateCounts', [
+    ['full', (e) => e.readEmbeddingStateCounts({ mode: 'full', purgeWindowHours: 72 })],
+    ['full+sourceIds', (e) => e.readEmbeddingStateCounts({ mode: 'full', sourceIds: [SRC], purgeWindowHours: 72 })],
+    ['ops', (e) => e.readEmbeddingStateCounts({ mode: 'ops', purgeWindowHours: 72 })],
+  ]),
+  ...variants('listEmbeddingStateRows', [
+    ['default', (e) => e.listEmbeddingStateRows({ states: ['pending', 'empty'], limit: 51, purgeWindowHours: 72 })],
+    ['sourceIds', (e) => e.listEmbeddingStateRows({ sourceIds: [SRC], states: ['keyword_only'], limit: 11, purgeWindowHours: 72 })],
   ]),
   ...variants('deleteChunks', [['default', (e) => e.deleteChunks(SLUG)]]),
   ...variants('getEmbeddingsByChunkIds', [
@@ -739,11 +769,13 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('getCallersOf', [
     ['default', (e) => e.getCallersOf('B.g')],
     ['sourceId', (e) => e.getCallersOf('B.g', { sourceId: SRC })],
+    ['chunkId', (e) => e.getCallersOf('B.g', { sourceId: SRC, chunkId: 2 })],
   ]),
   ...variants('getCalleesOf', [
     ['default', (e) => e.getCalleesOf('A.f')],
     ['sourceId', (e) => e.getCalleesOf('A.f', { sourceId: SRC })],
     ['bareFallback', (e) => e.getCalleesOf('f', { bareFallback: true })],
+    ['chunkId', (e) => e.getCalleesOf('A.f', { sourceId: SRC, chunkId: 1 })],
   ]),
   ...variants('getEdgesByChunk', [
     ['default', (e) => e.getEdgesByChunk(1)],

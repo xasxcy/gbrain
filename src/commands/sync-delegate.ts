@@ -68,6 +68,7 @@ import {
   type WireSyncResult,
 } from '../core/context/sync-ipc.ts';
 import { OperationError } from '../core/ops/contract.ts';
+import { SYNC_FLAGS, syncFlagsRouted, type SyncFlagSpec } from '../core/sync-flags.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { ConsumerRow } from '../core/persistence/consumer-heartbeat.ts';
 import type { SyncOpts, SyncResult } from './sync.ts';
@@ -84,28 +85,17 @@ const MAX_POLL_FAILURES = 60;
 const PID_PROBE_EVERY = 5;
 
 /**
- * Flags forwardable over the wire (boolean → DelegatedSyncOptions field).
- * Everything not in this table, VALUE_FLAGS, or IGNORED_FLAGS refuses —
- * default-deny is what keeps a future flag from being silently dropped.
+ * The serve hand-off's view of the one sync flag table (`src/core/sync-flags.ts`). Everything the table does not
+ * route through the serve refuses: default-deny is what keeps a future flag from being silently dropped.
  */
-export const WIRE_BOOL_FLAGS: Record<string, keyof DelegatedSyncOptions> = {
-  '--full': 'full',
-  '--dry-run': 'dryRun',
-  '--no-pull': 'noPull',
-  '--no-embed': 'noEmbed',
-  '--no-extract': 'noExtract',
-  '--no-schema-pack': 'noSchemaPack',
-  '--skip-failed': 'skipFailed',
-  '--retry-failed': 'retryFailed',
-  '--include-gitignored': 'includeGitignored',
-  '--no-bulk': 'noBulk',
-};
+const SERVE_FLAGS = SYNC_FLAGS as Record<string, SyncFlagSpec>;
+/** Boolean flags forwarded over the wire (flag → DelegatedSyncOptions field). */
+export const WIRE_BOOL_FLAGS: Record<string, keyof DelegatedSyncOptions> = Object.fromEntries(syncFlagsRouted('serve', 'forward')
+  .filter(flag => SERVE_FLAGS[flag].arity === 'boolean' && SERVE_FLAGS[flag].sets === undefined).map(flag => [flag, SERVE_FLAGS[flag].field as keyof DelegatedSyncOptions]));
 /** Value-taking flags the ladder consumes itself (`--lanes` is validated and forwarded; the deadlines are derived). */
-export const VALUE_FLAGS = new Set(['--source', '--timeout', '--hard-deadline', '--lanes']);
+export const VALUE_FLAGS = new Set<string>([...syncFlagsRouted('serve', 'client'), ...syncFlagsRouted('serve', 'forward')].filter(flag => SERVE_FLAGS[flag].arity === 'value'));
 /** Flags that are meaningful only outside delegation, handled pre-ladder, or rendered by this client (`--json`). */
-export const IGNORED_FLAGS = new Set(['--yes', '--no-delegate', '--no-hard-deadline', '--json']);
-/** `--no-lanes` is `--lanes 1` (`src/commands/sync/args.ts`). */
-const NO_LANES_FLAG = '--no-lanes';
+export const IGNORED_FLAGS = new Set<string>(syncFlagsRouted('serve', 'client').filter(flag => SERVE_FLAGS[flag].arity === 'boolean'));
 
 export type ParsedDelegatedArgs =
   | { ok: true; options: Omit<DelegatedSyncOptions, 'timeoutSeconds'>; explicitSource: string | null }
@@ -124,8 +114,9 @@ export function parseDelegatedSyncArgs(args: string[]): ParsedDelegatedArgs {
       options[WIRE_BOOL_FLAGS[tok]] = true;
       continue;
     }
-    if (tok === NO_LANES_FLAG) {
-      options.lanes = 1;
+    const fixed = SERVE_FLAGS[tok];
+    if (fixed?.serve === 'forward' && fixed.sets !== undefined && fixed.field) {
+      options[fixed.field] = fixed.sets;
       continue;
     }
     if (IGNORED_FLAGS.has(tok)) continue;
@@ -145,8 +136,6 @@ export function parseDelegatedSyncArgs(args: string[]): ParsedDelegatedArgs {
     // --all, --watch, --exclude, --workers, …) and anything future.
     return { ok: false, refused: tok };
   }
-  const explicitProcessing = (['noEmbed', 'noExtract', 'noSchemaPack'] as const).filter(key => options[key] === true);
-  if (explicitProcessing.length) options.explicitProcessing = explicitProcessing;
   return { ok: true, options: options as Omit<DelegatedSyncOptions, 'timeoutSeconds'>, explicitSource };
 }
 
@@ -500,8 +489,13 @@ export type ManagedDelegationOutcome =
   | { kind: 'own_consumer'; reason: 'opted_out' | 'not_host' | 'not_postgres' | 'not_managed' | 'no_owner' | 'owner_not_serve' | 'probe_failed'
       | 'kill_switch' | 'unsupported_flag' | 'no_socket' | 'older_serve' | 'serve_refused' | 'serve_lost'; line: string | null };
 
-const fallbackLine = (pid: number, cause: string, fix = 'Restart that serve on this gbrain version to remove the second consumer.'): string =>
-  `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`;
+/**
+ * #6543: only a forced rung (the serve cannot take the run) really runs a consumer beside the serve; on the others this
+ * process admits its writes and, with persistence.single_consumer on, the serve's consumer publishes them.
+ */
+const fallbackLine = (pid: number, cause: string, forced: boolean, fix = 'Restart that serve on this gbrain version to run the catch-up inside it.'): string => forced
+  ? `[sync] ${cause}; this run uses its own consumer beside the serve (PID ${pid}). ${fix}`
+  : `[sync] ${cause}; this run does not delegate to the serve (PID ${pid}): it admits its own writes, and with persistence.single_consumer on the serve's consumer publishes them. ${fix}`;
 
 /**
  * The Postgres rung of the delegation ladder (#6317). Called with the connected
@@ -513,12 +507,16 @@ const fallbackLine = (pid: number, cause: string, fix = 'Restart that serve on t
  */
 export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args: string[], opts: SyncOpts, deps: ManagedDelegationDeps = {}): Promise<ManagedDelegationOutcome> {
   const env = deps.env ?? process.env;
-  const own = (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null): ManagedDelegationOutcome => {
+  // #6543: `force` makes "this run uses its own consumer" true where the serve cannot take the run (the opt-out, a serve
+  // not answering its socket, an older serve): with persistence.single_consumer on, this process would otherwise run
+  // waiter-only behind the serve it bypassed. A healthy serve beside a kill switch or an unsupported flag keeps consuming.
+  const own = async (reason: Extract<ManagedDelegationOutcome, { kind: 'own_consumer' }>['reason'], line: string | null = null, force = false): Promise<ManagedDelegationOutcome> => {
     if (line) serr(line);
+    if (force) (await import('../core/persistence/consumer-election.ts')).forceOwnConsumer(reason);
     return { kind: 'own_consumer', reason, line };
   };
   // 0. Opt-outs bypass the ladder before anything is probed or classified.
-  if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out');
+  if (args.includes('--no-delegate') || env.GBRAIN_SYNC_NO_DELEGATE === '1') return own('opted_out', null, true);
   const { resolveBrainId } = await import('../core/brain-resolver.ts');
   const { getCliOptions } = await import('../core/cli-options.ts');
   if (resolveBrainId(getCliOptions().brain) !== 'host') return own('not_host');
@@ -527,8 +525,12 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   if (cfg?.engine !== 'postgres' || !cfg.database_url) return own('not_postgres');
   const sourceId = opts.sourceId ?? 'default';
   // 1. Only a managed source has the two-consumer problem; classic sync keeps its own path.
-  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain?.enabled) return own('not_managed');
+  const { readManagedMode } = await import('../core/persistence/managed-mode.ts');
+  if (!await readManagedMode(engine)) return own('not_managed');
+  // #6696 C2: a flag the managed source refuses never reaches the serve; the refusal names it before any probe or socket call.
+  const { managedForbiddenFlag, managedSyncFlagRefusal } = await import('../core/persistence/managed-sync-flags.ts');
+  const forbidden = managedForbiddenFlag(opts);
+  if (forbidden) throw managedSyncFlagRefusal(forbidden, sourceId, args);
   // 2. The owner probe: the B3 heartbeat row, through the database (the persistence socket does not exist on Postgres).
   let owner: ConsumerRow | null;
   try {
@@ -546,18 +548,18 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
     return own('owner_not_serve', `[sync] the live write owner on this host is a ${owner.kind} process (PID ${pid}), which cannot host a delegated sync; this run uses its own consumer beside it.`);
   }
   if (env.GBRAIN_SERVE_SYNC_IPC === '0') {
-    return own('kill_switch', fallbackLine(pid, 'GBRAIN_SERVE_SYNC_IPC=0 turns serve-delegated sync off', 'Unset it to run the catch-up inside the serve.'));
+    return own('kill_switch', fallbackLine(pid, 'GBRAIN_SERVE_SYNC_IPC=0 turns serve-delegated sync off', false, 'Unset it to run the catch-up inside the serve.'));
   }
   // 3. Argv gate (default-deny). On Postgres an unsupported flag keeps today's own consumer instead of refusing.
   const parsed = parseDelegatedSyncArgs(args);
   if (!parsed.ok) {
-    return own('unsupported_flag', fallbackLine(pid, `\`${parsed.refused}\` isn't supported through serve-delegated sync`, 'Drop the flag to run the catch-up inside the serve.'));
+    return own('unsupported_flag', fallbackLine(pid, `\`${parsed.refused}\` isn't supported through serve-delegated sync`, false, 'Drop the flag to run the catch-up inside the serve.'));
   }
   // 4. Socket + secret: the serve bound to this source, else the legacy URL-keyed socket.
   const { sock, secret } = deps.socket ? await deps.socket(sourceId)
     : { sock: await hookResolveSocketForConfig(cfg, sourceId), secret: readIpcSecretForConfig(cfg) };
   if (!sock || !existsSync(sock) || !secret) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)'));
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve exposes no sync IPC socket (older gbrain, or GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false));
   }
   // 5. The hand-off: this CLI's durable writer registration (the one its own consumer would run under).
   const { registerLocalWriter } = await import('../core/persistence/identity.ts');
@@ -568,10 +570,13 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   const hard = await deriveDelegatedTimeoutSeconds(args, { env });
   const timeoutSeconds = soft && soft > 0 ? (hard > 0 ? Math.min(soft, hard) : soft) : hard;
   const options: DelegatedSyncOptions = {
-    sourceId, timeoutSeconds,
-    ...pick(opts, ['dryRun', 'full', 'noPull', 'noEmbed', 'noExtract', 'noSchemaPack', 'skipFailed', 'retryFailed', 'includeGitignored', 'noBulk'] as const),
+    // #6696 (A5): an operator's sync keeps the capacity background producers leave free.
+    sourceId, timeoutSeconds, origin: 'interactive',
+    // The table's forwarded booleans only: a field a newer gbrain retired (src/core/wire-skew.ts) is never in it, so it is never sent.
+    ...pick(opts as unknown as Record<string, boolean | undefined>, Object.values(WIRE_BOOL_FLAGS)) as Partial<DelegatedSyncOptions>,
     ...(opts.lanes !== undefined ? { lanes: opts.lanes } : {}),
-    ...(opts.explicitProcessing?.length ? { explicitProcessing: [...opts.explicitProcessing] } : {}),
+    // Sent only when set, so a serve that predates the field keeps accepting every run without a deferral.
+    ...(opts.embedDeferred ? { embedDeferred: true } : {}),
   };
   const clientToken = randomUUID();
   const { probeLiveFullConsumer, consumerIdentity } = await import('../core/persistence/consumer-heartbeat.ts');
@@ -585,19 +590,20 @@ export async function maybeDelegateManagedSyncToServe(engine: BrainEngine, args:
   let start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE && await ownerAlive()) start = await requestSyncStart(sock, { secret, clientToken, options, registration });
   if (start === IPC_UNAVAILABLE) {
-    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket'));
+    return own('no_socket', fallbackLine(pid, 'the running gbrain serve is not answering its IPC socket', true), true);
   }
   if ('degraded' in (start as object)) {
-    return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync'));
+    return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync', true), true);
   }
   const startResp = start as Exclude<SyncStartIpcResult, typeof IPC_UNAVAILABLE | { degraded: string }>;
   if (!startResp.ok) {
     if (startResp.refusal) throw operationErrorFromEnvelope(startResp.refusal);
     if (startResp.error === 'unsupported_kind') {
-      return own('older_serve', fallbackLine(pid, 'the running gbrain serve predates serve-delegated managed sync, or runs with GBRAIN_SERVE_SYNC_IPC=0'));
+      // #6543: a current serve that echoes the protocol with unsupported_kind is healthy with delegation off on its side: it keeps consuming.
+      return own('older_serve', fallbackLine(pid, 'the running gbrain serve runs with serve-delegated managed sync off (GBRAIN_SERVE_SYNC_IPC=0 on the serve)', false, 'Unset it on the serve to run the catch-up inside it.'));
     }
     if (startResp.error === 'permission_denied') throw operationErrorFromEnvelope({ error: 'permission_denied', message: 'The serve refused this CLI\'s writer registration.' });
-    return own('serve_refused', fallbackLine(pid, startRefusalText(startResp).replace(/\.$/, ''), 'Fix that, or let this run finish with its own consumer.'));
+    return own('serve_refused', fallbackLine(pid, startRefusalText(startResp).replace(/\.$/, ''), false, 'Fix that, or let this run finish without the serve.'));
   }
   const jobId = startResp.jobId!;
   serr(startResp.completed

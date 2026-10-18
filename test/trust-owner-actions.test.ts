@@ -271,22 +271,26 @@ describe('trust proposals through the owner (ENG-4, CEO-12)', () => {
     const { id } = await engine.transaction(tx => insertTrustProposal(tx, { action: 'supersede_fact', sourceId: b.sourceId,
       target: { table: 'facts', id: oldId }, related: { table: 'facts', id: newId }, before: { prior_tier: 'user_confirmed' }, after: { tier: 'agent_written' }, proposer: 'remember.replaces' }));
     const calls: unknown[] = [];
-    registerTrustProposalHandler('supersede_fact', {
+    // The handler registry is process-global: the real supersede_fact handler comes back after this test, or every
+    // later file in the same `bun test` process (shard order decides which) accepts supersessions without applying them.
+    const restoreHandler = registerTrustProposalHandler('supersede_fact', {
       async accept(e, proposal, ctx) {
         calls.push(ctx.confirmation);
         await transitionTrustProposal(e, proposal.id, 'pending', 'accepted');
         return decisionResult(proposal, 'accept', 'accepted');
       },
     });
-    nonTty();
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
-    expect(calls).toHaveLength(0);
-    tty('wrong');
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
-    tty(`tp${id}`);
-    expect(await ownerDo(b, { action: 'confirm', ref: `tp${id}` })).toMatchObject({ status: 'accepted' });
-    expect(calls).toEqual([{ via: 'tty' }]);
-    expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('invalid_params');
+    try {
+      nonTty();
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
+      expect(calls).toHaveLength(0);
+      tty('wrong');
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('confirmation_required');
+      tty(`tp${id}`);
+      expect(await ownerDo(b, { action: 'confirm', ref: `tp${id}` })).toMatchObject({ status: 'accepted' });
+      expect(calls).toEqual([{ via: 'tty' }]);
+      expect((await failure(ownerDo(b, { action: 'confirm', ref: `tp${id}` }))).code).toBe('invalid_params');
+    } finally { restoreHandler(); }
   }), 60_000);
 });
 

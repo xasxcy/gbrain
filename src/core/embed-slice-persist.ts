@@ -211,7 +211,7 @@ export async function persistStaleSlice(opts: PersistStaleSliceOptions): Promise
           throwIfPersistenceStopped(signal, opts.deadline, 'embedding persistence fence expired before commit');
         },
       });
-      outcome = installed && engineOutcome
+      outcome = installed.complete && engineOutcome
         ? engineOutcome
         : { committedChunks: 0, vectorCommittedChunks: 0, staleSkippedChunks: entries.length,
             staleSkippedChunkIndexes: entries.map(entry => entry.chunkIndex), ledgerUpserts: 0, ledgerDeletes: 0 };

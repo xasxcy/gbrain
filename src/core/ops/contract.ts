@@ -65,6 +65,9 @@ export type ErrorCode =
   // eslint-disable-next-line @typescript-eslint/ban-types
   | (string & {});      // OPEN union for forward-compat (eE7 / D13)
 
+/** `withdrawn` on a `fact_withdrawn` refusal: `subject` is the entity slug, or `all_entities` for a claim forgotten without one. */
+export interface WithdrawnDetail { at: string; subject: string; visibility: 'world' | 'private' }
+
 export class OperationError extends Error {
   /**
    * MEMORY_VERBS v1: verb handlers set `protocolVersion` (=1) and may set
@@ -89,6 +92,10 @@ export class OperationError extends Error {
   /** #6188 (D16, D18): a fence refusal's location and its blocking issues; location and class only, never a cell value. */
   public fence?: Record<string, unknown>;
   public fenceIssues?: Array<Record<string, unknown>>;
+  /** A `fact_withdrawn` refusal's withdrawal: when and for which subject the exact claim was forgotten. Absence carries no meaning. */
+  public withdrawn?: WithdrawnDetail;
+  /** #6643: a managed-sync refusal's owner-side classification (knock-on root, cursor fence snapshot); stored as the receipt's error_detail, never in the envelope. */
+  public syncRefusal?: Record<string, unknown>;
   /** Set to 1 by opError(); toJSON() emits `contract_version` only when set. */
   public contractVersion?: 1;
   /**
@@ -151,6 +158,7 @@ export class OperationError extends Error {
       ...(this.notices?.length ? { notices: this.notices.map(n => wireRenderer ? wireRenderer.notice(n) : n) } : {}),
       ...(this.fence ? { fence: this.fence } : {}),
       ...(this.fenceIssues?.length ? { fence_issues: this.fenceIssues } : {}),
+      ...(this.withdrawn ? { withdrawn: this.withdrawn } : {}),
       ...(this.contractVersion !== undefined ? { contract_version: this.contractVersion } : {}),
     };
   }
@@ -434,6 +442,11 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * #6696 (A5): who this caller's writes are for, set only by trusted host-side entry points (the CLI, the MCP
+   * transports). Unset is `background`; it is never derived from `remote` (persistence/admission-origin.ts).
+   */
+  admissionOrigin?: import('../persistence/admission-origin.ts').AdmissionOrigin;
+  /**
    * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
    * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
    * untrusted) but has no per-token auth (local pipe), so identity ops like
@@ -545,6 +558,22 @@ export interface OperationContext {
    * Shape only, never authority: nothing security-relevant reads it.
    */
   resultRows?: 'lean' | 'full';
+  /**
+   * Large pages (Wave A): the caller identified itself as gbrain's thin client
+   * (X-Gbrain-Client header). A thin client that names no `body` mode on
+   * get_page renders compiled_truth as the whole page, so the read is full
+   * or refused, never a window. Shape only, never authority.
+   */
+  thinClient?: boolean;
+  /**
+   * Whether this caller can call `opName` on its surface right now: the MCP
+   * dispatch predicate (the stdio session's surface after any `request_tools`
+   * widening, the HTTP client's effective surface and scopes under the
+   * server ceiling). Set by MCP dispatch only; publish-gated ops read as not
+   * callable. Unset on local and in-process callers. Shape only, never
+   * authority: dispatch enforces callability itself.
+   */
+  isCallable?: (opName: string) => boolean;
   /**
    * Resolved global CLI options (--quiet / --progress-json / --progress-interval).
    * CLI callers populate this from `getCliOptions()`. MCP / library callers
@@ -755,8 +784,8 @@ export interface Operation {
    * ARE NON-CONTRACTUAL: they exist so an agent can scan ~20 groups instead
    * of ~100 flat names; renaming/regrouping is never a breaking change.
    * Required (by the CI walker in test/mcp-tool-defs.test.ts) on every
-   * non-localOnly op; populated centrally via OP_AREAS at the bottom of
-   * this file.
+   * non-localOnly op; populated centrally via OP_AREAS in
+   * src/core/operation-load.ts.
    */
   area?: string;
   /**

@@ -4,14 +4,16 @@ import type { JournalLimits } from './model.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { writeHealth } from './health.ts';
+import { inspectPersistenceBrain } from './managed-mode.ts';
 import { claimStall, claimStateOf, isOwnerThisProcess, sqlLabel, type ClaimRow, type ClaimState, type ClaimStall } from './claim-phase.ts';
 import { cliRenderContext, renderAction, type Action, type RenderedAction } from '../agent-output.ts';
-import { enginePoolStats, type DriverPoolStats } from '../postgres-engine/pool-stats.ts';
-import { listHostConsumers, type ListedConsumer } from './consumer-heartbeat.ts';
+import { enginePoolStats } from '../postgres-engine/pool-stats.ts';
+import { listHostConsumers, type ConsumerPool, type ListedConsumer } from './consumer-heartbeat.ts';
 import type { WriteRequestState } from './types.ts';
 import { preparationBudgetMs } from './preparation-budget.ts';
 import { readWriteSwitchSnapshot } from './switches.ts';
-import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT } from './connector-errors.ts';
+import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT, ownerExceptionHint, unknownOriginHint } from './connector-errors.ts';
+import { readQueuedHeadBlockers } from './head-blocker.ts';
 
 export const WRITER_NEXT_ACTIONS: Record<string, string> = {
   unexpected_staging_bytes: 'Keep the worktree blocked and retain its staging files and recovery capacity. Compare the recorded staging size and hash, then reconcile unexpected bytes explicitly before retrying; never discard unverified staging files.',
@@ -27,6 +29,7 @@ export const WRITER_NEXT_ACTIONS: Record<string, string> = {
   recovery_required: 'Inspect the recorded publication fingerprints on the designated owner and settle recovery before publishing this worktree.',
   recovery_capacity: 'Allow recovery to settle or increase the applicable persistence.limits recovery byte cap. Do not remove recovery records.',
   queue_capacity: 'Let outstanding requests finish or increase the applicable persistence.limits cap. Accepted request IDs are never evicted.',
+  write_quota_exhausted: 'Raise the cumulative cap the refusal names with gbrain config set on the brain host (gbrain doctor --only persistence_capacity --json prints the value), then retry with the same request_id. Accepted request IDs are never evicted.',
   consumer_stopping: 'Restart the resident owner and inspect the same request_id before resubmitting.',
   source_changed: 'Inspect the source incarnation and worktree binding; queued requests cannot follow a recreated source.',
   permission_denied: 'Inspect the durable principal and current source, operation, and namespace grants.',
@@ -56,7 +59,7 @@ export function claimNextAction(claim: ClaimState, stall: ClaimStall | null, pol
     return { code: 'claim_lapsed', retry_after_ms: null, why: `The claim lapsed while running; the request is requeued once the transaction holding its row ends or the owner exits, and the next consumer claims it.`,
       fix: renderAction({ argv: status, consent: [], actor: 'agent', requires_exclusive: false, why: 'Read-only: rerun to see the request requeued or claimed again.', verify: { argv: status } }, ctx) };
   }
-  const age = claim.phase_age_ms ?? claim.claim_age_ms ?? 0;
+  const age = claim.phase === 'unrecorded' ? 0 : claim.phase_age_ms ?? claim.claim_age_ms ?? 0;
   const pastCeiling = claim.phase === 'preparing' && age >= policy.ceilingMs;
   const wedged = owner.row?.restart_required === true || (owner.row?.root_barrier_age_ms ?? -1) > policy.ceilingMs;
   if (pastCeiling || wedged) {
@@ -68,7 +71,7 @@ export function claimNextAction(claim: ClaimState, stall: ClaimStall | null, pol
   const budgetLeft = stall ? Math.max(0, policy.ceilingMs - age) : policy.budgetMs === null ? null : Math.max(0, policy.budgetMs - age);
   return { code: 'claim_running', retry_after_ms: budgetLeft,
     why: stall ? `${who} is past the ${Math.round(stall.budget_ms / 1000)}s preparation budget${where}; its own budget cuts the preparation off and frees the root by the ${Math.round(policy.ceilingMs / 1000)}s ceiling (${Math.round((budgetLeft ?? 0) / 1000)}s left). Nothing to do yet.`
-      : `${who} is ${claim.phase === 'publishing' ? 'publishing' : 'preparing'} this write${where}${owner.live === false ? '; its heartbeat row is not live' : ''}. Nothing to do yet.`,
+      : `${who} ${claim.phase === 'unrecorded' ? 'holds this write and has not recorded starting it (a group member waits for the members before it)' : `is ${claim.phase === 'publishing' ? 'publishing' : 'preparing'} this write`}${where}${owner.live === false ? '; its heartbeat row is not live' : ''}. Nothing to do yet.`,
     fix: renderAction({ argv: status, consent: [], actor: 'agent', requires_exclusive: false, why: 'Read-only: rerun after retry_after_ms to see the step advance or the claim settle.', verify: { argv: status } }, ctx) };
 }
 /**
@@ -109,7 +112,7 @@ export async function readOwnerBackends(engine: BrainEngine, owners: Array<Pick<
   }
 }
 /** #6317 (C1): the pool numbers for a running claim: this process's driver when it owns the claim, else the owner's heartbeat row. */
-function claimPool(engine: BrainEngine, claim: ClaimState, row: ListedConsumer | null): { pool: DriverPoolStats | null; pool_source: 'driver' | 'heartbeat' | null } {
+function claimPool(engine: BrainEngine, claim: ClaimState, row: ListedConsumer | null): { pool: ConsumerPool | null; pool_source: 'driver' | 'heartbeat' | null } {
   if (isOwnerThisProcess(claim.owner)) return { pool: enginePoolStats(engine), pool_source: enginePoolStats(engine) ? 'driver' : null };
   return { pool: row?.pool ?? null, pool_source: row?.pool ? 'heartbeat' : null };
 }
@@ -132,9 +135,18 @@ export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) 
     });
   });
 }
+/** #6719: the next step a recorded origin supports; only a database origin reads as a database refusal. */
+function recentFailureNextAction(origin: unknown, requestId: string): string {
+  if (origin === 'database_guard') return DATABASE_REFUSAL_HINT;
+  if (origin === 'database_trigger' || origin === 'database') return DATABASE_TRIGGER_HINT;
+  return origin === 'owner_exception' ? ownerExceptionHint(requestId) : unknownOriginHint(requestId);
+}
+
 /** Trusted-admin counts only: neither normalized intent nor private paths leave here. */
 export async function readWriterDiagnostics(engine: BrainEngine) {
-  const [brain] = await engine.executeRaw<{ enabled: boolean; brain_id: string }>('SELECT enabled,brain_id FROM persistence_brain WHERE singleton=1');
+  // #6482: writer status is the probe the mode refusal names, so a malformed singleton is reported here, never refused.
+  const inspected = await inspectPersistenceBrain(engine);
+  const brain = inspected.row ? { enabled: inspected.row.enabled, brain_id: inspected.row.brain_id } : { enabled: false, brain_id: null, persistence_mode_problem: inspected.problem };
   const worktrees = await engine.executeRaw(`SELECT w.id,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.topology_generation::text AS topology_generation,w.state,w.heartbeat_at,
     COUNT(r.id) FILTER (WHERE r.state='queued')::integer AS queued,
     COUNT(r.id) FILTER (WHERE r.state='running')::integer AS running,
@@ -147,10 +159,10 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     GROUP BY w.id ORDER BY w.id`);
   const counters = await engine.executeRaw<Counter>(`SELECT key,outstanding_count::text,intent_bytes::text,lifetime_ids::text,terminal_bytes::text,recovery_bytes::text FROM persistence_counters ORDER BY key`);
   // #6278: the operation and intent kind say which budget applies and tell a sync member from a maintenance write; the owner process comes from the live claim's stamp.
-  const blockers = await engine.executeRaw<{ request_id: string; worktree_id: string | null; source_id: string | null; state: WriteRequestState; created_at: Date | string; blocked_reason: string | null; error_code: string | null;
+  const blockers = await engine.executeRaw<{ id: string; request_id: string; worktree_id: string | null; source_id: string | null; state: WriteRequestState; created_at: Date | string; blocked_reason: string | null; error_code: string | null;
     operation: string; intent_kind: string | null; preparation_attempts: number | null } & Omit<ClaimRow, 'state'>>(
     `SELECT request_id,worktree_id,source_id,state,blocked_reason,error_code,created_at,claim_phase,execution_token,claim_expires_at<now() AS claim_lapsed,publication_started,
-      operation,intent->>'kind' AS intent_kind,preparation_attempts
+      operation,intent->>'kind' AS intent_kind,preparation_attempts,id::text AS id
     FROM persistence_requests WHERE state IN ('queued','running','recovering') OR blocked_reason IS NOT NULL ORDER BY sequence LIMIT 100`);
   const queue = await engine.executeRaw(`SELECT state,COUNT(*)::integer AS count,COALESCE(SUM(intent_bytes),0)::text AS intent_bytes,
     MIN(created_at) AS oldest_request_at,
@@ -177,6 +189,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   const tracked = (engine as { getPoolDiagnostics?: () => { tracked?: unknown } | null }).getPoolDiagnostics?.()?.tracked ?? null;
   const claimStates = blockers.map(row => claimStateOf({ state: row.state, claim_phase: row.claim_phase, execution_token: row.execution_token, claim_lapsed: row.claim_lapsed, publication_started: row.publication_started }));
   const backends = await readOwnerBackends(engine, claimStates.flatMap(state => state?.owner ? [state.owner] : []));
+  const headBlockers = await readQueuedHeadBlockers(engine, blockers, hostId);
   // C-NEW-4: the consumer is per process, so this is the answering process's own ingress, never proof the brain's owner is down.
   const local = persistenceConsumerStatus(engine);
   const local_process_ingress = { ...local, scope: local.state === 'not_running'
@@ -184,9 +197,9 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
     local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits), preparation_policy,
-    recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
+    recent_failures: failures.map(row => ({ ...row, next_action: recentFailureNextAction(row.error_detail?.origin, row.request_id) })),
     backend_visibility: backends.visibility,
-    blockers: blockers.map(({ claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
+    blockers: blockers.map(({ id: rowId, claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
       const health = writeHealth(row);
       const advice = writerNextAction(row.blocked_reason ?? row.error_code);
       // #6176: a running request names the phase its claim is in and how long it has held it; #6278: its step, wait cause, owner
@@ -202,7 +215,10 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
         ...(budget === null ? {} : { budget_ms: budget }), stall, ...claimPool(engine, state, ownerRow), pool_tracked_subset: tracked,
         owner_live: ownerRow ? ownerRow.liveness === 'live' : null, owner_mode: ownerRow?.mode ?? null,
         next: claimNextAction(state, stall, { budgetMs: budget, ceilingMs }, row.source_id, { row: ownerRow, live: ownerRow ? ownerRow.liveness === 'live' : null }) } : undefined;
-      return { ...row, preparation_attempts: row.preparation_attempts ?? 0, ...health, ...(claim ? { claim } : {}), next_action: health.diagnostic?.next_action === 'inspect_owner' && advice !== WRITER_INSPECTION_HINT
-        ? `${WRITER_INSPECTION_HINT} ${advice}` : advice };
+      // #6543 (B2): a queued head names what keeps it unclaimed, and the cancel command only when this caller may cancel the blocking request.
+      const head = headBlockers.get(rowId);
+      const adviceText = health.diagnostic?.next_action === 'inspect_owner' && advice !== WRITER_INSPECTION_HINT ? `${WRITER_INSPECTION_HINT} ${advice}` : advice;
+      return { ...row, preparation_attempts: row.preparation_attempts ?? 0, ...health, ...(claim ? { claim } : {}), ...head?.fields,
+        next_action: head?.advice ? `${head.advice} ${adviceText}` : adviceText };
     }) };
 }

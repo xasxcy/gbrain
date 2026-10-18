@@ -177,6 +177,10 @@ export async function finalizeIncrementalSync(
   await backstopAffectedPageFacts(run, plan);
 
   const { embedded, embedSlugs } = await embedAffectedPages(run, plan, noEmbed);
+  // #6722: the pages this run left large or embed_skip, read once after the imports.
+  const { readPageSizeStates, addSizeState } = await import('../../core/page-embedding-budget.ts');
+  const sizeStates = (await readPageSizeStates(engine, opts.sourceId ?? 'default', pagesAffected.filter(slug => !run.deletedSlugs.has(slug))))
+    .reduce<import('../../core/page-embedding-budget.ts').SyncSizeStates | undefined>((tally, state) => addSizeState(tally, state), undefined);
 
   if (malformedSkipped.length > 0) {
     serr(
@@ -205,12 +209,22 @@ export async function finalizeIncrementalSync(
     chunksCreated: run.chunksCreated,
     embedded,
     pagesAffected,
+    ...(sizeStates ? { size_states: sizeStates } : {}),
     ...(totalChanges > 100 && embedSlugs.length > 0 ? { embedDeferralReason: 'large_sync' as const } : {}),
     malformedSkipped: malformedSkipped.length,
     ...(typeWarningsEnabled && typeWarnings.length > 0 ? { type_warnings: typeWarnings } : {}),
     ...(uncommittedDrift ? { uncommitted: uncommittedDrift } : {}),
     ...(extractError ? { extract_error: extractError } : {}),
+    ...identityDowngradesOf(plan),
   };
+}
+
+/** #6729: the inexact renames this run split into a delete plus an add, in the source's origin form (recorded by `performSync`). */
+function identityDowngradesOf(plan: Pick<SyncPlan, 'manifest' | 'inScope' | 'isSelectedForRun' | 'syncOpts' | 'modePath'>): Pick<SyncResult, 'identityDowngrades'> {
+  const selected = (path: string) => plan.inScope(path) && plan.isSelectedForRun(path, plan.syncOpts);
+  const pairs = (plan.manifest.downgradedRenames ?? []).filter(pair => selected(pair.from) || selected(pair.to))
+    .map(pair => ({ ...pair, from: plan.modePath(pair.from), to: plan.modePath(pair.to) }));
+  return pairs.length ? { identityDowngrades: pairs } : {};
 }
 
 /** v0.42.x (#1794, T3): pin-reachability gate; records a `<head>` sentinel on a rewrite. */

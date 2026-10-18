@@ -28,26 +28,21 @@
  * `needs_human` for a page that keeps moving. Only a systemic failure (the
  * preparation breaker, authority or binding loss) still ends a run.
  */
-import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import { RECOVERY_VERSION } from '../markdown.ts';
-import { sha256 } from './digest.ts';
+import { gitBlobOid, sha256 } from './digest.ts';
 import type { WriteRequest } from './model.ts';
 import { readSyncFile, syncGitPath, type SyncDiscovery, type SyncEntry, type SyncRename } from './sync-discovery.ts';
 import { readTreeBlobs } from './sync-blobs.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { HeldEntry } from './sync-screen.ts';
-import type { GitHoldMeta } from './sync-holds.ts';
+import type { GitHoldMeta, GitHoldRecord } from './sync-holds.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
+import { KEEP_DISK_ABANDONED_PREFIX } from './verb-errors.ts';
 
 export { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
 
 type HoldEntry = Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld' | 'action'>;
-
-/** Git's blob id of `bytes` in the object format HEAD uses (sha1, or sha256 when HEAD's ids are 64 hex digits). */
-function blobOid(bytes: Buffer, format: 'sha1' | 'sha256'): string {
-  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-}
 
 /**
  * The working-tree bytes of `path` when they are exactly what HEAD commits for it (their blob id equals
@@ -62,7 +57,7 @@ export function headCommittedBytes(context: Pick<SyncDiscovery, 'root' | 'gitRoo
   let head: { oid: string } | undefined;
   try { head = readTreeBlobs(context.gitRoot, 'HEAD', [gitPath]).get(gitPath); } catch { return null; }
   if (!head) return null;
-  const oid = blobOid(bytes, head.oid.length === 64 ? 'sha256' : 'sha1');
+  const oid = gitBlobOid(bytes, head.oid.length === 64 ? 'sha256' : 'sha1');
   return oid === head.oid ? { content: bytes.toString('utf8'), oid, rawHash: sha256(bytes) } : null;
 }
 
@@ -86,6 +81,42 @@ export async function pageChangeProof(engine: Pick<BrainEngine, 'executeRaw'>, i
 }
 
 /**
+ * #6600: proof that a deletion entry the origin check refuses was already carried out: its exact page (the id and the
+ * revision this sync enumerated) is soft-deleted, the revision was written by a committed, authorized delete of that
+ * page in the same source incarnation, and no live page records the entry's origin. Such an entry settles as an
+ * idempotent deletion and clears its hold; a live replacement at the origin, a revision that moved since enumeration or
+ * any other writer keeps the hold.
+ */
+export async function idempotentDeletionProof(engine: Pick<BrainEngine, 'executeRaw'>, input: { sourceId: string; incarnation: string; pageId: number | null;
+  revision: string | null; sourcePath: string }): Promise<{ request_id: string } | null> {
+  if (input.pageId === null || input.revision === null) return null;
+  const [page] = await engine.executeRaw<{ revision: string; writer: string | null; deleted: boolean }>(
+    'SELECT knowledge_revision::text AS revision, revision_write_request_id::text AS writer, deleted_at IS NOT NULL AS deleted FROM pages WHERE id=$1 AND source_id=$2', [input.pageId, input.sourceId]);
+  if (!page?.deleted || !page.writer || page.revision !== input.revision) return null;
+  const [writer] = await engine.executeRaw<{ request_id: string; operation: string; kind: string | null; state: string; incarnation: string; page_id: number | null }>(
+    `SELECT request_id::text, operation, intent->>'kind' AS kind, state, source_incarnation::text AS incarnation, page_id FROM persistence_requests WHERE id=$1::uuid`, [page.writer]);
+  if (!writer || writer.state !== 'committed' || writer.incarnation !== input.incarnation || Number(writer.page_id) !== input.pageId
+    || !(writer.operation === 'delete_page' || writer.kind === 'managed_sync_delete')) return null;
+  const live = await engine.executeRaw('SELECT 1 FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND id<>$2 AND source_path=$3 LIMIT 1', [input.sourceId, input.pageId, input.sourcePath]);
+  return live.length ? null : { request_id: writer.request_id };
+}
+
+/**
+ * #6712 dependency edge: the hold of an entry whose slug or page id an earlier entry of the same sync shares, when that
+ * entry was held in the sync: it takes the predecessor's code and waits on it (`meta.blocked_on`) instead of publishing
+ * against a page whose earlier change never landed.
+ */
+export function dependentHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid'>,
+  predecessor: { path: string; code: GitHoldRecord['code'] }): HeldEntry {
+  const rename: SyncRename | undefined = entry.renameFrom ?? entry.renameHeld;
+  return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code: predecessor.code,
+    message: `${entry.path} changes page ${slug}, which ${predecessor.path} changes earlier in the same sync, and ${predecessor.path} is held (${predecessor.code}); this file waits on it and the next sync after that hold clears imports it.`,
+    upstream_version: typeof intent.content === 'string' ? sha256(intent.content) : null,
+    meta: { recovery_version: RECOVERY_VERSION, ...(typeof intent.blobOid === 'string' ? { blob_oid: intent.blobOid } : {}), ...(entry.working ? { working: true } : {}),
+      ...(rename ? { rename_from: rename } : {}), ...(entry.action === 'delete' ? { deleted: true as const } : {}), blocked_on: predecessor.path } };
+}
+
+/**
  * The page's current revision, soft-deleted pages included (a deletion advances the revision, and a new-file entry whose slug
  * a page now occupies has moved too); null when no row exists. For a hold that records what it observed.
  */
@@ -96,12 +127,43 @@ export async function liveRevision(engine: Pick<BrainEngine, 'executeRaw'>, sour
   return row?.revision ?? null;
 }
 
-function base(entry: HoldEntry, slug: string, pageId: number | null, code: 'concurrent_write' | 'worktree_dirty',
+function base(entry: HoldEntry, slug: string, pageId: number | null, code: 'concurrent_write' | 'worktree_dirty' | 'file_drift',
   message: string, content: string | null, blobOid: string | null | undefined, meta: Partial<GitHoldMeta>): HeldEntry {
   const rename: SyncRename | undefined = entry.renameFrom ?? entry.renameHeld;
   return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code, message, upstream_version: content === null ? null : sha256(content),
     meta: { recovery_version: RECOVERY_VERSION, ...(blobOid ? { blob_oid: blobOid } : {}), ...(entry.working ? { working: true } : {}),
       ...(rename ? { rename_from: rename } : {}), ...(entry.action === 'delete' ? { deleted: true as const } : {}), ...meta } };
+}
+
+/**
+ * #6712 PR 1: the `file_drift` hold for an import whose page moved since its file was last imported (`sides`, from the
+ * discovery baseline, sync-prescreen.ts) and whose import is not a no-op: importing would overwrite a database version
+ * sync never saw. `proof` names the database-only request that wrote the current revision when one did. Identifiers
+ * and revisions only, never content. `repair file-drift` is the exit; the hold is re-screened when the file or the
+ * page revision changes.
+ */
+export function fileDriftHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid'>,
+  observed: { sides: 'database' | 'both' | 'unknown'; revision: string | null; proof: PageChangeProof | null; sharedOrigin: boolean }): HeldEntry {
+  const by = observed.proof ? `${observed.proof.operation} request ${observed.proof.request_id} wrote page ${slug} straight to the database` : `page ${slug} changed in the database`;
+  const file = observed.sides === 'database' ? 'its file did not change in Git' : observed.sides === 'both' ? 'its file changed too'
+    : 'there is no import record to tell which side changed';
+  return base(entry, slug, pageId, 'file_drift',
+    `${entry.path}: ${by} since the file was last imported and ${file}, so sync held the import instead of overwriting the database version; the rest of the source synced.`,
+    intent.content ?? null, intent.blobOid, { sides: observed.sides, ...(observed.revision ? { page_revision: observed.revision } : {}),
+      ...(observed.proof ? { competing_request_id: observed.proof.request_id, competing_operation: observed.proof.operation } : {}),
+      ...(observed.sharedOrigin ? { shared_origin: true as const } : {}) });
+}
+
+/**
+ * #6517: whether `sourcePath`'s page survived a shared-origin delete (another page recording the same file was soft-deleted
+ * with `write_through.skipped: shared_origin`, keeping the file). Its `file_drift` hold leads with importing the file, as
+ * the delete's receipt does.
+ */
+export async function sharedOriginSurvivor(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, sourcePath: string): Promise<boolean> {
+  const rows = await engine.executeRaw(`SELECT 1 FROM pages d JOIN persistence_requests r ON r.source_id=d.source_id AND r.slug=d.slug
+    WHERE d.source_id=$1 AND d.deleted_at IS NOT NULL AND d.source_path=$2 AND r.operation='delete_page' AND r.state='committed'
+      AND r.outcome->'write_through'->>'skipped'='shared_origin' LIMIT 1`, [sourceId, sourcePath]);
+  return rows.length > 0;
 }
 
 /**
@@ -126,23 +188,37 @@ export function pageChangedHold(entry: HoldEntry, slug: string, pageId: number |
  * so discovery re-screens the hold when a later commit changes the file, and `sources retry-held` re-screens it once
  * the edit is committed.
  */
-export function worktreeDirtyHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid' | 'rawHash'>): HeldEntry {
+export function worktreeDirtyHold(entry: HoldEntry, slug: string, pageId: number | null, intent: Pick<SyncIntent, 'content' | 'blobOid' | 'rawHash'>,
+  conflict: 'page' | 'writeback' = 'page'): HeldEntry {
+  const what = conflict === 'writeback' ? `has uncommitted working-tree bytes newer than the pinned commit, which the import's canonical correction would overwrite`
+    : 'has uncommitted working-tree bytes that match neither the pinned commit nor the current page';
   return base(entry, slug, pageId, 'worktree_dirty',
-    `${entry.path} has uncommitted working-tree bytes that match neither the pinned commit nor the current page, so its import is held and the rest of the source synced; the local edit was not overwritten. Commit the file (or restore it) and the next sync imports it.`,
+    `${entry.path} ${what}, so its import is held and the rest of the source synced; the local edit was not overwritten. Commit the file (or restore it) and the next sync imports it.`,
     typeof intent.content === 'string' ? intent.content : null, typeof intent.blobOid === 'string' ? intent.blobOid : null,
     { ...(intent.rawHash ? { working_hash: intent.rawHash } : {}) });
 }
 
-/** The receipt of a `managed_sync_import` that publication refused as `pinned_git_worktree_conflict` (sync-prepare.ts `newerWorkingTree`). */
+/** The sync-prepare.ts refusal of a canonical correction (writeback) whose target file holds newer uncommitted bytes (#6513). */
+export const CANONICAL_WRITEBACK_CONFLICT = 'Canonical sanitization cannot overwrite newer working-tree bytes.';
+
+/**
+ * The receipt of a `managed_sync_import` that publication refused as `pinned_git_worktree_conflict`: sync-prepare.ts
+ * `newerWorkingTree`, or (#6513) its canonical-writeback refusal, which until then blocked the cursor with no exit
+ * because `--retry-failed` replays the same pin against the same newer bytes.
+ */
 export function pinnedWorktreeConflict(done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'>): boolean {
   return done.state !== 'committed' && done.error_code === 'source_changed'
-    && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.'].includes(done.error_message ?? '');
+    && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.', CANONICAL_WRITEBACK_CONFLICT].includes(done.error_message ?? '');
 }
 
-/** The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts). */
+/**
+ * The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts),
+ * or (#6858) whose stuck publication `gbrain repair stuck-recovery --keep disk` abandoned, keeping the file as edited on disk.
+ */
 export function fileChangedAfterAdmission(done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'>): boolean {
   return done.state !== 'committed' && done.error_code === 'source_changed'
-    && ['The imported file changed after sync admission.', 'The canonical file changed after preparation.', 'The canonical file changed during preparation.'].includes(done.error_message ?? '');
+    && (['The imported file changed after sync admission.', 'The canonical file changed after preparation.', 'The canonical file changed during preparation.'].includes(done.error_message ?? '')
+      || (done.error_message ?? '').startsWith(KEEP_DISK_ABANDONED_PREFIX));
 }
 
 /** A `revision_conflict` receipt whose page really moved (its live revision differs from the frozen one); run-level conflicts stay blocking. */
@@ -167,7 +243,7 @@ export async function receiptPageFaultHold(engine: Pick<BrainEngine, 'executeRaw
   if (proof) return concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof);
   const moved = await pageMovedSinceAdmission(engine, input.sourceId, pending, done);
   if (moved) return pageChangedHold(entry, pending.slug, pending.pageId, pending.intent, { proof: null, revision: moved.revision, why: `page ${pending.slug} changed in the database` });
-  return page && pinnedWorktreeConflict(done) ? worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent) : null;
+  return page && pinnedWorktreeConflict(done) ? worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent, done.error_message === CANONICAL_WRITEBACK_CONFLICT ? 'writeback' : 'page') : null;
 }
 
 /**

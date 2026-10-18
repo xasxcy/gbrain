@@ -63,9 +63,9 @@ import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { buildVectorCastFragment, normalizeEngineColumn } from './embedding-column.ts';
 import { resolveBoostMap, resolveHardExcludes } from './source-boost.ts';
 import { buildBestPerPagePoolCte, buildHardExcludeClause, buildSourceFactorCase, buildVisibilityClause } from './sql-ranking.ts';
+import { chunkGenerationProbe } from './safe-chunks.ts';
 
 export const VECTOR_EXTENSION_VERSION_SQL = `SELECT extversion FROM pg_extension WHERE extname = 'vector'`;
-export const SET_STATEMENT_TIMEOUT_SQL = `SELECT set_config('statement_timeout', $1, true)`;
 
 export interface VectorSearchStatementInput {
   dialect: 'postgres' | 'pglite';
@@ -79,6 +79,8 @@ export interface VectorSearchStatementInput {
    * omitted; at most SCOPE_SCAN_MAX_CHUNKS adds the scope scan.
    */
   scope?: VectorScope;
+  /** chunkManifestReads; unset reads the manifest. */
+  chunkManifest?: boolean;
 }
 
 export interface VectorSearchStatement {
@@ -101,6 +103,14 @@ export interface VectorSearchStatement {
   /** Exact scan over a small source scope's chunks (relaxed variant), same parameters as `sql`; runs after the walk when both exist. */
   scopeScanSql?: string;
 }
+
+/**
+ * The page columns the index walk's candidates, page filters and visibility
+ * read, probed by key per ANN row. Named, never `*`: the body columns stay out
+ * of the probe (a segmented page has no body string).
+ */
+export const INDEX_WALK_PAGE_COLUMNS = ['id', 'slug', 'source_id', 'title', 'type', 'frontmatter', 'deleted_at', 'updated_at', 'effective_date',
+  'effective_date_source', 'trust_tier', 'body_generation', 'chunker_version', 'knowledge_revision', 'text_projection_revision'] as const;
 
 /** Raw rows the index walk orders per window slot, so page filters can drop some and still fill the window. */
 export const INDEX_WALK_OVERFETCH = 2;
@@ -172,6 +182,7 @@ export const SCOPE_CHUNK_SAMPLE_PAGES = 400;
  * deterministic (`hashint4`, so interleaved page ids do not alias a stride)
  * and costs one pass over the scope's page ids plus ~400 index probes.
  */
+// chunk-visibility-ok: planner size estimate; staged rows only nudge the sample count
 export const SCOPE_CHUNKS_SQL = `WITH scope_pages AS MATERIALIZED (
     SELECT id FROM pages WHERE source_id = ANY($1::text[]) AND deleted_at IS NULL),
   total AS (SELECT count(*)::int AS pages FROM scope_pages),
@@ -253,6 +264,21 @@ export function vectorScopeLoader(
   };
 }
 
+/**
+ * The statement in both chunkManifestReads forms, each built on first use. The forms differ only in SQL text, so
+ * either one answers for the shape (windows, params, walk and scope-scan presence). A Postgres search attempt picks
+ * its form with the probe it runs inside its own transaction, after the settings, so the attempt's statement_timeout
+ * bounds the probe as well (a probe before the transaction waited on a content_chunks lock with no bound).
+ */
+export function vectorStatementForms(build: (chunkManifest: boolean) => VectorSearchStatement): (chunkManifest: boolean) => VectorSearchStatement {
+  const forms = new Map<boolean, VectorSearchStatement>();
+  return chunkManifest => {
+    let stmt = forms.get(chunkManifest);
+    if (!stmt) forms.set(chunkManifest, stmt = build(chunkManifest));
+    return stmt;
+  };
+}
+
 export function buildVectorSearchStatement(input: VectorSearchStatementInput): VectorSearchStatement {
   const { dialect, limit, offset, opts } = input;
   const resolvedCol = normalizeEngineColumn(opts?.embeddingColumn);
@@ -322,7 +348,8 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
   const modalityFilter = resolvedCol.name === 'embedding_image' ? `AND cc.modality = 'image'`
     : resolvedCol.name === 'embedding_multimodal' ? '' : `AND cc.modality = 'text'`;
   // v0.26.5: visibility in the inner CTE so hidden rows never take candidate slots.
-  const visibilityClause = buildVisibilityClause('p', 's', opts);
+  const visibilityClause = buildVisibilityClause('p', 's', { ...opts, chunkAlias: 'cc' });
+  const pageVisibilityClause = buildVisibilityClause('p', 's', opts);
   const candidateFrom = (generation: string) => `FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
         JOIN sources s ON s.id = p.source_id
@@ -372,8 +399,13 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
           ${hashCurrent} AS hash_current,
           1 - ann.distance AS raw_score
         FROM ann
-        JOIN content_chunks cc ON cc.id = ann.id
-        JOIN pages p ON p.id = cc.page_id
+        -- Key probes behind OFFSET 0 fences: one chunk and one page lookup per
+        -- ANN row, so the plan is bounded by the window whatever the scope
+        -- size or page-filter estimate. A plain join let the planner
+        -- materialize the whole scope's chunk-page join under the ANN loop
+        -- and rescan it per row, spilling past work_mem on large scopes (#6728).
+        CROSS JOIN LATERAL (SELECT * FROM content_chunks c WHERE c.id = ann.id OFFSET 0) cc
+        CROSS JOIN LATERAL (SELECT ${INDEX_WALK_PAGE_COLUMNS.map(c => `pg.${c}`).join(', ')} FROM pages pg WHERE pg.id = cc.page_id OFFSET 0) p
         CROSS JOIN LATERAL (SELECT src.archived FROM sources src WHERE src.id = p.source_id OFFSET 0) s
         WHERE true
           ${pageFilters.join('\n          ')}
@@ -394,8 +426,9 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
             WHERE true
               ${pageFilters.join('\n              ')}
               ${hardExcludeClause}
-              ${visibilityClause}
+              ${pageVisibilityClause}
           ))
+          AND ${chunkGenerationProbe('cc', input.chunkManifest ?? true)}
           AND cc.${col} IS NOT NULL ${modalityFilter}
           ${chunkFilters.join('\n          ')}
           ${relaxedGeneration}

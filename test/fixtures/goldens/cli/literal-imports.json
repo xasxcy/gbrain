@@ -16,6 +16,9 @@
       "backfill": [
         "./commands/backfill.ts"
       ],
+      "beliefs": [
+        "./commands/beliefs.ts"
+      ],
       "book-mirror": [
         "./commands/book-mirror.ts"
       ],
@@ -56,7 +59,8 @@
         "./commands/edges-backfill.ts"
       ],
       "embed": [
-        "./commands/embed.ts"
+        "./commands/embed.ts",
+        "./core/held-embedding.ts"
       ],
       "embed-failures": [
         "./commands/embed-failures.ts"
@@ -137,6 +141,9 @@
         "./commands/trust.ts",
         "./commands/quarantine.ts"
       ],
+      "questions": [
+        "./commands/questions.ts"
+      ],
       "recall": [
         "./commands/recall.ts"
       ],
@@ -147,6 +154,7 @@
         "./commands/reindex.ts",
         "./commands/reindex-multimodal.ts",
         "./core/sync-concurrency.ts",
+        "./core/oversized-backfill.ts",
         "./commands/reindex-vectors.ts",
         "./commands/reindex-aliases.ts",
         "./commands/reindex.ts",

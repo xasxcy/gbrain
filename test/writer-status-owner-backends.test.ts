@@ -77,7 +77,7 @@ describe('claim stamp identity and last_sql', () => {
   });
 
   test('driverPoolStats reads the vendored driver\'s queues and reports null for a driver without the accessor', () => {
-    expect(driverPoolStats({ pool: { max: 10, open: 6, busy: 2, full: 1, reserved: 1, connecting: 0, closed: 0, ended: 0, queued: 3 } })).toEqual({ checked_out: 4, max: 10, waiters: 3 });
+    expect(driverPoolStats({ pool: { max: 10, open: 6, busy: 2, full: 1, reserved: 1, connecting: 0, closed: 0, ended: 0, queued: 3, inflight_oldest_ms: 250, completed: 42 } })).toEqual({ checked_out: 4, max: 10, waiters: 3, inflight_oldest_ms: 250, completed: 42 });
     expect(driverPoolStats({})).toBeNull();
     expect(driverPoolStats(null)).toBeNull();
   });
@@ -137,6 +137,11 @@ describe('writer status running claims', () => {
     const running = claimNextAction(young, null, { budgetMs: 120_000, ceilingMs: 600_000 }, 's', { row: null, live: null });
     expect(running).toMatchObject({ code: 'claim_running', fix: { next: 'run' } });
     expect(running.retry_after_ms).toBeGreaterThan(100_000);
+    // #6650: an undispatched follower that has waited longer than its budget has spent none of it.
+    const follower = claimStateOf({ state: 'running', claim_phase: { token: 't', owner: claimOwner(), claimed_at: new Date(Date.now() - 180_000).toISOString() }, execution_token: 't' })!;
+    const waiting = claimNextAction(follower, null, { budgetMs: 120_000, ceilingMs: 600_000 }, 's', { row: null, live: null });
+    expect(waiting).toMatchObject({ code: 'claim_running', retry_after_ms: 120_000, fix: { next: 'run' } });
+    expect(waiting.why).toContain('has not recorded starting it');
     const lapsed = claimStateOf({ state: 'running', claim_phase: null, execution_token: 't', claim_lapsed: true })!;
     expect(claimNextAction(lapsed, null, { budgetMs: null, ceilingMs: 600_000 }, null, { row: null, live: null })).toMatchObject({ code: 'claim_lapsed', retry_after_ms: null, fix: { next: 'run', argv: ['gbrain', 'sources', 'writer', 'status', '--json'] } });
   });

@@ -5,7 +5,7 @@ import type { PageSnapshot } from '../page-state/types.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { PreparedMutation } from './coordinator.ts';
-import { sha256 } from './digest.ts';
+import { fileContentHash } from './large-file.ts';
 import { PARK_AFTER_FAILURES, REMOTE_AUTO_LINKS_KEY, REMOTE_MENTION_OPERATIONS, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { recordChronicleDecision } from '../chronicle/ledger.ts';
@@ -61,7 +61,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     // an escaping ../../ target that the effect worker must refuse.
     const target = nativeFileTarget(binding.local_path, physicalFilePath(binding.local_path, prepared.file.path), 'source_changed');
     queue('git', { relative_path: relative(binding.local_path, target).split(sep).join('/'),
-      expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content),
+      expected_hash: prepared.file.content === null ? null : fileContentHash(prepared.file.content),
       ...(commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailer ? { commit_trailer: commit.trailer } : {}) } : {}) });
     if (outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
   }
@@ -177,16 +177,18 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
   if (limit <= 0) return [];
   const rows = await engine.transactionDirect(async tx => {
     await declarePersistenceProtocol(tx);
+    // The worktree-wide conditions (owner, refresh fence, recovery blocks) are one
+    // InitPlan, so the claim walks persistence_effects_pending in order and stops at
+    // $3 rows instead of probing every ready effect of the worktree.
     return tx.executeRaw<PersistenceEffect>(`WITH ready AS (SELECT e.id FROM persistence_effects e
-      JOIN persistence_worktrees w ON w.id=e.worktree_id AND w.owner_host_id=$1::uuid
-      WHERE e.worktree_id=$2::uuid AND e.kind='git' AND e.data ? 'relative_path'
+      WHERE EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=$2::uuid AND w.owner_host_id=$1::uuid
+        AND ${refreshFenceClear('w', 'id')}
+        AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=w.id AND blocked.recovery IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=w.id AND blocked.recovery IS NOT NULL))
+      AND e.worktree_id=$2::uuid AND e.kind='git' AND e.data ? 'relative_path'
       AND NOT (e.data ? 'targets') AND NOT (e.data ? 'source_scan') AND NOT (e.data ? 'version')
       AND (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
-      AND ${refreshFenceClear('e')}
-      AND e.recovery IS NULL AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked
-        WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
-      AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked
-        WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
+      AND e.recovery IS NULL
       AND NOT EXISTS (SELECT 1 FROM persistence_effects mirror
         WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state<>'committed')
       ORDER BY e.next_attempt_at,e.id LIMIT $3 FOR UPDATE OF e SKIP LOCKED)
@@ -221,6 +223,29 @@ export async function releaseAbandonedClaims(engine: BrainEngine, processStarted
     WHERE state='running' AND recovery IS NULL AND publication_started=false AND updated_at<$1::timestamptz
     AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString(), chargePreparing]);
   return effects.length + requests.length;
+}
+
+/** @internal Claim renewals made between the pieces of a segmented page's file (effectClaimKeeper), by effect kind, for the bounded-work test. Counts, not time. */
+export const effectClaimWork: Record<string, number> = {};
+
+/**
+ * Called between the pieces of a long read or write under a withdrawal-mirror or Git claim (a segmented page's file
+ * rendered, staged or compared): renews the 2-minute claim once `intervalMs` has passed since the last renewal, also
+ * while the mirror holds its recovery record, and refuses with `write_claim_lost` once the claim moved.
+ */
+export function effectClaimKeeper(engine: BrainEngine, effect: PersistenceEffect, intervalMs: number): () => Promise<void> {
+  let last = performance.now();
+  return async () => {
+    if (performance.now() - last < intervalMs) return;
+    last = performance.now();
+    effectClaimWork[effect.kind] = (effectClaimWork[effect.kind] ?? 0) + 1;
+    const rows = await engine.executeRawDirect(`UPDATE persistence_effects SET claim_expires_at=now()+interval '2 minutes',updated_at=now()
+      WHERE id=$1 AND execution_token=$2::uuid AND state='running' AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [effect.id, effect.execution_token]);
+    if (rows.length !== 1) throw opError('write_claim_lost', 'The effect claim changed.',
+      `Another worker took over this ${effect.kind} effect of source ${effect.source_id} (its claim expired or was reassigned), so this attempt stopped; the current holder finishes it. Inspect the owner's effects rather than retrying by hand.`,
+      { fix: readFix(`Shows source ${effect.source_id}'s canonical owner with its blocking, retrying and parked effects, read-only.`,
+        { argv: ['gbrain', 'sources', 'writer', 'status', '--source', effect.source_id, '--json'] }) });
+  };
 }
 
 export async function renewPersistenceEffectClaim(engine: SqlEngine, effect: PersistenceEffect): Promise<boolean> {

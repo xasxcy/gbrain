@@ -66,7 +66,7 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
   // #5232: the CLI resolves its write wait before choosing a transport, engine-free.
   'persistence.write_wait_ms',
   // Engine graduation opt-out: the pre-connect migrate router reads it engine-free.
-  'migrate.graduation',
+  'migrate.graduation', 'doctor.default_budget_ms', // #6803: the CLI doctor reads it pre-connect (commands/doctor/default-budget.ts)
 ]);
 
 /** #5489: every self_upgrade.* reader (cli.ts startup check, autopilot,
@@ -108,7 +108,7 @@ async function unsetFilePlaneKey(key: string): Promise<boolean> {
   const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const cfg = loadConfigFileOnly();
   const dot = key.indexOf('.');
-  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate';
+  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor';
   const leaf = key.slice(dot + 1);
   const branch = cfg?.[top] as Record<string, unknown> | undefined;
   if (!cfg || !branch || !(leaf in branch)) return false;
@@ -396,6 +396,10 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     const err = validateFenceConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
+  if (key === 'sync.slug_conflicts.auto_remove') { const err = (await import('../core/repair/slug-autoheal.ts')).slugAutoRemoveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.origin_twins.auto_resolve') { const err = (await import('../core/repair/origin-twins-heal.ts')).originAutoResolveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
     const err = validateMaxClaimConfigValue(key, value);
@@ -404,6 +408,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (key.startsWith('persistence.')) await (await import('./config/preparation-keys.ts')).refuseInvalidPreparationValue(engine, key, value);
   if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
+  if (key === 'search.contextual_retrieval') console.log((await import('./config/contextual-mode-hint.ts')).contextualModeHint());
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);
   if (!key.startsWith('decide.slots.')) return;
   try {
@@ -543,8 +548,8 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
     cfg.backup = { ...(cfg.backup ?? {}), check_enabled: on };
     saveConfig(cfg);
     console.log(`Set ${key} = ${on} (file plane: ~/.gbrain/config.json)`);
-  } else if (key === 'persistence.write_wait_ms') {
-    await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'persistence.write_wait_ms') { await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'doctor.default_budget_ms') { (await import('./doctor/default-budget.ts')).setDoctorDefaultBudget(cfg, value, saveConfig);
   } else if (key === 'migrate.graduation') {
     const on = isConfigTruthy(value);
     cfg.migrate = { ...(cfg.migrate ?? {}), graduation: on };
@@ -878,6 +883,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   const positionals = args.filter((a) => a !== '--raw');
   const key = positionals[1];
   const value = positionals[2];
+  if ((action === 'get' || action === 'set') && key) (await import('../core/questions/auto-think-migration.ts')).noteAutoThinkReplacement(key);
+  if ((action === 'get' || action === 'set') && key && await (await import('../core/sync-config-keys.ts')).handleSyncKeyConfig(engine, action, key)) return; // #6712 PR 2
 
   if (action === 'get' && (key === EMBEDDING_DISABLED_KEY || key === 'schema_pack')) {
     const effective = key === 'schema_pack' ? await effectiveSchemaPack(engine) : await effectiveEmbeddingDisabled(engine);
@@ -1201,6 +1208,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const coverageOverride =
       args.includes('--coverage-override') || args.includes('--yes');
 
+    // #6290: provider_chat_options rows are one JSON object per selector; a dotted leaf would be inert.
+    if (key.startsWith('provider_chat_options.')) await import('../core/config-db-merge.ts').then(m => m.assertProviderChatOptionsSetValue(key, value)).catch((error: Error) => { console.error(`[config] ${error.message}`); process.exit(1); });
     // #5470: every admission parses the journal caps; a malformed value
     // would refuse all managed writes, so reject it here.
     const { JOURNAL_CONFIG_KEYS, parseJournalConfigValue } = await import('../core/persistence/limits.ts');
@@ -1258,6 +1267,13 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const { parseClusterThreshold } = await import('../core/cycle/phases/consolidate.ts');
       try { parseClusterThreshold(value); }
       catch (error) { console.error(`[config] ${(error as Error).message}`); process.exit(1); }
+    }
+
+    // #5461: think falls back to the default budget on a malformed value (and warns); refuse it here.
+    if (key === 'think.pages_budget_chars' || key === 'think.excerpt_ceiling_chars') {
+      const { pagesBudgetConfigError } = await import('../core/think/pages-budget.ts');
+      const error = pagesBudgetConfigError(key, value);
+      if (error) { console.error(`[config] ${error}`); process.exit(1); }
     }
 
     // Validate sources.default at set time. This key is read by
@@ -1434,8 +1450,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // set that already persisted.
     if (key === 'search.mode') {
       try {
-        const { runModeSwitchUx } = await import('../core/search/mode-switch-ux.ts');
-        const { isSearchMode } = await import('../core/search/mode.ts');
+        const [{ runModeSwitchUx }, { isSearchMode }] = await Promise.all([import('../core/search/mode-switch-ux.ts'), import('../core/search/mode.ts')]);
+        if (isSearchMode(value)) await engine.setConfig('search.mode_source', 'operator');
         await runModeSwitchUx({
           oldMode: oldSearchMode && isSearchMode(oldSearchMode) ? oldSearchMode : null,
           newMode: value,

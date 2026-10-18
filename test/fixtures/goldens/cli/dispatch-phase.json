@@ -139,6 +139,15 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "beliefs": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "route-then-refuse",
+        "thinClientRoutedSubcommands": [
+          "changes"
+        ]
+      },
       "bench": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -923,6 +932,25 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "git": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'git'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "git"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "google": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1344,6 +1372,13 @@
           "list"
         ]
       },
+      "questions": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "recall": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -1623,6 +1658,25 @@
           }
         ],
         "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "setup": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'setup'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "setup"
+            ]
+          }
+        ],
+        "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
       "skillify": {
@@ -2134,6 +2188,9 @@
       ]
     },
     "thinClientRoutes": {
+      "beliefs": [
+        "changes"
+      ],
       "cache": [
         "stats"
       ],

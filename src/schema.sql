@@ -158,17 +158,15 @@ CREATE TABLE IF NOT EXISTS pages (
   -- the content allow-list IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  -- Wave B (migration v248): body_storage, body_bytes, truth_bytes, body_lines,
+  -- body_generation, segment_count, segmenter_version, body_flags, truth_lead and
+  -- timeline_lead, the NULL-able compiled_truth/timeline and pages_body_storage_chk
+  -- come from the migration on every install, after the migration-added pages
+  -- columns, so fresh and upgraded brains share their ordinals.
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
--- v0.40.3.0 cache invalidation trigger (migration v91; mirrored in
--- src/core/pglite-schema.ts). BEFORE INSERT OR UPDATE so every write path
--- bumps generation per D6 / codex #4. INSERT: pages get
--- COALESCE(MAX(generation), 0) + 1 so the bookmark gate fires for any
--- cache row stored before the new page existed. UPDATE: bumps only when
--- content columns IS DISTINCT FROM (allow-list widened per D6 + codex #3
--- to include title/type/page_kind/corpus_generation/content_hash) so
--- read-time mutations don't invalidate every cache row.
+-- BEGIN GENERATED from src/core/page-body/schema.ts (PAGE_GENERATION_BUMP_FN_SQL). Edit that file, then run: bun run build:schema
 CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
 BEGIN
   IF (TG_OP = 'INSERT') THEN
@@ -185,10 +183,15 @@ BEGIN
      OR (OLD.content_hash IS DISTINCT FROM NEW.content_hash)
   THEN
     NEW.generation := OLD.generation + 1;
+  ELSIF OLD.compiled_truth IS NULL AND NEW.compiled_truth IS NULL THEN
+    IF OLD.body_generation IS DISTINCT FROM NEW.body_generation THEN
+      NEW.generation := OLD.generation + 1;
+    END IF;
   END IF;
   RETURN NEW;
 END;
 $func$ LANGUAGE plpgsql;
+-- END GENERATED from src/core/page-body/schema.ts (PAGE_GENERATION_BUMP_FN_SQL)
 
 DROP TRIGGER IF EXISTS bump_page_generation_trg ON pages;
 CREATE TRIGGER bump_page_generation_trg
@@ -266,6 +269,9 @@ CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
+-- v240: the entity name lookups (exact title, alias title check, slug suffix) as index scans.
+CREATE INDEX IF NOT EXISTS idx_pages_source_title_lower ON pages (source_id, lower(title));
+CREATE INDEX IF NOT EXISTS idx_pages_slug_trgm ON pages USING GIN (slug gin_trgm_ops);
 -- v0.13.1 #170: avoids 14.6s seqscan on large brains when listing pages newest-first.
 CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 -- v0.18.0: source-scoped scans (per /plan-eng-review Section 4).
@@ -334,6 +340,14 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- doctor's embeddings check ages the backlog from it, never from created_at)
   -- is added by migration v221 on every install, after the migration-added
   -- content_chunks columns, so fresh and upgraded brains share their ordinals.
+  -- v244: projected_byte_start / projected_byte_end (a prose chunk's UTF-8
+  -- span in its source's read projection) are added the same way.
+  -- v248: occurrence_id, local_ordinal, raw_byte_start/end and body_generation
+  -- (segmented-page chunks; NULL for inline pages) and
+  -- content_chunks_occurrence_idx are added the same way, and so is v248's
+  -- retired_generation, which nothing writes or reads but released chunk readers
+  -- still select (v252 keeps it and adds content_chunks_generation_idx; v256
+  -- adds content_chunks_occurrence_generation_idx for chunk retirement).
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash    TEXT,
@@ -409,6 +423,16 @@ CREATE TABLE IF NOT EXISTS embed_failures (
 CREATE INDEX IF NOT EXISTS embed_failures_active_idx
   ON embed_failures (page_id, chunk_index, embedding_signature, chunk_hash);
 
+-- #6370: indexing and the title query read text through gbrain_fts_input(),
+-- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
+-- BEGIN GENERATED from src/core/fts-language.ts (FTS_INPUT_FUNCTION_SQL). Edit that file, then run: bun run build:schema
+CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog
+AS $fn$
+  SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\1 \2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\1 \2', 'g')
+$fn$;
+-- END GENERATED from src/core/fts-language.ts (FTS_INPUT_FUNCTION_SQL)
+
 -- v0.20.0 Cathedral II: chunk-grain FTS trigger.
 -- Weight 'A' on doc_comment + symbol_name_qualified; weight 'B' on chunk_text.
 -- NL queries ("how do we handle errors") rank doc-comment hits above body text.
@@ -417,9 +441,9 @@ CREATE INDEX IF NOT EXISTS embed_failures_active_idx
 CREATE OR REPLACE FUNCTION update_chunk_search_vector() RETURNS TRIGGER SET search_path = pg_catalog, public AS $fn$
 BEGIN
   NEW.search_vector :=
-    setweight(to_tsvector('english', COALESCE(NEW.doc_comment, '')), 'A') ||
-    setweight(to_tsvector('english', COALESCE(NEW.symbol_name_qualified, '')), 'A') ||
-    setweight(to_tsvector('english', COALESCE(NEW.chunk_text, '')), 'B');
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.doc_comment, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.symbol_name_qualified, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(COALESCE(NEW.chunk_text, ''))), 'B');
   RETURN NEW;
 END;
 $fn$ LANGUAGE plpgsql;
@@ -654,6 +678,9 @@ CREATE TABLE IF NOT EXISTS page_versions (
   compiled_truth TEXT    NOT NULL,
   frontmatter    JSONB   NOT NULL DEFAULT '{}',
   snapshot_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- v248: body_storage, body_generation, body_bytes, content_hash, the NULL-able
+  -- compiled_truth and page_versions_body_chk come from the migration on every
+  -- install (a segmented snapshot references a generation, not a body copy).
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_page ON page_versions(page_id);
@@ -673,7 +700,11 @@ CREATE TABLE IF NOT EXISTS ingest_log (
   source_ref    TEXT    NOT NULL,
   pages_updated JSONB   NOT NULL DEFAULT '[]',
   summary       TEXT    NOT NULL DEFAULT '',
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Migration v254: the writing binary's version, host and segment-reader mark (NULL from a binary older than v254).
+  writer_version TEXT,
+  writer_host_id UUID,
+  writer_segment_reader BOOLEAN
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingest_log_source_type_created
@@ -1005,6 +1036,9 @@ CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
   fail_count   INTEGER     NOT NULL DEFAULT 0,
   tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #6503 (migration v240): the max_input_chars cap a cut transcript was read
+  -- under; discovery skips it until the cap rises. NULL when not partial.
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_id, file_path, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
@@ -1161,18 +1195,21 @@ CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
 CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $$
 DECLARE
   timeline_text TEXT;
+  timeline_lead_text TEXT;
 BEGIN
-  -- Gather timeline_entries text for this page
-  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+  SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
   WHERE page_id = NEW.id;
 
-  -- Build weighted tsvector
+  IF NEW.timeline IS NULL THEN
+    timeline_lead_text := NEW.timeline_lead;
+  END IF;
+
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(NEW.timeline, timeline_lead_text, ''), 65536))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(left(coalesce(timeline_text, ''), 32768))), 'C');
 
   RETURN NEW;
 END;
@@ -1785,49 +1822,28 @@ CREATE TRIGGER minion_job_notify AFTER INSERT OR UPDATE OF status ON minion_jobs
 DO $$
 DECLARE
   has_bypass BOOLEAN;
+  target TEXT;
 BEGIN
   -- #1385: recognize superuser + inherited-role BYPASSRLS, not just the role's
   -- own rolbypassrls (alias `pr` avoids any plpgsql record-variable collision).
   SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
   IF has_bypass THEN
-    ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE content_chunks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE wanted_links ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE raw_data ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE timeline_entries ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE page_versions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE ingest_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE config ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE files ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_jobs ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE sources ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE file_migration_ledger ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_inbox ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE minion_attachments ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_messages ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_tool_executions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE subagent_rate_leases ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE gbrain_cycle_locks ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_takes_quality_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.32.6 contradiction probe tables
-    ALTER TABLE eval_contradictions_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE eval_contradictions_runs ENABLE ROW LEVEL SECURITY;
-    -- v0.36.1.0 Hindsight calibration wave tables
-    ALTER TABLE calibration_profiles ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_proposals ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_grade_cache ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE take_nudge_log ENABLE ROW LEVEL SECURITY;
-    -- v0.26 OAuth 2.1 tables
-    ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+    -- #5227 (W14 P1.6): conditional enables. ALTER TABLE ... ENABLE ROW LEVEL SECURITY takes an
+    -- ACCESS EXCLUSIVE lock even when RLS is already on, so re-running this block on a live brain
+    -- queued behind every open transaction; a table whose relrowsecurity is already set is skipped.
+    FOREACH target IN ARRAY ARRAY[
+      'pages','content_chunks','links','wanted_links','tags','raw_data','timeline_entries',
+      'page_versions','ingest_log','config','files','minion_jobs','sources','file_migration_ledger',
+      'access_tokens','mcp_request_log','minion_inbox','minion_attachments','subagent_messages',
+      'subagent_tool_executions','subagent_rate_leases','gbrain_cycle_locks','dream_verdicts',
+      'eval_candidates','eval_capture_failures','eval_takes_quality_runs','eval_contradictions_cache',
+      'eval_contradictions_runs','calibration_profiles','take_proposals','take_grade_cache',
+      'take_nudge_log','oauth_clients','oauth_tokens','oauth_codes'] LOOP
+      IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = current_schema() AND c.relname = target AND c.relrowsecurity) THEN
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', target);
+      END IF;
+    END LOOP;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
@@ -1874,17 +1890,21 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
     PRIMARY KEY (source_incarnation, slug)
   );
 CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+    DECLARE body_moved boolean := false;
     BEGIN
       IF OLD.knowledge_revision IS NULL THEN
         NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
         NEW.text_projection_revision := NULL;
         RETURN NEW;
       END IF;
+      IF NEW.compiled_truth IS NULL AND OLD.compiled_truth IS NULL THEN
+        body_moved := NEW.body_generation IS DISTINCT FROM OLD.body_generation;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
          (OLD.source_id, OLD.slug, OLD.type, OLD.page_kind, OLD.title, OLD.compiled_truth,
-          OLD.timeline, OLD.frontmatter, OLD.deleted_at) THEN
+          OLD.timeline, OLD.frontmatter, OLD.deleted_at) OR body_moved THEN
         IF NEW.knowledge_revision = OLD.knowledge_revision AND NOT (
           COALESCE(current_setting('gbrain.materializing_revision', true), '') = OLD.knowledge_revision::text
           AND (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.frontmatter, NEW.deleted_at)
@@ -1930,11 +1950,30 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
   fail_count INTEGER NOT NULL DEFAULT 0 CHECK (fail_count >= 0),
   tombstoned BOOLEAN NOT NULL DEFAULT false,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- #6503 (migration v240): the max_input_chars cap a cut page was read under;
+  -- discovery skips it until the cap rises. NULL when not partial.
+  partial_input_chars INTEGER,
   PRIMARY KEY (source_incarnation, page_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+-- (migration v246) Per-page embedding spend ledger for large pages
+-- (page-embedding-budget.ts): held pages wait for approval, capped pages are
+-- partially embedded up to embed.max_usd_per_page.
+CREATE TABLE IF NOT EXISTS page_embedding_budget (
+  page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'held', 'capped')),
+  reason TEXT,
+  embedding_signature TEXT,
+  spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (spent_usd >= 0),
+  reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  reserved_at TIMESTAMPTZ,
+  unpriced_calls INTEGER NOT NULL DEFAULT 0 CHECK (unpriced_calls >= 0),
+  cap_usd DOUBLE PRECISION CHECK (cap_usd IS NULL OR cap_usd >= 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS page_embedding_budget_state_idx ON page_embedding_budget (state) WHERE state <> 'open';
 -- #5876 (migration chronicle_page_state): Life Chronicle ledger, the durable
 -- record of each page content's automatic-extraction decision and outcome.
 CREATE TABLE IF NOT EXISTS chronicle_page_state (
@@ -1985,6 +2024,138 @@ CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
   completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (source_id, idempotency_key)
 );
+-- Large pages A7 (migration v247): per-page extraction watermark and the
+-- durable receipt of a partial-input extraction (src/core/extraction-watermark.ts).
+CREATE TABLE IF NOT EXISTS page_extraction_state (
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  pipeline TEXT NOT NULL CHECK (pipeline IN ('facts_backstop','extract_atoms','conversation_facts')),
+  pipeline_version INTEGER NOT NULL,
+  watermark_bytes BIGINT CHECK (watermark_bytes >= 0),
+  watermark_sha256 TEXT,
+  input_truncated JSONB,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, pipeline)
+);
+CREATE INDEX IF NOT EXISTS page_extraction_state_truncated_idx
+  ON page_extraction_state (pipeline, page_id) WHERE input_truncated IS NOT NULL;
+-- Wave B segmented pages (migration v253): get_page view sizes and digests per
+-- page revision and audience (src/core/page-window/segmented.ts).
+CREATE TABLE IF NOT EXISTS page_view_digests (
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  revision TEXT NOT NULL,
+  view TEXT NOT NULL CHECK (view IN ('read','markdown')),
+  audience TEXT NOT NULL CHECK (audience IN ('trusted','remote')),
+  total_bytes BIGINT NOT NULL CHECK (total_bytes >= 0),
+  total_lines BIGINT NOT NULL CHECK (total_lines >= 0),
+  sha256 TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (page_id, revision, view, audience)
+);
+-- Wave B segmented page storage (migration v248): segment texts, the
+-- generation-ranged body manifest and body stagings (src/core/page-body/).
+-- Before the persistence region so the managed-writer guard covers them.
+-- BEGIN GENERATED from src/core/page-body/schema.ts (PAGE_BODY_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE SEQUENCE IF NOT EXISTS page_body_occurrence_id_seq;
+CREATE TABLE IF NOT EXISTS page_segment_texts (
+  source_id  TEXT    NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  sha256     BYTEA   NOT NULL CHECK (octet_length(sha256) = 32),
+  byte_len   INTEGER NOT NULL CHECK (byte_len BETWEEN 1 AND 1048576),
+  line_count INTEGER NOT NULL CHECK (line_count >= 0),
+  body       BYTEA   NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, sha256)
+);
+CREATE TABLE IF NOT EXISTS page_body_manifest (
+  page_id           INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  occurrence_id     BIGINT  NOT NULL,
+  gen_from          BIGINT  NOT NULL,
+  gen_to            BIGINT,
+  seq               INTEGER NOT NULL,
+  region            TEXT    NOT NULL CHECK (region IN ('truth','timeline')),
+  source_id         TEXT    NOT NULL,
+  sha256            BYTEA   NOT NULL,
+  byte_start        BIGINT  NOT NULL,
+  byte_len          INTEGER NOT NULL,
+  line_start        BIGINT  NOT NULL,
+  line_count        INTEGER NOT NULL,
+  cut_kind          TEXT    NOT NULL CHECK (cut_kind IN ('heading','day','message','blank','forced','region_end','eof')),
+  entry_state       JSONB   NOT NULL,
+  protected_regions JSONB   NOT NULL DEFAULT '[]',
+  facts_slots       JSONB   NOT NULL DEFAULT '[]',
+  static_proj_bytes BIGINT  NOT NULL,
+  static_proj_lines INTEGER NOT NULL,
+  outline           JSONB   NOT NULL DEFAULT '[]',
+  date_min          DATE,
+  date_max          DATE,
+  hash_state        BYTEA   NOT NULL,
+  staging_id        UUID,
+  staging_key       UUID GENERATED ALWAYS AS (COALESCE(staging_id, '00000000-0000-0000-0000-000000000000'::uuid)) STORED,
+  PRIMARY KEY (page_id, occurrence_id, gen_from, staging_key),
+  FOREIGN KEY (source_id, sha256) REFERENCES page_segment_texts(source_id, sha256)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS page_body_manifest_live_seq ON page_body_manifest (page_id, seq) WHERE gen_to IS NULL AND staging_id IS NULL;
+CREATE INDEX IF NOT EXISTS page_body_manifest_live_bytes ON page_body_manifest (page_id, byte_start) WHERE gen_to IS NULL;
+CREATE INDEX IF NOT EXISTS page_body_manifest_text ON page_body_manifest (source_id, sha256);
+CREATE INDEX IF NOT EXISTS page_body_manifest_staging ON page_body_manifest (staging_id) WHERE staging_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS page_body_stagings (
+  id                 UUID PRIMARY KEY,
+  kind               TEXT NOT NULL CHECK (kind IN ('upload','import','sync','put','append','edit','resegment')),
+  principal_kind     TEXT NOT NULL,
+  principal_id       TEXT NOT NULL,
+  client_request_id  UUID NOT NULL,
+  source_id          TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  source_incarnation UUID NOT NULL,
+  slug               TEXT NOT NULL,
+  page_id            INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+  mode               TEXT NOT NULL CHECK (mode IN ('create','replace','append')),
+  base_revision      UUID,
+  base_generation    BIGINT,
+  declared_bytes     BIGINT NOT NULL CHECK (declared_bytes >= 0),
+  declared_sha256    BYTEA,
+  received_bytes     BIGINT NOT NULL DEFAULT 0,
+  next_part          INTEGER NOT NULL DEFAULT 0,
+  reserved_bytes     BIGINT NOT NULL,
+  state              TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','sealed','prepared','committed','aborted','expired')),
+  commit_request_id  UUID,
+  idle_expires_at    TIMESTAMPTZ NOT NULL,
+  hard_expires_at    TIMESTAMPTZ NOT NULL,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (principal_kind, principal_id, client_request_id)
+);
+CREATE INDEX IF NOT EXISTS page_body_stagings_expiry ON page_body_stagings (hard_expires_at) WHERE state IN ('open','sealed','prepared');
+CREATE TABLE IF NOT EXISTS page_body_staging_parts (
+  staging_id UUID    NOT NULL REFERENCES page_body_stagings(id) ON DELETE CASCADE,
+  part_no    INTEGER NOT NULL CHECK (part_no >= 0),
+  byte_start BIGINT  NOT NULL,
+  byte_len   INTEGER NOT NULL CHECK (byte_len BETWEEN 1 AND 4194304),
+  sha256     BYTEA   NOT NULL,
+  body       BYTEA   NOT NULL,
+  PRIMARY KEY (staging_id, part_no)
+);
+CREATE TABLE IF NOT EXISTS page_body_staging_texts (
+  staging_id UUID  NOT NULL REFERENCES page_body_stagings(id) ON DELETE CASCADE,
+  source_id  TEXT  NOT NULL,
+  sha256     BYTEA NOT NULL,
+  PRIMARY KEY (staging_id, sha256)
+);
+CREATE INDEX IF NOT EXISTS page_body_staging_texts_text ON page_body_staging_texts (source_id, sha256);
+-- END GENERATED from src/core/page-body/schema.ts (PAGE_BODY_SCHEMA_SQL)
+
+-- BEGIN GENERATED from src/core/page-body/schema.ts (PAGE_BODY_RLS_SQL). Edit that file, then run: bun run build:schema
+DO $rls$
+DECLARE target TEXT;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    FOREACH target IN ARRAY ARRAY['page_segment_texts','page_body_manifest','page_body_stagings','page_body_staging_parts','page_view_digests','page_body_staging_texts'] LOOP
+      IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = target AND c.relkind = 'r' AND NOT c.relrowsecurity) THEN
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', target);
+      END IF;
+    END LOOP;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/page-body/schema.ts (PAGE_BODY_RLS_SQL)
 
 -- Durable concurrent persistence (migration 151).
 -- BEGIN GENERATED from src/core/persistence/schema.ts (PERSISTENCE_SCHEMA_STATEMENTS). Edit that file, then run: bun run build:schema
@@ -2017,6 +2188,7 @@ CREATE TABLE IF NOT EXISTS persistence_host_bindings (
     host_id uuid NOT NULL,
     local_path text NOT NULL,
     coordination_path text NOT NULL,
+    git_durability text CHECK (git_durability IN ('enabled','disabled')),
     PRIMARY KEY(worktree_id,host_id)
   );
 CREATE TABLE IF NOT EXISTS persistence_local_writers (
@@ -2101,6 +2273,9 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
     persistence_home text NOT NULL,
     minted_under jsonb,
     version text NOT NULL,
+    boot_id text,
+    process_start text,
+    segment_reader boolean,
     PRIMARY KEY(host_id,pid,nonce)
   );
 
@@ -2110,14 +2285,22 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM persistence_brain WHERE singleton=1 AND enabled) THEN
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   END IF;
-  row_data := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
-  IF TG_OP='UPDATE' THEN old_data := to_jsonb(OLD); END IF;
+  IF TG_TABLE_NAME='page_segment_texts' THEN
+    -- Only the source decides; the segment body (up to 1 MiB of bytea) never becomes JSON.
+    IF TG_OP='DELETE' THEN row_data := jsonb_build_object('source_id',OLD.source_id); ELSE row_data := jsonb_build_object('source_id',NEW.source_id); END IF;
+    IF TG_OP='UPDATE' THEN old_data := jsonb_build_object('source_id',OLD.source_id); END IF;
+  ELSE
+    row_data := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
+    IF TG_OP='UPDATE' THEN old_data := to_jsonb(OLD); END IF;
+  END IF;
   IF TG_TABLE_NAME='pages' AND TG_OP='UPDATE' THEN
     IF (NEW.source_id,NEW.slug,NEW.type,NEW.page_kind,NEW.title,NEW.compiled_truth,NEW.timeline,NEW.frontmatter,NEW.deleted_at,NEW.knowledge_revision)
       IS NOT DISTINCT FROM
        (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision)
       -- The trust tier is guarded content (trust/schema.ts); read by key so brains before the column keep working.
-      AND row_data->'trust_tier' IS NOT DISTINCT FROM old_data->'trust_tier' THEN RETURN NEW; END IF;
+      AND row_data->'trust_tier' IS NOT DISTINCT FROM old_data->'trust_tier'
+      -- A segmented page's body identity (page-body/schema.ts); read by key for brains before the column.
+      AND row_data->'body_generation' IS NOT DISTINCT FROM old_data->'body_generation' THEN RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME='sources' THEN
     IF TG_OP='UPDATE' AND (NEW.id,NEW.incarnation,NEW.local_path,NEW.archived)
       IS NOT DISTINCT FROM (OLD.id,OLD.incarnation,OLD.local_path,OLD.archived) THEN
@@ -2169,7 +2352,7 @@ END $fn$;
 DO $body$
 DECLARE target text;
 BEGIN
-  FOREACH target IN ARRAY ARRAY['pages','tags','slug_aliases','page_aliases','facts','takes','timeline_entries','sources'] LOOP
+  FOREACH target IN ARRAY ARRAY['pages','tags','slug_aliases','page_aliases','facts','takes','timeline_entries','sources','page_segment_texts','page_body_manifest'] LOOP
     IF to_regclass(target) IS NOT NULL THEN
       EXECUTE format('DROP TRIGGER IF EXISTS managed_writer_guard ON %I',target);
       EXECUTE format('CREATE TRIGGER managed_writer_guard BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()',target);
@@ -2181,8 +2364,11 @@ END $body$;
 -- Verified text projection work (migration 153).
 -- BEGIN GENERATED from src/core/page-state/projection-schema.ts (PAGE_PROJECTION_SCHEMA_SQL). Edit that file, then run: bun run build:schema
 DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
-CREATE TRIGGER trg_pages_search_vector BEFORE INSERT OR UPDATE OF title,timeline ON pages
-    FOR EACH ROW EXECUTE FUNCTION update_page_search_vector();
+DO $trg$ BEGIN
+    EXECUTE format('CREATE TRIGGER trg_pages_search_vector BEFORE INSERT OR UPDATE OF %s ON pages FOR EACH ROW EXECUTE FUNCTION update_page_search_vector()',
+      CASE WHEN EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'timeline_lead' AND NOT attisdropped)
+        THEN 'title,timeline,timeline_lead' ELSE 'title,timeline' END);
+  END $trg$;
 CREATE TABLE IF NOT EXISTS page_projection_jobs (
     source_incarnation UUID NOT NULL REFERENCES sources(incarnation) ON DELETE CASCADE,
     slug TEXT NOT NULL,
@@ -2934,6 +3120,11 @@ DO $rls$ BEGIN
 END $rls$;
 -- END GENERATED from src/core/facts/purge-schema.ts (MEMORY_PURGE_SCHEMA_SQL)
 
+-- BEGIN GENERATED from src/core/facts/purge-schema.ts (FACT_PURGE_LOOKUP_INDEX_SQL). Edit that file, then run: bun run build:schema
+CREATE INDEX IF NOT EXISTS fact_purges_subject_idx ON fact_purges (source_id, subject, fact_hash) INCLUDE (visibility, purged_at);
+CREATE INDEX IF NOT EXISTS fact_purges_all_subjects_idx ON fact_purges (source_id, purged_at) WHERE subject = '*';
+-- END GENERATED from src/core/facts/purge-schema.ts (FACT_PURGE_LOOKUP_INDEX_SQL)
+
 -- #5575 blocking write gate: verdict receipts and held facts/takes.
 -- BEGIN GENERATED from src/core/write-gate-schema.ts (WRITE_GATE_SCHEMA_SQL). Edit that file, then run: bun run build:schema
 CREATE TABLE IF NOT EXISTS write_gate_receipts (
@@ -2993,3 +3184,169 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_checked_at TIMESTAMPTZ;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_commit TEXT;
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_behind INTEGER;
 
+-- Pinned questions (C4): answers and their evidence pointers live outside pages.
+-- BEGIN GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS pinned_questions (
+  id                        BIGSERIAL PRIMARY KEY,
+  source_id                 TEXT NOT NULL,
+  slug                      TEXT NOT NULL,
+  question                  TEXT NOT NULL,
+  scope_slug_prefix         TEXT,
+  scope_entity              TEXT,
+  state                     TEXT NOT NULL DEFAULT 'active',
+  inactive_reason           TEXT,
+  publish_mode              TEXT NOT NULL DEFAULT 'publish',
+  model                     TEXT,
+  cooldown_days             REAL,
+  origin                    TEXT NOT NULL DEFAULT 'pin',
+  created_by                TEXT NOT NULL,
+  revision                  BIGINT NOT NULL DEFAULT 1,
+  answer_revision           INTEGER NOT NULL DEFAULT 0,
+  answer                    TEXT,
+  answer_model              TEXT,
+  last_refresh_at           TIMESTAMPTZ,
+  last_attempt_at           TIMESTAMPTZ,
+  last_error                TEXT,
+  watermark_generation      BIGINT,
+  watermark_fact_id         BIGINT,
+  watermark_at              TIMESTAMPTZ,
+  lease_token               TEXT,
+  lease_owner               TEXT,
+  lease_expires_at          TIMESTAMPTZ,
+  refresh_attempts          INTEGER NOT NULL DEFAULT 0,
+  spend_usd                 DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  archived_at               TIMESTAMPTZ,
+  CONSTRAINT pinned_questions_source_slug_key UNIQUE (source_id, slug)
+);
+CREATE INDEX IF NOT EXISTS pinned_questions_state_idx ON pinned_questions (state, source_id);
+CREATE TABLE IF NOT EXISTS question_evidence (
+  id                        BIGSERIAL PRIMARY KEY,
+  question_id               BIGINT NOT NULL,
+  answer_revision           INTEGER NOT NULL,
+  sentence_id               TEXT NOT NULL,
+  kind                      TEXT NOT NULL,
+  source_id                 TEXT NOT NULL,
+  page_id                   INTEGER,
+  page_slug                 TEXT,
+  page_generation           BIGINT,
+  page_revision             TEXT,
+  item_id                   BIGINT,
+  content_hash              TEXT,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS question_evidence_question_idx ON question_evidence (question_id, answer_revision);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE pinned_questions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE question_evidence ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/questions/schema.ts (PINNED_QUESTIONS_SCHEMA_SQL)
+
+-- Belief ledger (W1, docs/designs/BELIEF_LEDGER.md): append-only canonical audit state.
+-- BEGIN GENERATED from src/core/belief/schema.ts (BELIEF_LEDGER_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS belief_events (
+  id                 BIGSERIAL PRIMARY KEY,
+  event_key          BYTEA NOT NULL UNIQUE,
+  source_id          TEXT NOT NULL,
+  source_incarnation UUID NOT NULL,
+  page_lifetime      UUID,
+  slug               TEXT NOT NULL,
+  subject_kind       TEXT NOT NULL CHECK (subject_kind IN ('page','fact','take','link','link_transition','coverage')),
+  subject_key        TEXT NOT NULL,
+  event_type         TEXT NOT NULL,
+  origin             TEXT NOT NULL DEFAULT 'live' CHECK (origin IN ('live','unmanaged','baseline','backfill','reconcile')),
+  trust_tier         TEXT NOT NULL,
+  writer_tier        TEXT,
+  tier_basis         TEXT NOT NULL DEFAULT 'row' CHECK (tier_basis IN ('row','writer','unknown')),
+  visibility         TEXT NOT NULL,
+  publication_id     UUID NOT NULL,
+  ord                INTEGER NOT NULL,
+  recorded_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  source_time        TIMESTAMPTZ,
+  valid_from         TIMESTAMPTZ,
+  valid_until        TIMESTAMPTZ,
+  value              JSONB,
+  value_hash         TEXT,
+  prior_hash         TEXT,
+  state_hash         TEXT NOT NULL,
+  cause              JSONB NOT NULL,
+  claim_fp           TEXT,
+  purged             BOOLEAN NOT NULL DEFAULT false,
+  redacted_fields    TEXT[]
+);
+CREATE INDEX IF NOT EXISTS belief_events_page ON belief_events (source_id, slug, id);
+CREATE INDEX IF NOT EXISTS belief_events_subject ON belief_events (source_id, subject_kind, subject_key, id);
+CREATE INDEX IF NOT EXISTS belief_events_recorded ON belief_events (recorded_at);
+CREATE INDEX IF NOT EXISTS belief_events_claim_fp ON belief_events (source_id, claim_fp) WHERE claim_fp IS NOT NULL;
+CREATE INDEX IF NOT EXISTS belief_events_lifetime ON belief_events (page_lifetime, id) WHERE page_lifetime IS NOT NULL;
+CREATE INDEX IF NOT EXISTS belief_events_publication ON belief_events (publication_id);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE belief_events ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS belief_page_lifetimes (
+  page_lifetime      UUID PRIMARY KEY,
+  source_id          TEXT NOT NULL,
+  source_incarnation UUID NOT NULL,
+  slug               TEXT NOT NULL,
+  page_id            INTEGER,
+  started_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  ended_at           TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS belief_page_lifetimes_open ON belief_page_lifetimes (source_incarnation, slug) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS belief_page_lifetimes_slug ON belief_page_lifetimes (source_id, slug);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE belief_page_lifetimes ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS belief_commit_marks (
+  publication_id UUID PRIMARY KEY,
+  observed_at    TIMESTAMPTZ NOT NULL
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE belief_commit_marks ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS belief_retier_manifest (
+  summary_event BIGINT NOT NULL,
+  source_id     TEXT NOT NULL,
+  subject_kind  TEXT NOT NULL,
+  subject_key   TEXT NOT NULL,
+  from_tier     TEXT,
+  to_tier       TEXT NOT NULL,
+  PRIMARY KEY (summary_event, subject_kind, subject_key)
+);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE belief_retier_manifest ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+CREATE TABLE IF NOT EXISTS belief_redactions (
+  id            BIGSERIAL PRIMARY KEY,
+  source_id     TEXT NOT NULL,
+  subject_key   TEXT NOT NULL,
+  field         TEXT NOT NULL,
+  purge_request UUID NOT NULL,
+  field_hash    TEXT NOT NULL,
+  released_by   UUID,
+  released_hash TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS belief_redactions_subject ON belief_redactions (source_id, subject_key, field);
+CREATE INDEX IF NOT EXISTS belief_redactions_field_hash ON belief_redactions (source_id, field_hash);
+DO $rls$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE belief_redactions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END $rls$;
+-- END GENERATED from src/core/belief/schema.ts (BELIEF_LEDGER_SCHEMA_SQL)

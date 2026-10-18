@@ -37,7 +37,7 @@ import type { BrainEngine } from './engine.ts';
 import type { IdleBlocker, Migration } from './migrate.ts';
 // v135 interpolates the configured FTS config name straight into DDL; this is
 // the same validated accessor migrate.ts uses for upstream's v123/v124.
-import { getFtsLanguage } from './fts-language.ts';
+import { FTS_INPUT_FUNCTION_SQL, getFtsLanguage, pageSearchVectorTriggerFnSql } from './fts-language.ts';
 import { isRetryableConnError, isStatementTimeoutError } from './retry-matcher.ts';
 import { MINION_QUEUE_PROTOCOL_FUNCTION_SQL } from './schema-migrations/v205-minion-spend-authorization.ts';
 
@@ -122,40 +122,22 @@ async function noticeIdleBlockers(engine: BrainEngine, deps: ForkMigrationDeps):
 
 /** Lowest version number owned by the fork. Everything below belongs to
  *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 231;
+export const FORK_MIGRATION_FLOOR = 261;
 
 /**
- * The v235 trigger function. The text is deliberately byte-identical (modulo the language literal) to the one the
- * PGLite schema blob replays on every boot (pglite-schema.generated.ts). If it differed even in whitespace, boot N
- * would leave this body and boot N+1 would silently swap it for the blob's, so the "repeat boot is a no-op"
- * invariant (test/pglite-upgrade-replay.test.ts) would not hold.
+ * The final page trigger function: upstream's own text (fts-language.ts), the same text the schema blob replays on
+ * every boot, so a fresh install, an upgrade boot and a repeat boot agree (test/pglite-upgrade-replay.test.ts).
+ * Upstream v245 now carries what this migration originally added (no compiled_truth, bounded timeline), plus the
+ * #6370 gbrain_fts_input() boundary split, which is created first so this step never depends on v232 having run.
  */
-function pageSearchVectorFunctionSql(lang: string): string {
-  return `
-CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $fn$
-DECLARE
-  timeline_text TEXT;
-BEGIN
-  SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
-  INTO timeline_text
-  FROM timeline_entries
-  WHERE page_id = NEW.id;
-
-  NEW.search_vector :=
-    setweight(to_tsvector('${lang}', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('${lang}', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('${lang}', coalesce(timeline_text, '')), 'C');
-
-  RETURN NEW;
-END;
-$fn$ LANGUAGE plpgsql;
-        `;
+function pageSearchVectorFunctionSql(lang: string): string[] {
+  return [FTS_INPUT_FUNCTION_SQL, pageSearchVectorTriggerFnSql(lang)];
 }
 
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 231,
+      version: 261,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -173,7 +155,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 232,
+      version: 262,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -200,7 +182,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 233,
+      version: 263,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -229,7 +211,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 234,
+      version: 264,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -264,63 +246,22 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 235,
+      version: 265,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
       handler: async (engine) => {
-        // Fork-only. Upstream's v123/v124 pair leaves two defects that upstream
-        // has not fixed: v123 still builds search_vector from compiled_truth (an
-        // unbounded whole-page body) and full-table-backfills it for non-English
-        // languages, which overflows Postgres's 1MB tsvector cap on large pages
-        // ('string is too long for tsvector') and aborts the migration; and v124
-        // only does CREATE OR REPLACE, never touching existing rows, so upgraded
-        // brains keep compiled_truth baked into search_vector forever.
-        //
-        // This migration is the fork's standing repair for both. It lives here
-        // rather than as an edit to v123/v124 so the upstream half of this file
-        // stays byte-identical and the automated sync stops conflicting on it.
-        const lang = getFtsLanguage();
-        await engine.executeRaw(pageSearchVectorFunctionSql(lang));
-        // Explicit, batched backfill of every existing row whose search_vector
-        // is non-null — regardless of language. Pre-fix, this step only did
-        // CREATE OR REPLACE and never touched existing rows, so upgraded
-        // brains kept compiled_truth baked into search_vector forever (page/
-        // title-arm hits on body text, double-counted against the chunk arm
-        // in RRF) while freshly created brains never had it. Batched by id
-        // range (SERIAL PK) so a huge pages table can't hold one giant
-        // transaction/lock for the whole backfill.
-        const batchSize = 500;
-        let lastId = 0;
-        let totalBackfilled = 0;
-        for (;;) {
-          const rows = await engine.executeRaw<{ id: number }>(
-            // trg_pages_search_vector is declared UPDATE OF title,timeline.
-            // Updating id would rewrite the row but *not* invoke the trigger,
-            // leaving its old compiled_truth-derived vector intact. Assigning
-            // title to itself is deliberately value-preserving while naming a
-            // watched column, so every selected row is rebuilt by the final
-            // trigger function.
-            `UPDATE pages SET title = title
-               WHERE id IN (
-                 SELECT id FROM pages
-                  WHERE id > $1 AND search_vector IS NOT NULL
-                  ORDER BY id
-                  LIMIT $2
-               )
-             RETURNING id`,
-            [lastId, batchSize],
-          );
-          if (rows.length === 0) break;
-          totalBackfilled += rows.length;
-          lastId = Math.max(...rows.map((r) => r.id));
-          if (rows.length < batchSize) break;
-        }
-        deps.migrationNotice(`  v135: compiled_truth dropped from pages trigger (was overflowing tsvector on large pages, #2704); backfilled ${totalBackfilled} existing row(s)\n`);
+        // Fork-only, kept as the standing "final trigger" step. It used to install a fork body (no compiled_truth,
+        // which overflowed the 1MB tsvector cap on large pages) and rebuild every page row. Upstream v245 now ships
+        // that fix with a bounded timeline and backfills only the rows that need it, and v232 adds the CJK/Latin
+        // boundary split; installing the old fork body here would revert both. So this step installs upstream's
+        // current body and rebuilds nothing (a full-table rebuild on a large brain is hours of index writes).
+        for (const statement of pageSearchVectorFunctionSql(getFtsLanguage())) await engine.executeRaw(statement);
+        deps.migrationNotice('  fork: page search_vector trigger is upstream\'s bounded-timeline body (no rebuild)\n');
       },
     },
     {
-      version: 236,
+      version: 266,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -348,7 +289,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 237,
+      version: 267,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -389,7 +330,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 238,
+      version: 268,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -460,7 +401,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 239,
+      version: 269,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -540,7 +481,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 240,
+      version: 270,
       name: 'repair_masked_upstream_146_149',
       // Fifth instance of the masking class this file's header describes, from
       // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
@@ -631,7 +572,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 241,
+      version: 271,
       name: 'repair_masked_upstream_150_159',
       // Sixth instance of the masking class this file's header describes, from
       // the 2026-09-20 upstream sync (v0.50.0.0 → v0.51.0.0).
@@ -724,7 +665,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 242,
+      version: 272,
       name: 'repair_masked_upstream_160_165',
       // The 2026-09-27 upstream merge extended the upstream range through
       // v165 after this fork had already used 160-165. Renumbering the fork
@@ -794,7 +735,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 243,
+      version: 273,
       name: 'repair_masked_upstream_166_177',
       // Eighth instance of the masking class this file's header describes, from
       // the upstream v0.60.139.0 sync. Upstream's range now runs through 230;
@@ -824,6 +765,35 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         }
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 166-177 masked by the upstream v0.60.139.0 fork renumber\n',
+        );
+      },
+    },
+    {
+      version: 274,
+      name: 'repair_masked_upstream_231_243',
+      // Ninth instance of the masking class this file's header describes, from the upstream v0.60.299.0 sync.
+      // Upstream's range now runs through 260; the fork previously occupied 231-243 (renumbered to 261+ above), so a
+      // brain stamped 243 by the old fork numbering has `m.version > current` false for upstream's real 231-243.
+      //
+      // Looked up in the live registry at execution time (never copied), all thirteen declare `idempotent: true`.
+      // 231, 236, 240 and 241 build indexes online (CONCURRENTLY on Postgres) and 232 batches its backfill outside a
+      // transaction, so this outer migration must not be transaction-wrapped.
+      //
+      // ORDERING: on a 243-stamped brain this runs AFTER upstream 244-260. That is safe: the schema blob replay and
+      // the forward-reference bootstrap in initSchema run before runMigrations and create gbrain_fts_input() and the
+      // current trigger bodies v245 relies on, and no upstream 244-260 migration references an object 231-243
+      // creates. COST: v232's replay rebuilds the search_vector of every chunk with a CJK/Latin boundary; on a large
+      // CJK brain with the PGroonga chunk index that is a long index-write pass, measured on a rehearsal copy first.
+      idempotent: true,
+      transaction: false,
+      sql: '',
+      handler: async (engine) => {
+        for (const version of [231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243]) {
+          const masked = requireMaskedMigration(deps, 'repair_masked_upstream_231_243', version);
+          await deps.applyOneMigration(engine, masked);
+        }
+        deps.migrationNotice(
+          '  repair: re-applied upstream migrations 231-243 masked by the upstream v0.60.299.0 fork renumber\n',
         );
       },
     },

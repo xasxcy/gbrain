@@ -75,7 +75,7 @@ describe('fork migration registry seam', () => {
     expect(notIdempotent).toEqual([]);
   });
 
-  test('v240 never commits v149\'s obsolete queue protocol when canonical restoration is interrupted', async () => {
+  test('v270 never commits v149\'s obsolete queue protocol when canonical restoration is interrupted', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let committedProtocol = 'canonical protocol';
     const engine = {
@@ -98,13 +98,13 @@ describe('fork migration registry seam', () => {
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
     });
-    const repair = migrations.find(migration => migration.version === 240)!;
+    const repair = migrations.find(migration => migration.version === 270)!;
 
     await expect(repair.handler!(engine)).rejects.toThrow('interrupted before canonical protocol can commit');
     expect(committedProtocol).toBe('canonical protocol');
   });
 
-  test('v240 keeps the migration runner envelope: SET LOCAL statement_timeout first, retry on statement_timeout, fail loud otherwise', async () => {
+  test('v270 keeps the migration runner envelope: SET LOCAL statement_timeout first, retry on statement_timeout, fail loud otherwise', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     const attempts: string[][] = [];
     let failuresLeft = 1;
@@ -126,7 +126,7 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
-    }).find(migration => migration.version === 240)!;
+    }).find(migration => migration.version === 270)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => {
       await repair.handler!(engine);
       expect(attempts.length).toBe(2); // one retried statement_timeout, then success
@@ -150,7 +150,7 @@ describe('fork migration registry seam', () => {
     });
   });
 
-  test('v240 retries announce the attempt, the error, the delay and the idle-in-transaction blockers (F4a R4-5)', async () => {
+  test('v270 retries announce the attempt, the error, the delay and the idle-in-transaction blockers (F4a R4-5)', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let failuresLeft = 2;
     const engine = {
@@ -175,7 +175,7 @@ describe('fork migration registry seam', () => {
         blockerLookups.push(lookupEngine);
         return [{ pid: 4242, state: 'idle in transaction', query_start: '2026-10-10 00:00:00+00', query: 'LOCK TABLE minion_jobs' }];
       },
-    }).find(migration => migration.version === 240)!;
+    }).find(migration => migration.version === 270)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
     expect(blockerLookups).toEqual([engine, engine]); // once per retry, against the migrating engine
 
@@ -189,7 +189,7 @@ describe('fork migration registry seam', () => {
     expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
   });
 
-  test('v240: a failing blocker diagnostic costs only the diagnostic, never the migration', async () => {
+  test('v270: a failing blocker diagnostic costs only the diagnostic, never the migration', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let failuresLeft = 1;
     const engine = {
@@ -208,14 +208,14 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: line => { notices.push(line); },
       getIdleBlockers: async () => { throw new Error('pg_stat_activity is restricted'); },
-    }).find(migration => migration.version === 240)!;
+    }).find(migration => migration.version === 270)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
     expect(notices.join('')).toContain('[retry 1/3] v149');
     expect(notices.join('')).not.toContain('idle-in-transaction blocker');
     expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
   });
 
-  test('v240 on PGLite never issues SET LOCAL statement_timeout (F4a R4-5)', async () => {
+  test('v270 on PGLite never issues SET LOCAL statement_timeout (F4a R4-5)', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     const statements: string[] = [];
     const engine = {
@@ -229,7 +229,7 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
-    }).find(migration => migration.version === 240)!;
+    }).find(migration => migration.version === 270)!;
     await repair.handler!(engine);
     expect(statements.length).toBe(2); // v149's body and the canonical protocol, nothing else
     expect(statements[0]).toBe('old protocol');
@@ -248,7 +248,7 @@ describe('fork repair under the managed PGLite writer guard', () => {
     await engine.disconnect();
   });
 
-  test('v243 can replay v174 withdrawal expiry under the managed PGLite writer guard without leaking its source grant', async () => {
+  test('v273 can replay v174 withdrawal expiry under the managed PGLite writer guard without leaking its source grant', async () => {
     const fact = await engine.insertFact(
       { fact: 'Managed repair withdrawal sentinel', source: 'test', visibility: 'world' },
       { source_id: 'default' },

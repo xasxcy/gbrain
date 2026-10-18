@@ -14,6 +14,8 @@
  */
 
 import type { BrainEngine } from './engine.ts';
+import type { OperationContext } from './ops/contract.ts';
+import { OperationError } from './ops/contract.ts';
 import { waitForCapacity } from './backoff.ts';
 import { quarantineMarkers } from './extraction-review.ts';
 import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
@@ -27,8 +29,10 @@ import { isAvailable } from './ai/gateway.ts';
 // #4222: shared generic-token reject list — same list gates the by-mention
 // gazetteer and drives the junk_entity_hubs doctor check.
 import { isJunkEntityName } from './entity-name-quality.ts';
+import { followRetirement } from './entities/resolve.ts';
 import { maintenanceTransaction } from './persistence/attribution.ts';
-import { deriveTrust, derivedMaintenanceTransaction, lowerDerivedPage } from './trust/taint.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
+import { deriveTrust, derivedMaintenanceTransaction, lowerDerivedPage, lowerDerivedPageIn } from './trust/taint.ts';
 import { derivedGateConfig, derivedGateInput, recordTimelineFlag, timelineRowAllowed } from './trust/derived-gate.ts';
 import { assessTimelineForGate } from './write-gate.ts';
 
@@ -63,6 +67,8 @@ export interface EnrichmentTrustOptions {
   trusted?: boolean;
   /** Source to read/write in (multi-source brains). Omitted → engine default. */
   sourceId?: string;
+  /** #6262: the caller's context; on a managed brain every write goes through the coordinator under its authority. */
+  ctx?: OperationContext;
 }
 
 export interface EnrichmentResult {
@@ -70,6 +76,8 @@ export interface EnrichmentResult {
   action: 'created' | 'updated' | 'skipped';
   /** True when the created stub landed in the quarantine lane (issue #160). */
   quarantined?: boolean;
+  /** Why nothing was written: the page is retired and its superseded_by / merged_into chain has no live target (B-9). */
+  skipped_reason?: 'retired_page_unfollowable';
   tier: 1 | 2 | 3;
   backlinkCreated: boolean;
   timelineAdded: boolean;
@@ -156,6 +164,13 @@ export async function enrichEntity(
   const scope = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
   // #5575 I2: a stub and its timeline row restate the source page's mention, so they carry its taint (capped at agent_written).
   const derivation = await deriveTrust(engine, [{ table: 'pages', sourceId, slug: request.sourceSlug }], { channel: 'derive:enrichment' });
+  const ctx = opts?.ctx;
+  // #6262: a managed brain refuses direct writes, so each one goes through the coordinator under the caller's authority.
+  const managed = ctx !== undefined && await managedPersistenceEnabled(engine);
+  const coordinated = async <T>(lockSlugs: string[], write: (tx: BrainEngine) => Promise<T>) => {
+    const { coordinatedDatabaseWrite } = await import('./persistence/database-write.ts');
+    return coordinatedDatabaseWrite(ctx!, 'extract_entities', slug, lockSlugs, write, derivation.trust);
+  };
 
   // 1. Count existing mentions for tier auto-escalation
   const { mentionCount, mentionSources } = await countMentions(engine, request.entityName, opts?.sourceId);
@@ -177,6 +192,15 @@ export async function enrichEntity(
       const same = (t: string) => t.normalize('NFC').trim().toLowerCase();
       if (legacyPage && same(legacyPage.title ?? '') === same(request.entityName)) { slug = legacySlug; existingPage = legacyPage; }
     }
+  }
+  // B-9: a retired page (canonical: false, superseded_by) answers through its canonical page, as fact resolution does (#6898).
+  if (existingPage) {
+    const live = await followRetirement(engine, sourceId, slug);
+    if (!live) {
+      return { slug, action: 'skipped', skipped_reason: 'retired_page_unfollowable', tier, backlinkCreated: false, timelineAdded: false,
+        mentionCount, mentionSources, suggestedTier, tierEscalated };
+    }
+    if (live.slug !== slug) { slug = live.slug; existingPage = await engine.getPage(slug, { sourceId }); }
   }
   let action: 'created' | 'updated' | 'skipped';
 
@@ -215,7 +239,14 @@ export async function enrichEntity(
       // carry provenance + unverified markers until the owner reviews them.
       ...(trusted ? {} : quarantineMarkers()),
     };
-    try {
+    if (managed) {
+      // No direct-write fallback: a refusal or a pending write reaches the caller as its envelope.
+      const { submitPageMutation } = await import('./persistence/page-mutations.ts');
+      const md = serializeMarkdown(frontmatter, content, '', { type, title, tags: [] });
+      await submitPageMutation(ctx!, { operation: 'put_page', params: { slug, content: md,
+        ...(derivation.trust.tier === 'external_untrusted' ? { content_origin: 'tool_output' } : {}) } });
+      await coordinated([slug], tx => lowerDerivedPageIn(tx, derivation, sourceId, slug));
+    } else try {
       // #3994: canonical import pipeline so the stub is chunked (+ embedded
       // when a provider is configured) and reachable by the recall arms.
       const md = serializeMarkdown(frontmatter, content, '', { type, title, tags: [] });
@@ -248,21 +279,27 @@ export async function enrichEntity(
     const entry = { date: new Date().toISOString().split('T')[0] ?? '', summary: `Referenced in [${request.sourceSlug}](${request.sourceSlug}) — ${request.context}`, source: request.sourceSlug };
     // #5575 B3: the caller's context lands on the entity page, so it passes the write gate at the derived tier.
     const assessment = assessTimelineForGate(entry, derivedGateInput(derivation.trust), await derivedGateConfig(engine));
-    timelineAdded = timelineRowAllowed(assessment) && await maintenanceTransaction(engine, async tx => {
+    const write = async (tx: BrainEngine) => {
       const added = await tx.addTimelineEntry(slug, entry, scope); // gbrain-allow-direct-insert: auto-timeline reconciliation triggered by entity reference in source markdown
       if (added) await recordTimelineFlag(tx, assessment, { slug, source_id: sourceId, ...entry });
       return true;
-    }, derivation.trust);
-  } catch {
+    };
+    timelineAdded = timelineRowAllowed(assessment) &&
+      (managed ? (await coordinated([slug], write))!.value : await maintenanceTransaction(engine, write, derivation.trust));
+  } catch (e) {
+    if (managed) throw e;
     // Timeline add failed (page might not support it)
   }
 
   // 5. Add backlink from entity to source
   let backlinkCreated = false;
   try {
-    await engine.addLink(slug, request.sourceSlug, `Entity mention from ${request.sourceSlug}`, undefined, undefined, undefined, undefined, opts?.sourceId ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId } : undefined); // gbrain-allow-direct-insert: auto-link reconciliation triggered by entity reference in source markdown
+    const link = (tx: BrainEngine) => tx.addLink(slug, request.sourceSlug, `Entity mention from ${request.sourceSlug}`, undefined, undefined, undefined, undefined, opts?.sourceId ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId } : undefined); // gbrain-allow-direct-insert: auto-link reconciliation triggered by entity reference in source markdown
+    if (managed) await coordinated([slug, request.sourceSlug], link);
+    else await link(engine);
     backlinkCreated = true;
-  } catch {
+  } catch (e) {
+    if (managed && e instanceof OperationError) throw e;
     // Link might already exist
   }
 
@@ -295,7 +332,15 @@ export async function enrichEntities(
     if (config?.throttle !== false) {
       await waitForCapacity({ maxAttempts: 5 }); // shorter timeout for batch items
     }
-    const result = await enrichEntity(engine, req, { trusted: config?.trusted, sourceId: config?.sourceId });
+    let result: EnrichmentResult;
+    try { result = await enrichEntity(engine, req, { trusted: config?.trusted, sourceId: config?.sourceId, ctx: config?.ctx }); }
+    catch (e) {
+      // #6262: a managed refusal stops the batch and says which entities were already written.
+      if (e instanceof OperationError && results.length) {
+        e.why = `${e.why ?? ''} ${results.length} of ${requests.length} entities were written before ${req.entityName}: ${results.map(r => r.slug).join(', ')}. Run extract_entities again on the same text once the write can commit; written entities are updated, not duplicated.`.trim();
+      }
+      throw e;
+    }
     results.push(result);
     config?.onProgress?.(results.length, requests.length, req.entityName);
   }

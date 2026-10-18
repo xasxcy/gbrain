@@ -2,6 +2,8 @@ import type { BrainEngine } from './engine.ts';
 // FORK: migration bodies live outside this upstream-owned file (ADR-087).
 import { buildForkMigrations } from './fork-migrations.ts';
 import type { Migration } from './schema-migrations/types.ts';
+import { isLockTimeoutError } from './retry-matcher.ts';
+import { resolveSchemaLockTimeoutMs, schemaLockBlockedError, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
 import { MIGRATIONS } from './schema-migrations/registry.generated.ts';
 import { hasPendingMigrations } from './migrate-pending.ts';
 import { migrationNotice, setQuietMigrationNotices } from './schema-migrations/helpers.ts';
@@ -210,7 +212,7 @@ async function runMigrationSQLWithRetry(
  * Uses SET LOCAL statement_timeout inside a transaction to override
  * server-enforced timeouts (required for Supabase Postgres).
  */
-async function runMigrationSQL(
+export async function runMigrationSQL(
   engine: BrainEngine,
   m: Migration,
   sql: string,
@@ -220,16 +222,23 @@ async function runMigrationSQL(
   if (useTransaction || engine.kind === 'pglite') {
     // Wrap in transaction with extended timeout for Supabase compatibility.
     // SET LOCAL scopes the timeout to this transaction only.
-    await engine.transaction(async (tx) => {
-      if (engine.kind === 'postgres') {
-        try {
-          await tx.runMigration(m.version, "SET LOCAL statement_timeout = '600000'");
-        } catch {
-          // Non-fatal: PGLite or older Postgres versions may not support this
+    try {
+      await engine.transaction(async (tx) => {
+        if (engine.kind === 'postgres') {
+          try {
+            await tx.runMigration(m.version, "SET LOCAL statement_timeout = '600000'");
+            // #5227 (W14 P1.6): a real transaction, so SET LOCAL binds the lock wait to this migration only.
+            await tx.runMigration(m.version, `SET LOCAL lock_timeout = '${resolveSchemaLockTimeoutMs()}ms'`);
+          } catch {
+            // Non-fatal: PGLite or older Postgres versions may not support this
+          }
         }
-      }
-      await tx.runMigration(m.version, sql);
-    });
+        await tx.runMigration(m.version, sql);
+      });
+    } catch (error) {
+      if (engine.kind === 'postgres' && isLockTimeoutError(error)) throw schemaLockBlockedError({ step: `migration v${m.version}`, timeoutMs: resolveSchemaLockTimeoutMs(), sessions: null, sampledDuringWait: false });
+      throw error;
+    }
   } else {
     // Postgres + transaction:false → can't use SET LOCAL (needs a txn),
     // can't use plain SET on the pooled connection (leaks to other
@@ -252,7 +261,13 @@ async function runMigrationSQL(
         // Non-fatal: some managed Postgres may restrict this GUC.
         // Falling through means the DDL runs with the server default.
       }
-      await conn.executeRaw(sql);
+      // #5227 (W14 P1.6): no transaction here, so the lock bound is session-level on this reserved backend and restored after.
+      // #6543 (A4): the raised statement_timeout is restored too, so the connection does not carry this migration's budget back to the pool.
+      try {
+        await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${m.version}` });
+      } finally {
+        await conn.executeRaw('RESET statement_timeout').catch(() => {});
+      }
     }, { selfContained: true });
   }
 }

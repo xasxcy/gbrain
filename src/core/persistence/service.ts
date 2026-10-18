@@ -1,3 +1,4 @@
+import { PENDING_IMPORT, pendingImportRefusal } from './pending-import.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
@@ -21,8 +22,10 @@ import { receiptDeliveredHint } from './connector-errors.ts';
 import type { PgAccessReason } from '../pg-access-classify.ts';
 import { contentRefusalFromReceipt } from '../import-screen.ts';
 import { fenceIssuesFromDetail, fenceLocationFromDetail } from '../fence-repair/refusal.ts';
+import { withdrawnFromDetail } from '../facts/withdrawal.ts';
 import { heldFileDiagnostic } from './verb-errors.ts';
 import { isMissingPageMessage } from './page-identity.ts';
+import { registerPersistenceConsumerConfig } from '../embedding-disabled.ts';
 
 interface Service { consumer: PersistenceConsumerLike; heartbeat?: ConsumerHeartbeat; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
 const services = new WeakMap<BrainEngine, Service>();
@@ -110,6 +113,8 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
  * `autopilot`, `mcp`) get a `WaiterOnlyConsumer` that probes the host's consumer rows on its first tick and settles to
  * full or waiter-only (consumer-election.ts). Either way the returned object has the consumer's whole surface.
  */
+/** #6696 C7: the resident owners whose full consumer runs the storage.keep_db policy (never a short-lived command). */
+const KEEP_DB_POLICY_OWNERS = ['serve', 'jobs', 'autopilot'];
 export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConfig): PersistenceConsumerLike {
   const prior = services.get(engine);
   if (prior) {
@@ -120,7 +125,7 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     return prior.consumer;
   }
   const full = () => new PersistenceConsumer(engine, config, preparePersistedMutation,
-    { onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
+    { drainNotice: claimOwnerKind() === 'serve', keepDbPolicy: KEEP_DB_POLICY_OWNERS.includes(claimOwnerKind()), onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
   const kind = claimOwnerKind();
   const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
     ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
@@ -184,6 +189,7 @@ export function persistenceConsumerConfig(engine: BrainEngine): GBrainConfig | u
   const service = services.get(engine);
   return service && !service.stopping ? service.consumer.config : undefined;
 }
+registerPersistenceConsumerConfig(persistenceConsumerConfig);
 export function persistenceConsumerStatus(engine: BrainEngine) {
   const service = services.get(engine);
   return service ? { state: service.stopping ? 'closing' : 'open', ...service.consumer.status() }
@@ -330,6 +336,11 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
       ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #6693: a write refused while its page's file awaited import says so, with the wait (remember) or the sync to run first.
+  if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === PENDING_IMPORT) {
+    const pending = pendingImportRefusal(row, row.authority?.remote === true);
+    Object.assign(error, { suggestion: pending.suggestion, fix: pending.fix, reason: pending.reason, detail: pending.detail, docs: pending.docs ?? error.docs });
+  }
   // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
   if (!isTerminal(row) && hints.waiterOnlyOwner) {
     const owner = hints.waiterOnlyOwner;
@@ -351,6 +362,8 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
     }
     if (content.key || content.line !== undefined) error.detail = [content.key ? `key ${content.key}` : '', content.line !== undefined ? `line ${content.line}` : ''].filter(Boolean).join(', ');
   }
+  const withdrawn = isTerminal(row) ? withdrawnFromDetail(row.error_detail) : undefined;
+  if (withdrawn) error.withdrawn = withdrawn;
   if (reason === 'page_identity_changed' && isMissingPageMessage(row.error_message)) error.canonical = 'page_not_found';
   error.receiptFields = { operation: row.operation, source_id: row.source_id, slug: row.slug || null, principal_kind: row.principal_kind, principal_id: row.principal_id };
   error.writeRequest = receipt as WriteReceipt;

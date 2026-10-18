@@ -5,9 +5,10 @@ import { isAbsolute } from 'node:path';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
+import type { ProjectionBacklog } from '../page-state/projections.ts';
 import { resolveSocketPathForConfig, socketHasLiveListener } from '../context/resolve-ipc.ts';
 import { isWriteErrorCode, isWriteReceipt, isWriteRequestId, publicWriteReceipt } from './types.ts';
-import { isPersistenceAdminOperation, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminOperation } from './admin-contract.ts';
+import { isPersistenceAdminExtension, isPersistenceAdminOperation, PERSISTENCE_ADMIN_EXTENSIONS, PERSISTENCE_ADMIN_OPERATIONS, type PersistenceAdminExtension, type PersistenceAdminOperation } from './admin-contract.ts';
 import { claimLocalIpcBinding, isWindowsIpcPipe, prepareLocalIpcPath } from '../context/ipc-path.ts';
 
 export const PERSISTENCE_IPC_VERSION = 1;
@@ -65,8 +66,10 @@ export interface PersistenceIpcCapabilities {
   brain_id: string;
   operations: readonly PersistenceIpcOperation[];
   max_frame_bytes: number;
-  /** Optional for protocol compatibility with owners predating local administration. */
+  /** Optional for protocol compatibility with owners predating local administration. Frozen: new operations go in `administration_extensions`. */
   administration?: readonly PersistenceAdminOperation[];
+  /** #6650: administration added after `administration` froze; older clients ignore the key, a client keeps only the entries it knows. */
+  administration_extensions?: readonly PersistenceAdminExtension[];
   /** #5232: the owner honors `write_wait_ms` on operation requests. */
   write_wait?: true;
 }
@@ -80,12 +83,15 @@ export interface PersistenceIpcAdminRequest {
   registration: PersistenceIpcRegistration;
 }
 
-/** #5401: the resident's queued text-projection backlog. Counts only, never identifiers. */
-export interface PersistenceProjectionStatus {
-  pending: number;
-  failed: number;
-  oldest_age_seconds: number | null;
-}
+/**
+ * #5401: the resident's queued text-projection backlog. Counts only, never
+ * identifiers. #6803: `pending` and `failed` keep their meaning (rows the
+ * resident drains); the class counts are optional, so an older doctor reading
+ * a new reply sees an unchanged `pending` and a new doctor reading an old one
+ * knows the resident predates them.
+ */
+export type PersistenceProjectionStatus = ProjectionBacklog;
+const PROJECTION_CLASS_KEYS = ['sealable', 'sealable_with_visual', 'reimport', 'ocr_required', 'protected', 'archived'] as const;
 
 export interface PersistenceIpcProvider {
   brainId: string;
@@ -231,7 +237,7 @@ export async function startPersistenceIpcServer(
             socket.end(responseFrame({ version: 1, ok: true, result: {
               version: 1, brain_id: provider.brainId, operations: PERSISTENCE_IPC_OPERATIONS,
               max_frame_bytes: PERSISTENCE_IPC_MAX_BYTES,
-              ...(provider.administer ? { administration: PERSISTENCE_ADMIN_OPERATIONS } : {}),
+              ...(provider.administer ? { administration: PERSISTENCE_ADMIN_OPERATIONS, administration_extensions: PERSISTENCE_ADMIN_EXTENSIONS } : {}),
               write_wait: true,
             } satisfies PersistenceIpcCapabilities }));
             return;
@@ -393,7 +399,15 @@ export async function requestPersistenceCapabilities(socketPath: string, timeout
     || value.max_frame_bytes < 1 || value.max_frame_bytes > PERSISTENCE_IPC_MAX_BYTES) {
     throw new PersistenceIpcTransportError(false);
   }
-  return value as unknown as PersistenceIpcCapabilities;
+  // #6650: an extension list is advisory: a malformed one is dropped, an entry this build does not know is ignored.
+  const extensions = Array.isArray(value.administration_extensions) ? value.administration_extensions.filter(isPersistenceAdminExtension) : undefined;
+  const { administration_extensions: _ignored, ...rest } = value;
+  return { ...rest, ...(extensions ? { administration_extensions: extensions } : {}) } as unknown as PersistenceIpcCapabilities;
+}
+
+/** Whether a resident owner's capabilities include an administration operation (a frozen one or an extension). */
+export function ownerAdministers(capability: Pick<PersistenceIpcCapabilities, 'administration' | 'administration_extensions'>, operation: PersistenceAdminOperation): boolean {
+  return isPersistenceAdminExtension(operation) ? capability.administration_extensions?.includes(operation) === true : capability.administration?.includes(operation) === true;
 }
 
 function count(value: unknown): value is number {
@@ -404,7 +418,9 @@ export async function requestPersistenceProjectionStatus(socketPath: string, tim
   const value = await exchange(socketPath, { version: 1, kind: 'projection_status' }, timeoutMs);
   if (!record(value) || !count(value.pending) || !count(value.failed)
     || !(value.oldest_age_seconds === null || count(value.oldest_age_seconds))) throw new PersistenceIpcTransportError(false);
-  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds };
+  const classes = Object.fromEntries(PROJECTION_CLASS_KEYS.flatMap(key => count(value[key]) ? [[key, value[key]]] : []));
+  return { pending: value.pending, failed: value.failed, oldest_age_seconds: value.oldest_age_seconds, ...classes,
+    ...(typeof value.as_of === 'string' ? { as_of: value.as_of } : {}) };
 }
 
 export async function requestPersistenceOperation(socketPath: string, request: PersistenceIpcRequest, timeoutMs = 30_000): Promise<unknown> {
