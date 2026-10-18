@@ -30,7 +30,7 @@ concurrency:
 jobs:
   convergence:
     name: Convergence nightly / Bun ${{ matrix.bun }} / seed ${{ inputs.seed || github.run_id }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -38,7 +38,7 @@ jobs:
         bun: ['1.4.0', '1.4.3']
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test

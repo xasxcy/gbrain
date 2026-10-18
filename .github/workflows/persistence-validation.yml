@@ -16,7 +16,7 @@ permissions:
 jobs:
   read-performance:
     name: Read latency / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 55
     strategy:
       fail-fast: false
@@ -27,7 +27,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -59,7 +59,7 @@ jobs:
 
   deployment-matrix:
     name: PgBouncer, RLS and pool capacity / Bun ${{ matrix.bun }}
-    runs-on: ubicloud-standard-8-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -69,7 +69,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -184,7 +184,7 @@ jobs:
   # end a minute inside the step's 20 minutes (ARM_SHARD_BUDGET_MS).
   unit-postgres-arms:
     name: Unit-lane PostgreSQL arms ${{ matrix.shard }}/16 / Bun ${{ matrix.bun }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -195,7 +195,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -270,7 +270,7 @@ jobs:
     name: ${{ matrix.engine }} / Bun ${{ matrix.bun }}
     # The soak uses 1.3-1.8 busy cores: the 2,500-write PGLite soak took 523s on
     # 4 vCPUs, 539s on 8 and 500s on 16.
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 110
     strategy:
       fail-fast: false
@@ -281,7 +281,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -325,7 +325,7 @@ jobs:
   # manifest); pushes, schedules and manual runs crash every seam.
   crash-robot:
     name: Crash robot / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -336,7 +336,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -404,7 +404,7 @@ jobs:
   # neither holds the other's runner: each is about four minutes on PGLite.
   reconciliation:
     name: Reconciliation crashes / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -415,7 +415,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
@@ -467,7 +467,7 @@ jobs:
   convergence:
     name: Managed-sync convergence / Bun ${{ matrix.bun }}
     if: ${{ inputs.convergence != 'skip' }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -477,7 +477,7 @@ jobs:
         # included, runs both supported Bun versions (docs/TESTING.md#event-parity).
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: ghcr.io/xasxcy/gbrain-cjk-postgres:20260720
         env:
           POSTGRES_USER: gbrain_test
           POSTGRES_PASSWORD: gbrain_test
