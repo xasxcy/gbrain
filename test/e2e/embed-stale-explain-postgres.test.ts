@@ -6,6 +6,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { resolveActiveEmbeddingColumnFromEngine } from '../../src/core/search/embedding-column.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -26,7 +27,6 @@ d('Postgres EXPLAIN — stale eligibility branches', () => {
     engine = new PostgresEngine();
     await engine.connect({ database_url: DATABASE_URL! } as never);
     await engine.initSchema();
-    await engine.executeRaw(`SET enable_seqscan = off`);
     await engine.executeRaw(`INSERT INTO sources (id, name, local_path)
       VALUES ('explain-source', 'explain-source', '/tmp/explain-source')
       ON CONFLICT (id) DO NOTHING`);
@@ -54,7 +54,6 @@ d('Postgres EXPLAIN — stale eligibility branches', () => {
 
   afterAll(async () => {
     if (!engine) return;
-    await engine.executeRaw(`RESET enable_seqscan`);
     await engine.executeRaw(`DELETE FROM pages WHERE source_id = 'explain-source' AND slug = 'explain/stale'`);
     await engine.disconnect();
   });
@@ -62,13 +61,15 @@ d('Postgres EXPLAIN — stale eligibility branches', () => {
   test('four branches preserve the stale partial-index keyset and active-ledger index lookup', async () => {
     // These are the production selector builders, deliberately reached from
     // the engine instance rather than duplicated predicates in this test.
+    // FORK: the builder takes the active embedding column first; without a signature it adds no ledger
+    // predicate, so the unsigned call is both the total-stale selector and the ledger-join base.
     const production = engine as unknown as {
-      buildStaleChunkWhere(opts: { sourceId: string }): { where: string; params: unknown[] };
-      buildListStaleChunkWhere(opts: { sourceId: string; signature?: string }): { where: string; params: unknown[] };
+      buildListStaleChunkWhere(column: string, opts: { sourceId: string; signature?: string }): { where: string; params: unknown[] };
     };
-    const total = production.buildStaleChunkWhere({ sourceId: 'explain-source' });
-    const eligible = production.buildListStaleChunkWhere({ sourceId: 'explain-source', signature: 'explain:model:1536' });
-    const base = production.buildListStaleChunkWhere({ sourceId: 'explain-source' });
+    const column = (await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name;
+    const total = production.buildListStaleChunkWhere(column, { sourceId: 'explain-source' });
+    const eligible = production.buildListStaleChunkWhere(column, { sourceId: 'explain-source', signature: 'explain:model:1536' });
+    const base = total;
     const signatureParam = base.params.length + 1;
     const exact = `l.source_id = p.source_id
       AND l.page_id = cc.page_id
@@ -83,10 +84,17 @@ d('Postgres EXPLAIN — stale eligibility branches', () => {
     };
 
     await engine.getEmbedFailureSummary({ sourceId: 'explain-source', signature: 'explain:model:1536' });
-    const plans = await Promise.all(Object.values(queries).map(async ({ sql, params }) => {
-      const rows = await engine.executeRaw<{ 'QUERY PLAN': unknown }>(`EXPLAIN (FORMAT JSON) ${sql}`, params);
-      return planText(rows[0]?.['QUERY PLAN']);
-    }));
+    // FORK: a session-level SET reaches only one pooled connection, so the EXPLAINs run on one
+    // transaction connection under SET LOCAL instead of fanning out across the pool.
+    const plans = await engine.transaction(async (tx) => {
+      await tx.executeRaw(`SET LOCAL enable_seqscan = off`);
+      const out: string[] = [];
+      for (const { sql, params } of Object.values(queries)) {
+        const rows = await tx.executeRaw<{ 'QUERY PLAN': unknown }>(`EXPLAIN (FORMAT JSON) ${sql}`, params);
+        out.push(planText(rows[0]?.['QUERY PLAN']));
+      }
+      return out;
+    });
     for (const plan of plans) {
       // Planner may pick either stale partial index (content_chunks_stale_idx
       // keyset index or the older idx_chunks_embedding_null); acceptance is
