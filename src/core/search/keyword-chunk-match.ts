@@ -19,6 +19,16 @@
  * FORK: `pgroonga` swaps the match for the PGroonga operator (`chunk_text &@~ $1`), which
  * finds CJK text the english tsvector cannot split; ranking stays on the caller's ts_rank.
  */
+/**
+ * FORK: Groonga's query syntax only honors uppercase `OR`, while websearch_to_tsquery reads a bare `or`
+ * in any case, so `acme or globex` would match nothing on the PGroonga path. Uppercase a bare `or`
+ * between two terms outside double quotes (a phrase stays literal in both syntaxes). ts_rank reads the
+ * same $1 and websearch parses `OR` exactly as `or`, so the tsvector side is unchanged.
+ */
+export function pgroongaWebsearchOr(query: string): string {
+  return query.replace(/("[^"]*")|(?<=\S\s+)or(?=\s+\S)/gi, (_m, quoted) => quoted ?? 'OR');
+}
+
 export function buildKeywordChunkMatch(ftsLang: string, excludePrivate: boolean | undefined, pgroonga = false): { from: string; match: string; modality: string } {
   const tsq = `websearch_to_tsquery('${ftsLang}', $1)`;
   const matchOn = (alias: string) => pgroonga ? `${alias}chunk_text &@~ $1` : `${alias}search_vector @@ ${tsq}`;

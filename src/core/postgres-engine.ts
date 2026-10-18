@@ -117,7 +117,7 @@ import { drainBackgroundWorkBeforeDisconnect } from './background-work.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery, boundWebsearchQuery, collapseWebsearchDashRuns } from './search/sql-ranking.ts';
-import { buildKeywordChunkMatch } from './search/keyword-chunk-match.ts';
+import { buildKeywordChunkMatch, pgroongaWebsearchOr } from './search/keyword-chunk-match.ts';
 import { privatePagesFilterFragment, privateSnapshotFilterFragment, privateLinkOriginFilterFragment, privateTimelineEventFilterFragment, privateProvenanceFilterFragment } from './search/private-visibility.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
@@ -1215,7 +1215,8 @@ export class PostgresEngine implements BrainEngine {
       [statementTimeout, relaxed, rawQuery, collapseWebsearchDashRuns(queryText), params.slice(1), opts?.sourceIds ?? null, opts?.sourceId ?? null], () =>
       this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, (tx) => {
         const boundParams = [...params];
-        boundParams[0] = collapseWebsearchDashRuns(queryText);
+        // FORK: PGroonga reads only uppercase OR (pgroongaWebsearchOr); the cache key above keeps the caller's text.
+        boundParams[0] = this._usePgroonga ? pgroongaWebsearchOr(collapseWebsearchDashRuns(queryText)) : collapseWebsearchDashRuns(queryText);
         return tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
       }, { alwaysTransaction: true, jitOff: true, settings: relaxed ? { statement_timeout: statementTimeout, enable_seqscan: 'off' } : { statement_timeout: statementTimeout } }));
     let rows = await runKeyword(query);
@@ -1371,6 +1372,7 @@ export class PostgresEngine implements BrainEngine {
     // extension is absent.
     const ftsLang = getFtsLanguage();
     await this.ensurePgroongaProbed();
+    if (this._usePgroonga) params[0] = pgroongaWebsearchOr(params[0] as string); // FORK: PGroonga reads only uppercase OR
     // PGroonga selects matches; ranking keeps upstream's ts_rank * source factor. A PGroonga-only hit has ts_rank 0:
     // the 1e-6 floor keeps the factor ordering it; real hits stay byte-identical (evidence-delivery-parity).
     const rankExpr = `ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1))`;
