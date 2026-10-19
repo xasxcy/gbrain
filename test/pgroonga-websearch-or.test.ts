@@ -19,6 +19,10 @@ describe('pgroongaWebsearchOr', () => {
     expect(pgroongaWebsearchOr('or acme')).toBe('or acme');
     expect(pgroongaWebsearchOr('acme or')).toBe('acme or');
     expect(pgroongaWebsearchOr('"this or that" or globex')).toBe('"this or that" OR globex');
+    // Punctuation inside a phrase is literal in both syntaxes; a backslash is Groonga's escape even there.
+    expect(pgroongaWebsearchOr('alpha or "beta-gamma"')).toBe('alpha OR "beta-gamma"');
+    expect(pgroongaWebsearchOr('"alpha*" or beta')).toBe('"alpha*" OR beta');
+    expect(pgroongaWebsearchOr('alpha or "beta\\" gamma"')).toBe('alpha or "beta\\" gamma"');
     // Groonga reads `alpha - OR beta` as `(alpha AND "-") OR beta`; websearch reads the original as alpha AND beta.
     expect(pgroongaWebsearchOr('alpha - or beta')).toBe('alpha - or beta');
     expect(pgroongaWebsearchOr('alpha or -beta')).toBe('alpha or -beta');
