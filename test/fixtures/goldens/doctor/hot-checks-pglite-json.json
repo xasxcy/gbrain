@@ -1034,14 +1034,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1258 column(s) verified against live schema",
+            "message": "1272 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 149 table(s) the applied migrations create exist.",
+            "message": "All 150 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -3755,6 +3755,13 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "gateway not configured — skipping embed_failures check.",
+            "name": "embed_failures",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "Skipped on PGLite (single bundled pgvector version).",
             "name": "facts_embedding_width_consistency",
             "status": "ok"
@@ -5312,14 +5319,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1258 column(s) verified against live schema",
+            "message": "1272 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 149 table(s) the applied migrations create exist.",
+            "message": "All 150 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -8028,6 +8035,13 @@
             "elapsed_ms": "<volatile>",
             "message": "Embeddings disabled — no active embedding width to reconcile.",
             "name": "embedding_width_consistency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "gateway not configured — skipping embed_failures check.",
+            "name": "embed_failures",
             "status": "ok"
           },
           {
