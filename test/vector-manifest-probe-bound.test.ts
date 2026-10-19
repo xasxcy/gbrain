@@ -13,7 +13,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from '#postgres';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
+import { PostgresEngine, POSTGRES_VECTOR_POOL_BUDGET_MS } from '../src/core/postgres-engine.ts';
 import { searchSettingsStatement, type SearchSettings } from '../src/core/postgres-engine/search-settings.ts';
 import { ensureSearchStatistics } from '../src/core/search/projection-statistics.ts';
 import type { SearchOpts } from '../src/core/types.ts';
@@ -137,7 +137,8 @@ if (testBackends().includes('postgres')) {
       const { ms, outcome } = await underLock(fresh => fresh.searchVector(embedding, { onVectorPoolMeta: meta => { metas.push(meta); } }));
       expect(outcome, `searchVector after ${ms.toFixed(0)} ms`).toEqual({ value: [] });
       expect(metas).toEqual([expect.objectContaining({ underfilled: true, incomplete: true, reason: 'deadline' })]);
-      expect(ms).toBeLessThan(13_000);
+      // FORK: the pool budget is POSTGRES_VECTOR_POOL_BUDGET_MS (15 s, upstream 8 s); the 5 s slack is upstream's.
+      expect(ms).toBeLessThan(POSTGRES_VECTOR_POOL_BUDGET_MS + 5_000);
     }, 60_000);
 
     test('explainVectorSearch fails with 57014 at its 8 s attempt budget', async () => {
