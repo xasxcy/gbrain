@@ -64,7 +64,7 @@ export async function freshBrainFactory(kind: 'pglite' | 'postgres', databaseUrl
   }
   const { default: postgres } = await import('#postgres');
   const { PostgresEngine } = await import('../../src/core/postgres-engine.ts');
-  const { isolatedPersistencePostgres } = await import('./persistence-postgres.ts');
+  const { isolatedPersistencePostgres, rebuildClonedPgroongaIndexes } = await import('./persistence-postgres.ts');
   const template = await isolatedPersistencePostgres(databaseUrl!);
   const [row] = await template.engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
   await template.engine.disconnect();
@@ -81,6 +81,7 @@ export async function freshBrainFactory(kind: 'pglite' | 'postgres', databaseUrl
       const engine = new PostgresEngine();
       await engine.connect({ database_url: url.toString(), poolSize: 4 });
       current = engine;
+      await rebuildClonedPgroongaIndexes(engine); // FORK: a TEMPLATE clone loses the Groonga store (see persistence-postgres.ts)
       return engine as BrainEngine;
     },
     dispose: async () => {

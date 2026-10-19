@@ -45,7 +45,7 @@ export async function persistencePostgresTemplate(databaseUrl:string, poolSize=4
  * carry over ("pgroonga: PGrnLookupWithSize: object isn't found: <Sources...>" on the first write to the indexed
  * table). Rebuilding the cloned index recreates the store; on a server without the extension there is nothing to do.
  */
-async function rebuildClonedPgroongaIndexes(engine: PostgresEngine): Promise<void> {
+export async function rebuildClonedPgroongaIndexes(engine: PostgresEngine): Promise<void> {
   const rows = await engine.executeRaw<{ index: string }>(
     `SELECT format('%I.%I', n.nspname, c.relname) AS index
        FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
