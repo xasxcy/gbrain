@@ -36,6 +36,7 @@ import { serr } from './console-prefix.ts';
 import { gitChildEnv } from './git-env.ts';
 import { isMultimodalEnabled } from './sync.ts';
 import { embedCostStopVerdict, noteEmbedCostStop, type EmbedCostCap, type EmbedCostStopFields } from './embed-cost-cap.ts';
+import { embedTimeBudgetMs, type EmbedRunBudget } from './embed-budget-stop.ts';
 
 export interface StaleImageSweepResult extends EmbedCostStopFields {
   candidates: number;
@@ -65,13 +66,16 @@ export interface StaleImageSweepResult extends EmbedCostStopFields {
   failure_samples: string[];
   /** Up to 5 `source:slug: no file at <path tried>` lines for the candidates without a source file. */
   missing_samples: string[];
+  /** FORK: the sweep stopped at the run's `GBRAIN_EMBED_TIME_BUDGET_MS` window; `deferred` candidates wait for the next run. */
+  time_budget?: boolean;
+  deferred?: number;
 }
 
 const SAMPLE_CAP = 5;
 
 export async function embedStaleImages(
   engine: BrainEngine,
-  opts: { sourceId?: string; dryRun: boolean; costCap?: EmbedCostCap | null },
+  opts: { sourceId?: string; dryRun: boolean; costCap?: EmbedCostCap | null; budget?: EmbedRunBudget },
 ): Promise<StaleImageSweepResult> {
   const ocrWanted = process.env.GBRAIN_EMBEDDING_IMAGE_OCR === 'true';
   const params: unknown[] = [ocrWanted];
@@ -108,9 +112,17 @@ export async function embedStaleImages(
   const gitRoots = new Map<string, string | null>();
   const listings: DirectoryListings = new Map();
   const cap = opts.costCap;
-  for (const row of rows) {
+  const budget = opts.budget;
+  let attempted = 0;
+  for (const [i, row] of rows.entries()) {
     // Fix wave 13 P1.18: the approved cap stops the sweep before the next image; a refused image is not a failure.
     if (cap?.hit()) break;
+    // FORK: the run's time budget stops the sweep too, after at least one import attempt so every run makes progress.
+    if (attempted > 0 && budget && budget.budgetMs != null && Date.now() - budget.startedAt > budget.budgetMs) {
+      result.time_budget = true;
+      result.deferred = rows.length - i;
+      break;
+    }
     const root = row.local_path ?? (row.source_id === 'default' ? repoPath : null);
     // An image slug is the lower-cased repo-relative path, so it names the file when the importer never recorded source_path.
     const located = root ? locateSourceFile(root, [row.source_path, row.slug], gitRoots, listings) : null;
@@ -126,6 +138,7 @@ export async function embedStaleImages(
     // A managed brain imports through the source's owner (the coordinated importer, as `gbrain import` does); the legacy writer refuses it.
     // The owner reads only files inside the source root: a subpath-scoped page found under the git root is reported, not copied in.
     if (managed && located.viaGitRoot) { fail(row, `${file} is outside source ${row.source_id}'s root ${root}; a managed brain imports only files inside the source root`); continue; }
+    attempted++;
     try {
       const run = () => managed ? importManagedFile(engine, file, sourcePath, { sourceId: row.source_id }) : importImageFile(engine, file, sourcePath, { sourceId: row.source_id });
       const imported = cap ? await cap.metered(run) : await run();
@@ -153,7 +166,7 @@ function sweepFoundNoFiles(result: StaleImageSweepResult): boolean {
  * their image vector, OCR text and sealed projection in the same run instead of
  * a printed `--images` command; a text-only install gets null (and keeps the hint).
  */
-export async function runStaleImageSweepFirst(engine: BrainEngine, opts: { sourceId?: string; dryRun: boolean; costCap?: EmbedCostCap | null }): Promise<StaleImageSweepResult | null> {
+export async function runStaleImageSweepFirst(engine: BrainEngine, opts: { sourceId?: string; dryRun: boolean; costCap?: EmbedCostCap | null; budget?: EmbedRunBudget }): Promise<StaleImageSweepResult | null> {
   if (!isMultimodalEnabled()) return null;
   return embedStaleImages(engine, opts);
 }
@@ -167,6 +180,7 @@ export async function runStaleImageSweepFirst(engine: BrainEngine, opts: { sourc
 export function foldImageSweep<T extends { failures: number; failure_samples: string[]; images?: StaleImageSweepResult }>(result: T, sweep: StaleImageSweepResult | null): T {
   if (!sweep) return result;
   result.images = sweep;
+  if (sweep.time_budget) serr(`[embed] images: stopped at the time budget (GBRAIN_EMBED_TIME_BUDGET_MS); ${sweep.deferred} image page(s) wait for the next embed --stale run.`);
   if (sweep.missingFile > 0) serr(`[embed] images: ${sweep.missingFile} image page(s) have no source file in the checkout and were not rebuilt (first: ${sweep.missing_samples[0]}); delete those pages or restore the files.`);
   if (sweep.failures > 0) {
     result.failures += sweep.failures;
@@ -183,7 +197,8 @@ export async function runEmbedStaleImagesCli(engine: BrainEngine, args: string[]
   }
   const srcI = args.indexOf('--source');
   const dryRun = args.includes('--dry-run');
-  const result = await embedStaleImages(engine, { sourceId: srcI >= 0 ? args[srcI + 1] : undefined, dryRun, costCap });
+  const result = await embedStaleImages(engine, { sourceId: srcI >= 0 ? args[srcI + 1] : undefined, dryRun, costCap,
+    budget: { startedAt: Date.now(), budgetMs: embedTimeBudgetMs(args.includes('--catch-up')) } });
   if (sweepFoundNoFiles(result)) {
     result.failures += result.missingFile;
     result.failure_samples.push(...result.missing_samples.slice(0, SAMPLE_CAP - result.failure_samples.length));
@@ -200,6 +215,7 @@ export async function runEmbedStaleImagesCli(engine: BrainEngine, args: string[]
   if (result.missing_samples.length) serr(`[embed] first missing image file: ${result.missing_samples[0]}`);
   if (result.failures > 0) serr(`[embed] first image failure: ${result.failure_samples[0]}`);
   if (capped) (args.includes('--json') ? serr : console.log)(embedCostStopVerdict(result, capped));
+  if (result.time_budget) serr(`[embed] images: stopped at the time budget (GBRAIN_EMBED_TIME_BUDGET_MS); ${result.deferred} image page(s) wait for the next run (--catch-up runs without a time cap).`);
   return result;
 }
 

@@ -30,7 +30,7 @@ import { writeCliError } from '../cli/cli-error.ts';
 import { countRestampOnlyChunks, invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-invalidation.ts';
 import { loadConfig, type GBrainConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
-import { embedBudgetStopVerdict, noteEmbedBudgetStop } from '../core/embed-budget-stop.ts';
+import { embedBudgetStopVerdict, embedTimeBudgetMs, noteEmbedBudgetStop } from '../core/embed-budget-stop.ts';
 import { embedCostCap, embedCostStopVerdict, noteEmbedCostStop } from '../core/embed-cost-cap.ts';
 import type { Authorization } from '../core/consent.ts';
 import { filterOutEmbedSkipped, isEmbedSkipped } from '../core/embed-skip.ts';
@@ -202,6 +202,7 @@ export interface EmbedOpts {
    * remediation submits on big stale backlogs.
    */
   catchUp?: boolean;
+  startedAt?: number; // FORK: the run's budget start, shared with the image sweep so `--stale` keeps one window.
   /**
    * #1737: cooperative-abort signal from the Minions worker (wall-clock
    * timeout, lock loss, SIGTERM). When it fires, the embed loops break
@@ -794,7 +795,7 @@ async function runEmbedCoreInner(engine: BrainEngine, opts: EmbedOpts): Promise<
         await withChunkStatisticsRefresh(engine, () => !opts.dryRun && result.embedded > 0 && !isAborted(drainSignal), () => embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
           batchSize: opts.batchSize,
           priority: opts.priority,
-          catchUp: opts.catchUp,
+          catchUp: opts.catchUp, startedAt: opts.startedAt,
           pacer,
           paceMaxConcurrency,
           quiet: opts.quiet,
@@ -1068,7 +1069,9 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
   if (costCap) opts.signal = costCap.signal;
   try {
     // #6529: a multimodal install rebuilds its image pages first, inside the same cap (lazy: keeps import-file out of embed's graph).
-    const images = stale && slugsIdx < 0 ? await (await import('../core/embed-stale-images.ts')).runStaleImageSweepFirst(engine, { sourceId, dryRun, costCap }) : null;
+    opts.startedAt = Date.now(); // FORK: one budget window for the image sweep and the text drain
+    const images = stale && slugsIdx < 0 ? await (await import('../core/embed-stale-images.ts')).runStaleImageSweepFirst(engine, { sourceId, dryRun, costCap,
+      budget: { startedAt: opts.startedAt, budgetMs: embedTimeBudgetMs(catchUp) } }) : null;
     const result = (await import('../core/embed-stale-images.ts')).foldImageSweep(costCap ? await costCap.metered(() => runEmbedCore(engine, opts)) : await runEmbedCore(engine, opts), images);
     if (progressDone !== null) progress.finish();
     const capped = costCap?.hit();
@@ -1356,7 +1359,7 @@ async function embedAll(
   staleOpts?: {
     batchSize?: number;
     priority?: 'recent';
-    catchUp?: boolean;
+    catchUp?: boolean; startedAt?: number;
     /** DB-contention pacer (paced-backfill); no-op when pacing is off. */
     pacer?: DbPacer;
     /** Resolved concurrency cap (E-1: the worker count, no separate permit). */
@@ -1628,9 +1631,7 @@ async function healChunklessPages(
   assertOwned?: (tx?: BrainEngine) => Promise<void>,
 ): Promise<void> {
   const BATCH_SIZE = 50;
-  const BUDGET_MS: number | null = catchUp
-    ? null
-    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  const BUDGET_MS: number | null = embedTimeBudgetMs(catchUp);
   const activePacer = pacer ?? createNoopPacer();
   let afterPageId: number | undefined;
   let pagesHealed = 0;
@@ -1741,7 +1742,7 @@ async function embedAllStale(
   staleOpts?: {
     batchSize?: number;
     priority?: 'recent';
-    catchUp?: boolean;
+    catchUp?: boolean; startedAt?: number;
     /** DB-contention pacer (paced-backfill); no-op when pacing is off. */
     pacer?: DbPacer;
     /** Resolved concurrency cap (E-1: the worker count, no separate permit). */
@@ -1762,10 +1763,8 @@ async function embedAllStale(
   // this SAME start time, so a run's total wall-clock spend stays capped at
   // ONE `GBRAIN_EMBED_TIME_BUDGET_MS` window instead of summing two
   // independent 30-minute budgets.
-  const overallStartedAt = Date.now();
-  const BUDGET_MS: number | null = staleOpts?.catchUp
-    ? null
-    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  const overallStartedAt = staleOpts?.startedAt ?? Date.now();
+  const BUDGET_MS: number | null = embedTimeBudgetMs(staleOpts?.catchUp);
 
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.

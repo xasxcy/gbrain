@@ -31,6 +31,7 @@ import { planEmbeddingReuse } from './embed-reuse.ts';
 import { reuseStoredChunkVectors } from './import-chunk-reuse.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+import { currentVisualModel, reusableVisualVector } from './image-visual-reuse.ts';
 // #3374 — import-path embeds ride the shared retry loop (429 retry-after +
 // transient network backoff) instead of bare embedBatch, so one socket blip
 // mid-sync no longer aborts the whole file import. Same core→commands edge
@@ -2109,9 +2110,10 @@ export async function importImageFile(
   // including markers made recognizable by NUL removal.
   const ocrText = sanitizeText(ocr.text);
 
-  // Multimodal embed.
-  let embedding: Float32Array | null = null;
-  if (!opts.noEmbed) {
+  // Multimodal embed. FORK: unchanged bytes keep their stored vector (core/image-visual-reuse.ts).
+  let embedding: Float32Array | null = !opts.noEmbed && existing?.content_hash === hash && !opts.forceReembed
+    ? await reusableVisualVector(engine, sourceOpts.sourceId, imageSlug, existing.frontmatter as Record<string, unknown>) : null;
+  if (!opts.noEmbed && !embedding) {
     try {
       const [vec] = await embedMultimodal([
         { kind: 'image_base64', data: embeddingPayload.buf.toString('base64'), mime: embeddingPayload.mime },
@@ -2133,6 +2135,7 @@ export async function importImageFile(
     bytes: buf.byteLength,
     ...exif,
     ...(ocr.successful ? { ocr_status: 'done' } : {}),
+    ...(embedding ? { visual_model: currentVisualModel() } : {}), // FORK: the model behind embedding_image (image-visual-reuse.ts)
   };
 
   // Single chunk per image. chunk_text holds OCR text or filename so

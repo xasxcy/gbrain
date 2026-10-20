@@ -44,3 +44,14 @@ export function embedBudgetStopVerdict(result: EmbedBudgetStopFields): string {
     `Finish without a time cap: ${result.resume_command} (paid embedding calls for the remaining chunks), ` +
     'or rerun gbrain embed --stale for another budget window; either resumes where this run stopped.';
 }
+
+/**
+ * The `--stale` wall-clock budget in ms (`GBRAIN_EMBED_TIME_BUDGET_MS`, default 30 min), or null under
+ * `--catch-up`. One window per run: the image sweep and the text drain measure it from the same start.
+ */
+export function embedTimeBudgetMs(catchUp: boolean | undefined): number | null {
+  return catchUp ? null : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+}
+
+/** The run's shared budget window; `budgetMs` null means no cap. */
+export interface EmbedRunBudget { startedAt: number; budgetMs: number | null }
