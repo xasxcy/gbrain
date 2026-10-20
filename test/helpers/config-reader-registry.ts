@@ -25,6 +25,7 @@ export interface InternalConfigState {
 
 export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'version', reason: 'schema version stamp written by migrate.ts' },
+  { key: 'fork_schema_version', reason: 'FORK: the fork migration counter stamp written by fork-migrations.ts' },
   { key: '_internal.link_extraction_generation', reason: 'link-extraction watermark generation (link-extraction-watermark.ts)' },
   { key: 'code.cluster_generation', reason: 'code-intel traversal cache generation counter' },
   { key: 'embedding_migration.state', reason: 'gbrain migrate-embeddings resume state' },
