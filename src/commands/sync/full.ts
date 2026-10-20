@@ -63,6 +63,16 @@ export async function readSourceExcludePaths(engine: BrainEngine, sourceId: stri
   return Array.isArray(cfg.exclude_paths) ? (cfg.exclude_paths as string[]) : [];
 }
 
+/**
+ * FORK: the one predicate both sync paths apply to `exclude_paths`. Each entry
+ * matches itself and, read as a directory, its whole subtree (`dir` and `dir/`
+ * → `dir`, `dir/**`). runImport's glob filter alone matches a bare directory
+ * entry against the directory and none of the files inside it.
+ */
+export function sourceExcludeGlobs(patterns: readonly string[]): string[] {
+  return patterns.flatMap(pattern => [pattern, `${pattern.replace(/\/$/, '')}/**`]);
+}
+
 export async function performFullSync(
   engine: BrainEngine,
   // #753/#774: the three roots resolved once at the top of performSyncInner.
@@ -94,7 +104,10 @@ export async function performFullSync(
   // files were waiting.
   // #5988: paths are relative to the slug base, the same keys holds and the ledger use.
   const holdRoot = slugRoot ?? syncScopeRoot;
-  if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, opts, { holds, holdRoot });
+  // FORK: source config exclude_paths, expanded by the same predicate the
+  // incremental delta filter uses, gate the dry run and the import alike.
+  const sourceExclude = sourceExcludeGlobs(await readSourceExcludePaths(engine, opts.sourceId));
+  if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, opts, { holds, holdRoot }, sourceExclude);
 
   // v0.22.13 (PR #490 A1 + Q5): full sync is always "large" by definition
   // (entire working tree). Auto-concurrency fires unconditionally for Postgres;
@@ -109,9 +122,6 @@ export async function performFullSync(
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (opts.includeGitignored) importArgs.push('--include-gitignored');
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
-  // FORK: resolve source config exclude_paths so full sync honours the same
-  // exclusions as incremental sync.
-  const fullSyncExcludePaths = await readSourceExcludePaths(engine, opts.sourceId);
   // v0.31.2: thread strategy through so code-strategy first sync
   // actually enumerates code files (closes bug 1).
   // v0.30.x: thread sourceId so performFullSync routes pages to the named
@@ -129,7 +139,7 @@ export async function performFullSync(
       strategy: opts.strategy,
       sourceId: opts.sourceId,
       // FORK: compose source-level exclude_paths with --exclude.
-      exclude: [...fullSyncExcludePaths, ...(opts.exclude ?? [])],
+      exclude: [...sourceExclude, ...(opts.exclude ?? [])],
       includeHidden: opts.includeHidden,
       includeGitignored: opts.includeGitignored,
       slugRoot,
@@ -267,7 +277,7 @@ export async function performFullSync(
 }
 
 async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCommit: string, opts: SyncOpts,
-  hold: { holds: LegacyHolds | null; holdRoot: string }): Promise<SyncResult> {
+  hold: { holds: LegacyHolds | null; holdRoot: string }, sourceExclude: readonly string[]): Promise<SyncResult> {
   const dryRunMalformed: string[] = [];
   let allFiles = collectSyncableFiles(syncScopeRoot, {
     strategy: opts.strategy ?? 'markdown',
@@ -275,8 +285,9 @@ async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCo
     onExcluded: (rel) => { dryRunMalformed.push(rel); },
     includeHidden: opts.includeHidden,
   });
-  if (opts.exclude && opts.exclude.length > 0) {
-    allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(syncScopeRoot, abs), opts.exclude));
+  const exclude = [...sourceExclude, ...(opts.exclude ?? [])];
+  if (exclude.length > 0) {
+    allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(syncScopeRoot, abs), exclude));
   }
   slog(
     `Full-sync dry run (strategy=${opts.strategy ?? 'markdown'}): ` +

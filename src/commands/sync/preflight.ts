@@ -48,7 +48,7 @@ import type { SyncManifest } from '../../core/sync.ts';
 import type { SyncResult, SyncOpts } from '../sync.ts';
 import { syncCheckpointKeys, resolveSyncCheckpointEvery } from './checkpoint.ts';
 import { runConnectorSync } from './connector.ts';
-import { performFullSync, readSourceExcludePaths } from './full.ts';
+import { performFullSync, readSourceExcludePaths, sourceExcludeGlobs } from './full.ts';
 import { applyHoldsToManifest, planHoldRescreen, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 import type { SyncPlan, SyncActivePack } from './sync-run.ts';
@@ -895,7 +895,7 @@ async function resolveWorkingTreeScope(
     scoped && p.startsWith(syncScopeRelPath + '/') ? p.slice(syncScopeRelPath.length + 1) : p;
   // FORK: source-config `exclude_paths` participates in the same predicate as
   // --exclude so the untracked-gap drift counter and the delta filter agree.
-  const sourceExcludePaths: string[] = company ? [] : await readSourceExcludePaths(engine, opts.sourceId);
+  const sourceExclude: string[] = company ? [] : sourceExcludeGlobs(await readSourceExcludePaths(engine, opts.sourceId));
   // #6729: an imported dirty tree's inexact renames are confirmed (base HEAD, target the working tree) before any
   // filter reads them; a manifest only counted as drift decomposes its renames anyway.
   if (importWorkingTree) workingTreeManifest = await confirmRenameIdentities(engine, gitContextRoot, 'HEAD', null, workingTreeManifest,
@@ -907,7 +907,7 @@ async function resolveWorkingTreeScope(
     : isSyncable(path, options);
   const excluded = (p: string): boolean => company ? !includedPaths!.has(scopeRel(p)) :
     (opts.exclude !== undefined && opts.exclude.length > 0 && matchesAnyGlob(scopeRel(p), opts.exclude)) ||
-    sourceExcludePaths.some(pattern => matchesAnyGlob(scopeRel(p), [pattern, `${pattern.replace(/\/$/, '')}/**`]));
+    matchesAnyGlob(scopeRel(p), sourceExclude);
   // #4027: includeHidden must ride along wherever isSyncable() consults these
   // opts — dropping it here silently disables --include-hidden on the whole
   // delta path (and the #3974 drift counter) while the flag still parses.
