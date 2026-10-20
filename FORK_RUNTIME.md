@@ -97,3 +97,17 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
   - 每次启动的 schema 重放（`CREATE/ADD ... IF NOT EXISTS`）会悄悄补上一部分被跳过的迁移，所以“被跳过”和“留下缺口”是两回事；已知缺口由 `src/core/fork-migrations.ts` 里的 `repair_masked_*` 迁移补，最早的一段（上游 117–122）由 fork#15（旧编号 v275）补。
   - 全新库 vs 迁移库的 catalog 对比看不到两类东西：视图的 `reloptions`（例如 `page_links` 的 `security_invoker`）和纯数据语句（`setval`、`UPDATE`）。这两类要单独查。
   - 不要整段重放旧迁移：后来的迁移可能已经删掉它建的东西（v188 删了 v122 的索引），或它会 `ALTER` 运行角色不拥有的对象（`auto_enable_rls`、`page_links` 归 postgres）。
+
+## 合并上游
+
+工具都在 `scripts/fork/merge/`，fork 独有。
+
+- **装一次就行**：`bash scripts/fork/merge/install.sh`。它把 `scripts/fork/merge/attributes` 装进 `.git/info/attributes`（所有 worktree 共用，上游的 `.gitattributes` 不动），配好三个合并驱动，并打开 `rerere.enabled`。驱动命令是相对路径 `bun scripts/fork/merge/driver.ts`，在还没有这个文件的旧 checkout 里会失败，git 会把对应文件标成冲突，不会丢内容。
+  - `fork-theirs`：生成文件（`*.generated.ts`、`llms*.txt`、`plugin*/**`、`structural-suites.tsv`、权重 metadata）和 `test/fixtures/goldens/**` 直接取上游版本，合并后由 after-merge 重新生成。
+  - `fork-tsv`：ratchet / baseline TSV 按行做三方合并。两边都改了同一行时，数字列 = 上游值 + fork 增量，理由列 = 上游文本 + fork 追加的部分。合不了的行加冲突标记；同一个键出现两行时，回退到 git 的文本合并。
+  - `fork-json-union`：`scripts/*-weights.json` 取上游版本，加上 fork 新增的键，去掉 fork 删掉的键。
+- **先试合并**：`bash scripts/fork/merge/trial.sh [--keep] [tag]`，默认用最新的上游 release tag。在一次性 worktree 里真合并一次，报告冲突文件数和冲突块数；`--keep` 会保留现场。只拉 `master` 和 `v*` tag，因为上游有一个会移动的 `latest-stable` tag，`fetch --tags` 会被它拒绝。
+- **演练和正式合并是“同一次合并做两遍”**：在 `--keep` 的现场里解完冲突后执行 `git rerere`，把解法记进共享的 `rr-cache`；正式合并时这些块会被自动预填（`rerere.autoupdate=false`，仍要人复核后 `git add`）。rerere 对没见过的新冲突块不起作用。
+- **解完冲突、提交之前**：`bash scripts/fork/merge/after-merge.sh`（要刷新 Postgres goldens 就带上测试库的 `DATABASE_URL`）。它依次执行：检查本次合并涉及的文件里有没有残留冲突标记；跑 regen；刷新 goldens；再跑一次 regen；跑 module-size / function-size / chunk-visibility / engine-sql 四个 ratchet；最后列出和合并前 fork 版本不同的 goldens。
+- **git 看不出来的冲突靠 typecheck 发现**：两边给同一个类型加了同名但类型不同的字段（v0.60.323.0 演练里的 `embed-backfill` `reason`）。驱动合并出来的上限如果放不下合并后的代码，ratchet 会报出来；这时要人带着理由调整上限，不能直接放宽。
+- 记录：v0.60.323.0（881 个上游提交）只开 git 时有 22 个冲突文件；开驱动后剩 10 个文件、11 块；用演练的 rerere 预填后是 0 块。细节在 vault 的 `tasks/2026-10-20_fork-merge-speedup/PLAN-V1.md`。
