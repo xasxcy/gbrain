@@ -241,6 +241,8 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
   // Every summary branch starts from the same registry-active/live-page
   // candidate set as count/list stale. Ledger state is the only distinction.
   const activeColumn = await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true });
+  // Unnamed statements, as the engines' own sql.unsafe/db.query calls ran them (executeRaw prepares by default).
+  const NO_PREPARE = { prepare: false };
   const candidate = buildListStaleChunkWhere(activeColumn.name, opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
   const totalRows = await engine.executeRaw(
     // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
@@ -248,6 +250,7 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE ${candidate.where}`,
     candidate.params,
+    NO_PREPARE,
   );
   const total_null = Number((totalRows[0] as { count?: number } | undefined)?.count ?? 0);
   const eligible = buildListStaleChunkWhere(activeColumn.name, opts);
@@ -257,6 +260,7 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
        FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
       WHERE ${eligible.where}`,
     eligible.params,
+    NO_PREPARE,
   );
   const eligible_now = Number((eligibleRows[0] as { count?: number } | undefined)?.count ?? 0);
 
@@ -281,6 +285,7 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
      LEFT JOIN embed_failures l ON ${ledgerJoin}
      WHERE ${base.where}`,
     params,
+    NO_PREPARE,
   );
   const state = stateRows[0] as { backoff_deferred?: number; quarantined?: number; earliest_retry_at?: Date | string | null } | undefined;
   const by_error_class = (await engine.executeRaw(
@@ -292,6 +297,7 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
       GROUP BY l.error_class
       ORDER BY count DESC, l.error_class ASC`,
     params,
+    NO_PREPARE,
   )).map((row) => ({
     error_class: row.error_class as EmbedFailureSummary['by_error_class'][number]['error_class'],
     count: Number(row.count),
@@ -305,6 +311,7 @@ export async function getEmbedFailureSummary(engine: BrainEngine, opts: { source
       ORDER BY l.attempt_count DESC, l.last_seen DESC, p.slug ASC, cc.chunk_index ASC
       LIMIT 5`,
     params,
+    NO_PREPARE,
   )).map((row) => ({
     slug: String(row.slug),
     chunk_index: Number(row.chunk_index),
