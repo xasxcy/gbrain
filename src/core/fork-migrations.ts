@@ -162,7 +162,7 @@ export async function noticePageLinksSecurityInvoker(engine: BrainEngine, notice
     `SELECT pg_get_userbyid(c.relowner) AS owner FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public' AND c.relname = 'page_links' AND c.relkind = 'v'
         AND NOT EXISTS (SELECT 1 FROM pg_options_to_table(c.reloptions) o
-                         WHERE o.option_name = 'security_invoker' AND o.option_value::boolean IS TRUE)`);
+                         WHERE CASE WHEN o.option_name = 'security_invoker' THEN o.option_value::boolean END)`);
   for (const row of rows) {
     notice(`  v275: public.page_links still runs with its owner's rights (owned by ${row.owner}, not the role running this migration). As that owner or a superuser run: ALTER VIEW public.page_links SET (security_invoker = on);\n`);
   }

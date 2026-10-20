@@ -55,17 +55,18 @@ describe.skipIf(!DATABASE_URL)('v275 repair_masked_upstream_119_120 (Postgres E2
     await engine.executeRaw(`CREATE ROLE ${role} NOLOGIN`);
     try {
       const conn = await (engine as any).sql.reserve();
-      let roleReset = false;
       try {
         await conn.unsafe(`SET ROLE ${role}`);
         await conn.unsafe(PAGE_LINKS_SECURITY_INVOKER_SQL);
       } finally {
+        // A connection that may still carry the probe role must never return to the pool: destroy it instead.
+        let roleReset = false;
         try {
           await conn.unsafe('RESET ROLE');
           roleReset = true;
         } finally {
-          // A connection that may still carry the probe role must never return to the pool.
-          if (roleReset) conn.release(); else await conn.unsafe('DISCARD ALL').catch(() => {}).finally(() => conn.release());
+          if (!roleReset) conn.discard();
+          conn.release();
         }
       }
     } finally {
@@ -82,6 +83,10 @@ describe.skipIf(!DATABASE_URL)('v275 repair_masked_upstream_119_120 (Postgres E2
     };
     await engine.executeRaw("ALTER VIEW public.page_links SET (security_invoker = 't')");
     expect(await noticed()).toBe(0);
+    // A non-boolean option next to it must never reach the boolean cast.
+    await engine.executeRaw('ALTER VIEW public.page_links SET (check_option = local)');
+    expect(await noticed()).toBe(0);
+    await engine.executeRaw('ALTER VIEW public.page_links RESET (check_option)');
     await engine.executeRaw('ALTER VIEW public.page_links SET (security_invoker = off)');
     expect(await noticed()).toBe(1);
     await engine.executeRaw('ALTER VIEW public.page_links RESET (security_invoker)');
