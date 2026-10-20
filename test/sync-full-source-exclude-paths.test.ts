@@ -13,7 +13,8 @@
  *      trailing-slash `trail/` entry, at any depth, without over-matching a
  *      sibling that only shares the prefix (`dirx/`);
  *   2. `--full --dry-run` counts the same set the real walk imports;
- *   3. an explicit `--full` re-walk skips a newly-added excluded file and does
+ *   3. the incremental diff excludes the same set;
+ *   4. an explicit `--full` re-walk skips a newly-added excluded file and does
  *      NOT soft-delete a page imported before the exclusion existed
  *      (exclusion gates imports only; the reconcile walk carries no exclude).
  */
@@ -160,6 +161,26 @@ describe('sources.config.exclude_paths on the full-walk path', () => {
       expect(dry.status).toBe('dry_run');
       expect(dry.added).toBe(2);
       expect(await liveSlugs(engine, sourceId)).toEqual([]);
+    }
+  }, 120_000);
+
+  test('the incremental delta applies the same predicate', async () => {
+    for (const engine of engines) {
+      const repo = makeRepo({ 'keep/z.md': SEED['keep/z.md'] });
+      const sourceId = await addSource(engine, null);
+      expect((await sync(engine, repo, sourceId)).status).toBe('first_sync');
+
+      await setExcludePaths(engine, sourceId, ['dir', 'trail/']);
+      write(repo, 'dir/inc.md', '# Inc\n\nexcluded on the incremental diff\n');
+      write(repo, 'dir/deep/inc.md', '# Deep inc\n\nexcluded at depth\n');
+      write(repo, 'trail/inc.md', '# Trail inc\n\nexcluded by a trailing-slash entry\n');
+      write(repo, 'dirx/inc.md', '# Dirx inc\n\nshares the prefix only, indexed\n');
+      write(repo, 'keep/inc.md', '# Keep inc\n\nindexed\n');
+      commitAll(repo, 'incremental files');
+
+      const inc = await sync(engine, repo, sourceId);
+      expect(inc.status).toBe('synced');
+      expect(await liveSlugs(engine, sourceId)).toEqual(['dirx/inc', 'keep/inc', 'keep/z']);
     }
   }, 120_000);
 
