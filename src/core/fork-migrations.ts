@@ -134,6 +134,40 @@ function pageSearchVectorFunctionSql(lang: string): string[] {
   return [FTS_INPUT_FUNCTION_SQL, pageSearchVectorTriggerFnSql(lang)];
 }
 
+/**
+ * The one lasting gap upstream v120 leaves on a brain that skipped it: the `page_links` view without
+ * `security_invoker = on`. The function search_paths v120 also set are already pinned there by the later definitions
+ * of those functions (catalog-verified), except `auto_enable_rls`, which is superuser-owned: replaying v120 itself is
+ * not an option, it ALTERs that function unconditionally (v211 tolerates and reports the same case). Only the view's owner may ALTER it, so a view owned by another role is left as it was
+ * and reported by `noticePageLinksSecurityInvoker`.
+ */
+export const PAGE_LINKS_SECURITY_INVOKER_SQL = `
+DO $v275$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = 'page_links' AND c.relkind = 'v'
+       AND NOT pg_has_role(c.relowner, 'USAGE')
+  ) THEN
+    RETURN;
+  END IF;
+  ALTER VIEW IF EXISTS public.page_links SET (security_invoker = on);
+END
+$v275$;
+`;
+
+/** Reports a `page_links` view that still runs as its owner; `notice` is injectable for tests. */
+export async function noticePageLinksSecurityInvoker(engine: BrainEngine, notice: (line: string) => void): Promise<void> {
+  const rows = await engine.executeRaw<{ owner: string }>(
+    `SELECT pg_get_userbyid(c.relowner) AS owner FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = 'page_links' AND c.relkind = 'v'
+        AND NOT EXISTS (SELECT 1 FROM pg_options_to_table(c.reloptions) o
+                         WHERE o.option_name = 'security_invoker' AND o.option_value::boolean IS TRUE)`);
+  for (const row of rows) {
+    notice(`  v275: public.page_links still runs with its owner's rights (owned by ${row.owner}, not the role running this migration). As that owner or a superuser run: ALTER VIEW public.page_links SET (security_invoker = on);\n`);
+  }
+}
+
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
@@ -797,6 +831,29 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           '  repair: re-applied upstream migrations 231-243 masked by the upstream v0.60.299.0 fork renumber\n',
         );
       },
+    },
+    {
+      version: 275,
+      name: 'repair_masked_upstream_119_120',
+      // Tenth instance of the masking class, the oldest: upstream 117-122 were merged in 2026-06/07 under numbers the
+      // fork's own migrations had already stamped (the fork held 120-122 when upstream's 120-122 arrived). The schema
+      // blob replay healed what CREATE/ADD ... IF NOT EXISTS reaches (118's setval too: the production sequence is
+      // above both clocks); a catalog diff vs a fresh install leaves 119's op_checkpoints CHECK and 120's view option.
+      // 119 is replayed from the live registry (nothing later supersedes it); 120 only for its view option, because a
+      // wholesale replay of 117-122 would also bring back an index v188 dropped and ALTER a superuser-owned function.
+      idempotent: true,
+      sql: '',
+      handler: async (engine) => {
+        await deps.applyOneMigration(engine, requireMaskedMigration(deps, 'repair_masked_upstream_119_120', 119));
+        if (engine.kind === 'postgres') {
+          await engine.executeRaw(PAGE_LINKS_SECURITY_INVOKER_SQL);
+          await noticePageLinksSecurityInvoker(engine, deps.migrationNotice);
+        }
+        deps.migrationNotice('  repair: re-applied upstream migration 119 (and on Postgres 120\'s page_links view option), masked by the fork\n');
+      },
+      verify: async (engine) => (await engine.executeRaw(
+        `SELECT 1 FROM pg_constraint WHERE conname = 'op_checkpoints_completed_keys_array' AND conrelid = 'op_checkpoints'::regclass`,
+      )).length === 1,
     },
   ];
 }
