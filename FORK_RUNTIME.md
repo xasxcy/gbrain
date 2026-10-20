@@ -63,6 +63,12 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
 - `~/Library/Logs/gbrain-sync.paused` 里写着持有者 pid,该 pid 活着就跳过这一轮;pid 死了的残留标记会被忽略,所以杀进程不会永久卡住 cron。
 - `MERGE_HEAD` 存在时直接拒跑,不碰半合并的树。
 
+包装脚本里 embed 相关的环境变量(2026-10-20 调过):`GBRAIN_EMBED_TIME_BUDGET_MS=600000`(10 分钟)、`GBRAIN_EMBED_CONCURRENCY=4`、`GBRAIN_AI_EMBED_TIMEOUT_MS=180000`、`GBRAIN_EMBEDDING_IMAGE_OCR=false`。
+
+- OCR 关掉的原因:OCR 模型调用失败时,缺 OCR 文字的图片每一轮都会被重建,每次重建都要付费调用 DashScope 多模态接口。
+- 10 分钟预算同时约束图片 sweep 和文字 drain,两者共用一个时间窗口。
+- 字节没变、而且 `visual_model` 标记与当前模型一致的图片,重建时直接复用已有向量,不再付费。
+
 日志:`~/Library/Logs/gbrain-sync.log`。注意**只有「跳过」的轮次才带时间戳**,正常开跑的轮次不带,所以不能靠时间戳行数数轮次。
 
 ---
