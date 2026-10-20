@@ -138,8 +138,8 @@ export async function performFullSync(
       commit: headCommit,
       strategy: opts.strategy,
       sourceId: opts.sourceId,
-      // FORK: compose source-level exclude_paths with --exclude.
-      exclude: [...sourceExclude, ...(opts.exclude ?? [])],
+      exclude: opts.exclude,
+      sourceExclude,
       includeHidden: opts.includeHidden,
       includeGitignored: opts.includeGitignored,
       slugRoot,

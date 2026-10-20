@@ -153,6 +153,24 @@ describe('sources.config.exclude_paths on the full-walk path', () => {
     }
   }, 120_000);
 
+  test('a source exclusion is not reported as an --exclude flag', async () => {
+    for (const engine of engines) {
+      const repo = makeRepo({ 'dir/x.md': SEED['dir/x.md'], 'dir/deep/y.md': SEED['dir/deep/y.md'] });
+      const sourceId = await addSource(engine, ['dir']);
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        await sync(engine, repo, sourceId);
+      } finally {
+        console.warn = originalWarn;
+      }
+      expect(await liveSlugs(engine, sourceId)).toEqual([]);
+      // The incremental filter applies exclude_paths silently; the full walk must too.
+      expect(warnings.filter(w => w.includes('--exclude'))).toEqual([]);
+    }
+  }, 120_000);
+
   test('--full --dry-run counts only the files the real walk would import', async () => {
     for (const engine of engines) {
       const repo = makeRepo(SEED);

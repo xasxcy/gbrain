@@ -266,6 +266,8 @@ export async function runImport(
      * Threaded by performFullSync for `gbrain sync --exclude`.
      */
     exclude?: string[];
+    /** FORK: `exclude_paths` expanded by sourceExcludeGlobs; filtered silently (logs/NAV-4 name --exclude only). */
+    sourceExclude?: string[];
     /**
      * #2404-class: repeatable glob patterns (same dialect as `exclude`)
      * that waive the leading-dot prune heuristic for matching paths — see
@@ -585,6 +587,7 @@ export async function runImport(
   }
   const fileTypeLabel = strategy === 'code' ? 'code'
     : strategy === 'auto' ? 'syncable' : 'markdown';
+  if (!company && opts.sourceExclude?.length) allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.sourceExclude));
   // #753/#774: apply --exclude glob patterns (threaded by performFullSync).
   if (!company && opts.exclude && opts.exclude.length > 0) {
     const beforeExclude = allFiles.length;
