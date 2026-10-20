@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { LATEST_VERSION, MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
+import { FORK_MIGRATIONS, LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 import { DEFAULT_EMBEDDING_MODEL } from '../src/core/ai/defaults.ts';
 
 let engine: PGLiteEngine;
@@ -80,10 +81,8 @@ describe('persistEmbedOutcome', () => {
   });
 
   test('embed_failures_ledger covers fresh, upgrade, replay, and verify', async () => {
-    // Looked up by NAME, not version number. Fork migrations are re-sequenced
-    // to max(upstream)+1 on every upstream sync, so any hardcoded number here
-    // is a merge-time landmine — this entry has already moved 126 -> 134.
-    const ledger = MIGRATIONS.find((migration) => migration.name === 'embed_failures_ledger');
+    // A fork migration: it runs on the fork's own counter (fork_schema_version), after upstream's loop.
+    const ledger = FORK_MIGRATIONS.find((migration) => migration.name === 'embed_failures_ledger');
     expect(ledger).toBeDefined();
     const priorVersion = String(ledger!.version - 1);
     // Fresh schema includes the canonical objects. resetPgliteState wipes `config`, and a
@@ -95,22 +94,18 @@ describe('persistEmbedOutcome', () => {
     expect(await engine.executeRaw(`SELECT 1 FROM pg_indexes WHERE indexname = 'embed_failures_active_idx'`)).toHaveLength(1);
     expect(await ledger!.verify!(engine)).toBe(true);
 
-    // Upgrade starts one version below the ledger migration with its objects
-    // absent, then executes the real migration entry and its verify hook.
-    // runMigrations always drives the schema to LATEST_VERSION (not just to
-    // this migration), so the assertion targets THIS migration's own behavior
-    // — the pending count from the prior version plus its verify — instead of
-    // hardcoding a latest-version equality, which broke the moment later
-    // migrations were added.
-    const pendingFromPrior = MIGRATIONS.filter((m) => m.version >= ledger!.version).length;
+    // Upgrade starts the fork counter one below the ledger migration with its
+    // objects absent; the fork pass runs the real entry and its verify hook.
     await engine.executeRaw(`DROP TABLE embed_failures`);
-    await engine.setConfig('version', priorVersion);
-    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromPrior, current: LATEST_VERSION });
+    await engine.setConfig(FORK_COUNTER_KEY, priorVersion);
+    expect(await runMigrations(engine)).toMatchObject({ current: LATEST_VERSION });
+    expect(await engine.getConfig(FORK_COUNTER_KEY)).toBe(String(FORK_LATEST_VERSION));
     expect(await ledger!.verify!(engine)).toBe(true);
 
-    // Replay is the migration body again, not a second fresh-schema init.
-    await engine.setConfig('version', priorVersion);
-    expect(await runMigrations(engine)).toMatchObject({ applied: pendingFromPrior, current: LATEST_VERSION });
+    // Replay is the migration body again over existing objects, not a second fresh-schema init.
+    await engine.setConfig(FORK_COUNTER_KEY, priorVersion);
+    expect(await runMigrations(engine)).toMatchObject({ current: LATEST_VERSION });
+    expect(await engine.getConfig(FORK_COUNTER_KEY)).toBe(String(FORK_LATEST_VERSION));
     expect(await ledger!.verify!(engine)).toBe(true);
   });
 
