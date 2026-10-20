@@ -78,6 +78,10 @@ reproduce byte for byte. Each file is written by `test/helpers/golden.ts` as
   `scripts/lib/normalize-tokens.ts`; never `Function.toString()`). Records are located
   by shape across `src/core/migrate.ts` and `src/core/schema-migrations/**`, helpers
   keyed by name, so the W3 split must reproduce the file unchanged.
+- `migrations/fork-records.json` (FORK-ONLY, `test/fork-migrations-golden.test.ts`,
+  `fork-migrations-record-v1`): the same record shape for `FORK_MIGRATIONS` (counter
+  `fork_schema_version`), located in `src/core/fork-migrations.ts`. Published fork
+  migrations are frozen, so any diff other than an appended record is a regression.
 - `serve-http/routes.json` (`test/serve-http-route-golden.test.ts`,
   `serve-http-routes-v1`): the ordered Express registration stack from `runServeHttp`
   by AST, following mount functions that receive the app.
