@@ -26,7 +26,8 @@
 
 import { execFileSync } from './spawn.ts';
 import type { BrainEngine } from './engine.ts';
-import { importImageFile } from './import-file.ts';
+import { importImageFile, ocrBudgetExceeded } from './import-file.ts';
+import { currentModelCredit } from './image-visual-reuse.ts';
 import { resolveRecordedImageFile, type DirectoryListings, type RecordedImageFile } from './image-asset-resolver.ts';
 import { importManagedFile } from './persistence/import-mutations.ts';
 import { readManagedMode } from './persistence/managed-mode.ts';
@@ -69,6 +70,8 @@ export interface StaleImageSweepResult extends EmbedCostStopFields {
   /** FORK: the sweep stopped at the run's `GBRAIN_EMBED_TIME_BUDGET_MS` window; `deferred` candidates wait for the next run. */
   time_budget?: boolean;
   deferred?: number;
+  /** FORK: sealed pages missing only OCR text, left for a later run once this run's OCR cap was spent (a rebuild could not add the text). */
+  ocr_deferred?: number;
 }
 
 const SAMPLE_CAP = 5;
@@ -87,8 +90,11 @@ export async function embedStaleImages(
   const incompleteSealed = `(NOT (${safeChunksFilter('p')})
           OR NOT EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id = p.id AND c.embedding_image IS NOT NULL)
           OR ($1 AND COALESCE(p.frontmatter->>'ocr_status', '') <> 'done' AND btrim(p.compiled_truth) = ''))`;
-  const rows = await engine.executeRaw<{ slug: string; source_id: string; source_path: string | null; local_path: string | null }>(
-    `SELECT p.slug, p.source_id, p.source_path, s.local_path ${scope}
+  // FORK: a sealed page whose only gap is OCR text (`ocr_only`) gains nothing from a rebuild once the run's OCR cap is spent.
+  const ocrOnly = `NOT (${unsealed}) AND ${safeChunksFilter('p')} AND EXISTS (SELECT 1 FROM content_chunks c WHERE c.page_id = p.id AND c.embedding_image IS NOT NULL) -- chunk-visibility-ok: existence probe for the visual vector, the importer's own completeness test
+`;
+  const rows = await engine.executeRaw<{ slug: string; source_id: string; source_path: string | null; local_path: string | null; ocr_only: boolean; visual_model: string | null }>(
+    `SELECT p.slug, p.source_id, p.source_path, s.local_path, (${ocrOnly}) AS ocr_only, p.frontmatter->>'visual_model' AS visual_model ${scope}
         AND CASE WHEN ${unsealed} THEN k.cls = 'reimport' ELSE ${incompleteSealed} END
       ORDER BY p.id`, params);
   const [counts] = await engine.executeRaw<Record<'reimport' | 'incomplete_sealed' | 'ocr_required' | 'sealable' | 'protected' | 'archived', number>>(
@@ -114,6 +120,8 @@ export async function embedStaleImages(
   const cap = opts.costCap;
   const budget = opts.budget;
   let attempted = 0;
+  // An OCR-only page waits for OCR only while its vector is the current model's; otherwise the rebuild refreshes the vector.
+  const credited = await currentModelCredit(engine);
   for (const [i, row] of rows.entries()) {
     // Fix wave 13 P1.18: the approved cap stops the sweep before the next image; a refused image is not a failure.
     if (cap?.hit()) break;
@@ -123,6 +131,7 @@ export async function embedStaleImages(
       result.deferred = rows.length - i;
       break;
     }
+    if (row.ocr_only && credited(row.visual_model) && await ocrBudgetExceeded(engine)) { result.ocr_deferred = (result.ocr_deferred ?? 0) + 1; continue; }
     const root = row.local_path ?? (row.source_id === 'default' ? repoPath : null);
     // An image slug is the lower-cased repo-relative path, so it names the file when the importer never recorded source_path.
     const located = root ? locateSourceFile(root, [row.source_path, row.slug], gitRoots, listings) : null;
@@ -181,6 +190,7 @@ export function foldImageSweep<T extends { failures: number; failure_samples: st
   if (!sweep) return result;
   result.images = sweep;
   if (sweep.time_budget) serr(`[embed] images: stopped at the time budget (GBRAIN_EMBED_TIME_BUDGET_MS); ${sweep.deferred} image page(s) wait for the next embed --stale run.`);
+  if (sweep.ocr_deferred) serr(`[embed] images: ${sweep.ocr_deferred} image page(s) missing only OCR text wait for the next run (this run's OCR cap is spent; embedding_image_ocr_max_images).`);
   if (sweep.missingFile > 0) serr(`[embed] images: ${sweep.missingFile} image page(s) have no source file in the checkout and were not rebuilt (first: ${sweep.missing_samples[0]}); delete those pages or restore the files.`);
   if (sweep.failures > 0) {
     result.failures += sweep.failures;
@@ -215,6 +225,7 @@ export async function runEmbedStaleImagesCli(engine: BrainEngine, args: string[]
   if (result.missing_samples.length) serr(`[embed] first missing image file: ${result.missing_samples[0]}`);
   if (result.failures > 0) serr(`[embed] first image failure: ${result.failure_samples[0]}`);
   if (capped) (args.includes('--json') ? serr : console.log)(embedCostStopVerdict(result, capped));
+  if (result.ocr_deferred) serr(`[embed] images: ${result.ocr_deferred} image page(s) missing only OCR text wait for the next run (this run's OCR cap is spent; embedding_image_ocr_max_images).`);
   if (result.time_budget) serr(`[embed] images: stopped at the time budget (GBRAIN_EMBED_TIME_BUDGET_MS); ${result.deferred} image page(s) wait for the next run (--catch-up runs without a time cap).`);
   return result;
 }

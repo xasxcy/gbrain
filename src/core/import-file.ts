@@ -1835,7 +1835,7 @@ export function _getOcrRunBudgetForTests(): { images: number; estUsd: number; wa
 }
 
 /** Returns a human reason when this run's OCR cap is exhausted, else null. */
-async function ocrBudgetExceeded(engine: BrainEngine): Promise<string | null> {
+export async function ocrBudgetExceeded(engine: BrainEngine): Promise<string | null> {
   let maxImages = OCR_MAX_IMAGES_DEFAULT;
   let maxUsd = OCR_MAX_USD_DEFAULT;
   try {

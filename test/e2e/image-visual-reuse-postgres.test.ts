@@ -113,8 +113,9 @@ describe.skipIf(!DATABASE_URL)('image visual vector reuse (Postgres E2E)', () =>
     await engine.executeRaw(`CREATE ROLE ${role} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
     try {
       await engine.executeRaw(`GRANT USAGE ON SCHEMA public TO ${role}`);
-      await engine.executeRaw(`GRANT SELECT ON pages, content_chunks TO ${role}`);
-      for (const t of ['pages', 'content_chunks']) await engine.executeRaw(`CREATE POLICY ${role}_read ON ${t} FOR SELECT TO ${role} USING (true)`);
+      // A writer role reads config like every gbrain role; only the segment tables are withheld.
+      await engine.executeRaw(`GRANT SELECT ON pages, content_chunks, config TO ${role}`);
+      for (const t of ['pages', 'content_chunks', 'config']) await engine.executeRaw(`CREATE POLICY ${role}_read ON ${t} FOR SELECT TO ${role} USING (true)`);
       const reused = await engine.transaction(async tx => {
         await tx.executeRaw(`SET LOCAL ROLE ${role}`);
         return reusableVisualVector(tx, 'img', 'photos/role.png', fm);
@@ -122,7 +123,7 @@ describe.skipIf(!DATABASE_URL)('image visual vector reuse (Postgres E2E)', () =>
       expect(reused).not.toBeNull();
       expect(Array.from(reused!)).toEqual((await storedVector('photos/role.png'))!);
     } finally {
-      for (const t of ['pages', 'content_chunks']) await engine.executeRaw(`DROP POLICY IF EXISTS ${role}_read ON ${t}`);
+      for (const t of ['pages', 'content_chunks', 'config']) await engine.executeRaw(`DROP POLICY IF EXISTS ${role}_read ON ${t}`);
       await engine.executeRaw(`DROP OWNED BY ${role}`).catch(() => undefined);
       await engine.executeRaw(`DROP ROLE IF EXISTS ${role}`);
     }

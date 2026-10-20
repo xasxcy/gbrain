@@ -10,6 +10,7 @@ export const RUNTIME_READER_CONFIG_KEYS: readonly string[] = [
   'facts.absorb_warn_threshold', // doctor facts_extraction_health absorb-refusal warn threshold, default 10 per 24 h
   'think.trajectory_enabled', // think/index.ts: trajectory substrate on temporal intents, default on
   'embedding_image_ocr_max_images', 'embedding_image_ocr_max_usd', // import-file.ts image-OCR per-run caps, default 200 images / $1
+  'embedding_image_legacy_visual_model', // FORK image-visual-reuse.ts: model credited with the vectors of image pages written before the visual_model stamp, default unset (they pay once)
   'agent.search_snippet_chars', // ops/search.ts subagent snippet cap, default 300 (0 = full text)
   'skillopt.allowed_skills', // JSON array of skills remote callers may optimize (ops/skillopt.ts, shared-skills/optimizer.ts); default deny-all
   'skillopt.capture_enabled', // skillopt/held-out.ts production rollout capture, default off

@@ -15,7 +15,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { importImageFile } from '../src/core/import-file.ts';
+import { importImageFile, _resetOcrRunBudgetForTests } from '../src/core/import-file.ts';
 import { embedStaleImages } from '../src/core/embed-stale-images.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
@@ -53,6 +53,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   embedCalls = 0;
+  _resetOcrRunBudgetForTests();
   globalThis.fetch = (async () => {
     embedCalls++;
     const v = ++vectorSeq / 1000;
@@ -143,6 +144,17 @@ describe('image rebuild reuses an unchanged visual vector', () => {
     expect(await reusableVisualVector(engine, s.id, 'photos/legacy.png', null)).toBeNull();
     // Source-scoped: the same slug in another source has nothing to reuse.
     expect(await reusableVisualVector(engine, 'default', 'photos/legacy.png', { visual_model: MODEL })).toBeNull();
+
+    // embedding_image_legacy_visual_model credits unstamped pages to a model; a stamp always wins over it.
+    try {
+      await engine.setConfig('embedding_image_legacy_visual_model', MODEL);
+      expect(await reusableVisualVector(engine, s.id, 'photos/legacy.png', { mime_type: 'image/png' })).not.toBeNull();
+      expect(await reusableVisualVector(engine, s.id, 'photos/legacy.png', { visual_model: 'dashscope:qwen3-vl-embedding' })).toBeNull();
+      await engine.setConfig('embedding_image_legacy_visual_model', 'dashscope:qwen3-vl-embedding');
+      expect(await reusableVisualVector(engine, s.id, 'photos/legacy.png', null)).toBeNull();
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'embedding_image_legacy_visual_model'`);
+    }
   }, 60_000);
 
   test('changed bytes pay for a fresh vector', async () => {
@@ -232,5 +244,41 @@ describe('image sweep time budget', () => {
     const res = await cli(['--stale', '--catch-up', '--source', s.id, '--json']) as { images?: ImagesOut };
     expect(res.images).toMatchObject({ rebuilt: 2 });
     expect(res.images?.time_budget).toBeUndefined();
+  }, 60_000);
+});
+
+describe('OCR-only candidates after the run OCR cap', () => {
+  test('a sealed image missing only OCR text waits once the OCR cap is spent; a vectorless image is still rebuilt', async () => {
+    const s = await freshSource();
+    await importImageFile(engine, s.write('photos/text.png', PNG), 'photos/text.png', { sourceId: s.id });
+    await s.seedVectorless(['novec']);
+    const revisionOf = async (slug: string) => (await engine.getPage(slug, { sourceId: s.id }))?.knowledge_revision;
+    const before = await revisionOf('photos/text.png');
+
+    // The default per-run cap is 200 OCR calls: preset it as spent.
+    _resetOcrRunBudgetForTests({ images: 200 });
+    embedCalls = 0;
+    const swept = await sweepWantingOcr(s.id);
+    expect(swept).toMatchObject({ candidates: 2, rebuilt: 1, ocr_deferred: 1, failures: 0 });
+    expect(embedCalls).toBe(1);
+    expect(await revisionOf('photos/text.png')).toBe(before);
+
+    // After a multimodal model switch the same page is not deferred: the rebuild refreshes its vector.
+    const t = await freshSource();
+    configure('dashscope:qwen3-vl-embedding');
+    await importImageFile(engine, t.write('photos/old.png', PNG), 'photos/old.png', { sourceId: t.id });
+    configure(MODEL);
+    _resetOcrRunBudgetForTests({ images: 200 });
+    embedCalls = 0;
+    expect(await sweepWantingOcr(t.id)).toMatchObject({ candidates: 1, rebuilt: 1 });
+    expect(embedCalls).toBe(1);
+
+    // A fresh run with OCR budget left rebuilds both (OCR is wanted, the text is still missing), reusing their vectors.
+    _resetOcrRunBudgetForTests();
+    embedCalls = 0;
+    const next = await sweepWantingOcr(s.id);
+    expect(next).toMatchObject({ candidates: 2, rebuilt: 2 });
+    expect(embedCalls).toBe(0);
+    expect(next.ocr_deferred).toBeUndefined();
   }, 60_000);
 });
