@@ -15,6 +15,7 @@ import {
   PROBED_TTL_MS, PROBE_TIMEOUT_MS, type ReadinessEntry,
 } from '../src/core/readiness.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
@@ -33,7 +34,8 @@ function spyEngine(opts: { hang?: boolean; delayMs?: number } = {}): SpyEngine {
     },
     async getConfig(key: string) {
       calls.push('getConfig');
-      return key === 'version' ? String(LATEST_VERSION) : null;
+      // FORK: a current brain also carries the fork's own migration counter at its latest.
+      return key === 'version' ? String(LATEST_VERSION) : key === FORK_COUNTER_KEY ? String(FORK_LATEST_VERSION) : null;
     },
   };
   const engine = new Proxy(target, {

@@ -1,6 +1,6 @@
 import type { BrainEngine } from './engine.ts';
-// FORK: migration bodies live outside this upstream-owned file (ADR-087).
-import { buildForkMigrations } from './fork-migrations.ts';
+// FORK: migration bodies live outside this upstream-owned file, on their own counter (fork-migrations.ts header).
+import { adoptForkCounter, buildForkMigrations, runForkPass } from './fork-migrations.ts';
 import type { Migration } from './schema-migrations/types.ts';
 import { isLockTimeoutError } from './retry-matcher.ts';
 import { resolveSchemaLockTimeoutMs, schemaLockBlockedError, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
@@ -77,14 +77,13 @@ export class MigrationRetryExhausted extends Error {
 // assert migration contents. Read-only contract.
 export { MIGRATIONS };
 
-// FORK: appended rather than inlined so the upstream registry remains generated.
-// This must precede LATEST_VERSION, which gates pending migrations.
-MIGRATIONS.push(...buildForkMigrations({
+// FORK: the fork's migrations, gated on their own counter by runForkMigrations; never part of MIGRATIONS.
+export const FORK_MIGRATIONS: Migration[] = buildForkMigrations({
   allMigrations: () => MIGRATIONS,
   applyOneMigration,
   migrationNotice,
   getIdleBlockers,
-}));
+});
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
   ? Math.max(...MIGRATIONS.map(m => m.version))
@@ -399,7 +398,9 @@ export function isDeadlockError(err: unknown): boolean {
   return /40P01|deadlock detected/i.test(msg);
 }
 
-export async function runMigrations(engine: BrainEngine, opts: { migrations?: readonly Migration[] } = {}): Promise<{ applied: number; current: number }> {
+export async function runMigrations(engine: BrainEngine, opts: { migrations?: readonly Migration[]; forkMigrations?: Migration[] } = {}): Promise<{ applied: number; current: number }> {
+  await adoptForkCounter(engine); // FORK: one-time move off the shared counter, before `version` is read.
+  const forkPass = (quiet: boolean) => runForkPass(engine, opts.forkMigrations ?? FORK_MIGRATIONS, applyOneMigration, quiet);
   const currentStr = await engine.getConfig('version');
   const current = parseInt(currentStr || '1', 10);
 
@@ -470,6 +471,7 @@ export async function runMigrations(engine: BrainEngine, opts: { migrations?: re
 
   const backfill = () => resumePageRevisionBackfill(engine).catch(e => console.error(`[migrate] page revision backfill paused (#5216): ${e instanceof Error ? e.message : String(e)}`));
   if (pending.length === 0) {
+    await forkPass(false);
     await backfill();
     return { applied: 0, current };
   }
@@ -520,6 +522,7 @@ export async function runMigrations(engine: BrainEngine, opts: { migrations?: re
       if (!quietReplay) process.stderr.write(`  [${m.version}] ✓ ${m.name}\n`);
       applied++;
     }
+    await forkPass(quietReplay);
   } finally {
     // Never leak the fresh-install quiet flag into a later in-process run —
     // covers every exit path from here on (incl. the pre-flight probe).

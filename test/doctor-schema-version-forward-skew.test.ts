@@ -15,6 +15,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { buildChecks } from '../src/commands/doctor.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
@@ -50,6 +51,8 @@ describe('schema_version — forward skew (#2036)', () => {
 
   test('still oks when the DB version exactly matches latest', async () => {
     await engine.setConfig('version', String(LATEST_VERSION));
+    // FORK: a current brain also carries the fork's own migration counter at its latest (resetPgliteState empties config).
+    await engine.setConfig(FORK_COUNTER_KEY, String(FORK_LATEST_VERSION));
 
     const checks = await buildChecks(engine, [], undefined);
     const schemaCheck = checks.find((c) => c.name === 'schema_version');

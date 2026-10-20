@@ -24,58 +24,61 @@
  * edits passes on an empty result.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { MIGRATIONS, LATEST_VERSION } from '../src/core/migrate.ts';
-import { buildForkMigrations, FORK_MIGRATION_FLOOR } from '../src/core/fork-migrations.ts';
+import { FORK_MIGRATIONS, MIGRATIONS, LATEST_VERSION } from '../src/core/migrate.ts';
+import { buildForkMigrations, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
+import { LATEST_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { Migration } from '../src/core/migrate.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { FACT_WITHDRAWAL_NORMALIZED_SQL } from '../src/core/facts/withdrawal-schema.ts';
 
+/** Fork migrations as published, in order: fork #k is the k-th entry (legacy number 260 + k). Append only. */
+const PUBLISHED_FORK_MIGRATIONS = [
+  'pgroonga_fts_chinese', 'files_source_id_storage_path_unique', 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
+  'embed_failures_ledger', 'fork_page_search_vector_final_trigger_and_batched_backfill', 'repair_masked_upstream_126_127_128',
+  'repair_masked_upstream_125', 'repair_masked_upstream_131_137', 'repair_masked_upstream_142_145',
+  'repair_masked_upstream_146_149', 'repair_masked_upstream_150_159', 'repair_masked_upstream_160_165',
+  'repair_masked_upstream_166_177', 'repair_masked_upstream_231_243', 'repair_masked_upstream_119_120',
+];
+
 describe('fork migration registry seam', () => {
-  test('LATEST_VERSION is computed AFTER the fork migrations are pushed', () => {
-    // The failure this catches is LATEST_VERSION === max(upstream) while the
-    // array already holds higher fork versions.
-    expect(LATEST_VERSION).toBe(Math.max(...MIGRATIONS.map(m => m.version)));
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(FORK_MIGRATION_FLOOR);
+  test('MIGRATIONS and LATEST_VERSION hold upstream migrations only', () => {
+    // The fork runs on its own counter; a fork entry in MIGRATIONS would gate on upstream's
+    // config.version again and bring the masking class back.
+    expect(LATEST_VERSION).toBe(LATEST_SCHEMA_VERSION);
+    expect(Math.max(...MIGRATIONS.map(m => m.version))).toBe(LATEST_SCHEMA_VERSION);
+    expect(MIGRATIONS.filter(m => FORK_MIGRATIONS.includes(m))).toEqual([]);
   });
 
-  test('the fork migrations are present and contiguous from the floor', () => {
-    const forkVersions = MIGRATIONS
-      .filter(m => m.version >= FORK_MIGRATION_FLOOR)
-      .map(m => m.version)
-      .sort((a, b) => a - b);
-
-    expect(forkVersions.length).toBeGreaterThan(0);
-    // Contiguous: a gap means a migration was dropped during a renumber.
-    const expected = Array.from(
-      { length: forkVersions.length },
-      (_, i) => FORK_MIGRATION_FLOOR + i,
-    );
-    expect(forkVersions).toEqual(expected);
+  test('fork migrations are numbered contiguously from 1, and FORK_LATEST_VERSION is the last', () => {
+    const forkVersions = FORK_MIGRATIONS.map(m => m.version).sort((a, b) => a - b);
+    expect(forkVersions).toEqual(Array.from({ length: forkVersions.length }, (_, i) => i + 1));
+    expect(FORK_LATEST_VERSION).toBe(forkVersions.length);
   });
 
-  test('no duplicate version numbers anywhere in the registry', () => {
-    // A duplicate is not a numbering-hygiene nit: runMigrations gates on a
-    // single high-water integer, so the second entry under a shared number is
-    // masked permanently. That is how upstream v125 went unapplied for weeks
-    // while the brain reported schema_version 136 (ADR-087 补充).
-    const versions = MIGRATIONS.map(m => m.version);
-    const duplicates = versions.filter((v, i) => versions.indexOf(v) !== i);
-    expect(duplicates).toEqual([]);
+  test('published fork numbers are frozen: new fork migrations only append', () => {
+    // Legacy brains are adopted by position (fork #k ran as 260 + k), so a reorder or rename here
+    // would map an adopted brain onto the wrong migration.
+    expect(FORK_MIGRATIONS.slice(0, PUBLISHED_FORK_MIGRATIONS.length).map(m => `${m.version}:${m.name}`))
+      .toEqual(PUBLISHED_FORK_MIGRATIONS.map((name, i) => `${i + 1}:${name}`));
+  });
+
+  test('no duplicate version numbers in either registry', () => {
+    // Each registry gates on its own single high-water integer, so a second entry under a shared
+    // number is masked permanently (how upstream v125 once went unapplied for weeks).
+    for (const versions of [MIGRATIONS.map(m => m.version), FORK_MIGRATIONS.map(m => m.version)]) {
+      expect(versions.filter((v, i) => versions.indexOf(v) !== i)).toEqual([]);
+    }
   });
 
   test('every fork migration declares idempotent: true', () => {
-    // Renumbering on each upstream sync means a brain that already ran one of
-    // these under an older number runs the same DDL again under the new one.
-    // ADR-087 ③ makes real idempotency the precondition for the whole scheme.
-    const notIdempotent = MIGRATIONS
-      .filter(m => m.version >= FORK_MIGRATION_FLOOR && m.idempotent !== true)
-      .map(m => `${m.version}:${m.name}`);
-    expect(notIdempotent).toEqual([]);
+    // Adoption maps a legacy brain by position and a fresh brain replays every repair, so each
+    // body must be safe to run on a brain that already has its effect.
+    expect(FORK_MIGRATIONS.filter(m => m.idempotent !== true).map(m => `${m.version}:${m.name}`)).toEqual([]);
   });
 
-  test('v270 never commits v149\'s obsolete queue protocol when canonical restoration is interrupted', async () => {
+  test('fork#10 (legacy v270) never commits v149\'s obsolete queue protocol when canonical restoration is interrupted', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let committedProtocol = 'canonical protocol';
     const engine = {
@@ -98,13 +101,13 @@ describe('fork migration registry seam', () => {
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
     });
-    const repair = migrations.find(migration => migration.version === 270)!;
+    const repair = migrations.find(migration => migration.version === 10)!;
 
     await expect(repair.handler!(engine)).rejects.toThrow('interrupted before canonical protocol can commit');
     expect(committedProtocol).toBe('canonical protocol');
   });
 
-  test('v270 keeps the migration runner envelope: SET LOCAL statement_timeout first, retry on statement_timeout, fail loud otherwise', async () => {
+  test('fork#10 (legacy v270) keeps the migration runner envelope: SET LOCAL statement_timeout first, retry on statement_timeout, fail loud otherwise', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     const attempts: string[][] = [];
     let failuresLeft = 1;
@@ -126,7 +129,7 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
-    }).find(migration => migration.version === 270)!;
+    }).find(migration => migration.version === 10)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => {
       await repair.handler!(engine);
       expect(attempts.length).toBe(2); // one retried statement_timeout, then success
@@ -150,7 +153,7 @@ describe('fork migration registry seam', () => {
     });
   });
 
-  test('v270 retries announce the attempt, the error, the delay and the idle-in-transaction blockers (F4a R4-5)', async () => {
+  test('fork#10 (legacy v270) retries announce the attempt, the error, the delay and the idle-in-transaction blockers (F4a R4-5)', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let failuresLeft = 2;
     const engine = {
@@ -175,7 +178,7 @@ describe('fork migration registry seam', () => {
         blockerLookups.push(lookupEngine);
         return [{ pid: 4242, state: 'idle in transaction', query_start: '2026-10-10 00:00:00+00', query: 'LOCK TABLE minion_jobs' }];
       },
-    }).find(migration => migration.version === 270)!;
+    }).find(migration => migration.version === 10)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
     expect(blockerLookups).toEqual([engine, engine]); // once per retry, against the migrating engine
 
@@ -189,7 +192,7 @@ describe('fork migration registry seam', () => {
     expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
   });
 
-  test('v270: a failing blocker diagnostic costs only the diagnostic, never the migration', async () => {
+  test('fork#10 (legacy v270): a failing blocker diagnostic costs only the diagnostic, never the migration', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     let failuresLeft = 1;
     const engine = {
@@ -208,14 +211,14 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: line => { notices.push(line); },
       getIdleBlockers: async () => { throw new Error('pg_stat_activity is restricted'); },
-    }).find(migration => migration.version === 270)!;
+    }).find(migration => migration.version === 10)!;
     await withEnv({ GBRAIN_MIGRATE_BACKOFF_MS: '0' }, async () => { await repair.handler!(engine); });
     expect(notices.join('')).toContain('[retry 1/3] v149');
     expect(notices.join('')).not.toContain('idle-in-transaction blocker');
     expect(notices[notices.length - 1]).toContain('repair: re-applied upstream migrations 146/147/148/149');
   });
 
-  test('v270 on PGLite never issues SET LOCAL statement_timeout (F4a R4-5)', async () => {
+  test('fork#10 (legacy v270) on PGLite never issues SET LOCAL statement_timeout (F4a R4-5)', async () => {
     const v149: Migration = { version: 149, name: 'minion_submission_authority', sql: 'old protocol' };
     const statements: string[] = [];
     const engine = {
@@ -229,7 +232,7 @@ describe('fork migration registry seam', () => {
       applyOneMigration: async () => {},
       migrationNotice: () => {},
       getIdleBlockers: async () => [],
-    }).find(migration => migration.version === 270)!;
+    }).find(migration => migration.version === 10)!;
     await repair.handler!(engine);
     expect(statements.length).toBe(2); // v149's body and the canonical protocol, nothing else
     expect(statements[0]).toBe('old protocol');
@@ -248,7 +251,7 @@ describe('fork repair under the managed PGLite writer guard', () => {
     await engine.disconnect();
   });
 
-  test('v273 can replay v174 withdrawal expiry under the managed PGLite writer guard without leaking its source grant', async () => {
+  test('fork#13 (legacy v273) can replay v174 withdrawal expiry under the managed PGLite writer guard without leaking its source grant', async () => {
     const fact = await engine.insertFact(
       { fact: 'Managed repair withdrawal sentinel', source: 'test', visibility: 'world' },
       { source_id: 'default' },

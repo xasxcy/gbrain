@@ -11,27 +11,30 @@
  * single-quoted TypeScript string) and produced a file that did not parse.
  * Silently: nothing in the injector could detect it.
  *
- * Holding the bodies here instead means the injector's whole job is three
- * fixed edits to `migrate.ts` — an import, a push, and one `export` keyword —
- * with no migration text passing through the quoting layers at all. And the
+ * Holding the bodies here instead means `migrate.ts` carries only small fixed
+ * hooks: the import, the `FORK_MIGRATIONS` export, `adoptForkCounter` at the top
+ * of `runMigrations` and `runForkPass` on its two exits. No migration text passes
+ * through any quoting layer. And the
  * bodies now sit in a normal TypeScript file, so `typecheck` and the test
  * suite cover them.
  *
- * NUMBERING (ADR-087)
- * -------------------
- * Fork migrations are appended at `max(upstream) + 1` and are RENUMBERED on
- * every upstream sync that adds migrations. Upstream's numbers are kept
- * byte-identical so they can never be masked. That renumbering is only safe
- * because every migration below is genuinely idempotent: a brain that already
- * ran one of these under its old number will run the same DDL again under the
- * new one. `idempotent: true` is a claim the SQL itself has to earn.
+ * NUMBERING: A COUNTER OF ITS OWN
+ * --------------------------------
+ * Fork migrations are numbered 1..N and gated on their own config key,
+ * `fork_schema_version`, by `runForkMigrations` after upstream's loop. Upstream's
+ * `config.version` holds upstream numbers only, so neither side's high-water can
+ * ever mask the other's migrations. A published fork number is frozen forever:
+ * new fork migrations append at N + 1 and nothing is ever renumbered.
  *
- * `runMigrations` gates on a single high-water integer, not an applied-set, so
- * an upstream migration that ever shares a number with a fork migration is
- * skipped forever, silently. v136 and v137 repair four such migrations. They
- * look their targets up in the live registry rather than copying DDL, which is
- * why this module takes them as injected dependencies instead of importing
- * `migrate.ts` (that would be a runtime cycle).
+ * Until 2026-10 both shared `config.version` (ADR-087): the fork sat at
+ * `max(upstream) + 1` and was renumbered on every upstream sync, and a brain
+ * stamped by an old fork number skipped the upstream migrations that later took
+ * that number. Ten migrations below (3 and 6-15) repair those skips; their
+ * comments still cite the legacy numbers they ran under (fork #k ran as 260 + k
+ * in the last legacy layout). `adoptForkCounter` moves a legacy-stamped brain to
+ * the new layout once. The repairs look their targets up in the live registry
+ * rather than copying DDL, which is why this module takes them as injected
+ * dependencies instead of importing `migrate.ts` (that would be a runtime cycle).
  */
 import type { BrainEngine } from './engine.ts';
 import type { IdleBlocker, Migration } from './migrate.ts';
@@ -120,9 +123,17 @@ async function noticeIdleBlockers(engine: BrainEngine, deps: ForkMigrationDeps):
   }
 }
 
-/** Lowest version number owned by the fork. Everything below belongs to
- *  upstream and must stay byte-identical to it. */
-export const FORK_MIGRATION_FLOOR = 261;
+/** The config key holding the fork's own high-water (see the header). */
+export const FORK_COUNTER_KEY = 'fork_schema_version';
+
+/**
+ * The last layout in which fork migrations shared `config.version`: upstream ended at 260 and fork #k ran as
+ * 260 + k, up to 275. Constants on purpose, never derived from the live registry: once upstream grows past 275, a
+ * runtime "upstream max" would move a brain still stamped 275 onto upstream's real 261-275 and skip them, which is
+ * the very class the counter ends.
+ */
+export const LEGACY_UPSTREAM_MAX = 260;
+export const LEGACY_FORK_MAX = 275;
 
 /**
  * The final page trigger function: upstream's own text (fts-language.ts), the same text the schema blob replays on
@@ -171,7 +182,7 @@ export async function noticePageLinksSecurityInvoker(engine: BrainEngine, notice
 export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   return [
     {
-      version: 261,
+      version: 1,
       name: 'pgroonga_fts_chinese',
       // Postgres-only Chinese and mixed CJK keyword search. PGLite cannot load
       // extensions, so it keeps the existing tsvector / CJK ILIKE fallback path.
@@ -189,7 +200,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 262,
+      version: 2,
       name: 'files_source_id_storage_path_unique',
       // FORK-FIX: files had UNIQUE(storage_path) which is global across sources.
       // Two sources importing the same relative path would fight over one row,
@@ -216,7 +227,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 263,
+      version: 3,
       name: 'repair_code_edges_source_backfill_skipped_by_fork_renumber',
       // Fork DBs stamped at v116 (pgroonga) skipped upstream v116
       // (code_edges_source_backfill_and_callee_index). This repair applies
@@ -246,7 +257,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       `,
     },
     {
-      version: 264,
+      version: 4,
       name: 'embed_failures_ledger',
       // Current-state retry ledger for partial stale embedding. The DDL is
       // intentionally identical to the fresh schemas and safe to replay.
@@ -281,7 +292,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 265,
+      version: 5,
       name: 'fork_page_search_vector_final_trigger_and_batched_backfill',
       idempotent: true,
       sql: '',
@@ -296,7 +307,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 266,
+      version: 6,
       name: 'repair_masked_upstream_126_127_128',
       // One-time repair for the fork-renumber masking class (#2038 in this
       // file's own history). runMigrations gates on a single high-water
@@ -324,7 +335,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 267,
+      version: 7,
       name: 'repair_masked_upstream_125',
       // Fourth masked migration, missed by v136. v136 was derived by diffing
       // fork-vs-upstream for SAME NUMBER, DIFFERENT NAME — but upstream's v125
@@ -365,7 +376,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 268,
+      version: 8,
       name: 'repair_masked_upstream_131_137',
       // Third instance of the masking class this file's header describes, from
       // the 2026-08-25 upstream sync (v0.46.16.0 → v0.46.29.0).
@@ -436,7 +447,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 269,
+      version: 9,
       name: 'repair_masked_upstream_142_145',
       // Fourth instance of the masking class this file's header describes, from
       // the 2026-09-06 upstream sync (v0.46.29.0 → v0.48.2.0).
@@ -516,7 +527,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 270,
+      version: 10,
       name: 'repair_masked_upstream_146_149',
       // Fifth instance of the masking class this file's header describes, from
       // the 2026-09-14 upstream sync (v0.48.2.0 → v0.50.0.0).
@@ -607,7 +618,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 271,
+      version: 11,
       name: 'repair_masked_upstream_150_159',
       // Sixth instance of the masking class this file's header describes, from
       // the 2026-09-20 upstream sync (v0.50.0.0 → v0.51.0.0).
@@ -700,7 +711,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 272,
+      version: 12,
       name: 'repair_masked_upstream_160_165',
       // The 2026-09-27 upstream merge extended the upstream range through
       // v165 after this fork had already used 160-165. Renumbering the fork
@@ -770,7 +781,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 273,
+      version: 13,
       name: 'repair_masked_upstream_166_177',
       // Eighth instance of the masking class this file's header describes, from
       // the upstream v0.60.139.0 sync. Upstream's range now runs through 230;
@@ -804,7 +815,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 274,
+      version: 14,
       name: 'repair_masked_upstream_231_243',
       // Ninth instance of the masking class this file's header describes, from the upstream v0.60.299.0 sync.
       // Upstream's range now runs through 260; the fork previously occupied 231-243 (renumbered to 261+ above), so a
@@ -833,7 +844,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
       },
     },
     {
-      version: 275,
+      version: 15,
       name: 'repair_masked_upstream_119_120',
       // Tenth instance of the masking class, the oldest: upstream 117-122 were merged in 2026-06/07 under numbers the
       // fork's own migrations had already stamped (the fork held 120-122 when upstream's 120-122 arrived). The schema
@@ -858,14 +869,7 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
   ];
 }
 
-/**
- * Highest version this fork owns. Upstream's generated LATEST_SCHEMA_VERSION
- * (schema-migrations/latest.generated.ts) only counts upstream's own files, so
- * the cheap `hasPendingMigrations` probe must also consult this value or a brain
- * stamped at upstream's max would never run the fork migrations above it.
- * Derived from the migration list itself (bodies are closures; nothing runs here),
- * so the sync script's renumber keeps it correct without a second edit.
- */
+/** Highest fork migration number (the fork counter's target), derived from the list itself. */
 export const FORK_LATEST_VERSION: number = Math.max(
   ...buildForkMigrations({
     allMigrations: () => [],
@@ -874,3 +878,108 @@ export const FORK_LATEST_VERSION: number = Math.max(
     getIdleBlockers: async () => [],
   }).map(m => m.version),
 );
+
+/**
+ * The fork counter's one-time adoption. Runs before upstream's loop reads `config.version`, and does nothing once
+ * the fork key exists (every branch writes it, in the same transaction as any `version` rewrite):
+ *  - version <= 260: upstream numbering already (fresh install, or a legacy layout older than the last one, whose
+ *    repairs the fork pass replays): fork counter 0, every fork migration runs.
+ *  - 261..275: the last legacy layout. `version` becomes 260, the fork counter its position (version - 260).
+ *  - above 275: refused. It is not a layout this binary can place, and guessing would mask migrations again.
+ */
+export async function adoptForkCounter(engine: BrainEngine): Promise<void> {
+  if (await engine.getConfig(FORK_COUNTER_KEY) !== null) return;
+  await engine.transaction(async (tx) => {
+    // Serialize concurrent adopters on the version row; the loser re-reads the key below and stops.
+    await tx.executeRaw(`SELECT value FROM config WHERE key = 'version' FOR UPDATE`);
+    if (await tx.getConfig(FORK_COUNTER_KEY) !== null) return;
+    const current = Number.parseInt((await tx.getConfig('version')) || '1', 10);
+    if (!Number.isSafeInteger(current) || current > LEGACY_FORK_MAX) {
+      throw new Error(`fork counter adoption: schema version ${String(current)} is above the last legacy fork layout (${LEGACY_FORK_MAX}); this binary cannot tell which migrations ran. Restore a backup or run the gbrain build that wrote it.`);
+    }
+    if (current > LEGACY_UPSTREAM_MAX) {
+      await tx.setConfig('version', String(LEGACY_UPSTREAM_MAX));
+      await tx.setConfig(FORK_COUNTER_KEY, String(current - LEGACY_UPSTREAM_MAX));
+    } else {
+      await tx.setConfig(FORK_COUNTER_KEY, '0');
+    }
+  });
+}
+
+/**
+ * The fork's own pass, after upstream's loop: runs every fork migration above the fork counter, stamping the counter
+ * after each one. `quiet` mirrors upstream's fresh-install summary line.
+ */
+export async function runForkMigrations(
+  engine: BrainEngine, migrations: Migration[], apply: ForkMigrationDeps['applyOneMigration'], quiet: boolean,
+): Promise<number> {
+  const current = Number.parseInt((await engine.getConfig(FORK_COUNTER_KEY)) || '0', 10);
+  const pending = [...migrations].sort((a, b) => a.version - b.version).filter(m => m.version > current);
+  if (pending.length === 0) return 0;
+  process.stderr.write(quiet
+    ? `  Setting up fork schema (fork#${FORK_LATEST_VERSION})...\n`
+    : `  Fork schema fork#${current} → fork#${FORK_LATEST_VERSION} (${pending.length} migration(s) pending)\n`);
+  for (const m of pending) {
+    if (!quiet) process.stderr.write(`  [fork#${m.version}] ${m.name}...\n`);
+    try {
+      await apply(engine, m);
+      await engine.setConfig(FORK_COUNTER_KEY, String(m.version));
+    } catch (err) {
+      if (quiet) process.stderr.write(`  [fork#${m.version}] ${m.name} failed\n`);
+      throw err;
+    }
+    if (!quiet) process.stderr.write(`  [fork#${m.version}] ✓ ${m.name}\n`);
+  }
+  return pending.length;
+}
+
+/**
+ * Fork objects an upstream migration could drop without knowing about them (a column rewrite drops the PGroonga
+ * index; a table rebuild drops the composite key). Under the shared counter every upstream sync renumbered and so
+ * re-ran these; with the fork's own counter a cheap catalog probe re-applies only the migration whose object is
+ * gone. Checked against upstream's migrations and schema.sql on 2026-10-20: none touches these objects today.
+ */
+const FORK_DRIFT_PROBES: { version: number; engine?: BrainEngine['kind']; missing: string }[] = [
+  { version: 1, engine: 'postgres', missing: `SELECT to_regclass('public.idx_content_chunks_pgroonga') IS NULL AS missing` },
+  { version: 2, missing: `SELECT NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'files_source_storage_key' AND conrelid = 'files'::regclass) AS missing` },
+];
+
+/**
+ * Health checks that call a brain "current" when `version` reaches upstream's latest must also ask this: non-null
+ * (a status phrase) when the fork's own counter is missing or behind this binary, e.g. after a fork migration failed.
+ */
+export async function forkSchemaBehind(engine: Pick<BrainEngine, 'getConfig'>): Promise<string | null> {
+  const raw = await engine.getConfig(FORK_COUNTER_KEY);
+  const current = raw === null ? null : Number.parseInt(raw, 10);
+  if (current !== null && current >= FORK_LATEST_VERSION) return null;
+  return current === null
+    ? `the fork schema counter is not adopted yet (this gbrain expects fork#${FORK_LATEST_VERSION})`
+    : `the fork schema is at fork#${current}, fork#${FORK_LATEST_VERSION} is available`;
+}
+
+/** The fork pass migrate.ts runs after upstream's loop: pending fork migrations, then the drift self-heal. */
+export async function runForkPass(
+  engine: BrainEngine, migrations: Migration[], apply: ForkMigrationDeps['applyOneMigration'], quiet: boolean,
+): Promise<void> {
+  await runForkMigrations(engine, migrations, apply, quiet);
+  await healForkDrift(engine, migrations, apply);
+}
+
+/** Re-applies an already-applied fork migration whose object a later upstream migration removed. */
+export async function healForkDrift(
+  engine: BrainEngine, migrations: Migration[], apply: ForkMigrationDeps['applyOneMigration'],
+): Promise<number[]> {
+  const current = Number.parseInt((await engine.getConfig(FORK_COUNTER_KEY)) || '0', 10);
+  const healed: number[] = [];
+  for (const probe of FORK_DRIFT_PROBES) {
+    if (probe.version > current || (probe.engine && probe.engine !== engine.kind)) continue;
+    const [row] = await engine.executeRaw<{ missing: boolean }>(probe.missing);
+    if (!row?.missing) continue;
+    const m = migrations.find(x => x.version === probe.version);
+    if (!m) continue;
+    process.stderr.write(`  [fork#${m.version}] ${m.name}: object missing after an upstream migration, re-applying\n`);
+    await apply(engine, m);
+    healed.push(m.version);
+  }
+  return healed;
+}

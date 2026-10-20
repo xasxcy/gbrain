@@ -8,6 +8,7 @@ import { PGLiteEngine } from '../pglite-engine.ts';
 import { acquireBootstrapLock } from '../bootstrap/lock.ts';
 import { configDir, type GBrainConfig } from '../config.ts';
 import { LATEST_VERSION } from '../migrate.ts';
+import { LEGACY_FORK_MAX } from '../fork-migrations.ts';
 import { backupDumpFailed, sweepStaleRuntimeArtefacts } from './runtime-artefacts.ts';
 import { AgentInstallError, checkedManagedPaths, checkedRoot, confinedPath, privateWrite, readFileConfigState, readInstallReceipt, syncDirectory, type AgentInstallReceipt } from '../agent-install/state.ts';
 import { extractPgliteDump, hashFile, isBackupArchiveFile, readBackupArchive, writeBackupArchive, type ArchiveManifest } from './archive.ts';
@@ -217,7 +218,8 @@ function metadataOf(manifest: ArchiveManifest): BackupMetadata {
     throw new AgentInstallError('invalid_backup', 'Invalid PGLite backup metadata.');
   }
   if (relativeBackupPath(value.original_root, value.original_root) !== '') throw new AgentInstallError('invalid_backup', 'Invalid archived root.');
-  if (value.schema_version > LATEST_VERSION) throw new AgentInstallError('newer_backup_schema', 'Upgrade GBrain before restoring this newer database schema.');
+  // FORK: a pre-counter fork backup is stamped up to LEGACY_FORK_MAX; the next connect adopts it (fork-migrations.ts).
+  if (value.schema_version > Math.max(LATEST_VERSION, LEGACY_FORK_MAX)) throw new AgentInstallError('newer_backup_schema', 'Upgrade GBrain before restoring this newer database schema.');
   checkedManagedPaths(null, value.managed_paths);
   if ([...value.credential_references, ...value.omitted].some(v => typeof v !== 'string')) throw new AgentInstallError('invalid_backup', 'Invalid backup reconnect inventory.');
   for (const source of value.sources) {

@@ -7,13 +7,15 @@ export interface SchemaVersionHealth {
 export function schemaVersionHealth(
   version: number,
   latestVersion: number,
-  opts: { remote?: boolean } = {},
+  /** FORK: forkBehind is fork-migrations.ts `forkSchemaBehind`'s phrase when the fork's own counter is behind. */
+  opts: { remote?: boolean; forkBehind?: string | null } = {},
 ): SchemaVersionHealth {
   const migrationFix = opts.remote
     ? 'Run `gbrain apply-migrations --yes` on the host.'
     : 'Fix: gbrain apply-migrations --yes';
 
   if (version === latestVersion) {
+    if (opts.forkBehind) return { status: 'warn', message: `Version ${version} (latest: ${latestVersion}), but ${opts.forkBehind}. ${migrationFix}` };
     return { status: 'ok', message: `Version ${version} (latest: ${latestVersion})` };
   }
 

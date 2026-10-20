@@ -615,10 +615,12 @@ const migrationsProbe: Prober = {
     const base = { capability: 'migrations' as const, tier: 'probed' as const, http_visible: false };
     const { LATEST_VERSION } = await import('./migrate.ts');
     const current = parseInt((await engine.getConfig('version')) || '1', 10);
-    if (current >= LATEST_VERSION) return { ...base, state: 'ok', reason: 'current', why: `Schema is at v${current}.` };
+    const forkBehind = await (await import('./fork-migrations.ts')).forkSchemaBehind(engine); // FORK: the fork's own counter
+    if (current >= LATEST_VERSION && !forkBehind) return { ...base, state: 'ok', reason: 'current', why: `Schema is at v${current}.` };
     return {
       ...base, state: 'degraded', reason: 'pending',
-      why: `Schema is at v${current}; v${LATEST_VERSION} is available, so newer features may refuse until migrations run.`,
+      why: current >= LATEST_VERSION ? `Schema is at v${current}, but ${forkBehind}.`
+        : `Schema is at v${current}; v${LATEST_VERSION} is available, so newer features may refuse until migrations run.`,
       fix: { argv: ['gbrain', 'apply-migrations', '--yes', '--no-autopilot-install'], consent: [], actor: 'agent', requires_exclusive: true,
         why: 'Applies the pending schema migrations without installing background services.', verify: VERIFY('schema_version') },
     };

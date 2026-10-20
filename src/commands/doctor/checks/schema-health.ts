@@ -215,7 +215,8 @@ async function runSchemaVersion(ctx: DoctorContext): Promise<Check[]> {
   try {
     const version = await engine.getConfig('version');
     schemaVersion = parseInt(version || '0', 10);
-    checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION) });
+    const { forkSchemaBehind } = await import('../../../core/fork-migrations.ts'); // FORK: the fork's own counter
+    checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION, { forkBehind: await forkSchemaBehind(engine) }) });
 
     // 6b. Schema columns — gbrain#4421/#4425. The ledger counter alone can
     // lie: a PgBouncer transaction-mode pooler can swallow an ALTER TABLE

@@ -199,7 +199,8 @@ export async function checkUpgradeErrors(
     if (engine) {
       try {
         const v = parseInt((await engine.getConfig('version')) || '0', 10);
-        schemaCurrent = v >= LATEST_VERSION;
+        // FORK: current only when the fork's own counter is current too.
+        schemaCurrent = v >= LATEST_VERSION && (await (await import('../../../core/fork-migrations.ts')).forkSchemaBehind(engine)) === null;
       } catch { /* unverifiable → keep warning */ }
     }
     if (upgradeErrorResolved(latest.to_version, GBRAIN_BINARY_VERSION, schemaCurrent, latest.from_version)) {

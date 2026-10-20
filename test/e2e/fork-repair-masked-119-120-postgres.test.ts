@@ -1,6 +1,6 @@
 /**
  * FORK-ONLY E2E. v275 on real Postgres: restores the op_checkpoints CHECK and the page_links security_invoker
- * option on a brain stamped 274 that lacks both, and leaves a view it does not own untouched (reported instead of
+ * option on a legacy brain stamped 274 that lacks both, and leaves a view it does not own untouched (reported instead of
  * failing the migration, as on a brain whose view a superuser created).
  *
  * Run: DATABASE_URL=postgresql://... bun run test:e2e test/e2e/fork-repair-masked-119-120-postgres.test.ts
@@ -8,8 +8,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
-import { MIGRATIONS, runMigrations } from '../../src/core/migrate.ts';
-import { noticePageLinksSecurityInvoker, PAGE_LINKS_SECURITY_INVOKER_SQL } from '../../src/core/fork-migrations.ts';
+import { LATEST_VERSION, runMigrations } from '../../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, noticePageLinksSecurityInvoker, PAGE_LINKS_SECURITY_INVOKER_SQL } from '../../src/core/fork-migrations.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -31,17 +31,21 @@ describe.skipIf(!DATABASE_URL)('v275 repair_masked_upstream_119_120 (Postgres E2
     await close?.();
   });
 
-  test('the runner restores the CHECK and the view option on a brain stamped 274 that lacks both', async () => {
+  test('the runner restores the CHECK and the view option on a legacy brain stamped 274 that lacks both', async () => {
     await engine.executeRaw(`ALTER TABLE op_checkpoints DROP CONSTRAINT ${CHECK}`);
     await engine.executeRaw('ALTER VIEW public.page_links RESET (security_invoker)');
     await engine.executeRaw(`INSERT INTO op_checkpoints (op, fingerprint, completed_keys)
       VALUES ('v275-test', 'scalar', '5'::jsonb)`);
+    // A brain stamped 274 by the last shared-counter layout: adoption maps it to (260, fork#14).
     await engine.setConfig('version', '274');
+    await engine.executeRaw(`DELETE FROM config WHERE key = '${FORK_COUNTER_KEY}'`);
     expect(await engine.executeRaw(VIEW_OPTIONS)).toEqual([{ reloptions: null }]);
 
-    const result = await runMigrations(engine, { migrations: MIGRATIONS.filter(m => m.version === 275) });
+    const result = await runMigrations(engine);
 
-    expect(result).toEqual({ applied: 1, current: 275 });
+    expect(result.current).toBe(LATEST_VERSION);
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    expect(await engine.getConfig(FORK_COUNTER_KEY)).toBe('15');
     expect(await engine.executeRaw(VIEW_OPTIONS)).toEqual([{ reloptions: ['security_invoker=on'] }]);
     expect(await engine.executeRaw(`SELECT completed_keys FROM op_checkpoints
       WHERE op = 'v275-test' AND fingerprint = 'scalar'`)).toEqual([{ completed_keys: [] }]);

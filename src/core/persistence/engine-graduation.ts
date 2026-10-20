@@ -426,9 +426,10 @@ function probeTargetEmpty(probe: TargetProbe): boolean { return probe.empty; }
 
 /** initSchema writes these config keys (plus the copier's deferred-index marker); any other key is user data. */
 // The trust migrations seed two bookkeeping keys on an empty brain (v226 backfill completion, v227 scan baseline).
+// FORK: plus the fork's own migration counter (fork-migrations.ts).
 const SEED_CONFIG_KEYS = new Set(['chunk_strategy', 'embedding_dimensions', 'embedding_model', 'engine', 'version', 'graduation.deferred_indexes',
-  TRUST_BACKFILL_COMPLETED_KEY, WRITE_GATE_SCAN_BASELINE_KEY]);
-async function userConfigKeys(main: BrainEngine): Promise<string[]> {
+  TRUST_BACKFILL_COMPLETED_KEY, WRITE_GATE_SCAN_BASELINE_KEY, 'fork_schema_version']);
+export async function userConfigKeys(main: BrainEngine): Promise<string[]> {
   const rows = await main.executeRaw<{ key: string }>('SELECT key FROM config ORDER BY key COLLATE "C"');
   return rows.map(r => r.key).filter(key => !SEED_CONFIG_KEYS.has(key));
 }

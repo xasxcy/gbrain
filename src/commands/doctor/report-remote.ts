@@ -126,7 +126,7 @@ export async function doctorReportRemote(
     const version = parseInt(versionStr || '0', 10);
     checks.push({
       name: 'schema_version',
-      ...schemaVersionHealth(version, LATEST_VERSION, { remote: true }),
+      ...schemaVersionHealth(version, LATEST_VERSION, { remote: true, forkBehind: await (await import('../../core/fork-migrations.ts')).forkSchemaBehind(engine) }), // FORK
     });
   } catch {
     checks.push(checkError('schema_version', 'check schema version'));

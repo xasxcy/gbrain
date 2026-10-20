@@ -27,7 +27,6 @@ import { delimiter, join } from 'node:path';
 import { defineNormalizer, mapStrings, scrubKeys, scrubPaths, scrubTimestamps } from './golden.ts';
 import { PROVIDER_ENV_KEYS } from './provider-env.ts';
 import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
-import { FORK_LATEST_VERSION } from '../../src/core/fork-migrations.ts';
 import { SEGMENTED_WRITER_FLOOR } from '../../src/core/page-body/writer-floor.ts';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..');
@@ -35,9 +34,7 @@ const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const PRELOAD = join(import.meta.dir, 'no-network-preload.ts');
 const CLOCK_PRELOAD = join(import.meta.dir, 'fixed-clock-preload.ts');
 const PACKAGE_VERSION = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as { version: string }).version;
-// FORK: migrate.ts appends the fork-owned migrations (v231+) to the generated upstream registry at load time, so the
-// version a fresh brain migrates to (and the doctor reports) is max(upstream registry, fork migrations) = LATEST_VERSION.
-const REGISTRY_LATEST = Math.max(Math.max(...MIGRATIONS.map((m) => m.version)), FORK_LATEST_VERSION);
+const REGISTRY_LATEST = Math.max(...MIGRATIONS.map((m) => m.version));
 const SCHEMA_LATEST = /\b(Version |latest: |latest is |latest known version \()(\d+)\b/g;
 
 export interface DoctorHome {

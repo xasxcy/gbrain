@@ -43,7 +43,7 @@ check-worker-pool-atomicity.sh	scanner	todo
 check-gateway-routed-no-direct-anthropic.sh	scanner	yes	no runtime @anthropic-ai/sdk import or new Anthropic() in gateway-routed files; GBRAIN_GUARD_ROOT seam
 check-engine-dynamic-import.sh	scanner	yes	.ts companion is its implementation, not a separate guard; scans engine façades, their module dirs, engine-sql/ and schema-migrations/; GBRAIN_GUARD_ROOT seam
 check-fork-migration-engine-parity.sh	scanner	todo	fork-only; parses migrate.ts FORK migrations + both engines for ON CONFLICT column-set agreement (Check A) and ADD CONSTRAINT idempotency guards (Check B)
-check-fork-migration-masking.sh	scanner	todo	fork-only; diffs fork-migrations.ts against a pre-merge git ref to catch upstream migration numbers masked by a fork renumber (ADR-087/095/096)
+check-fork-migration-masking.sh	scanner	todo	fork-only; fork migrations stay contiguous from 1 on their own fork_schema_version counter, out of MIGRATIONS, and append-only against a pre-merge git ref
 check-key-files-current-state.sh	scanner	todo
 check-trailing-newline.sh	scanner	yes	tracked src/test/root text files end with a newline (guard fixtures excluded); GBRAIN_GUARD_ROOT seam scans with find
 check-test-isolation.sh	scanner	yes	allowlist data file: check-test-isolation.allowlist; fixture mode (GBRAIN_GUARD_ROOT) lints *.test.fixture.ts (bad: R5, bad-r1: R1, bad-r6: R6)

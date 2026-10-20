@@ -5,8 +5,8 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { MIGRATIONS, runMigrations } from '../src/core/migrate.ts';
-import { noticePageLinksSecurityInvoker } from '../src/core/fork-migrations.ts';
+import { FORK_MIGRATIONS, LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, noticePageLinksSecurityInvoker } from '../src/core/fork-migrations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 const CHECK = 'op_checkpoints_completed_keys_array';
@@ -22,15 +22,19 @@ describe('v275 repair_masked_upstream_119_120 (PGLite)', () => {
     await engine.disconnect();
   });
 
-  test('the runner restores the CHECK on a brain stamped 274 that lacks it, resetting only scalar rows', async () => {
+  test('the runner restores the CHECK on a legacy brain stamped 274 that lacks it, resetting only scalar rows', async () => {
     await engine.executeRaw(`ALTER TABLE op_checkpoints DROP CONSTRAINT ${CHECK}`);
     await engine.executeRaw(`INSERT INTO op_checkpoints (op, fingerprint, completed_keys) VALUES
       ('v275-test', 'scalar', '5'::jsonb), ('v275-test', 'array', '["a","b"]'::jsonb)`);
+    // A brain stamped 274 by the last shared-counter layout: adoption maps it to (260, fork#14).
     await engine.setConfig('version', '274');
+    await engine.executeRaw(`DELETE FROM config WHERE key = '${FORK_COUNTER_KEY}'`);
 
-    const result = await runMigrations(engine, { migrations: MIGRATIONS.filter(m => m.version === 275) });
+    const result = await runMigrations(engine);
 
-    expect(result).toEqual({ applied: 1, current: 275 });
+    expect(result.current).toBe(LATEST_VERSION);
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    expect(await engine.getConfig(FORK_COUNTER_KEY)).toBe('15');
     expect(await engine.executeRaw(`SELECT conname FROM pg_constraint WHERE conname = '${CHECK}'`)).toHaveLength(1);
     expect(await engine.executeRaw(`SELECT fingerprint, completed_keys FROM op_checkpoints
       WHERE op = 'v275-test' ORDER BY fingerprint`)).toEqual([
@@ -42,7 +46,7 @@ describe('v275 repair_masked_upstream_119_120 (PGLite)', () => {
   }, 60_000);
 
   test('re-running v275 on a repaired brain is a no-op that still verifies', async () => {
-    const v275 = MIGRATIONS.find(m => m.version === 275)!;
+    const v275 = FORK_MIGRATIONS.find(m => m.version === 15)!;
     await v275.handler!(engine as unknown as BrainEngine);
     expect(await v275.verify!(engine as unknown as BrainEngine)).toBe(true);
     expect(await engine.executeRaw(`SELECT conname FROM pg_constraint WHERE conname = '${CHECK}'`)).toHaveLength(1);

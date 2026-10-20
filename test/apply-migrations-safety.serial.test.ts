@@ -122,6 +122,8 @@ await runApplyMigrations(['--yes']);
 import { mock } from 'bun:test';
 import { loadConfig } from ${JSON.stringify(join(root, 'src/core/config.ts'))};
 import { LATEST_VERSION } from ${JSON.stringify(join(root, 'src/core/migrate.ts'))};
+// FORK: a current brain also carries the fork's own migration counter at its latest.
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from ${JSON.stringify(join(root, 'src/core/fork-migrations.ts'))};
 if (loadConfig()?.engine !== 'postgres') throw new Error('fixture must resolve to an applicable Postgres install');
 const migrationSetup = await import(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))});
 mock.module(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))}, () => ({
@@ -139,6 +141,7 @@ mock.module(${JSON.stringify(join(root, 'src/core/engine-factory.ts'))}, () => (
   createEngine: async () => ({
     connect: async () => {}, disconnect: async () => {},
     getConfig: async (key) => {
+      if (key === FORK_COUNTER_KEY) return String(FORK_LATEST_VERSION);
       if (key !== 'version') throw new Error('unexpected preflight read: ' + key);
       return String(LATEST_VERSION);
     },
@@ -274,6 +277,8 @@ describe('v0.11.0 Phase F without a repo path (#6755)', () => {
       const setup = `
 import { mock } from 'bun:test';
 import { LATEST_VERSION } from ${JSON.stringify(join(root, 'src/core/migrate.ts'))};
+// FORK: a current brain also carries the fork's own migration counter at its latest.
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from ${JSON.stringify(join(root, 'src/core/fork-migrations.ts'))};
 const migrationSetup = await import(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))});
 mock.module(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))}, () => ({
   ...migrationSetup, runMigrateOnlyCore: async () => ({ engine: 'postgres' }),
@@ -290,7 +295,7 @@ mock.module(${JSON.stringify(join(root, 'src/core/engine-factory.ts'))}, () => (
   ...factory,
   createEngine: async () => ({
     kind: 'postgres', connect: async () => {}, disconnect: async () => {},
-    getConfig: async (key) => key === 'version' ? String(LATEST_VERSION) : key === 'sync.repo_path' ? (brain.syncRepoPath ?? null) : null,
+    getConfig: async (key) => key === 'version' ? String(LATEST_VERSION) : key === FORK_COUNTER_KEY ? String(FORK_LATEST_VERSION) : key === 'sync.repo_path' ? (brain.syncRepoPath ?? null) : null,
     executeRaw: async (sql) => /FROM sources WHERE id = 'default'/.test(sql) ? [{ local_path: brain.defaultSourcePath ?? null }] : [],
   }),
 }));

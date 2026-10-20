@@ -90,20 +90,26 @@ export async function checkSchemaAfterOrchestrators(opts: {
   try {
     const { engine, close } = await connectMigrationEngine(cfg);
     let current: number;
+    // FORK: the fork's own counter (fork_schema_version) can be behind, or not yet adopted, at upstream head.
+    const { hasPendingMigrations } = await import('../core/migrate.ts');
+    let forkPending: boolean;
     try {
       current = parseInt(await engine.getConfig('version') || '1', 10);
       const { latest } = await pendingAbove(current);
-      if (pglite && authorized && current < latest) {
-        console.error(`Schema v${current} is behind v${latest}; applying schema migrations in-process...`);
+      forkPending = await hasPendingMigrations(engine);
+      if (pglite && authorized && (current < latest || forkPending)) {
+        console.error(current < latest ? `Schema v${current} is behind v${latest}; applying schema migrations in-process...`
+          : 'Fork schema migrations are pending; applying schema migrations in-process...');
         try { await opts.apply(engine, current); } catch (err) { console.error(`Schema migration failed: ${await redactDbError(err)}`); }
         current = parseInt(await engine.getConfig('version') || '1', 10);
+        forkPending = await hasPendingMigrations(engine);
       }
     } finally {
       await close();
     }
     lastRead = current;
     const { latest, pending } = await pendingAbove(current);
-    if (current >= latest) return null;
+    if (current >= latest && !forkPending) return null;
     return { reason: authorized ? 'still_behind' : 'not_applied', current, latest, pending };
   } catch (err) {
     if (err instanceof PgliteBusyError) throw err;

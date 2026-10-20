@@ -409,13 +409,17 @@ function printDryRun(plan: Plan, installed: string, dbProbe: DbProbeOutcome): vo
 async function resolveSchemaBehind(opts: {
   schemaVer: number;
   latest: number;
+  /** FORK: true when only the fork counter (fork_schema_version) is behind or not yet adopted. */
+  forkPending?: boolean;
   autoApply: boolean;
   run: () => Promise<{ applied: number; current: number }>;
 }): Promise<boolean> {
   const { schemaVer, latest, autoApply, run } = opts;
-  if (schemaVer >= latest) return false;
+  if (schemaVer >= latest && !opts.forkPending) return false;
   if (autoApply) {
-    console.error(`Schema version ${schemaVer} is behind latest ${latest}; running schema migrations...`);
+    console.error(schemaVer >= latest
+      ? 'Fork schema migrations are pending; running schema migrations...'
+      : `Schema version ${schemaVer} is behind latest ${latest}; running schema migrations...`);
     try {
       const result = await run();
       console.error(`Applied ${result.applied} schema migration(s); now at v${result.current}.`);
@@ -426,7 +430,7 @@ async function resolveSchemaBehind(opts: {
     }
   }
   console.warn(
-    `\n⚠️  Schema version ${schemaVer} is behind latest ${latest}.\n` +
+    (schemaVer >= latest ? '\n⚠️  Fork schema migrations are pending.\n' : `\n⚠️  Schema version ${schemaVer} is behind latest ${latest}.\n`) +
     `   Run \`gbrain apply-migrations --yes\` to apply now, or \`gbrain init --migrate-only\`.\n`,
   );
   return true;
@@ -928,9 +932,11 @@ async function preflightSchema(
       } else {
         const { engine: eng, version: schemaVer } = await connectAtSchemaVersion(cfg);
         dbProbe = { status: 'connected', schemaVer, latest: LATEST_VERSION };
+        const { hasPendingMigrations } = await import('../core/migrate.ts');
         schemaBehind = await resolveSchemaBehind({
           schemaVer,
           latest: LATEST_VERSION,
+          forkPending: await hasPendingMigrations(eng),
           // --list and --dry-run are read-only surfaces: never mutate schema
           // even when combined with --yes/--non-interactive.
           autoApply: (cli.yes || cli.nonInteractive) && !cli.dryRun && !cli.list,

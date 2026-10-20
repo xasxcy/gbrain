@@ -1,7 +1,7 @@
 import type { BrainEngine } from './engine.ts';
 import { LATEST_SCHEMA_VERSION } from './schema-migrations/latest.generated.ts';
-// FORK: fork migrations sit above upstream's generated latest version.
-import { FORK_LATEST_VERSION } from './fork-migrations.ts';
+// FORK: fork migrations run on their own counter (fork-migrations.ts), so both counters gate "pending".
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from './fork-migrations.ts';
 
 /**
  * Cheap probe: does this engine have schema migrations pending?
@@ -25,7 +25,10 @@ export async function hasPendingMigrations(engine: BrainEngine): Promise<boolean
   try {
     const currentStr = await engine.getConfig('version');
     const current = parseInt(currentStr || '1', 10);
-    return current < Math.max(LATEST_SCHEMA_VERSION, FORK_LATEST_VERSION);
+    if (current < LATEST_SCHEMA_VERSION) return true;
+    // FORK: a missing fork key is a brain the counter has not adopted yet (adoption runs inside runMigrations).
+    const forkStr = await engine.getConfig(FORK_COUNTER_KEY);
+    return forkStr === null || parseInt(forkStr, 10) < FORK_LATEST_VERSION;
   } catch {
     return true;
   }

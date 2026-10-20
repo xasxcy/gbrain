@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { MIGRATIONS } from '../src/core/migrate.ts';
+import { FORK_MIGRATIONS, MIGRATIONS } from '../src/core/migrate.ts';
 import { pageSearchVectorTriggerFnSql, resetFtsLanguageCache } from '../src/core/fts-language.ts';
 
 const ENV_KEY = 'GBRAIN_FTS_LANGUAGE';
@@ -106,9 +106,9 @@ describe('configurable_fts_language migration', () => {
   test('the fork final-trigger step installs upstream\'s bounded body and rebuilds nothing', async () => {
     // Upstream v245 now owns what this fork step used to add (no compiled_truth, bounded timeline) and backfills
     // only the rows that need it; v232 adds the CJK/Latin boundary split. The fork step installs that same body
-    // (gbrain_fts_input first, so it never depends on v232 having run) and issues no row rewrite. Looked up BY NAME:
-    // fork migrations are re-sequenced to max(upstream)+1 on every sync.
-    const forkMig = MIGRATIONS.find(
+    // (gbrain_fts_input first, so it never depends on v232 having run) and issues no row rewrite. Looked up BY NAME
+    // in FORK_MIGRATIONS, the fork's own counter.
+    const forkMig = FORK_MIGRATIONS.find(
       m => m.name === 'fork_page_search_vector_final_trigger_and_batched_backfill',
     );
     expect(forkMig).toBeDefined();

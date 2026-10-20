@@ -25,12 +25,6 @@ import {
 import { baseMigrations } from '../../scripts/check-schema-migration-order.ts';
 import { LATEST_VERSION, MIGRATIONS } from '../../src/core/migrate.ts';
 import { LATEST_SCHEMA_VERSION } from '../../src/core/schema-migrations/latest.generated.ts';
-import { FORK_LATEST_VERSION, FORK_MIGRATION_FLOOR } from '../../src/core/fork-migrations.ts';
-
-// FORK: migrations at or above FORK_MIGRATION_FLOOR are appended by buildForkMigrations, not generated
-// from the directory, so the generated registry is compared with the upstream-owned slice only.
-const UPSTREAM_MIGRATIONS = MIGRATIONS.filter((m) => m.version < FORK_MIGRATION_FLOOR);
-const FORK_MIGRATION_COUNT = MIGRATIONS.length - UPSTREAM_MIGRATIONS.length;
 
 const REPO = resolve(import.meta.dir, '..', '..');
 const DIR = join(REPO, 'src/core/schema-migrations');
@@ -68,13 +62,13 @@ describe('committed registry', () => {
   test('latest.generated.ts is what the generator produces and equals migrate.ts LATEST_VERSION', () => {
     // test-reads-source-ok[structural]: generated-file freshness contract.
     expect(readFileSync(join(DIR, 'latest.generated.ts'), 'utf8')).toBe(renderLatest(scanMigrations(DIR)));
-    expect(LATEST_VERSION).toBe(Math.max(LATEST_SCHEMA_VERSION, FORK_LATEST_VERSION));
+    expect(LATEST_SCHEMA_VERSION).toBe(LATEST_VERSION);
   });
 
   test('covers every migration file once, uses static imports only, and keeps master order', () => {
     const files = scanMigrations(DIR);
-    expect(files.length + FORK_MIGRATION_COUNT).toBe(MIGRATIONS.length);
-    expect(registryOrder(files).map((m) => m.version)).toEqual(UPSTREAM_MIGRATIONS.map((m) => m.version));
+    expect(files.length).toBe(MIGRATIONS.length);
+    expect(registryOrder(files).map((m) => m.version)).toEqual(MIGRATIONS.map((m) => m.version));
     const text = renderRegistry(files);
     expect(text).not.toMatch(/import\s*\(/);
     expect(text).not.toContain('require(');
