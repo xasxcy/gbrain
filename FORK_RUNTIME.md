@@ -80,3 +80,6 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
 
   差 22 倍。重复文本几乎不产生 token 负载,字节数对得上不等于负载对得上。真实内容约 **8.2 秒/chunk 且线性**,所以 32 条一批 ≈ 262 秒,已经超过 `GBRAIN_AI_EMBED_TIMEOUT_MS=180000`——**这类批在数学上就跑不完,重试多少次都一样**。判端点健不健康,拿真实 chunk 打。
 - **`schema_version` 对得上不代表迁移都跑过。** runMigrations 用的是单个高水位整数,不是已应用集合;被同号占掉的迁移会被永久静默跳过。要确认就做对账式检查:解析迁移声称创建的对象,逐个查生产 catalog。见 vault ADR-087。
+  - 每次启动的 schema 重放（`CREATE/ADD ... IF NOT EXISTS`）会悄悄补上一部分被跳过的迁移，所以“被跳过”和“留下缺口”是两回事；已知缺口由 `src/core/fork-migrations.ts` 里的 `repair_masked_*` 迁移补，最早的一段（上游 117–122）由 v275 补。
+  - 全新库 vs 迁移库的 catalog 对比看不到两类东西：视图的 `reloptions`（例如 `page_links` 的 `security_invoker`）和纯数据语句（`setval`、`UPDATE`）。这两类要单独查。
+  - 不要整段重放旧迁移：后来的迁移可能已经删掉它建的东西（v188 删了 v122 的索引），或它会 `ALTER` 运行角色不拥有的对象（`auto_enable_rls`、`page_links` 归 postgres）。
