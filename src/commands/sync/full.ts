@@ -106,7 +106,7 @@ export async function performFullSync(
   const holdRoot = slugRoot ?? syncScopeRoot;
   // FORK: source config exclude_paths, expanded by the same predicate the
   // incremental delta filter uses, gate the dry run and the import alike.
-  const sourceExclude = sourceExcludeGlobs(await readSourceExcludePaths(engine, opts.sourceId));
+  const sourceExclude = company ? [] : sourceExcludeGlobs(await readSourceExcludePaths(engine, opts.sourceId));
   if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, opts, { holds, holdRoot }, sourceExclude);
 
   // v0.22.13 (PR #490 A1 + Q5): full sync is always "large" by definition
