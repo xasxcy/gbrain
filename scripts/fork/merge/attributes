@@ -1,0 +1,27 @@
+# FORK: merge drivers for machine-maintained files (installed into
+# $GIT_COMMON_DIR/info/attributes by scripts/fork/merge/install.sh, so the
+# upstream .gitattributes stays untouched). after-merge.sh regenerates every
+# `fork-theirs` file from the merged sources.
+
+# Generated sources and bundles: take upstream, regenerate after the merge.
+*.generated.ts merge=fork-theirs
+llms.txt merge=fork-theirs
+llms-full.txt merge=fork-theirs
+plugin/** merge=fork-theirs
+plugin-variants/** merge=fork-theirs
+scripts/structural-suites.tsv merge=fork-theirs
+scripts/*-weights.metadata.json merge=fork-theirs
+# Contract goldens: take upstream, regenerate with regen:all --goldens (+ Postgres goldens).
+test/fixtures/goldens/** merge=fork-theirs
+
+# Ratchet / baseline TSVs: keyed three-way row merge (merge-lib.ts TSV_SPECS).
+scripts/module-size-limits.tsv merge=fork-tsv
+scripts/function-size-baseline.tsv merge=fork-tsv
+scripts/chunk-visibility-baseline.tsv merge=fork-tsv
+scripts/item-allowlist-catches-baseline.tsv merge=fork-tsv
+scripts/serial-files.tsv merge=fork-tsv
+scripts/engine-sql-baseline.tsv merge=fork-tsv
+scripts/guards-manifest.tsv merge=fork-tsv
+
+# Shard weights: upstream's measurements plus the fork's own test files.
+scripts/*-weights.json merge=fork-json-union
