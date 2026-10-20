@@ -89,7 +89,6 @@ import { readStoredEmbeddingIdentity } from './stored-embedding-identity.ts';
 import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP, TRAVERSE_WALK_ROW_CAP } from './engine-constants.ts';
 import { PageMissingError } from './engine-errors.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkGenerationFilter, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
-import { pageBudgetLimitedFilter } from './page-size-policy.ts';
 import { acquireLock, pgliteLockDirFor, releaseLock, type LockHandle } from './pglite-lock.ts';
 import { assertPgliteGraduationOpenable } from './persistence/graduation-custody.ts';
 // Engine-live path (#3596): static import, never a lazy `import()` in the
@@ -1817,89 +1816,7 @@ export class PGLiteEngine implements BrainEngine {
   async persistEmbedOutcome(request: PersistEmbedOutcomeRequest): Promise<PersistEmbedOutcomeResult> { return embedFailuresLedger.persistEmbedOutcome(this, request); }
   async listEmbedFailures(opts: { sourceId?: string; slug?: string } = {}): Promise<EmbedFailureRecord[]> { return embedFailuresLedger.listEmbedFailures(this, opts); }
   async releaseEmbedFailures(opts: { sourceId?: string; slug: string; chunkIndex?: number }): Promise<number> { return embedFailuresLedger.releaseEmbedFailures(this, opts); }
-  async getEmbedFailureSummary(opts: { sourceId?: string; signature: string }): Promise<EmbedFailureSummary> { // engine-sql-ok: summary combines the engine's stale predicate and PGLite row adapter; extraction must preserve that shared predicate.
-    // Every summary branch starts from the same registry-active/live-page
-    // candidate set as count/list stale. Ledger state is the only distinction.
-    const activeColumn = await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true });
-    const candidate = this.buildListStaleChunkWhere(activeColumn.name, opts.sourceId === undefined ? undefined : { sourceId: opts.sourceId });
-    const totalResult = await this.db.query(
-      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
-      `SELECT count(*)::int AS count
-         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-        WHERE ${candidate.where}`,
-      candidate.params,
-    );
-    const total_null = Number((totalResult.rows[0] as { count?: number } | undefined)?.count ?? 0);
-    const eligible = this.buildListStaleChunkWhere(activeColumn.name, opts);
-    const eligibleResult = await this.db.query(
-      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
-      `SELECT count(*)::int AS count
-         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-        WHERE ${eligible.where}`,
-      eligible.params,
-    );
-    const eligible_now = Number((eligibleResult.rows[0] as { count?: number } | undefined)?.count ?? 0);
-
-    const base = candidate;
-    const params = [...base.params, opts.signature];
-    const signatureParam = params.length;
-    const ledgerJoin = `l.source_id = p.source_id
-      AND l.page_id = cc.page_id
-      AND l.chunk_index = cc.chunk_index
-      AND l.embedding_signature = $${signatureParam}
-      AND l.chunk_hash = md5(cc.chunk_text)`;
-    const stateResult = await this.db.query(
-      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
-      `SELECT
-         count(*) FILTER (WHERE l.quarantined_at IS NULL AND l.next_retry_at > now())::int AS backoff_deferred,
-         count(*) FILTER (WHERE l.quarantined_at IS NOT NULL)::int AS quarantined,
-         min(l.next_retry_at) FILTER (WHERE l.quarantined_at IS NULL AND l.next_retry_at > now()) AS earliest_retry_at
-       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-       LEFT JOIN embed_failures l ON ${ledgerJoin}
-       WHERE ${base.where}`,
-      params,
-    );
-    const state = stateResult.rows[0] as { backoff_deferred?: number; quarantined?: number; earliest_retry_at?: Date | string | null } | undefined;
-    const classResult = await this.db.query(
-      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
-      `SELECT l.error_class, count(*)::int AS count
-         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-         JOIN embed_failures l ON ${ledgerJoin}
-        WHERE ${base.where}
-        GROUP BY l.error_class
-        ORDER BY count DESC, l.error_class ASC`,
-      params,
-    );
-    const topResult = await this.db.query(
-      // chunk-visibility-ok: the WHERE comes from buildListStaleChunkWhere, which applies chunkGenerationFilter
-      `SELECT p.slug, cc.chunk_index, l.error_class, l.attempt_count
-         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
-         JOIN embed_failures l ON ${ledgerJoin}
-        WHERE ${base.where} AND l.quarantined_at IS NOT NULL
-        ORDER BY l.attempt_count DESC, l.last_seen DESC, p.slug ASC, cc.chunk_index ASC
-        LIMIT 5`,
-      params,
-    );
-    return {
-      counts: {
-        total_null,
-        eligible_now,
-        backoff_deferred: Number(state?.backoff_deferred ?? 0),
-        quarantined: Number(state?.quarantined ?? 0),
-      },
-      earliest_retry_at: state?.earliest_retry_at == null ? null : new Date(state.earliest_retry_at),
-      by_error_class: (classResult.rows as Array<{ error_class: EmbedFailureSummary['by_error_class'][number]['error_class']; count: number }>).map((row) => ({
-        error_class: row.error_class,
-        count: Number(row.count),
-      })),
-      quarantined_top: (topResult.rows as Array<{ slug: string; chunk_index: number; error_class: EmbedFailureSummary['quarantined_top'][number]['error_class']; attempt_count: number }>).map((row) => ({
-        slug: row.slug,
-        chunk_index: Number(row.chunk_index),
-        error_class: row.error_class,
-        attempt_count: Number(row.attempt_count),
-      })),
-    };
-  }
+  async getEmbedFailureSummary(opts: { sourceId?: string; signature: string }): Promise<EmbedFailureSummary> { return embedFailuresLedger.getEmbedFailureSummary(this, opts); }
 
   private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number; deferSeal?: true }): Promise<void> {
     return chunksImpl.upsertChunksOnce(this.engineSql, {
@@ -1933,48 +1850,7 @@ export class PGLiteEngine implements BrainEngine {
     return quoteIdentifier(col.name);
   }
 
-  /**
-   * FORK: retry-ledger helpers for getEmbedFailureSummary (raw `$N` SQL). The
-   * stale-list/count paths get the same predicate from engine-sql/chunks.ts.
-   * Appends the active retry-ledger anti-join for a current signature.
-   */
-  private appendEmbedFailureEligibility( // engine-sql-ok: PGLite-only raw placeholder builder used by the legacy stale cursor path.
-    conds: string[],
-    params: unknown[],
-    signature: string | undefined,
-    ignoreBackoff?: boolean,
-  ): void {
-    if (signature === undefined || ignoreBackoff) return;
-    params.push(signature);
-    const signatureParam = params.length;
-    conds.push(`NOT EXISTS (
-      SELECT 1 FROM embed_failures l
-       WHERE l.page_id = cc.page_id
-         AND l.chunk_index = cc.chunk_index
-         AND l.embedding_signature = $${signatureParam}
-         AND l.chunk_hash = md5(cc.chunk_text)
-         AND (l.quarantined_at IS NOT NULL OR l.next_retry_at > now())
-    )`);
-  }
 
-  private buildListStaleChunkWhere(column: string, opts?: { sourceId?: string; signature?: string; ignoreBackoff?: boolean }): { where: string; params: unknown[] } {
-    const params: unknown[] = [];
-    const conds = [
-      `cc.${quoteIdentifier(column)} IS NULL`,
-      'p.deleted_at IS NULL',
-      // The same visibility and budget gates as listStaleChunks (engine-sql/chunks.ts staleChunkWhere), so the
-      // summary counts exactly the rows the drain can list: no staged/retired generations, no held large pages.
-      chunkGenerationFilter('p', 'cc'),
-      `NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')`,
-      `NOT ${pageBudgetLimitedFilter('p')}`,
-    ];
-    this.appendEmbedFailureEligibility(conds, params, opts?.signature, opts?.ignoreBackoff);
-    if (opts?.sourceId !== undefined) {
-      params.push(opts.sourceId);
-      conds.push(`p.source_id = $${params.length}`);
-    }
-    return { where: conds.join(' AND '), params };
-  }
 
   async countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean; ignoreBackoff?: boolean }): Promise<number> {
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;

@@ -59,8 +59,6 @@ export const DOMAIN_OF: Record<string, string> = {
   'jitOffRead': OOS.helper,
   'detectPgroonga': OOS.helper,
   'ensurePgroongaProbed': OOS.helper,
-  'appendEmbedFailureEligibility': OOS.helper,
-  'buildListStaleChunkWhere': OOS.helper,
   'persistEmbedOutcome': OOS.embedLedger,
   'listEmbedFailures': OOS.embedLedger,
   'releaseEmbedFailures': OOS.embedLedger,

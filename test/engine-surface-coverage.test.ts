@@ -134,10 +134,6 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'applyForwardReferenceBootstrap',
   'getBulkRetryOpts',
   'batchRetry',
-  // FORK: deleteObsoleteEmbedFailures moved to engine-sql/chunks.ts and the stale-chunk WHERE builders /
-  // signature-eligible listing folded into listStaleChunks in the v0.60 merge, so they are no longer engine methods.
-  'appendEmbedFailureEligibility',
-  'buildListStaleChunkWhere',
   'activeEmbeddingColId',
   'codeEdgesDeps',
   // refactor wave 1 C9: per-call engine-sql executor getter (EO1).

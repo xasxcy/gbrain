@@ -7,6 +7,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { resolveActiveEmbeddingColumnFromEngine } from '../../src/core/search/embedding-column.ts';
+import { buildListStaleChunkWhere } from '../../src/core/embed-failures-ledger.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -59,16 +60,12 @@ d('Postgres EXPLAIN — stale eligibility branches', () => {
   });
 
   test('four branches preserve the stale partial-index keyset and active-ledger index lookup', async () => {
-    // These are the production selector builders, deliberately reached from
-    // the engine instance rather than duplicated predicates in this test.
+    // These are the production selector builders (embed-failures-ledger.ts), not duplicated predicates.
     // FORK: the builder takes the active embedding column first; without a signature it adds no ledger
     // predicate, so the unsigned call is both the total-stale selector and the ledger-join base.
-    const production = engine as unknown as {
-      buildListStaleChunkWhere(column: string, opts: { sourceId: string; signature?: string }): { where: string; params: unknown[] };
-    };
     const column = (await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name;
-    const total = production.buildListStaleChunkWhere(column, { sourceId: 'explain-source' });
-    const eligible = production.buildListStaleChunkWhere(column, { sourceId: 'explain-source', signature: 'explain:model:1536' });
+    const total = buildListStaleChunkWhere(column, { sourceId: 'explain-source' });
+    const eligible = buildListStaleChunkWhere(column, { sourceId: 'explain-source', signature: 'explain:model:1536' });
     const base = total;
     const signatureParam = base.params.length + 1;
     const exact = `l.source_id = p.source_id
