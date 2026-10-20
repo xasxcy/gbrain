@@ -68,6 +68,8 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
 - OCR 关掉的原因:OCR 模型调用失败时,缺 OCR 文字的图片每一轮都会被重建,每次重建都要付费调用 DashScope 多模态接口。
 - 10 分钟预算同时约束图片 sweep 和文字 drain,两者共用一个时间窗口。
 - 字节没变、而且 `visual_model` 标记与当前模型一致的图片,重建时直接复用已有向量,不再付费。
+- 老图片没有 `visual_model` 标记,靠生产配置 `embedding_image_legacy_visual_model=dashscope:qwen3-vl-embedding` 认定为当前模型生成的。不要用 SQL 回填 frontmatter:触发器会推进 revision,所有图片页都会变成未封存。
+- 本轮 OCR 名额(`embedding_image_ocr_max_images`)用完后,只缺 OCR 文字的图片会跳过重建,计入日志里的 `ocr_deferred`,不再每轮重写这些 chunk、触发文字 re-embed。
 
 日志:`~/Library/Logs/gbrain-sync.log`。注意**只有「跳过」的轮次才带时间戳**,正常开跑的轮次不带,所以不能靠时间戳行数数轮次。
 
