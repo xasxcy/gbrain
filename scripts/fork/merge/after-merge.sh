@@ -12,7 +12,12 @@ step() { printf '\n== %s\n' "$*"; }
 fail=0
 
 step "files still holding conflict markers"
-markers="$(git diff --name-only --diff-filter=U; git grep -lE '^(<<<<<<<|>>>>>>>) ' -- ':!*.md' 2>/dev/null)"
+# Only paths the merge touched: some committed fixtures quote conflict markers on purpose.
+touched="$(git diff --name-only HEAD; git diff --name-only --cached HEAD)"
+markers="$(git diff --name-only --diff-filter=U
+  printf '%s\n' "${touched}" | sort -u | while IFS= read -r f; do
+    [ -f "${f}" ] && grep -qE '^(<<<<<<<|>>>>>>>) ' "${f}" && printf '%s\n' "${f}"
+  done)"
 if [ -n "${markers}" ]; then printf '%s\n' "${markers}" | sort -u; fail=1; else echo "none"; fi
 
 step "regen:all"
@@ -22,7 +27,8 @@ step "offline contract goldens"
 n=0
 while IFS= read -r t; do
   n=$((n + 1))
-  if ! GBRAIN_TEST_UPDATE_GOLDENS=1 bun test --timeout=60000 "${t}" >>"${log}" 2>&1; then echo "golden refresh failed: ${t}"; fail=1; fi
+  # Offline tests refuse to start with a DATABASE_URL in the environment.
+  if ! env -u DATABASE_URL -u GBRAIN_TEST_ALLOW_DATABASE_URL GBRAIN_TEST_UPDATE_GOLDENS=1 bun test --timeout=60000 "${t}" >>"${log}" 2>&1; then echo "golden refresh failed: ${t}"; fail=1; fi
 done < <(git grep -lE 'GBRAIN_TEST_UPDATE_GOLDENS|helpers/golden' -- 'test/*.test.ts' 'test/**/*.test.ts' ':!test/e2e/**')
 echo "${n} golden test file(s) refreshed"
 

@@ -8,10 +8,11 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { mergeJsonUnion, mergeKeyedTsv, TSV_SPECS } from '../scripts/fork/merge/merge-lib.ts';
+import { DuplicateKeyError, mergeJsonUnion, mergeKeyedTsv, TSV_SPECS } from '../scripts/fork/merge/merge-lib.ts';
 
 const MODULE = TSV_SPECS['scripts/module-size-limits.tsv']!;
 const FUNCTION = TSV_SPECS['scripts/function-size-baseline.tsv']!;
+const ENGINE_SQL = TSV_SPECS['scripts/engine-sql-baseline.tsv']!;
 const tsv = (...rows: string[][]) => rows.map(r => r.join('\t')).join('\n') + '\n';
 
 describe('mergeKeyedTsv', () => {
@@ -48,6 +49,33 @@ describe('mergeKeyedTsv', () => {
     const out = mergeKeyedTsv(base, ours, '', MODULE);
     expect(out.conflicts).toBe(1);
     expect(out.text).toBe('<<<<<<< fork\na.ts\t110\tratchet\tseed; +10\n=======\n>>>>>>> upstream\n');
+  });
+
+  test('a fork row ahead of every retained row stays ahead (sorted files keep their order)', () => {
+    const base = tsv(['b.ts', 'g', '400', 'seed']);
+    const ours = tsv(['a.ts', 'f', '320', 'FORK'], ['b.ts', 'g', '400', 'seed']);
+    const theirs = tsv(['b.ts', 'g', '380', 'seed; lowered']);
+    expect(mergeKeyedTsv(base, ours, theirs, FUNCTION).text).toBe(tsv(['a.ts', 'f', '320', 'FORK'], ['b.ts', 'g', '380', 'seed; lowered']));
+  });
+
+  test('a numeric change both sides made identically is not applied twice', () => {
+    const base = tsv(['a.ts', '100', 'ratchet', 'seed']);
+    const out = mergeKeyedTsv(base, tsv(['a.ts', '110', 'ratchet', 'seed']), tsv(['a.ts', '110', 'ratchet', 'seed; note']), MODULE);
+    expect(out).toEqual({ text: tsv(['a.ts', '110', 'ratchet', 'seed; note']), conflicts: 0 });
+  });
+
+  test('engine-sql rows of one file are distinct rows (whole-row key)', () => {
+    const base = tsv(['migrated', 'facts'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.a'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.b']);
+    const ours = tsv(['migrated', 'facts'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.a'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.b'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.fork']);
+    const theirs = tsv(['migrated', 'facts'], ['migrated', 'links'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.b']);
+    expect(mergeKeyedTsv(base, ours, theirs, ENGINE_SQL)).toEqual({
+      text: tsv(['migrated', 'facts'], ['migrated', 'links'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.b'], ['method', 'src/core/pglite-engine.ts', 'PGLiteEngine.fork']), conflicts: 0,
+    });
+  });
+
+  test('two rows under one key are refused, never silently dropped', () => {
+    const dup = tsv(['a.ts', '100', 'ratchet', 'seed'], ['a.ts', '90', 'ratchet', 'other']);
+    expect(() => mergeKeyedTsv(dup, dup, dup, MODULE)).toThrow(DuplicateKeyError);
   });
 
   test('a reason both sides rewrote (not an append) is a conflict', () => {

@@ -11,6 +11,9 @@
  * - `mergeJsonUnion`: shard-weight JSONs. Upstream's object, plus the keys the
  *   fork added, minus the keys the fork deleted.
  *
+ * A file with two rows under one key is not merged here (`DuplicateKeyError`):
+ * the driver falls back to git's text merge rather than drop a row.
+ *
  * The ratchet checks (`bun run verify`) still judge the merged numbers against
  * the merged code, so a delta that no longer fits fails loudly after the merge.
  */
@@ -39,6 +42,8 @@ interface Parsed {
 
 const HEADER = /^(path|kind|name)\t/;
 
+export class DuplicateKeyError extends Error {}
+
 function parseTsv(text: string, spec: TsvSpec): Parsed {
   const trailingNewline = text.endsWith('\n');
   const lines = text === '' ? [] : text.split('\n');
@@ -49,8 +54,7 @@ function parseTsv(text: string, spec: TsvSpec): Parsed {
   for (const line of lines) {
     if (rows.size === 0 && (line.startsWith('#') || HEADER.test(line) || line === '')) { head.push(line); continue; }
     const key = line.split('\t').slice(0, spec.keyCols).join('\t');
-    // A duplicate key keeps its first row; the ratchet checks reject duplicates themselves.
-    if (rows.has(key)) continue;
+    if (rows.has(key)) throw new DuplicateKeyError(`duplicate row key: ${key}`);
     rows.set(key, line);
     order.push(key);
   }
@@ -65,7 +69,7 @@ function combineRow(base: string, ours: string, theirs: string, spec: TsvSpec): 
   if (a.length !== o.length || b.length !== o.length) return null;
   const out = [...b];
   for (let i = spec.keyCols; i < o.length; i++) {
-    if (a[i] === o[i]) continue; // fork left it alone: upstream's value stands
+    if (a[i] === o[i] || a[i] === b[i]) continue; // fork left it alone, or both made the same change
     if (b[i] === o[i]) { out[i] = a[i]!; continue; } // only the fork changed it
     if (i === spec.numCol) {
       const [on, an, bn] = [Number(o[i]), Number(a[i]), Number(b[i])];
@@ -104,16 +108,21 @@ export function mergeKeyedTsv(baseText: string, oursText: string, theirsText: st
       merged.set(key, ['<<<<<<< fork', ...(a === undefined ? [] : [a]), '=======', ...(b === undefined ? [] : [b]), '>>>>>>> upstream'].join('\n'));
     } else if (row !== undefined) merged.set(key, row);
   }
-  // Upstream's order, with each fork-only row placed after the row that precedes it in the fork's file.
+  // Upstream's order, with each fork-only row placed after the row that precedes it in the fork's file
+  // (or, with no placed predecessor, before the row that follows it).
   const order = theirs.order.filter(k => merged.has(k));
   for (const [i, key] of ours.order.entries()) {
     if (!merged.has(key) || order.includes(key)) continue;
-    let at = order.length;
-    for (let j = i - 1; j >= 0; j--) {
+    let at = -1;
+    for (let j = i - 1; j >= 0 && at < 0; j--) {
       const p = order.indexOf(ours.order[j]!);
-      if (p >= 0) { at = p + 1; break; }
+      if (p >= 0) at = p + 1;
     }
-    order.splice(at, 0, key);
+    for (let j = i + 1; j < ours.order.length && at < 0; j++) {
+      const p = order.indexOf(ours.order[j]!);
+      if (p >= 0) at = p;
+    }
+    order.splice(at < 0 ? order.length : at, 0, key);
   }
   for (const key of merged.keys()) if (!order.includes(key)) order.push(key);
   const head = theirs.head.length ? theirs.head : ours.head;
@@ -142,6 +151,7 @@ export const TSV_SPECS: Record<string, TsvSpec> = {
   'scripts/chunk-visibility-baseline.tsv': { keyCols: 1, numCol: 1, textCol: -1 },
   'scripts/item-allowlist-catches-baseline.tsv': { keyCols: 1, numCol: 1, textCol: -1 },
   'scripts/serial-files.tsv': { keyCols: 1, numCol: -1, textCol: 2 },
-  'scripts/engine-sql-baseline.tsv': { keyCols: 2, numCol: -1, textCol: -1 },
+  // Rows are `migrated<TAB>domain` or `method<TAB>path<TAB>Name`: the whole row is the key.
+  'scripts/engine-sql-baseline.tsv': { keyCols: 3, numCol: -1, textCol: -1 },
   'scripts/guards-manifest.tsv': { keyCols: 1, numCol: -1, textCol: 3 },
 };

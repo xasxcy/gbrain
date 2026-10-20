@@ -11,7 +11,7 @@
  */
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { mergeJsonUnion, mergeKeyedTsv, TSV_SPECS } from './merge-lib.ts';
+import { DuplicateKeyError, mergeJsonUnion, mergeKeyedTsv, TSV_SPECS, type MergeOutcome } from './merge-lib.ts';
 
 const [kind, base, ours, theirs, path] = process.argv.slice(2);
 if (!kind || !base || !ours || !theirs) {
@@ -31,9 +31,16 @@ if (kind === 'theirs') {
   code = 0;
 } else if (kind === 'tsv') {
   const spec = path ? TSV_SPECS[path] : undefined;
-  if (!spec) code = textMerge();
+  let out: MergeOutcome | null = null;
+  if (spec) {
+    try { out = mergeKeyedTsv(read(base), read(ours), read(theirs), spec); }
+    catch (err) {
+      if (!(err instanceof DuplicateKeyError)) throw err;
+      console.error(`[fork-merge] ${path}: ${err.message}; falling back to a text merge`);
+    }
+  }
+  if (!out) code = textMerge();
   else {
-    const out = mergeKeyedTsv(read(base), read(ours), read(theirs), spec);
     writeFileSync(ours, out.text);
     code = out.conflicts ? 1 : 0;
     if (out.conflicts) console.error(`[fork-merge] ${path}: ${out.conflicts} row(s) changed differently on both sides; resolve the marked rows`);

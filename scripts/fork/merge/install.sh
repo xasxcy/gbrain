@@ -3,8 +3,8 @@
 # Idempotent. Run from anywhere inside the repository.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
-common="$(git rev-parse --git-common-dir)"
-case "${common}" in /*) ;; *) common="${root}/${common}" ;; esac
+# Absolute: a relative --git-common-dir is relative to the invocation directory, not the top.
+common="$(git rev-parse --path-format=absolute --git-common-dir)"
 mkdir -p "${common}/info"
 src="${root}/scripts/fork/merge/attributes"
 dst="${common}/info/attributes"
