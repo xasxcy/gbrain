@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- FORK: launchd agent for scripts/fork/ops/ollama-warm.sh. Installed by scripts/fork/ops/install-ollama-warm.sh,
+     which replaces __HOME__ with the real home directory. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.xasxcy.gbrain-ollama-warm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/.local/bin/gbrain-ollama-warm.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/gbrain-ollama-warm.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/gbrain-ollama-warm.log</string>
+</dict>
+</plist>
