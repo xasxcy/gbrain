@@ -365,3 +365,28 @@ its PGroonga version or leftover state in that database explains it is a hypothe
 `test/cli-contract.test.ts` (no `DATABASE_URL`, `TMPDIR` resolved to its real path): `setup --json` and
 `doctor --json` fail `assertFailureShape` with "failing invocation exits non-zero" (`cli-contract.test.ts:142`).
 The third earlier local failure (`import --json`) was the macOS `/var` symlink and passes with a real `TMPDIR`.
+
+---
+
+## FB-009 · Pre-existing fork test failures confirmed in the v0.60.331.0 sync CI
+
+- **Recorded**: 2026-10-21
+- **Status**: each fails identically before the merge (fork CI run on `ci/merge-speedup-r2`, or a local run on
+  `2c049521e`); none is caused by the sync. Root causes are listed only where established.
+- **Trigger**: before changing the area each one covers, or when cleaning up fork CI to a green baseline.
+
+- `test/managed-writer-guard-null-source-5983.test.ts` "upgrading a v196 brain": its FORK guard expects fork
+  migrations inside `MIGRATIONS` above `LATEST_SCHEMA_VERSION`. Since the fork counter split (fork migrations live in
+  `FORK_MIGRATIONS`) that set is empty, so `expect(forkOwned.length).toBeGreaterThan(0)` fails. Established.
+- `collect-migration` (3 tests) and `advisor-cli` (3 tests, FB-005): unexpected pending-migration findings.
+- `line falls back to the last log lines`: not investigated.
+- `test/scripts/test-shard.slow.test.ts` "runs the shard files in the planned order": fails locally on macOS only,
+  passes in fork CI.
+- Fork-environment E2E failures already known from the v0.60.299.0 sync: Tier 1 graduation (a hosted-style
+  NOSUPERUSER role cannot create the `pgroonga` extension), the PGLite ↔ Postgres index-parity check (the
+  Postgres-only `idx_content_chunks_pgroonga`), and the "Postgres 15 compatibility" lane (its `pgvector:pg15` image
+  has no PGroonga, so fork migration 1 fails).
+
+Seen once in fork CI and not reproduced locally (Postgres A-11 breaker 14/14; IPC test 3 of 3 runs green), treated as
+runner timing until they recur: `test/pathological/a11-effect-retry-budget.test.ts` (postgres; a seed `put_page`
+answered `write_pending` after 10.1 s) and `test/resolve-ipc-v2.test.ts` turn_context (`IPC_UNAVAILABLE`).
