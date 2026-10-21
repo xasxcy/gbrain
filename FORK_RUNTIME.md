@@ -51,7 +51,8 @@ Surge **代替目标主机接下了 TCP 握手**,之后才在隧道里失败。�
 
 | launchd 标签 | 干什么 | 现状 |
 |---|---|---|
-| cron 包装脚本 `~/.local/bin/gbrain-cron-sync.sh` | 每 30 分钟 `bun src/cli.ts sync` | **在跑** |
+| cron 包装脚本 `~/.local/bin/gbrain-cron-sync.sh` | 每 15 分钟 `bun src/cli.ts sync`(crontab `*/15`,2026-10-21 核实) | **在跑** |
+| `com.xasxcy.gbrain-ollama-warm` | 每 5 分钟向 `.124` 的 ollama 原生 `/api/embed` 发一次只加载、不计算的请求(`keep_alive: 30m`),让 embedding 模型常驻 | 源码在 `scripts/fork/ops/`,用 `bash scripts/fork/ops/install-ollama-warm.sh` 安装(`--remove` 卸载),日志 `~/Library/Logs/gbrain-ollama-warm.log` |
 | `com.xasxcy.gbrain-upstream-sync` | 原先每天 10:30 跑上游同步脚本 | **已不存在**：`~/Library/LaunchAgents` 里只剩 `com.xasxcy.gbrain-upstream-sync.plist.bak-20260720T122831`（2026-10-20 核实）。自动同步基本完不成，上游同步一律手动做。 |
 
 早期停用的背景见 `FORK_BACKLOG.md` 与 vault ADR-087。手动同步时不再给 fork 迁移改号，fork 迁移有自己的计数器，见下面“排障”里的迁移编号一条。
@@ -70,6 +71,8 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
 - 字节没变、而且 `visual_model` 标记与当前模型一致的图片,重建时直接复用已有向量,不再付费。
 - 老图片没有 `visual_model` 标记,靠生产配置 `embedding_image_legacy_visual_model=dashscope:qwen3-vl-embedding` 认定为当前模型生成的。不要用 SQL 回填 frontmatter:触发器会推进 revision,所有图片页都会变成未封存。
 - 本轮 OCR 名额(`embedding_image_ocr_max_images`)用完后,只缺 OCR 文字的图片会跳过重建,计入日志里的 `ocr_deferred`,不再每轮重写这些 chunk、触发文字 re-embed。
+
+embedding 冷启动(2026-10-21 实测):`.124` 上的 `qwen3-embedding:4b` 跑在 CPU 上(`size_vram 0`),常驻约 3.5GB。冷启动一次约 2.2 秒,热状态约 0.09 秒。ollama 默认空闲 5 分钟就卸载;gbrain 走的 `/v1/embeddings` 会**忽略** `keep_alive`,只有原生 `/api/embed` 认,所以保活要靠上面那个 agent。reranker(`8081`,llama-server,`qwen3-reranker-0.6b`)启动时加载、之后一直常驻,不需要保活。看模型在不在内存里:`curl http://192.168.50.124:11434/api/ps`。
 
 日志:`~/Library/Logs/gbrain-sync.log`。注意**只有「跳过」的轮次才带时间戳**,正常开跑的轮次不带,所以不能靠时间戳行数数轮次。
 
