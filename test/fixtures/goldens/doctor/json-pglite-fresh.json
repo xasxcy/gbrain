@@ -848,7 +848,7 @@
           "category": "brain",
           "details": {
             "archived": 0,
-            "as_of": "<ts>+08",
+            "as_of": "<ts>+00",
             "failed": 0,
             "ocr_required": 0,
             "oldest_age_seconds": "<volatile>",

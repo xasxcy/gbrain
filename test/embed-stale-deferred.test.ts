@@ -362,6 +362,22 @@ describe('lease loss detection does not depend on the signal reason (F5 R5-2)', 
 });
 
 describe('every rethrow point keeps lease loss a LockStolenError (F5 R5-3)', () => {
+  test('content-drift sweep: lease recorded as the abort reason (no throw) still fails the run, never a quiet abort', async () => {
+    // The sweep reads an aborted signal as `stopped` and returns; the fork re-raises a LockStolenError reason after it.
+    await seedPage('sweep-abort', ['a']);
+    const controller = new AbortController();
+    let txChecks = 0;
+    const { calls, embedFn } = recordingEmbed();
+    await expect(embedStaleForSource(engine, 'default', {
+      embedFn, signal: controller.signal,
+      assertOwned: async tx => {
+        // Transactional check 1 is the sweep's first batch transaction (start).
+        if (tx && ++txChecks === 1) controller.abort(new LockStolenError('embed-backfill:test'));
+      },
+    })).rejects.toBeInstanceOf(LockStolenError);
+    expect(calls).toEqual([]);
+  });
+
   test('heal catch: lease recorded as the abort reason inside the heal transaction, the step then fails with an abort', async () => {
     await seedPage('heal-abort', ['a']);
     const controller = new AbortController();

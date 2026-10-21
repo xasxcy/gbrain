@@ -22,6 +22,7 @@ import { withEnv } from './helpers/with-env.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
 import { tryAcquireDbLock, LockStolenError } from '../src/core/db-lock.ts';
 import { EMBED_PROBE_TEXT } from '../src/core/embed-stale.ts';
+import { CONTENT_DRIFT_SWEEP_KEY_PREFIX } from '../src/core/content-drift-sweep.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
@@ -192,19 +193,32 @@ describe('embed-backfill handler — D2 lock contract', () => {
   });
 
   test('F4a R4-2: ownership lost inside a fenced transaction (abort, then throw) rejects instead of status:aborted', async () => {
-    // Real drain. The content-drift invalidation transaction steals the lease from inside; its own second
-    // assertOwned(tx) then aborts the drain signal with a LockStolenError and throws. That catch used to map
-    // the stop to a quiet `aborted` return.
-    const prototype = Object.getPrototypeOf(engine) as { invalidateContentDriftEmbeddings: (...args: unknown[]) => Promise<unknown> };
-    (engine as unknown as Record<string, unknown>).invalidateContentDriftEmbeddings = async function (this: BrainEngine, ...args: unknown[]) {
-      await this.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid() WHERE id='gbrain-embed-backfill:default'");
-      return prototype.invalidateContentDriftEmbeddings.apply(this, args);
-    };
+    // Real drain. The content-drift sweep's batch transaction steals the lease from inside (when it locks its own
+    // state row, between its two assertOwned(tx) checks); the second check then aborts the drain signal with a
+    // LockStolenError and throws. That catch used to map the stop to a quiet `aborted` return.
+    const realTransaction = engine.transaction.bind(engine);
+    let stolen = false;
+    (engine as unknown as Record<string, unknown>).transaction = <T>(fn: (tx: BrainEngine) => Promise<T>) => realTransaction(tx => fn(new Proxy(tx, {
+      get(target, prop) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (!stolen && /FOR UPDATE/.test(sql) && params?.some(v => typeof v === 'string' && v.startsWith(CONTENT_DRIFT_SWEEP_KEY_PREFIX))) {
+              stolen = true;
+              await target.executeRaw("UPDATE gbrain_cycle_locks SET acquisition_token=gen_random_uuid() WHERE id='gbrain-embed-backfill:default'");
+            }
+            return target.executeRaw(sql, params as never);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    })));
     try {
       const handler = makeEmbedBackfillHandler(engine, { embedFn: async texts => texts.map(() => new Float32Array(1536)) });
       await expect(handler(fakeJob({ sourceId: 'default' }))).rejects.toBeInstanceOf(LockStolenError);
+      expect(stolen).toBe(true);
     } finally {
-      delete (engine as unknown as Record<string, unknown>).invalidateContentDriftEmbeddings;
+      delete (engine as unknown as Record<string, unknown>).transaction;
     }
   });
 
