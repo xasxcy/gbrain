@@ -6,12 +6,12 @@
       "--skills-dir",
       "<home>/skills"
     ],
-    "exit_code": 1,
+    "exit_code": 0,
     "report": {
-      "brain_checks_score": 70,
+      "brain_checks_score": 90,
       "budget_ms": "<volatile>",
       "category_scores": {
-        "brain": 70,
+        "brain": 90,
         "meta": 100,
         "ops": 100,
         "skill": 95
@@ -2049,78 +2049,27 @@
         {
           "category": "brain",
           "details": {
-            "code": "content_receipt_stale",
-            "no_successful_sync": [
-              {
-                "code": "content_receipt_stale",
-                "fix": {
-                  "actor": "agent",
-                  "argv": [
-                    "gbrain",
-                    "repair",
-                    "content-receipt-root",
-                    "--source",
-                    "default"
-                  ],
-                  "consent": [],
-                  "docs": "docs/guides/repair.md#content-receipt-root",
-                  "requires_exclusive": false,
-                  "verify": {
-                    "argv": [
-                      "gbrain",
-                      "doctor",
-                      "--only",
-                      "sync_freshness",
-                      "--json"
-                    ]
-                  },
-                  "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
-                },
-                "held": 0,
-                "job_id": null,
-                "last_attempt_at": null,
-                "reason": "receipt_root_moved",
-                "result": null,
-                "source_id": "default"
-              }
-            ],
-            "stale_count": 1,
+            "stale_count": 0,
             "synced_recently_count": 0,
-            "unchanged_count": 0
+            "unchanged_count": 0,
+            "writer_owned_count": 1
           },
           "elapsed_ms": "<volatile>",
-          "fix": {
-            "actor": "agent",
-            "argv": [
-              "gbrain",
-              "repair",
-              "content-receipt-root",
-              "--source",
-              "default",
-              "--brain",
-              "host"
-            ],
-            "command": "gbrain repair content-receipt-root --source default --brain host",
-            "consent": [],
-            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#content-receipt-root",
-            "next": "run",
-            "requires_exclusive": false,
-            "verify": {
-              "argv": [
-                "gbrain",
-                "doctor",
-                "--only",
-                "sync_freshness",
-                "--json",
-                "--brain",
-                "host"
-              ]
-            },
-            "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
-          },
-          "message": "Source 'default': no successful sync recorded; it is a gbrain-owned content directory whose content receipt names an old root, so sync does not apply and doctor cannot exempt it; run `gbrain repair content-receipt-root --source default`",
+          "message": "1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status.",
           "name": "sync_freshness",
-          "status": "fail"
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "pending_count": 0,
+            "recovering_count": 0,
+            "writer_owned_count": 1
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "1 writer-owned content source(s); no pending canonical publication or recovery.",
+          "name": "canonical_content_writes",
+          "status": "ok"
         },
         {
           "category": "ops",
@@ -3176,7 +3125,7 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
-          "message": "3 retrieval-affecting file(s) changed since HEAD: src/core/operations.ts, src/core/search/projection-statistics.ts, src/core/search/vector-statement.ts. Re-run `gbrain eval run-all` after committing these changes.",
+          "message": "No retrieval-affecting files changed in working tree.",
           "name": "eval_drift",
           "status": "ok"
         },
@@ -3451,46 +3400,11 @@
       "db_url_source": null,
       "elapsed_ms": "<volatile>",
       "engine": "pglite",
-      "health_score": 65,
+      "health_score": 85,
       "schema_version": 2,
-      "status": "unhealthy",
+      "status": "warnings",
       "tier": "standard",
       "top_issues": [
-        {
-          "action": {
-            "actor": "agent",
-            "argv": [
-              "gbrain",
-              "repair",
-              "content-receipt-root",
-              "--source",
-              "default",
-              "--brain",
-              "host"
-            ],
-            "command": "gbrain repair content-receipt-root --source default --brain host",
-            "consent": [],
-            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#content-receipt-root",
-            "next": "run",
-            "requires_exclusive": false,
-            "verify": {
-              "argv": [
-                "gbrain",
-                "doctor",
-                "--only",
-                "sync_freshness",
-                "--json",
-                "--brain",
-                "host"
-              ]
-            },
-            "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
-          },
-          "fix": "Source 'default': no successful sync recorded; it is a gbrain-owned content directory whose content receipt names an old root, so sync does not apply and doctor cannot exempt it; run `gbrain repair content-receipt-root --source default`",
-          "name": "sync_freshness",
-          "status": "fail",
-          "tier": "root"
-        },
         {
           "fix": "embedding: declared dims=3072 but actual is vector(1024). Fix one side: update config OR ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(3072);",
           "name": "embedding_column_registry",

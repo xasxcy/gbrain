@@ -103,6 +103,25 @@ describe('#5226 migrate embeddings dry run', () => {
     expect(mixedWorst).toEqual(paidWorst);
   });
 
+  test('FORK: a target-space vector with no input provenance on a contextual-mode page is priced, not kept', async () => {
+    // The fork's invalidation keeps only vectors with provable input (currentInputChunkPredicate): on a page
+    // whose contextual mode is set, a vector with embedding_input_hash NULL is cleared and re-embedded, so
+    // the worst-case authorization must charge for it exactly like a page with no vectors at all.
+    await seed(engine, 'no-vectors', 1, null);
+    await seed(engine, 'current-vectors', 2, null);
+    await engine.updatePageContextualRetrievalState('current-vectors', 'default', 'none', null);
+    const unvectored = await planMigrationWorstCase(engine,
+      await planEmbeddingMigration(engine, { to: MODEL, dim: DIMS, fromModel: 'legacy:model', fromDims: DIMS }));
+    await resetPgliteState(engine);
+    await seed(engine, 'no-vectors', 1, null);
+    await seed(engine, 'current-vectors', 2, { model: MODEL });
+    await engine.updatePageContextualRetrievalState('current-vectors', 'default', 'none', null);
+    const plan = await planEmbeddingMigration(engine, { to: MODEL, dim: DIMS, fromModel: 'legacy:model', fromDims: DIMS });
+    expect(plan.chunks_to_restamp).toBe(0);
+    expect(plan.chunks_to_embed).toBe(3);
+    expect(await planMigrationWorstCase(engine, plan)).toEqual(unvectored);
+  });
+
   test('PR #6959: a width change still prices current vectors (the column is rebuilt)', async () => {
     await seed(engine, 'no-vectors', 1, null);
     const target = { to: 'openai:text-embedding-3-small', dim: 1024, fromModel: MODEL, fromDims: DIMS };

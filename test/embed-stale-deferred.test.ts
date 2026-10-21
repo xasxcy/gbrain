@@ -370,11 +370,11 @@ describe('every rethrow point keeps lease loss a LockStolenError (F5 R5-3)', () 
     await expect(embedStaleForSource(engine, 'default', {
       embedFn, signal: controller.signal,
       assertOwned: async tx => {
-        // Transactional checks: content-drift invalidation (start, end), then the heal transaction (start).
-        if (tx && ++txChecks === 3) controller.abort(new LockStolenError('embed-backfill:test'));
+        // Transactional checks: the content-drift sweep's two batches (start, end each), then the heal transaction (start).
+        if (tx && ++txChecks === 5) controller.abort(new LockStolenError('embed-backfill:test'));
       },
     })).rejects.toBeInstanceOf(LockStolenError);
-    expect(txChecks).toBe(3);
+    expect(txChecks).toBe(5);
     expect(calls).toEqual([]);
     expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(1);
   });

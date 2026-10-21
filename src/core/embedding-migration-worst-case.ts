@@ -24,7 +24,7 @@ import { embedRequestCeilings, rerankRequestMaxInputTokens } from './ai/embed-ba
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import type { ChunkInput, CRMode } from './types.ts';
 import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
-import { currentSpaceChunkPredicate, falseStampPageWhere } from './embedding-invalidation.ts';
+import { currentInputChunkPredicate, falseStampPageWhere } from './embedding-invalidation.ts';
 import { resolveActiveEmbeddingColumnFromEngine, quoteIdentifier } from './search/embedding-column.ts';
 import { eligibleFactEmbedding, staleFactEmbedding } from './facts/embedding-identity.ts';
 import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
@@ -95,7 +95,8 @@ async function eachStalePage(engine: BrainEngine, plan: EmbeddingMigrationPlan, 
     ? quoteIdentifier((await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name)
     : null;
   // #5289: without a column rebuild, invalidation keeps a vector already in the target space and the drain never sends it.
-  const kept = (c: string) => plan.dim_change ? 'false' : currentSpaceChunkPredicate(column!, 2, 5, c);
+  // FORK: the fork's invalidation keeps only vectors with provable input (currentInputChunkPredicate), so the bound must too.
+  const kept = (c: string) => plan.dim_change ? 'false' : currentInputChunkPredicate(column!, 2, 5, c);
   const staleChunk = (c: string) => column === null ? 'true' : `((${c}.${column} IS NULL OR p.embedding_signature IS NULL OR p.embedding_signature <> $1
       OR (${c}.embedded_text_hash IS NOT NULL AND ${c}.embedded_text_hash <> md5(${c}.chunk_text))
       OR (${c}.${column} IS NOT NULL AND ${falseStampPageWhere(column, 1, 2)})) AND NOT ${kept(c)})`;

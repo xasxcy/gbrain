@@ -809,6 +809,11 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
           const masked = requireMaskedMigration(deps, 'repair_masked_upstream_166_177', version);
           await deps.applyOneMigration(engine, masked);
         }
+        // 169 and 174 reinstall the per-row INSERT withdrawal trigger that upstream 264 replaced with a
+        // statement-level guard; replaying them after 264 (fresh install, or any brain already past 264)
+        // would bring the per-row path back. Re-apply 264 (idempotent, DDL only) so the head definition wins.
+        const supersedes = deps.allMigrations().find(m => m.version === 264);
+        if (supersedes) await deps.applyOneMigration(engine, supersedes);
         deps.migrationNotice(
           '  repair: re-applied upstream migrations 166-177 masked by the upstream v0.60.139.0 fork renumber\n',
         );

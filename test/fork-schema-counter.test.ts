@@ -77,18 +77,21 @@ describe('fork schema counter (PGLite)', () => {
     expect(await counters(engine)).toEqual(['270', '3']);
   });
 
-  test('the masking class is gone: an upstream 261 runs on a brain the fork stamped 275', async () => {
-    // Under the shared counter this brain's high-water (275) is above 261, so the new upstream migration
-    // was skipped forever. Adoption moves upstream's counter back to 260 and the migration runs.
-    const upstream261: Migration = {
-      version: LEGACY_UPSTREAM_MAX + 1, name: 'synthetic_upstream_261', idempotent: true,
-      sql: 'CREATE TABLE IF NOT EXISTS synthetic_upstream_261 (id INT)',
+  test('the masking class is gone: upstream migrations above 260 run on a brain the fork stamped 275', async () => {
+    // Under the shared counter this brain's high-water (275) is above every new upstream version, so those
+    // migrations were skipped forever. Adoption moves upstream's counter back to 260 and they all run,
+    // including a synthetic one past upstream's current latest.
+    const upstreamLatest = Math.max(...MIGRATIONS.map(m => m.version));
+    const synthetic: Migration = {
+      version: upstreamLatest + 1, name: 'synthetic_upstream_next', idempotent: true,
+      sql: 'CREATE TABLE IF NOT EXISTS synthetic_upstream_next (id INT)',
     };
+    const realAbove = MIGRATIONS.filter(m => m.version > LEGACY_UPSTREAM_MAX).length;
     await stampLegacy(engine, LEGACY_FORK_MAX);
-    const result = await runMigrations(engine, { migrations: [...MIGRATIONS, upstream261] });
-    expect(result.applied).toBe(1);
-    expect(await engine.executeRaw(`SELECT to_regclass('synthetic_upstream_261') IS NOT NULL AS made`)).toEqual([{ made: true }]);
-    expect(await counters(engine)).toEqual([String(LEGACY_UPSTREAM_MAX + 1), String(FORK_LATEST_VERSION)]);
+    const result = await runMigrations(engine, { migrations: [...MIGRATIONS, synthetic] });
+    expect(result.applied).toBe(realAbove + 1);
+    expect(await engine.executeRaw(`SELECT to_regclass('synthetic_upstream_next') IS NOT NULL AS made`)).toEqual([{ made: true }]);
+    expect(await counters(engine)).toEqual([String(upstreamLatest + 1), String(FORK_LATEST_VERSION)]);
   }, 60_000);
 
   test('the fork pass runs only fork migrations above its own counter, whatever upstream\'s counter says', async () => {

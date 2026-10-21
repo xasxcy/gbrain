@@ -7,6 +7,9 @@
 #   DATABASE_URL=postgresql://…/gbrain_test_x bash scripts/fork/merge/after-merge.sh   # + Postgres goldens
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
+# macOS TMPDIR sits under the /var symlink; fixtures built there read as a moved content root
+# (doctor reports receipt_root_moved) or a refused symlinked import root, which pollutes the goldens.
+TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"; export TMPDIR
 log="${TMPDIR:-/tmp}/fork-after-merge-$$.log"
 step() { printf '\n== %s\n' "$*"; }
 fail=0

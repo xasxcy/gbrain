@@ -60,9 +60,9 @@ export function currentSpaceChunkPredicate(colId: string, modelParam: number, di
  * `p` (pages) aliases. This is the strict N2 rule: the drain's completion stamp
  * (`stampIfPageProvenanceComplete`) uses it as is.
  */
-export function currentInputChunkPredicate(colId: string, modelParam: number, dimsParam: number): string {
-  return `(${currentSpaceChunkPredicate(colId, modelParam, dimsParam)}
-              AND (cc.embedding_input_hash IS NOT NULL OR p.contextual_retrieval_mode IS NULL))`;
+export function currentInputChunkPredicate(colId: string, modelParam: number, dimsParam: number, alias = 'cc'): string {
+  return `(${currentSpaceChunkPredicate(colId, modelParam, dimsParam, alias)}
+              AND (${alias}.embedding_input_hash IS NOT NULL OR p.contextual_retrieval_mode IS NULL))`;
 }
 
 export async function lockEmbeddingSources(tx: Pick<BrainEngine, 'executeRaw'>, sourceId?: string): Promise<string[]> {
