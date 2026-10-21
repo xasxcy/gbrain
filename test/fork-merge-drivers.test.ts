@@ -147,6 +147,7 @@ describe('drivers in a real git merge', () => {
     expect(unmerged).toEqual(['src/code.ts']);
     expect(readFileSync(join(dir, 'scripts/module-size-limits.tsv'), 'utf8')).toBe(tsv(['src/a.ts', '95', 'ratchet', 'seed; lowered; +5 FORK']));
     expect(JSON.parse(readFileSync(join(dir, 'scripts/test-weights.json'), 'utf8'))).toEqual({ 'test/a.test.ts': 4, 'test/fork.test.ts': 2 });
+    // test-reads-source-ok[generated-artifact]: a scratch repo's generated fixture, checking the merge driver's output bytes
     expect(readFileSync(join(dir, 'src/x.generated.ts'), 'utf8')).toBe('export const X = 2;\n');
   }, 60_000);
 });
