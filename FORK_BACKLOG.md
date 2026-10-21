@@ -279,3 +279,30 @@ files), guarded so a `getChunks` failure skips the page for the pass rather than
 embedding a diverged snapshot, and update the ~9 SPEC V4 test mocks in
 `test/embed.serial.test.ts` to stub `getChunks`. Keep it symmetric across both
 cursor sites.
+
+## FB-005 · `advisor-cli` tests see an unexpected `pending_migration` finding
+
+- **Recorded**: 2026-10-21
+- **Status**: reproduced; root cause NOT established.
+- **Origin**: present on `95cc82201` (before the merge-speedup branch) and unchanged on `3b8dc0005`, so not
+  caused by that branch.
+
+### The failure
+
+`test/advisor-cli.test.ts`, run alone (`bun test test/advisor-cli.test.ts`, no `DATABASE_URL`): 9 pass,
+3 fail, identically on both commits:
+
+- `runAdvisorCli exit-verdict mapping … > worst = warn (ontology conflicts, no critical) → exit 1`
+- `runAdvisorCli exit-verdict mapping … > info-only findings → exit 0`
+- `runAdvisorCli --apply > unknown id with NOTHING runnable → "Nothing is runnable right now." suffix`
+
+Each gets an extra finding id `pending_migration` that the test does not expect (`advisor-cli.test.ts:156`).
+In fork CI the same three failed in a Test shard on `ci/merge-speedup-r2` but not on the baseline run
+`ci/baseline-95cc8-r1`, whose shard layout differed; the CI outcome is order- or shard-dependent, the local
+single-file run is not.
+
+### Not yet checked
+
+Whether the advisor's pending-migration collector reads upstream's `config.version` only, or also the fork's
+`fork_schema_version` (`src/core/fork-migrations.ts`), on the test's fresh brain. That is a hypothesis, not a
+finding.
