@@ -306,3 +306,62 @@ single-file run is not.
 Whether the advisor's pending-migration collector reads upstream's `config.version` only, or also the fork's
 `fork_schema_version` (`src/core/fork-migrations.ts`), on the test's fresh brain. That is a hypothesis, not a
 finding.
+
+---
+
+## FB-006 · Fork counter adoption cannot tell a vanilla upstream 261–275 brain from the last legacy fork layout
+
+- **Recorded**: 2026-10-21 (upstream v0.60.331.0 sync, adversarial review)
+- **Status**: latent; deliberately not fixed in that sync.
+- **Trigger**: any brain reaching this binary WITHOUT the `fork_schema_version` config key while its
+  `config.version` is 261–275. That is: a brain switched from vanilla upstream (which now ships 261–264) to this
+  fork, or an operator running `gbrain config unset fork_schema_version` (or `config unset --pattern fork_`).
+  Also re-evaluate when upstream's own range passes 275: adoption then refuses every vanilla brain above 275.
+
+### The defect
+
+`adoptForkCounter` (`src/core/fork-migrations.ts`) treats any version in 261–275 with no fork key as the last
+legacy fork layout: upstream's counter becomes 260 and the fork counter `version - 260`. On a vanilla upstream
+brain stamped 264 this sets the fork counter to 4 and skips fork migrations 1–4, including the `embed_failures`
+ledger table; later ledger operations fail with `relation "embed_failures" does not exist`. After a deleted key
+on an adopted brain, the same path replays upstream 261–264 and fork repairs 5–15 (repeated backfills; repair 10
+can fail its migration 149 while minions are active).
+
+### Why it is safe today
+
+The production brain was adopted in the v0.60.299.0 sync and carries the key. Nothing in `src` deletes it
+automatically (restore, `--force-schema` and config reset paths were checked); only the explicit operator
+command above can.
+
+### Fix direction (unverified)
+
+Discriminate the legacy layout by a fork-only object that every 261–275 legacy layout has, instead of by the
+version number alone, and refuse ambiguous brains rather than guessing.
+
+---
+
+## FB-007 · Two fork Postgres e2e files fail against the local rehearsal container on the pre-merge fork too
+
+- **Recorded**: 2026-10-21
+- **Status**: reproduced locally on `2c049521e` (pre-merge) and on the v0.60.331.0 merge alike; root cause NOT
+  established. Fork CI results for the same files not yet compared.
+- **Trigger**: the same failures in fork CI, or before any change to PGroonga search or the stale-embedding
+  eligibility SQL.
+
+- `test/e2e/postgres-engine-pgroonga.test.ts`: `① 纯中文` and `② 纯ASCII` return 0 results (expected ≥ 1).
+- `test/e2e/embed-stale-explain-postgres.test.ts`: the EXPLAIN shape assertion at line 99 is false.
+
+Run against `gbrain-pg-rehearsal` (`gbrain_test_base`), one file per process. Whether the container image,
+its PGroonga version or leftover state in that database explains it is a hypothesis, not a finding.
+
+---
+
+## FB-008 · `cli-contract` setup/doctor failure envelopes exit 0 in local runs
+
+- **Recorded**: 2026-10-21
+- **Status**: reproduced locally on `2c049521e` and on the v0.60.331.0 merge alike; root cause NOT established.
+- **Trigger**: the same failure in fork CI.
+
+`test/cli-contract.test.ts` (no `DATABASE_URL`, `TMPDIR` resolved to its real path): `setup --json` and
+`doctor --json` fail `assertFailureShape` with "failing invocation exits non-zero" (`cli-contract.test.ts:142`).
+The third earlier local failure (`import --json`) was the macOS `/var` symlink and passes with a real `TMPDIR`.
