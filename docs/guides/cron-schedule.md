@@ -192,6 +192,13 @@ per-transcript synthesis subagents. The dials:
   There is no per-page force flag: the tombstone is keyed by a hash of the
   page body, so any edit to the body re-extracts the page on the next cycle,
   and that is the only way to send one tombstoned page again.
+  A page the model refuses the same way in 3 cycles (a prompt too long for
+  the model, a content block) gets a separate failure tombstone and is
+  skipped while its body and the prompt version are unchanged; pages that
+  failed before are retried after the fresh ones, so they never block the
+  rest. `gbrain takes propose --failed` lists held pages and
+  `gbrain takes propose --retry-failed [--slug <slug>]` releases them.
+  Timeouts, rate limits and other transient errors are never held.
 - `dream.synthesize.attribution_rules` and `dream.propose_takes.attribution_rules`
   (default off) — extra prompt rules from #5425: keep who proposed what and
   later corrections explicit; an assistant-authored judgment is not the

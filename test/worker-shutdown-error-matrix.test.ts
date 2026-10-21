@@ -19,14 +19,18 @@
  * job is not in `inFlight` when the watchdog fires. Before the fix the job
  * launched unaborted and took the requestShutdown path (`worker_shutdown`
  * hand-back, or the handler's own text for an UnrecoverableError) instead of
- * `aborted: watchdog`; this is the window the un-forced watchdog test hit
- * on a CI Postgres.
+ * the watchdog abort; this is the window the un-forced watchdog test hit on a
+ * CI Postgres. Since GBRA-130 A-30 the watchdog charges only a job that ran
+ * alone when it tripped, so a claim that registers after the drain began goes
+ * back to `waiting` uncharged and marked to run alone
+ * (watchdog-attribution.ts).
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { requirePostgresTestDatabase, testBackends } from './helpers/test-backends.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
+import { WATCHDOG_DRAIN_RELEASE } from '../src/core/minions/watchdog-attribution.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { UnrecoverableError, type MinionJobContext } from '../src/core/minions/types.ts';
 import { LocalConfigurationError } from '../src/core/minions/configuration-error.ts';
@@ -42,7 +46,12 @@ const ERRORS: Record<string, (ctx: MinionJobContext) => unknown> = {
 
 type WorkerInternals = { queue: MinionQueue; inFlight: Map<number, unknown>; gracefulShutdown(reason: string): void };
 
-/** `holdClaimResult`: park the committed claim's result until the trigger has fired, so the trigger lands before launchJob. */
+/**
+ * Without `holdClaimResult` the trigger fires once the handler is running: a
+ * row already `active` in the database may still be in the claim round trip,
+ * where the watchdog would see a late claim instead of a job running alone.
+ * `holdClaimResult`: park the committed claim's result until the trigger has fired, so the trigger lands before launchJob.
+ */
 async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof ERRORS, holdClaimResult = false) {
   const queue = new MinionQueue(engine);
   const worker = new MinionWorker(engine, { pollInterval: 10, lockDuration: 60_000, healthCheckInterval: 0, stalledInterval: 600_000 });
@@ -50,7 +59,9 @@ async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const name = `matrix-${trigger}-${kind}${holdClaimResult ? '-held' : ''}`;
-  worker.register(name, async (ctx) => { await gate; throw ERRORS[kind]!(ctx); });
+  let handlerStarted!: () => void;
+  const started = new Promise<void>(resolve => { handlerStarted = resolve; });
+  worker.register(name, async (ctx) => { handlerStarted(); await gate; throw ERRORS[kind]!(ctx); });
   const job = await queue.add(name, {}, { max_attempts: 3 }, { allowProtectedSubmit: true });
   let releaseClaim = () => {};
   let claimCommitted: Promise<void> | null = null;
@@ -71,7 +82,7 @@ async function runCase(engine: BrainEngine, trigger: Trigger, kind: keyof typeof
     expect((await queue.getJob(job.id))?.status).toBe('active');
     expect(internals.inFlight.size).toBe(0);
   } else {
-    for (let i = 0; i < 400 && (await queue.getJob(job.id))?.status !== 'active'; i++) await Bun.sleep(10);
+    await started;
   }
   if (trigger === 'requestShutdown') worker.requestShutdown();
   else if (trigger === 'watchdog') internals.gracefulShutdown('watchdog');
@@ -110,9 +121,9 @@ for (const backend of testBackends()) describe(`worker shutdown error matrix (W9
     expect(await runCase(engine, 'watchdog', 'unrecoverable')).toEqual({ status: 'dead', attempts: 1, error: 'aborted: watchdog' });
   }, 60_000);
 
-  test('watchdog inside the claim round trip: a claim committed before the shutdown is aborted when it registers', async () => {
-    expect(await runCase(engine, 'watchdog', 'plain', true)).toEqual({ status: 'delayed', attempts: 1, error: 'aborted: watchdog' });
-    expect(await runCase(engine, 'watchdog', 'unrecoverable', true)).toEqual({ status: 'dead', attempts: 1, error: 'aborted: watchdog' });
+  test('watchdog inside the claim round trip: a claim committed before the shutdown is aborted when it registers and goes back uncharged (it did not run alone when the watchdog tripped)', async () => {
+    expect(await runCase(engine, 'watchdog', 'plain', true)).toEqual({ status: 'waiting', attempts: 0, error: WATCHDOG_DRAIN_RELEASE });
+    expect(await runCase(engine, 'watchdog', 'unrecoverable', true)).toEqual({ status: 'waiting', attempts: 0, error: WATCHDOG_DRAIN_RELEASE });
   }, 60_000);
 
   test('configuration block: every error releases through the configuration path with no attempt burned', async () => {

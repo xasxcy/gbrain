@@ -76,6 +76,7 @@
     "check:fork-migration-masking": "bash scripts/check-fork-migration-masking.sh",
     "check:cli-exec": "bash scripts/check-cli-executable.sh",
     "check:engine-dynamic-import": "bash scripts/check-engine-dynamic-import.sh",
+    "check:file-url-pathname": "bash scripts/check-file-url-pathname.sh",
     "check:grok-pin": "bash scripts/check-grok-pin.sh",
     "check:opencode-pin": "bash scripts/check-opencode-pin.sh",
     "check:pin-doc-privacy": "bash scripts/check-pin-doc-privacy.sh",
@@ -175,6 +176,8 @@
     "check:shared-tree-git": "bash scripts/check-shared-tree-git.sh",
     "check:bash32": "bash scripts/check-bash32.sh",
     "check:schema-migration-order": "bun scripts/check-schema-migration-order.ts",
+    "check:behavior-since": "bun scripts/check-behavior-since.ts",
+    "check:changelog-headings": "bun scripts/check-changelog-headings.ts",
     "check:compile-autoload": "bash scripts/check-compile-autoload.sh",
     "check:structural-manifest": "bash scripts/check-structural-manifest.sh",
     "regen:all": "bun scripts/regen-all.ts",
@@ -204,7 +207,7 @@
     "@electric-sql/pglite": "0.4.3",
     "@jsquash/avif": "^2.1.1",
     "@jsquash/png": "^3.1.1",
-    "@modelcontextprotocol/sdk": "1.31.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "ai": "^6.0.168",
     "chokidar": "^4.0.3",
     "cookie-parser": "^1.4.7",
@@ -242,7 +245,7 @@
     "bun": ">=1.4.0"
   },
   "license": "MIT",
-  "version": "0.60.299.0",
+  "version": "0.60.331.0",
   "overrides": {
     "@ai-sdk/provider-utils": "4.0.56",
     "@hono/node-server": "^2.0.5",
@@ -251,7 +254,7 @@
     "fast-xml-builder": "^1.1.7",
     "fast-xml-parser": "^5.7.0",
     "form-data": "^4.0.6",
-    "hono": "^4.13.5",
+    "hono": "^4.13.11",
     "ip-address": "^10.5.1",
     "qs": "6.16.0",
     "js-yaml": "^4.3.2"

@@ -32,6 +32,7 @@ import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import type { ScopedReadRunner } from './cjk-search.ts';
 import { compileRowNormalizer } from './normalize.ts';
 import { stagingNeedsTextSql } from '../page-body/schema.ts';
+import { atomRetirementPurgeHold } from '../persistence/atom-retirement-hold.ts';
 import { createPageVersion } from '../page-state/versions.ts';
 import { renderFragment, sqlFragment, trustedSql } from './fragment.ts';
 import { quoteIdentifier, resolveWriteColumnFromConfigRows } from '../search/embedding-column.ts';
@@ -320,7 +321,8 @@ export async function purgeDeletedPages(
         WHERE deleted_at IS NOT NULL
           AND deleted_at < now() - (${hours} || ' hours')::interval
           AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text
-            AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz)${excluded}
+            AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz)
+          AND ${trustedSql(atomRetirementPurgeHold('pages'))}${excluded}
         ORDER BY deleted_at ASC, slug ASC
       `);
       const pages = rows.map((r) => ({
@@ -340,7 +342,9 @@ export async function purgeDeletedPages(
           AND deleted_at < now() - (${hours} || ' hours')::interval
           -- #6729: the old page of an open rename-identity downgrade waits for its disposition (identityDowngradePurgeHold).
           AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text
-            AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz)${excluded}
+            AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz)
+          -- #7013: a restorable re-extraction retirement waits out its hold (atomRetirementPurgeHold).
+          AND ${trustedSql(atomRetirementPurgeHold('pages'))}${excluded}
         RETURNING slug, source_id
       `);
       if (rows.length) await tx.run(sqlFragment`DELETE FROM page_body_stagings s USING unnest(${rows.map(r => r.source_id)}::text[], ${rows.map(r => r.slug)}::text[]) AS d(source_id, slug)
@@ -460,6 +464,12 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const slugCondition = slugPrefix
       ? sqlFragment`AND p.slug LIKE ${slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%'} ESCAPE '\\'`
       : sqlFragment``;
+    // Search fallbacks must exclude before LIMIT: post-filtering can lose the
+    // entire evidence floor when newer excluded pages occupy every slot.
+    const excludedSlugs = filters?.excludeSlugPrefixes?.filter(prefix => prefix.length > 0) ?? [];
+    const excludedSlugCondition = excludedSlugs.length
+      ? sqlFragment` AND NOT EXISTS (SELECT 1 FROM unnest(${excludedSlugs}::text[]) AS excluded(prefix) WHERE starts_with(p.slug, excluded.prefix))`
+      : sqlFragment``;
     // #6500 slug keyset (single-source contract, see PageFilters.slugAfter).
     const slugAfterCondition = filters?.slugAfter !== undefined
       ? sqlFragment`AND p.slug > ${filters.slugAfter}`
@@ -498,7 +508,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition}${excludedSlugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);

@@ -97,12 +97,12 @@ export const GHOST_SCAN_LIMIT = 250_000;
 const BATCH = 10_000;
 
 interface PageRow { id: number; slug: string; source_path: string | null; source_uri: string | null }
-type SourceContext = { ok: true; root: string; owner: GhostOwner; mode: Awaited<ReturnType<typeof scannerSlugRootMode>>; gitScope: string[] | null }
+export type SourceContext = { ok: true; root: string; owner: GhostOwner; mode: Awaited<ReturnType<typeof scannerSlugRootMode>>; gitScope: string[] | null }
   | { ok: false; status: 'unknown' | 'not_applicable'; reason: string };
 
 const missing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException)?.code ?? '');
 
-async function sourceContext(engine: BrainEngine, sourceId: string): Promise<SourceContext> {
+export async function sourceContext(engine: BrainEngine, sourceId: string): Promise<SourceContext> {
   const hostId = existingLocalHostId();
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) return { ok: false, status: 'not_applicable', reason: 'not_applicable' };
@@ -121,7 +121,7 @@ async function sourceContext(engine: BrainEngine, sourceId: string): Promise<Sou
 }
 
 /** The path `prepareFileTarget` compares, resolved the same way (recorded source path, captured file URI, then the slug path). */
-function canonicalPath(context: Extract<SourceContext, { ok: true }>, page: Pick<PageRow, 'slug' | 'source_path' | 'source_uri'>): string {
+export function canonicalPath(context: Extract<SourceContext, { ok: true }>, page: Pick<PageRow, 'slug' | 'source_path' | 'source_uri'>): string {
   const captured = recordedPathFromFileUri(page.source_uri, context.root);
   return resolveSourceLocalFilePath(context.root, page.source_path, page.slug, page.source_path ? context.mode : undefined, context.gitScope)
     ?? (captured ? join(context.root, captured) : join(context.root, `${page.slug}.md`));

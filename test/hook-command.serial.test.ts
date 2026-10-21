@@ -27,6 +27,7 @@ import {
   HOOK_EVENTS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
+import { writeHeartbeat } from '../src/core/context/hook-heartbeat.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import {
   ensureIpcSecret,
@@ -103,6 +104,8 @@ async function startServer(opts: {
   secretOverride?: string;
   boundSourceId?: string;
   onRequest?: (req: TurnContextRequest) => void;
+  /** Answer only after this long, so the serve's backstop answers first. */
+  hangMs?: number;
 }): Promise<void> {
   mkdirSync(opts.dataDir, { recursive: true });
   const secret = opts.secretOverride ?? ensureIpcSecret(opts.dataDir);
@@ -113,6 +116,7 @@ async function startServer(opts: {
       resolve: async () => null,
       turn_context: async (req) => {
         opts.onRequest?.(req);
+        if (opts.hangMs) await new Promise((r) => setTimeout(r, opts.hangMs));
         if (opts.blockText == null) return null;
         return { text: opts.blockText, pointers: [], factsCount: 0 };
       },
@@ -195,6 +199,19 @@ describe('user-prompt source routing (#5941)', () => {
     expect(out.get()).not.toContain('OTHER-SOURCE-CONTEXT');
     expect((await lastHeartbeat())?.reason).toBe('source_mismatch');
   });
+});
+
+describe('serve backstop (GBRA-95 row)', () => {
+  test('a turn_context cut short by the serve backstop records a degraded server_budget heartbeat, never a silent ok', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'LATE-CONTEXT', hangMs: 3000 });
+    const out = collectStdout();
+    await runHook(['user-prompt', '--harness', 'codex'], { ...out.io, userPromptDeadlineMs: 2000, stdin: JSON.stringify({ prompt: 'hello Acme', cwd: tmp }) });
+    expect(out.get()).not.toContain('LATE-CONTEXT');
+    const hb = await lastHeartbeat();
+    expect({ outcome: hb?.outcome, reason: hb?.reason }).toEqual({ outcome: 'degraded', reason: 'server_budget' });
+  }, 10_000);
 });
 
 describe('dispatch', () => {
@@ -1013,6 +1030,26 @@ describe('session-end', () => {
     expect(existsSync(spooled('sess-drift.txt'))).toBe(false);
   });
 
+  test('a Claude Code session with only slash commands is empty_session, not parser_drift', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'empty.jsonl', [
+      JSON.stringify({ type: 'permission-mode', permissionMode: 'default', sessionId: 'sess-empty' }),
+      JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: '<system-reminder>session renamed</system-reminder>' } }),
+      JSON.stringify({ type: 'system', subtype: 'local_command', content: '<command-name>/rename</command-name>' }),
+      JSON.stringify({ type: 'cost-state', sessionId: 'sess-empty' }),
+    ]);
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-empty', transcript_path: transcript, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const hb = await lastHeartbeat();
+    expect(hb?.reason).toBe('empty_session');
+    expect(hb?.outcome).not.toBe('error');
+    expect(existsSync(await hookStatusPath())).toBe(false);
+  });
+
   test('confinement rejection: degraded heartbeat, no corpus write [S3#8]', async () => {
     const outside = join(tmp, 'outside.jsonl');
     writeFileSync(outside, userLine('outside content') + '\n');
@@ -1085,6 +1122,17 @@ describe('heartbeat', () => {
     expect(lines.length).toBe(HEARTBEAT_MAX_LINES);
     // The newest entry survived the compaction.
     expect(JSON.parse(lines[lines.length - 1]).event).toBe('stop');
+  });
+
+  test('#6794: every allowlisted key round-trips through writeHeartbeat', async () => {
+    const entry: Record<string, string | number> = {};
+    HEARTBEAT_ALLOWED_KEYS.forEach((key, i) => {
+      entry[key] = key === 'outcome' ? 'ok' : key === 'duration_ms' ? i : `v-${key}`;
+    });
+    await writeHeartbeat(entry as unknown as HookHeartbeatEntry);
+    const [written] = await readHeartbeatTail(1);
+    expect(Object.keys(written).sort()).toEqual([...HEARTBEAT_ALLOWED_KEYS].sort());
+    expect(written).toEqual(entry as unknown as HookHeartbeatEntry);
   });
 
   test('readHeartbeatTail returns the last n entries oldest→newest', async () => {

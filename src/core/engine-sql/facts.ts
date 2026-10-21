@@ -15,7 +15,7 @@
  */
 import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus, FactAttribution,
-  NewFact, FactListOpts, FactsHealth,
+  NewFact, FactListOpts, RecallFactReadOpts, FactsHealth,
 } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { tryParseEmbedding } from '../utils.ts';
@@ -28,6 +28,7 @@ import type { LegacyUnscopedRead } from './brands.ts';
 import { sqlFragment, trustedSql } from './fragment.ts';
 import { compileRowNormalizer } from './normalize.ts';
 import { projectionEligibleSql } from '../eligibility/sql.ts';
+import { FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING } from '../facts/insert-guard-schema.ts';
 import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
 import { storedTrustTier } from '../trust/tier.ts';
 import { ensureWellFormed } from '../text-safe.ts';
@@ -62,6 +63,19 @@ function privacyClause(opts: { excludePrivate?: boolean } | undefined) {
 
 function grepPattern(opts: FactListOpts | undefined): string | null {
   return (opts?.grep && opts.grep.trim()) ? '%' + escapeLikePattern(opts.grep.trim()) + '%' : null;
+}
+
+/**
+ * The pre-LIMIT narrowing both recall cursor reads apply (listFactsSince and,
+ * for --since-last-run paging, listFactsKeyset): entity, session, audit rows
+ * and --grep. Each part is opt-in, so a caller passing none (delta) gets none.
+ */
+function recallNarrowing(opts: RecallFactReadOpts | undefined) {
+  const grep = grepPattern(opts);
+  return sqlFragment`${opts?.entitySlug != null ? sqlFragment` AND entity_slug = ${opts.entitySlug}` : sqlFragment``}${
+    opts?.sessionId ? sqlFragment` AND source_session = ${opts.sessionId}` : sqlFragment``}${
+    opts?.excludeAuditRows ? sqlFragment` AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}${
+    grep ? sqlFragment` AND fact ILIKE ${grep} ESCAPE '\\'` : sqlFragment``}`;
 }
 
 export async function insertFact(
@@ -171,11 +185,15 @@ const wellFormed = <T extends string | null | undefined>(s: T): T => (typeof s =
  * #6574: inserts fact rows in chunks of FACT_INSERT_CHUNK with one statement
  * each. Returns each input's new id, aligned to `rows`, or null when the v51
  * ON CONFLICT DO NOTHING skipped it; within a chunk the first input for a
- * (slug, row_num) wins, as the per-row loop's order did.
+ * (slug, row_num) wins, as the per-row loop's order did. The inserts run
+ * under FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING, so a withdrawn row is stamped
+ * once per statement by facts_guard_inserted instead of by a per-row trigger
+ * call (#7105); the RETURNING below reads no stamped column.
  */
 async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
   rows: ReadonlyArray<NewFact & { row_num: number; source_markdown_slug: string }>, sourceId: string): Promise<Array<number | null>> {
   const rowIds: Array<number | null> = [];
+  (await tx.run(sqlFragment`SELECT set_config(${FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING}, 'on', true)`)).rows;
   for (let at = 0; at < rows.length; at += FACT_INSERT_CHUNK) {
     const chunk = rows.slice(at, at + FACT_INSERT_CHUNK).map((input, ord) => {
       const embedding = input.embedding ?? null;
@@ -227,6 +245,7 @@ async function insertFactRows(tx: SqlExecutor, castSuffix: EmbeddingCast,
     }
     for (const input of chunk) rowIds.push(byKey.get(factRowKey(input.source_markdown_slug, input.row_num ?? null))?.shift() ?? null);
   }
+  (await tx.run(sqlFragment`SELECT set_config(${FACT_WITHDRAWAL_STAMP_DEFERRED_SETTING}, '', true)`)).rows;
   return rowIds;
 }
 
@@ -396,7 +415,7 @@ export async function listFactsByEntity(
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
       SELECT * FROM facts
       WHERE source_id = ${source_id}
-        AND entity_slug = ${entitySlug}
+        AND entity_slug = ${entitySlug}${opts?.sessionId ? sqlFragment` AND source_session = ${opts.sessionId}` : sqlFragment``}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}
         ${kinds ? sqlFragment`AND kind = ANY(${kinds}::text[])` : sqlFragment``}
@@ -413,7 +432,7 @@ export async function listFactsSince(
   exec: LegacyUnscopedRead,
     source_id: string,
     since: Date,
-    opts?: FactListOpts & { entitySlug?: string; sessionId?: string },
+    opts?: RecallFactReadOpts,
   ): Promise<FactRow[]> {
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
@@ -421,23 +440,15 @@ export async function listFactsSince(
     const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
-    const entitySlug = opts?.entitySlug ?? null;
-    const sessionId = opts?.sessionId ?? null;
     const eventTime = opts?.eventTime === true;
-    const excludeAuditRows = opts?.excludeAuditRows === true;
-    const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
       SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
-        AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}
-        ${entitySlug != null ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
-        ${sessionId ? sqlFragment`AND source_session = ${sessionId}` : sqlFragment``}
+        AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}${recallNarrowing(opts)}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
         ${unconsolidatedOnly ? sqlFragment`AND consolidated_at IS NULL` : sqlFragment``}
         ${kinds ? sqlFragment`AND kind = ANY(${kinds}::text[])` : sqlFragment``}
-        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}
-        ${excludeAuditRows ? sqlFragment`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sqlFragment``}
-        ${grepPat ? sqlFragment`AND fact ILIKE ${grepPat} ESCAPE '\\'` : sqlFragment``}${eligibilityClause(opts)}
+        ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}${eligibilityClause(opts)}
       ORDER BY ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} DESC, id DESC
       LIMIT ${limit} OFFSET ${offset}
     `)).rows;
@@ -459,7 +470,7 @@ export async function listFactsKeyset(
   exec: LegacyUnscopedRead,
   source_id: string,
   after: { createdAt: string; id: number | null } | null,
-  opts?: FactListOpts,
+  opts?: RecallFactReadOpts,
 ): Promise<FactRow[]> {
   const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
   const activeOnly = opts?.activeOnly !== false;
@@ -474,7 +485,7 @@ export async function listFactsKeyset(
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
     FROM facts
     WHERE source_id = ${source_id}
-      ${afterCondition}
+      ${afterCondition}${recallNarrowing(opts)}
       ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
       ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}${privacyClause(opts)}${eligibilityClause(opts)}
     ORDER BY created_at ASC, id ASC

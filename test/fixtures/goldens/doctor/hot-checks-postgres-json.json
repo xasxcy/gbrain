@@ -506,18 +506,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 196974,
-                    "net_per_day_7d": 58822,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 196974,
-                    "reclaimable_bytes": 138152,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196974,
+                    "used": 199300,
                     "window_days": 1
                   },
                   {
@@ -543,18 +543,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 196974,
-                    "net_per_day_7d": 58822,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 196974,
-                    "reclaimable_bytes": 138152,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196974,
+                    "used": 199300,
                     "window_days": 1
                   }
                 ],
@@ -650,6 +650,20 @@
             "elapsed_ms": "<volatile>",
             "message": "No managed sync run is blocked.",
             "name": "managed_sync_blocked",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "age_seconds": null,
+              "docs": "docs/guides/error-codes.md#sync_admission_restricted",
+              "set_at": null,
+              "stored": null,
+              "value": "normal"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "sync.admission is normal: managed sync admits everything it classifies.",
+            "name": "sync_admission_restricted",
             "status": "ok"
           },
           {
@@ -961,6 +975,7 @@
             "details": {
               "effects": [],
               "exact": true,
+              "git_push_holds": [],
               "inspected": 0,
               "parked_effects": 0,
               "truncated": false
@@ -1016,7 +1031,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 149/149 public tables",
+            "message": "RLS enabled on 152/152 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -1030,14 +1045,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1278 column(s) verified against live schema",
+            "message": "1316 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 149 table(s) the applied migrations create exist.",
+            "message": "All 152 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -1453,6 +1468,7 @@
               "preparation_policy": {
                 "maintenance_preparation_ms": "<volatile>",
                 "max_preparation_attempts": 2,
+                "max_transient_retries": 5,
                 "preparation_ceiling_ms": "<volatile>",
                 "sync_preparation_ms": "<volatile>"
               },
@@ -1798,6 +1814,36 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/google-connect.md#api-access",
+              "sources": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+            "name": "google_api_access",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/repair.md#atoms-restore",
+              "hold_until": null,
+              "newest_retired_at": null,
+              "oldest_retired_at": null,
+              "origins": 0,
+              "repair": "atoms-restore",
+              "source_ids": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No atom retired by an empty re-extraction is waiting to be restored.",
+            "name": "atom_retirements_restorable",
+            "status": "ok"
+          },
+          {
             "category": "brain",
             "details": {
               "ambiguous": 0,
@@ -1853,6 +1899,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "affected": 0,
+              "docs": "docs/guides/repair.md#redacted-facts",
+              "repair": "redacted-facts"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active fact holds a redaction marker.",
+            "name": "facts_redaction_marker",
             "status": "ok"
           },
           {
@@ -2220,6 +2278,18 @@
           },
           {
             "category": "ops",
+            "details": {
+              "code": "content_drift_sweep",
+              "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+              "scopes": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+            "name": "content_drift_sweep",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "No connector source is waiting for its account to be repinned.",
             "name": "connector_account_mismatch",
@@ -2430,6 +2500,7 @@
                 "no_remote": 1,
                 "pages_at_risk": 0,
                 "recoverable_repos": 0,
+                "remote_timeouts": 0,
                 "unpushed": 0
               }
             },
@@ -2585,6 +2656,44 @@
             "elapsed_ms": "<volatile>",
             "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
             "name": "managed_sync_latency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/on-commit-sync.md",
+              "sources": [
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "default",
+                  "stalled": false,
+                  "state": null
+                },
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "notes",
+                  "stalled": false,
+                  "state": null
+                },
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "plain",
+                  "stalled": false,
+                  "state": null
+                }
+              ],
+              "sync_on_commit": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "sync.on_commit is off; residents still run explicit sync requests. notifier for default: none running; idle; notifier for notes: none running; idle; notifier for plain: none running; idle.",
+            "name": "commit_notifier",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -3246,6 +3355,54 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "default",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "notes",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "plain",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                }
+              ],
+              "count": 0,
+              "docs": "docs/guides/repair.md#uncommitted-deletions",
+              "exact": true,
+              "other_writer_count": 0,
+              "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+              "samples": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+            "name": "uncommitted_sync_deletions",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "docs": "docs/guides/repair.md#unindexed-files",
               "sources": [
                 {
@@ -3674,7 +3831,7 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "No retrieval-affecting files changed in working tree.",
+            "message": "3 retrieval-affecting file(s) changed since HEAD: src/core/operations.ts, src/core/search/projection-statistics.ts, src/core/search/vector-statement.ts. Re-run `gbrain eval run-all` after committing these changes.",
             "name": "eval_drift",
             "status": "ok"
           },
@@ -3955,14 +4112,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.5.0+4604112a is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 21)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 23)",
             "name": "type_proliferation",
             "status": "ok"
           },
@@ -4792,18 +4949,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 196974,
-                    "net_per_day_7d": 58822,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 196974,
-                    "reclaimable_bytes": 138152,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196974,
+                    "used": 199300,
                     "window_days": 1
                   },
                   {
@@ -4829,18 +4986,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 196974,
-                    "net_per_day_7d": 58822,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 196974,
-                    "reclaimable_bytes": 138152,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 196974,
+                    "used": 199300,
                     "window_days": 1
                   }
                 ],
@@ -4936,6 +5093,20 @@
             "elapsed_ms": "<volatile>",
             "message": "No managed sync run is blocked.",
             "name": "managed_sync_blocked",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "age_seconds": null,
+              "docs": "docs/guides/error-codes.md#sync_admission_restricted",
+              "set_at": null,
+              "stored": null,
+              "value": "normal"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "sync.admission is normal: managed sync admits everything it classifies.",
+            "name": "sync_admission_restricted",
             "status": "ok"
           },
           {
@@ -5247,6 +5418,7 @@
             "details": {
               "effects": [],
               "exact": true,
+              "git_push_holds": [],
               "inspected": 0,
               "parked_effects": 0,
               "truncated": false
@@ -5302,7 +5474,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 149/149 public tables",
+            "message": "RLS enabled on 152/152 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -5316,14 +5488,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1278 column(s) verified against live schema",
+            "message": "1316 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 149 table(s) the applied migrations create exist.",
+            "message": "All 152 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -5739,6 +5911,7 @@
               "preparation_policy": {
                 "maintenance_preparation_ms": "<volatile>",
                 "max_preparation_attempts": 2,
+                "max_transient_retries": 5,
                 "preparation_ceiling_ms": "<volatile>",
                 "sync_preparation_ms": "<volatile>"
               },
@@ -6084,6 +6257,36 @@
             "status": "ok"
           },
           {
+            "category": "ops",
+            "details": {
+              "count": 0,
+              "docs": "docs/guides/google-connect.md#api-access",
+              "sources": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+            "name": "google_api_access",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "by_source": [],
+              "count": 0,
+              "docs": "docs/guides/repair.md#atoms-restore",
+              "hold_until": null,
+              "newest_retired_at": null,
+              "oldest_retired_at": null,
+              "origins": 0,
+              "repair": "atoms-restore",
+              "source_ids": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No atom retired by an empty re-extraction is waiting to be restored.",
+            "name": "atom_retirements_restorable",
+            "status": "ok"
+          },
+          {
             "category": "brain",
             "details": {
               "ambiguous": 0,
@@ -6139,6 +6342,18 @@
             "elapsed_ms": "<volatile>",
             "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
             "name": "captured_facts_active",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "affected": 0,
+              "docs": "docs/guides/repair.md#redacted-facts",
+              "repair": "redacted-facts"
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No active fact holds a redaction marker.",
+            "name": "facts_redaction_marker",
             "status": "ok"
           },
           {
@@ -6506,6 +6721,18 @@
           },
           {
             "category": "ops",
+            "details": {
+              "code": "content_drift_sweep",
+              "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+              "scopes": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+            "name": "content_drift_sweep",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
             "elapsed_ms": "<volatile>",
             "message": "No connector source is waiting for its account to be repinned.",
             "name": "connector_account_mismatch",
@@ -6716,6 +6943,7 @@
                 "no_remote": 1,
                 "pages_at_risk": 0,
                 "recoverable_repos": 0,
+                "remote_timeouts": 0,
                 "unpushed": 0
               }
             },
@@ -6871,6 +7099,44 @@
             "elapsed_ms": "<volatile>",
             "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
             "name": "managed_sync_latency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
+              "docs": "docs/guides/on-commit-sync.md",
+              "sources": [
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "default",
+                  "stalled": false,
+                  "state": null
+                },
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "notes",
+                  "stalled": false,
+                  "state": null
+                },
+                {
+                  "pending_markers": 0,
+                  "reason": null,
+                  "resident": null,
+                  "source_id": "plain",
+                  "stalled": false,
+                  "state": null
+                }
+              ],
+              "sync_on_commit": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "sync.on_commit is off; residents still run explicit sync requests. notifier for default: none running; idle; notifier for notes: none running; idle; notifier for plain: none running; idle.",
+            "name": "commit_notifier",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -7532,6 +7798,54 @@
           {
             "category": "brain",
             "details": {
+              "by_source": [
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "default",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "notes",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                },
+                {
+                  "checked": 0,
+                  "other_writer": 0,
+                  "source_id": "plain",
+                  "status": "known",
+                  "sync_deleted": 0,
+                  "tombstones": 0,
+                  "truncated": false,
+                  "unknown": 0
+                }
+              ],
+              "count": 0,
+              "docs": "docs/guides/repair.md#uncommitted-deletions",
+              "exact": true,
+              "other_writer_count": 0,
+              "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+              "samples": [],
+              "truncated": false
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+            "name": "uncommitted_sync_deletions",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "details": {
               "docs": "docs/guides/repair.md#unindexed-files",
               "sources": [
                 {
@@ -7960,7 +8274,7 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "No retrieval-affecting files changed in working tree.",
+            "message": "3 retrieval-affecting file(s) changed since HEAD: src/core/operations.ts, src/core/search/projection-statistics.ts, src/core/search/vector-statement.ts. Re-run `gbrain eval run-all` after committing these changes.",
             "name": "eval_drift",
             "status": "ok"
           },
@@ -8241,14 +8555,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
+            "message": "Active pack gbrain-base-v2@1.5.0+4604112a is current (no successor declared)",
             "name": "pack_upgrade_available",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "5 distinct typed values (pack gbrain-base-v2 declares 21)",
+            "message": "5 distinct typed values (pack gbrain-base-v2 declares 23)",
             "name": "type_proliferation",
             "status": "ok"
           },

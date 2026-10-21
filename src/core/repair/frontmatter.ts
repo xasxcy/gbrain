@@ -54,6 +54,7 @@ import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { digest, sha256 } from '../persistence/digest.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { clearGitHold, readGitSourceHolds, type GitHoldRecord } from '../persistence/sync-holds.ts';
+import { loadRepairBusySet, repairBusy, repairBusyMessage, type RepairBusySet } from '../persistence/repair-busy.ts';
 import { fenceWhere } from '../fence-repair/refusal.ts';
 import type { SyncRename } from '../persistence/sync-discovery.ts';
 import { canonicalRepairFields, confinedRepairTarget, managedRepairRoot, prepareRepairPublication, repairScreenConfig, submitManagedFileRepair } from '../persistence/file-repair.ts';
@@ -182,7 +183,7 @@ function resolution(hold: Pick<ContentRefusal, 'code' | 'reason' | 'key' | 'line
     case 'purged_content': return `${path} carries purged page content; delete or edit it and commit, or the owner clears the tombstone with gbrain pages unpurge.`;
     case 'write_gate_rejected': return `The write gate refused ${path} as external instruction-like content; ask the user whether to edit it or whether write_gate.external_mode should stay reject.`;
     case 'rename_held': return `Re-run the preview with --include-ambiguous to re-bind the rename of ${path} to the current page, or restore the old file name.`;
-    case 'parser_regression': return `This is a gbrain bug: report the gbrain version, ${path} and the code; upgrade or pin the last good version.`;
+    case 'parser_regression': return `This is a gbrain bug: report the gbrain version, ${path} and the code; upgrade, or keep GBRAIN_SYNC_PARSER_REGRESSION=hold set for the process that syncs; never pin a release older than 0.60.305.0.`;
     default: return hold.reason === 'ambiguous_protected_key' ? `Write ${where} on one line with one quoted value; gbrain never guesses who may read a page or where it came from.`
       : hold.reason === 'ambiguous_identity_key' ? `Keep exactly one line for ${where}; gbrain never guesses which page a file is.`
       : `Fix ${where} by hand: one line per key, the whole value quoted on that line.`;
@@ -420,17 +421,15 @@ async function scan(engine: BrainEngine, scope: RepairScope, selection: Selectio
   return out;
 }
 
-/** E9: an unfinished managed sync cursor that still names one of these paths. */
-async function unfinishedSyncPath(engine: BrainEngine, sourceId: string, paths: Set<string>): Promise<string | null> {
-  const cursors = await engine.executeRaw<{ run_id: string; index: number | string | null }>(`SELECT completed_keys->0->>'runId' AS run_id, completed_keys->0->>'index' AS index
-    FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true' AND completed_keys->0->>'sourceId'=$1`, [sourceId]);
-  for (const cursor of cursors) {
-    const [manifest] = await engine.executeRaw<{ completed_keys: Array<{ path?: string; sourcePath?: string }> }>(
-      "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [cursor.run_id]);
-    const named = (manifest?.completed_keys ?? []).slice(Number(cursor.index ?? 0)).find(entry => paths.has(entry.path ?? '') || paths.has(entry.sourcePath ?? ''));
-    if (named) return named.path ?? named.sourcePath ?? null;
-  }
-  return null;
+/**
+ * E9: the first approved file a sync or write of the source still names, read through the repair busy set (#6712 PR 4b,
+ * design v3.2 §3.7: one interlock for every repair; an unreadable set names the first file).
+ */
+async function busySyncPath(engine: BrainEngine, sourceId: string, items: Array<{ path: string; source_path?: string | null; slug?: string | null }>): Promise<{ path: string; busy: RepairBusySet } | null> {
+  const [source] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [sourceId]);
+  const busy = await loadRepairBusySet(engine, sourceId, source?.incarnation ?? '');
+  const named = items.find(entry => repairBusy(busy, { path: entry.path, sourcePath: entry.source_path, slug: entry.slug }));
+  return named ? { path: named.path, busy } : null;
 }
 
 function item(repair: ApprovedRepair, selection: Selection, hash: string, index: number, last: boolean): FrontmatterItem {
@@ -456,8 +455,9 @@ export const frontmatterRepair: RepairHandler = {
         emptyHash: async () => previewHash({ kind: 'frontmatter-v1', brain_id: scope.brain_id, sources: (await engine.executeRaw<{ id: string; incarnation: string }>('SELECT id, incarnation::text AS incarnation FROM sources WHERE id=ANY($1::text[]) ORDER BY id', [scope.source_ids])), selection, items: [] }) });
       if (approved.items.some(entry => !sameSelection(entry.selection, selection))) throw previewChangedError(opts.expect, shellQuote(preview));
       for (const sourceId of new Set(approved.items.map(entry => entry.source_id))) {
-        const named = await unfinishedSyncPath(engine, sourceId, new Set(approved.items.filter(entry => entry.source_id === sourceId).flatMap(entry => [entry.path, entry.source_path])));
-        if (named) throw opError('sync_in_progress', `Source ${sourceId} has an unfinished managed sync that still names ${named}, so the repair wrote nothing.`,
+        const named = await busySyncPath(engine, sourceId, approved.items.filter(entry => entry.source_id === sourceId));
+        if (named) throw opError('sync_in_progress', named.busy.unknown !== null ? `${repairBusyMessage(named.busy, sourceId, named.path)} The repair wrote nothing.`
+          : `Source ${sourceId} has an unfinished managed sync or write that still names ${named.path}, so the repair wrote nothing.`,
           `Finish that sync first: gbrain sync --source ${sourceId} --no-pull — then preview the repair again (${shellQuote(preview)}) and approve its new hash.`,
           { fix: { argv: ['gbrain', 'sync', '--source', sourceId, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false,
             why: `Finishes source ${sourceId}'s unfinished sync cursor, which would otherwise race the repair of a file it still names.` } });

@@ -21,8 +21,8 @@ import {
   readChunkerVersion,
 } from '../../core/sync-anchor.ts';
 import type { SlugRootMode } from '../../core/sync-anchor.ts';
-import { buildDetachedWorkingTreeManifest, mergeSyncManifests } from '../../core/sync-delta.ts';
-import { confirmedSyncDelta, confirmRenameIdentities } from '../../core/sync-rename-identity.ts';
+import { buildLosslessWorkingTreeManifest, computeLosslessSyncDelta, mergeSyncManifests, type LosslessDelta } from '../../core/sync-delta.ts';
+import { confirmRenameIdentities, redecideHeldRename, type ConfirmedManifest } from '../../core/sync-rename-identity.ts';
 import {
   git,
   isWithinRoot,
@@ -34,7 +34,7 @@ import {
   unique,
 } from '../../core/sync-git.ts';
 import { buildPartialResult } from '../../core/sync-lock.ts';
-import { composeAbortSignals, massReconcileAllowed, MASS_RECONCILE_RATIO } from '../../core/sync-reconcile.ts';
+import { composeAbortSignals, massReconcileAllowed, MASS_RECONCILE_RATIO, readSyncDeleteCaps, syncDeleteTrip, syncDeleteTripText } from '../../core/sync-reconcile.ts';
 import {
   DEFAULT_SOURCE_ID,
   resolveSlugForPath,
@@ -49,9 +49,12 @@ import type { SyncResult, SyncOpts } from '../sync.ts';
 import { syncCheckpointKeys, resolveSyncCheckpointEvery } from './checkpoint.ts';
 import { runConnectorSync } from './connector.ts';
 import { performFullSync, readSourceExcludePaths, sourceExcludeGlobs } from './full.ts';
-import { applyHoldsToManifest, planHoldRescreen, wouldHoldFields, type LegacyHolds } from './holds.ts';
+import { applyHoldsToManifest, holdUnreadableRenames, planHoldRescreen, redecideUnreadableRenames, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 import type { SyncPlan, SyncActivePack } from './sync-run.ts';
+import { holdUnsupportedPaths, NO_BYTE_PATHS, selectBytePaths, type BytePaths } from './unsupported-paths.ts';
+import { formatUrlClonePullBlock, urlClonePullBlock } from '../../core/url-clone.ts';
+import { formatUpstreamNotice, recordUpstreamBeforeFetch, settleUpstreamAfterPull } from '../../core/sync-upstream-rewrite.ts';
 
 export type PreflightOutcome = { readonly done: SyncResult } | { readonly plan: SyncPlan };
 
@@ -130,15 +133,15 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
   const { ckpt, checkpointEvery, pin, completedPaths } = await resolveCheckpointPin(engine, opts, company, gitContextRoot, lastCommit, headCommit);
 
   const {
-    storedVersion, currentVersion, versionMismatch, versionNeverSet, importWorkingTree, workingTreeManifest,
+    storedVersion, currentVersion, versionMismatch, versionNeverSet, importWorkingTree, workingTreeManifest, workingTreeBytes,
     hasWorkingTreeChanges, uncommittedDrift, inScope, scopeRel, isSelectedForRun, excluded, syncOpts,
-  } = await resolveWorkingTreeScope(engine, opts, { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath });
+  } = await resolveWorkingTreeScope(engine, opts, { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable: !!holds?.active });
 
   // #5988: held files re-screen even when Git did not touch them; a run with
   // nothing else to do still re-screens them, and clears holds of gone files.
   const sourceRootMode = scoped && slugRootMode === 'source-root';
   if (holds) {
-    planHoldRescreen(holds, { root: sourceRootMode ? syncScopeRoot : gitContextRoot, touched: new Set(), selected: path => {
+    planHoldRescreen(holds, { root: sourceRootMode ? syncScopeRoot : gitContextRoot, gitRoot: gitContextRoot, touched: new Set(), selected: path => {
       const gitPath = sourceRootMode ? `${syncScopeRelPath}/${path}` : path;
       return inScope(gitPath) ? !excluded(gitPath) && isSelectedForRun(gitPath, syncOpts) : null;
     } });
@@ -222,13 +225,20 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
 
   const delta = await computeFilteredDelta(engine, opts, {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
-    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
+    workingTreeManifest, workingTreeBytes, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
   });
   if ('done' in delta) return delta;
-  const { manifest, filtered, malformedSkipped, syncImportRoot, modePath } = delta;
+  const { manifest, filtered, malformedSkipped, syncImportRoot, modePath, heldRenames, bytePaths } = delta;
   if (holds) {
     const touched = new Set([...filtered.added, ...filtered.modified, ...filtered.deleted, ...filtered.renamed.flatMap(r => [r.from, r.to])]);
     for (let i = holds.rescreen.length - 1; i >= 0; i--) if (touched.has(holds.rescreen[i]!)) holds.rescreen.splice(i, 1);
+    // GBRA-133 S-51: a pair whose identity the database refused waits as a hold; one held earlier is decided again
+    // once its file changes or a retry asks for it, before the hold replay turns it into a rename.
+    if (!opts.dryRun) {
+      await holdUnreadableRenames(engine, holds, syncImportRoot, heldRenames);
+      await redecideUnreadableRenames(engine, holds, syncImportRoot, filtered, pair => redecideHeldRename(engine, gitContextRoot, pin,
+        { ...pair, gitTo: sourceRootMode ? `${syncScopeRelPath}/${pair.to}` : pair.to }, { sourceId: holds.sourceId, sourcePathOf: scopeRel }));
+    }
     applyHoldsToManifest(holds, filtered);
   }
   const totalChanges = filtered.added.length + filtered.modified.length + filtered.deleted.length + filtered.renamed.length + (holds?.rescreen.length ?? 0);
@@ -238,12 +248,13 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     return { done: { ...dryRunResult({ lastCommit, headCommit, filtered, malformedSkipped, totalChanges }),
       ...(await wouldHoldFields(engine, holds, syncImportRoot, [...filtered.added, ...filtered.modified, ...filtered.renamed.map(r => r.to), ...(holds?.rescreen ?? [])], syncActivePack)) } };
   }
+  await holdUnsupportedPaths(engine, holds, bytePaths);
 
   return {
     plan: {
       opts, company, repoPath, gitContextRoot, anchorPath, syncImportRoot, syncActivePack, lastCommit, headCommit, pin,
       pullFailed, ckpt, completedPaths, checkpointEvery, manifest, filtered, malformedSkipped, totalChanges,
-      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath, holds,
+      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath, holds, gitlinks: bytePaths.gitlinks,
     },
   };
 }
@@ -607,6 +618,7 @@ async function pullAndResolveHead(
     // process exits could fast-forward the tree behind a released lock.
     const { pullRepo, isStoppedGitPull } = await import('../../core/git-remote.ts');
     const shutdown = abortOnCleanupPass('sync-git-pull');
+    if (opts.sourceId) await recordUpstreamBeforeFetch(engine, opts.sourceId, gitContextRoot);
     try {
       // v0.41.13.0 (T3 / D-V4-mech-7): the pull is bounded by the operator's
       // --timeout through opts.signal, and by pullRepo's own 300s default
@@ -614,6 +626,7 @@ async function pullAndResolveHead(
       // (gitContextRoot), not just the sync scope — git has no per-subdir pull.
       await pullRepo(gitContextRoot, { signal: composeAbortSignals(opts.signal, shutdown.signal) });
       serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+      if (opts.sourceId) await settleUpstreamAfterPull(engine, opts.sourceId, gitContextRoot, true);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 200)})`);
@@ -636,6 +649,11 @@ async function pullAndResolveHead(
       } else {
         serr(`Warning: git pull failed: ${msg.slice(0, 200)}`); // #1315 stderr-first
       }
+      const upstream = opts.sourceId ? await settleUpstreamAfterPull(engine, opts.sourceId, gitContextRoot, false) : null;
+      if (upstream) serr(formatUpstreamNotice(upstream));
+      // #6946: an owned clone's own checkout blocks it; name the files and the preview-first repair.
+      const block = opts.sourceId ? await urlClonePullBlock(engine, opts.sourceId) : null;
+      if (block) serr(formatUrlClonePullBlock(block));
     } finally {
       shutdown.release();
     }
@@ -827,9 +845,11 @@ async function resolveWorkingTreeScope(
     detachedHead: boolean;
     scoped: boolean;
     syncScopeRelPath: string;
+    /** GBRA-133 S-51: the run can hold a rename pair whose identity the database refused to read. */
+    holdUnreadable: boolean;
   },
 ) {
-  const { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath } = input;
+  const { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable } = input;
   // v0.20.0 Cathedral II Layer 12 (codex SP-1 fix): before returning
   // 'up_to_date' on git-HEAD equality, check the chunker version gate.
   // If sources.chunker_version mismatches CURRENT_CHUNKER_VERSION, force
@@ -867,9 +887,12 @@ async function resolveWorkingTreeScope(
   // counting degrades to empty with a stderr note; an EXPLICIT working-tree
   // import request fails closed with the reason (importing without the
   // manifest would silently skip the very files the caller asked for).
-  let workingTreeManifest: SyncManifest;
+  let workingTreeManifest: ConfirmedManifest;
+  let workingTreeBytes: BytePaths = NO_BYTE_PATHS;
   try {
-    workingTreeManifest = company ? { added: [], modified: [], deleted: [], renamed: [] } : buildDetachedWorkingTreeManifest(gitContextRoot);
+    const tree: LosslessDelta = company ? { manifest: { added: [], modified: [], deleted: [], renamed: [] }, ...NO_BYTE_PATHS } : buildLosslessWorkingTreeManifest(gitContextRoot);
+    workingTreeManifest = tree.manifest;
+    workingTreeBytes = tree;
   } catch (e) {
     if (importWorkingTree) {
       throw new Error(
@@ -899,7 +922,7 @@ async function resolveWorkingTreeScope(
   // #6729: an imported dirty tree's inexact renames are confirmed (base HEAD, target the working tree) before any
   // filter reads them; a manifest only counted as drift decomposes its renames anyway.
   if (importWorkingTree) workingTreeManifest = await confirmRenameIdentities(engine, gitContextRoot, 'HEAD', null, workingTreeManifest,
-    { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID, sourcePathOf: scopeRel });
+    { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID, sourcePathOf: scopeRel, holdUnreadable });
   const includedPaths = company ? new Set(company.plan.manifest.filter(entry => entry.disposition === 'included').map(entry => entry.path)) : null;
   const storedPaths = company ? new Set((await engine.executeRaw<{ source_path: string }>('SELECT source_path FROM pages WHERE source_id=$1 AND source_path IS NOT NULL', [opts.sourceId!])).map(page => page.source_path)) : null;
   const isSelectedForRun = (path: string, options?: Parameters<typeof isSyncable>[1]): boolean => company
@@ -945,7 +968,7 @@ async function resolveWorkingTreeScope(
     );
   }
   return {
-    storedVersion, currentVersion, versionMismatch, versionNeverSet, importWorkingTree, workingTreeManifest,
+    storedVersion, currentVersion, versionMismatch, versionNeverSet, importWorkingTree, workingTreeManifest, workingTreeBytes,
     hasWorkingTreeChanges, uncommittedDrift, inScope, scopeRel, isSelectedForRun, excluded, syncOpts,
   };
 }
@@ -963,7 +986,8 @@ async function computeFilteredDelta(
     pin: string;
     fullSyncRoots: { gitContextRoot: string; syncScopeRoot: string; anchorPath: string; slugRootMode: SlugRootMode };
     importWorkingTree: boolean;
-    workingTreeManifest: SyncManifest;
+    workingTreeManifest: ConfirmedManifest;
+    workingTreeBytes: BytePaths;
     detachedHead: boolean;
     scoped: boolean;
     slugRootMode: SlugRootMode;
@@ -976,11 +1000,12 @@ async function computeFilteredDelta(
   },
 ): Promise<
   | { done: SyncResult }
-  | { manifest: SyncManifest; filtered: SyncManifest; malformedSkipped: string[]; syncImportRoot: string; modePath: (p: string) => string; totalChanges: number }
+  | { manifest: SyncManifest; filtered: SyncManifest; malformedSkipped: string[]; syncImportRoot: string; modePath: (p: string) => string; totalChanges: number;
+      heldRenames: Array<{ from: string; to: string; gitTo: string; cause: unknown }>; bytePaths: BytePaths }
 > {
   const {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
-    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
+    workingTreeManifest, workingTreeBytes, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
   } = input;
   // Diff using git diff (net result, not per-commit). v0.42.x (#1794): diff
   // against the PINNED target, not live HEAD. With a fixed (lastCommit, pin)
@@ -1000,7 +1025,8 @@ async function computeFilteredDelta(
   // throwing — a slow correct reconcile beats a hard error or a silent walk.
   // #6729: inexact renames keep their page identity only when confirmed, before the company fold, the unsyncable fold
   // and the hold replay read the manifest; the already-confirmed working-tree manifest merges after.
-  const delta = await confirmedSyncDelta(engine, gitContextRoot, lastCommit, pin, { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID, sourcePathOf: scopeRel });
+  // GBRA-133: read as bytes (diff --raw -z), so a name is exactly Git's; names that are not page paths and gitlinks ride beside the manifest.
+  const delta = computeLosslessSyncDelta(gitContextRoot, lastCommit, pin);
   if (delta.status === 'unavailable') {
     serr(
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
@@ -1008,7 +1034,8 @@ async function computeFilteredDelta(
     );
     return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
   }
-  const manifest = importWorkingTree ? mergeSyncManifests(delta.manifest, workingTreeManifest) : delta.manifest;
+  const confirmed = await confirmRenameIdentities(engine, gitContextRoot, lastCommit, pin, delta.manifest, { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID, sourcePathOf: scopeRel, holdUnreadable: !!holds?.active });
+  const manifest = importWorkingTree ? mergeSyncManifests(confirmed, workingTreeManifest) : confirmed;
   if (company) {
     manifest.added.push(...manifest.renamed.map(rename => rename.to));
     manifest.deleted.push(...manifest.renamed.map(rename => rename.from));
@@ -1089,25 +1116,34 @@ async function computeFilteredDelta(
   // ratio + same env escape hatch. Deletes are skipped loudly; adds and
   // modifies still import, and committing the deletions (or
   // GBRAIN_ALLOW_MASS_RECONCILE=1) re-enables them.
-  if (importWorkingTree && !detachedHead && filtered.deleted.length >= 10 && !massReconcileAllowed()) {
-    try {
-      const rows = await engine.executeRaw<{ count: number }>(
-        opts.sourceId
-          ? `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1`
-          : `SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL`,
-        opts.sourceId ? [opts.sourceId] : [],
+  if (importWorkingTree && filtered.deleted.length > 0 && !massReconcileAllowed()) {
+    // #7130: the ratio is of the source's file-backed pages (the pages a missing file can delete). A failed read of the
+    // count or the caps withholds every deletion: the brake cannot be checked, so nothing is deleted.
+    const sid = opts.sourceId ?? DEFAULT_SOURCE_ID;
+    const read = await Promise.all([
+      engine.executeRaw<{ count: number }>(`SELECT count(*)::int AS count FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND source_path IS NOT NULL`, [sid]),
+      readSyncDeleteCaps(engine, sid),
+    ]).then(([rows, caps]) => ({ pageCount: Number(rows[0]?.count ?? 0), caps }), (error: unknown) => ({ error }));
+    if ('error' in read) {
+      serr(`\n  WARNING: refusing to delete ${filtered.deleted.length} page(s) from a working-tree sync: the delete limits could not be read (${read.error instanceof Error ? read.error.message : String(read.error)}). Adds/modifies still import; sync again once the database answers.\n`);
+      filtered.deleted = [];
+    }
+    const { pageCount, caps } = 'error' in read ? { pageCount: 0, caps: null } : read;
+    // The absolute caps apply on a detached HEAD too.
+    const trip = caps ? syncDeleteTrip(filtered.deleted.length, pageCount, caps) : null;
+    if (trip && caps) {
+      serr(`\n  WARNING: refusing to delete ${filtered.deleted.length} page(s) from a working-tree sync (${syncDeleteTripText(trip, caps)}). ` +
+        `Commit the deletions and sync again, raise the cap (gbrain config set ${trip === 'max_deletes' ? 'sync.max_deletes' : 'sync.max_delete_ratio'}.source.${sid} <value>), or re-run with GBRAIN_ALLOW_MASS_RECONCILE=1. Adds/modifies still import.\n`);
+      filtered.deleted = [];
+    } else if (!detachedHead && filtered.deleted.length >= 10 && pageCount > 0 && filtered.deleted.length > pageCount * MASS_RECONCILE_RATIO) {
+      serr(
+        `\n  WARNING: refusing to delete ${filtered.deleted.length} page(s) from a working-tree ` +
+        `sync (> ${Math.round(MASS_RECONCILE_RATIO * 100)}% of ${pageCount} file-backed page(s)). An uncommitted ` +
+        `tree deleting this much is almost always transient (mid-rebase, accidental rm) — commit the ` +
+        `deletions to apply them, or re-run with GBRAIN_ALLOW_MASS_RECONCILE=1. Adds/modifies still import.\n`,
       );
-      const pageCount = Number(rows[0]?.count ?? 0);
-      if (pageCount > 0 && filtered.deleted.length > pageCount * MASS_RECONCILE_RATIO) {
-        serr(
-          `\n  WARNING: refusing to delete ${filtered.deleted.length} page(s) from a working-tree ` +
-          `sync (> ${Math.round(MASS_RECONCILE_RATIO * 100)}% of ${pageCount} page(s)). An uncommitted ` +
-          `tree deleting this much is almost always transient (mid-rebase, accidental rm) — commit the ` +
-          `deletions to apply them, or re-run with GBRAIN_ALLOW_MASS_RECONCILE=1. Adds/modifies still import.\n`,
-        );
-        filtered.deleted = [];
-      }
-    } catch { /* valve is best-effort — a count failure must not block the sync */ }
+      filtered.deleted = [];
+    }
   }
 
   // NAV-4: warn when --exclude filtered out every candidate change — almost
@@ -1126,7 +1162,15 @@ async function computeFilteredDelta(
 
   const totalChanges = filtered.added.length + filtered.modified.length +
     filtered.deleted.length + filtered.renamed.length;
-  return { manifest, filtered, malformedSkipped, syncImportRoot, modePath, totalChanges };
+  // GBRA-133 S-51: pairs the identity confirmation could not read, in this run's scope, by the mode's page paths.
+  const heldRenames = [...(confirmed.heldRenames ?? []), ...(importWorkingTree ? workingTreeManifest.heldRenames ?? [] : [])]
+    .filter(pair => inScope(pair.to) && !excluded(pair.to) && isSelectedForRun(pair.to, syncOpts))
+    .map(pair => ({ from: modePath(pair.from), to: modePath(pair.to), gitTo: pair.to, cause: pair.cause }));
+  const bytePaths = company ? NO_BYTE_PATHS : selectBytePaths({
+    unsupported: [...delta.unsupported, ...(importWorkingTree ? workingTreeBytes.unsupported : [])],
+    gone: [...delta.gone, ...(importWorkingTree ? workingTreeBytes.gone : [])], gitlinks: delta.gitlinks,
+  }, { inScope, excluded, selected: p => isSelectedForRun(p, syncOpts), modeRel: modePath });
+  return { manifest, filtered, malformedSkipped, syncImportRoot, modePath, totalChanges, heldRenames, bytePaths };
 }
 
 function dryRunResult(input: {

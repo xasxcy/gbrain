@@ -8,8 +8,13 @@ export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-back
 export const REMOTE_AUTO_LINKS_KEY = 'mcp.remote_auto_links';
 /** link_source owned by the `links` effect; reconciliation of this producer never touches other producers' edges. */
 export const REMOTE_MENTION_LINK_SOURCE = 'mcp-remote-mention';
-/** Operations whose remote publications queue a `links` effect. */
+/**
+ * Operations whose remote publications queue a whole-page `links` effect. #7122: a remote append_page queues one
+ * scoped to the truth bytes it appended (`data.range`, effect-links.ts), so it never re-reads the page.
+ */
 export const REMOTE_MENTION_OPERATIONS: readonly string[] = ['put_page', 'capture', 'edit_page'];
+/** #7122: the stored truth-region bytes [start, end) an append added and their SHA-256, the only text its `links` effect reads. */
+export interface AppendedRange { start: number; end: number; sha256: string }
 /**
  * Commit metadata a trusted local preparer attaches to a page file target
  * (a fence or content repair): the subject when the file commits alone, its
@@ -30,7 +35,10 @@ export function contentRepairCommit(path: string, receipt: Pick<ContentRepairRec
 }
 export interface ParkedTarget { slug?: string; error_code: string }
 /** `page_body_segmented`: a segmented page an older binary's mirror or Git scan passed by; this one mirrors and commits it. */
-export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' | 'page_body_segmented' }
+/** `preview_changed`: a `gbrain repair segmented-mirror` target whose file or render no longer has the hash its preview approved (`data.approved_file`). */
+export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' | 'page_body_segmented' | 'withdrawal_not_mirrored' | 'preview_changed' }
+/** The code a page behind a failed withdrawal mirror is parked with: its file may still hold the withdrawn text. */
+export const WITHHELD_BY_MIRROR = 'withdrawal_mirror_failed';
 /** A Git or withdrawal target parks after this many consecutive execution failures. */
 export const PARK_AFTER_FAILURES = 5;
 /**
@@ -65,6 +73,8 @@ export interface PersistenceEffect {
   data: { version?: 2; targets?: WithdrawalTarget[]; slug?: string; page_id?: number; relative_path?: string; expected_hash?: string | null; after_slug?: string; source_id?: string; source_scan?: boolean; visibility?: 'private' | 'world'; embedding_attempt_base?: number; embedding_retry_base?: number;
     /** Wave B: the occurrences a segmented write added; its embedding effect embeds only their chunk rows. */
     occurrence_ids?: number[];
+    /** #7122: an append's `links` effect mines only these appended truth bytes and never removes an edge. */
+    range?: AppendedRange;
     /** A single-file Git target's GitCommitNote, when its preparer gave one. */
     commit_subject?: string;
     commit_line?: string;
@@ -80,7 +90,13 @@ export interface PersistenceEffect {
     /** Explicit retry authorizations granted to this effect's parked targets. */
     retried?: number;
     /** #5396: scan targets passed without a file publication (a sync-skip metafile, or a file with an uncoordinated local edit). */
-    skipped?: SkippedTarget[] };
+    skipped?: SkippedTarget[];
+    /** A `gbrain repair segmented-mirror` target: the file and render SHA-256 its preview approved; the mirror rewrites the file only while both still match. */
+    approved_file?: { slug: string; file_sha256: string; expected_sha256: string };
+    /** GBRA-130 A-12: pages whose file this withdrawal mirror rewrote, recorded by its recovery with the cursor step. */
+    published?: string[];
+    /** The SHA-256 of the bytes this mirror wrote to each published page's file, at the page revision it rendered. */
+    published_files?: Record<string, { hash: string; revision: string }> };
   state: 'queued' | 'running' | 'committed' | 'failed';
   execution_token: string | null;
   claim_expires_at: string | Date | null;

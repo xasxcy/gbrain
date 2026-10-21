@@ -271,6 +271,10 @@
       },
       {
         "category": "ops",
+        "name": "sync_admission_restricted"
+      },
+      {
+        "category": "ops",
         "name": "persistence_compaction"
       },
       {
@@ -530,6 +534,14 @@
         "name": "google_calendar_readable"
       },
       {
+        "category": "ops",
+        "name": "google_api_access"
+      },
+      {
+        "category": "brain",
+        "name": "atom_retirements_restorable"
+      },
+      {
         "category": "brain",
         "name": "extractor_facts_expired"
       },
@@ -544,6 +556,10 @@
       {
         "category": "brain",
         "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "facts_redaction_marker"
       },
       {
         "category": "brain",
@@ -683,6 +699,10 @@
       },
       {
         "category": "ops",
+        "name": "content_drift_sweep"
+      },
+      {
+        "category": "ops",
         "name": "connector_account_mismatch"
       },
       {
@@ -764,6 +784,10 @@
       {
         "category": "brain",
         "name": "managed_sync_latency"
+      },
+      {
+        "category": "brain",
+        "name": "commit_notifier"
       },
       {
         "category": "brain",
@@ -880,6 +904,10 @@
       {
         "category": "brain",
         "name": "missing_recorded_files"
+      },
+      {
+        "category": "brain",
+        "name": "uncommitted_sync_deletions"
       },
       {
         "category": "brain",

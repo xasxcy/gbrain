@@ -45,7 +45,9 @@
  * `guardTriggered` and the halt rollup still report the run; status returns
  * `warn` naming each failed page. Rows with no backing page or checkout
  * (slugify-floor / stub-guard-blocked slugs from the inline writer) are
- * structurally unfenceable and never gate.
+ * structurally unfenceable and never gate, and neither are the rows of a
+ * clone gbrain owns (#6946), which stay database-only and out of
+ * reconciliation.
  */
 
 import { withUnmanagedBeliefs } from '../belief/projection-point.ts';
@@ -96,6 +98,7 @@ import { embed, getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '.
 import { isAborted } from '../abort-check.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { urlCloneReadOnly } from '../url-clone.ts';
 import { acquirePageLock } from '../page-lock.ts';
 import {
   lockReconcileRevision,
@@ -797,9 +800,10 @@ export async function runExtractFacts(
   // the destructive reconciliation pass; the other pages reconcile.
   // #6610: rows the unbound-source policy keeps unfenced on database-only pages stay held out of reconciliation
   // but never gate the run; doctor fence_integrity names the opt-in that fences them.
+  // #6946: so do the database-only rows of a clone gbrain owns, which is never fenced.
   const pending = await pendingLegacyRows(engine, sourceId);
   const legacySlugs = new Set(pending.keys());
-  const gating = [...pending].filter(([slug]) => !unboundRefused.has(slug));
+  const gating = await urlCloneReadOnly(engine, sourceId) ? [] : [...pending].filter(([slug]) => !unboundRefused.has(slug));
   const legacyCount = gating.reduce((sum, [, n]) => sum + n, 0);
   result.legacyRowsPending = legacyCount;
   result.legacyPages = gating.map(([slug]) => slug).sort();
@@ -875,6 +879,9 @@ export async function runExtractFacts(
   result.phantomsHeldLegacyRows = phantomResult.held_legacy_rows;
   result.phantomsLockBusy = phantomResult.lock_busy;
   result.phantomsMorePending = phantomResult.more_pending;
+  for (const held of phantomResult.held) result.warnings.push(`phantom_redirect_held: ${held}`);
+  for (const f of phantomResult.failures) result.warnings.push(`phantom_redirect_failed: ${f.key} (${f.code}); retry: ${(f.fix.argv ?? []).join(' ')}`);
+  if (phantomResult.stopped) result.warnings.push(`phantom_redirect_stopped: ${phantomResult.stopped.message.slice(0, 300)}`);
 
   // ── Facts of soft-deleted pages ────────────────────────────────
   // Deleting a page removes the fence that is the facts' system of record,

@@ -32,11 +32,12 @@ test/autopilot-supervisor-wiring.test.ts	autopilot.ts ↔ ChildWorkerSupervisor 
 test/backup-cli.serial.test.ts	runBackupCli — PGLite lock fallback	3	readFileSync,source-surface-helper
 test/backup-invalidation.serial.test.ts	bootstrap repo — recordRepoInReceipt contract (source-text pin)	2	readFileSync
 test/backup-private-path-text-5312.test.ts	(file-level)	3	readFileSync
+test/behavior-change-notice-6712-block.test.ts	#6712 PR 4b BEHAVIOR_CHANGES block	4	readFileSync
 test/book-mirror.test.ts	gbrain book-mirror — source file invariants	2	readFileSync
 test/bootstrap-codex-door.test.ts	Codex door — rendered AGENTS.md pull protocol (Gate 3)	2	readFileSync
 test/bootstrap-contract.test.ts	bootstrap same-turn write-back contract	6	readFileSync
 test/bootstrap-opencode-door.serial.test.ts	opencode door — rendered AGENTS.md pull protocol	1	readFileSync
-test/bootstrap-shared-skills.test.ts	(file-level)	18	readFileSync
+test/bootstrap-shared-skills.test.ts	(file-level)	19	readFileSync
 test/brain-durability-hook.serial.test.ts	#4682 — push-lock timeout is fail-loud for the helper only	1	readFileSync
 test/brain-durability-hook.serial.test.ts	brain-commit-push.sh (D13 guarantee)	4	readFileSync
 test/brain-durability-hook.serial.test.ts	durability push remote confirmation (#5138)	9	readFileSync
@@ -123,6 +124,7 @@ test/doctor-skills-dir.test.ts	doctor --skills-dir (#4673)	6	readFileSync
 test/doctor-supervisor-singleton-pidfile.test.ts	doctor supervisor_singleton — honors the recorded pid_file (custom --pid-file)	2	doctor-source-helper
 test/doctor-supervisor-singleton-pidfile.test.ts	doctor supervisor_singleton — pid_file fallback (source-grep)	1	doctor-source-helper
 test/doctor-volunteer-channels.test.ts	checkVolunteerChannels	9	doctor-source-helper,readFileSync,source-surface-helper
+test/doctor-wedged-queue.test.ts	issue #1801 fix #3 — computeWedgedQueueCheck	14	doctor-source-helper
 test/doctor-wedged-queue.test.ts	issue #1801 fix #3 — remote queue_health state→status regression	1	doctor-source-helper
 test/doctor.test.ts	BUG 4 — in-progress sync via live lock, not stale freshness	8	doctor-source-helper
 test/doctor.test.ts	doctor command	35	doctor-source-helper
@@ -267,6 +269,7 @@ test/physical-root-birth-tolerance-6501.test.ts	samePhysicalBirth (#6501)	5	read
 test/postgres-driver-vendor.test.ts	vendored Postgres driver packaging	5	readFileSync
 test/postgres-engine.test.ts	postgres-engine / search date filtering	2	source-surface-helper
 test/postgres-engine.test.ts	postgres-engine / search path timeout isolation	7	source-surface-helper
+test/postgres15-sql-compat-7112.test.ts	#7112: shipped SQL parses on every supported Postgres (15+)	2	readFileSync
 test/private-visibility.test.ts	shared private predicate lives once (#4352 remediation)	1	readFileSync
 test/q2-typing-package.test.ts	(file-level)	3	readFileSync
 test/redos-hardening.test.ts	#1569 --no-schema-pack + heartbeat wiring (structural)	2	readFileSync,source-surface-helper
@@ -291,7 +294,7 @@ test/scripts/check-item-allowlist-catches.test.ts	CLI	2	readFileSync
 test/scripts/chunk-visibility-ratchet.test.ts	check-chunk-visibility.ts	6	readFileSync
 test/scripts/ci-bounded-run.test.ts	(file-level)	7	readFileSync
 test/scripts/ci-executed-counts.test.ts	CLI	2	readFileSync
-test/scripts/ci-gates.test.ts	CI execution evidence	7	readFileSync
+test/scripts/ci-gates.test.ts	CI execution evidence	11	readFileSync
 test/scripts/ci-gates.test.ts	test:full exit status	0	readFileSync
 test/scripts/ci-hydrate-admin-dist.test.ts	#6756 ci:local hydrates the admin/dist volume from the worktree	7	readFileSync
 test/scripts/ci-local-rendering.test.ts	ci-local command rendering	1	readFileSync
@@ -304,27 +307,30 @@ test/scripts/ci-runner-routing.test.ts	CI runner routing	7	readFileSync
 test/scripts/classify-tests.test.ts	classify-tests detectors	23	bun-file,doctor-source-helper,exec-scan,readFileSync,source-surface-helper
 test/scripts/classify-tests.test.ts	structural-suites manifest	1	readFileSync
 test/scripts/coverage-diff-gate.test.ts	exemptions	3	readFileSync
-test/scripts/data-safety-native-workflow.test.ts	data-safety native CI coverage	13	readFileSync
+test/scripts/data-safety-native-workflow.test.ts	data-safety native CI coverage	16	readFileSync
 test/scripts/e2e-backend-matrix.test.ts	scripts/e2e-backend-matrix.txt	3	readFileSync
 test/scripts/e2e-live-key-only.test.ts	shared live-key E2E exclusion list	4	readFileSync
 test/scripts/e2e-matrix.test.ts	frozen E2E matrix	9	readFileSync
+test/scripts/e2e-provider-key-notice.test.ts	scripts/e2e-provider-key-notice.sh	3	readFileSync
 test/scripts/e2e-runner.test.ts	second	5	readFileSync
 test/scripts/e2e-runner.test.ts	sequential E2E runner (GITHUB_ACTIONS=${githubActions})	9	readFileSync
 test/scripts/e2e-wiring.test.ts	(file-level)	12	readFileSync
 test/scripts/fix-wave-gate.test.ts	fix-wave gate workflow	3	readFileSync
+test/scripts/full-ci-workflow.test.ts	full CI on pull requests	4	readFileSync
+test/scripts/full-ci-workflow.test.ts	master-push reuse of a passed full-suite run	2	readFileSync
 test/scripts/heavy-door-workflow.test.ts	heavy door supply chain and coverage gates	8	readFileSync
 test/scripts/native-lock-prebuilds.test.ts	native lock distribution integrity	2	readFileSync
 test/scripts/native-setup-toolchain.test.ts	scripts/native/setup-toolchain.ts download budget	4	readFileSync
 test/scripts/nightly-e2e.test.ts	full E2E shard classification (#6040)	2	readFileSync
 test/scripts/nightly-e2e.test.ts	nightly E2E scheduling	4	readFileSync
 test/scripts/nightly-issue.test.ts	.github/nightly-known-red.tsv	2	readFileSync
-test/scripts/nightly-issue.test.ts	master-red: push-to-master runs	21	readFileSync
+test/scripts/nightly-issue.test.ts	master-red: push-to-master runs	28	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch coverage ratchet	1	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch incidents	9	readFileSync
 test/scripts/nightly-issue.test.ts	nightly-watch routing and guard	9	readFileSync
 test/scripts/nightly-issue.test.ts	operator messages carry docs anchors that resolve	1	readFileSync
 test/scripts/postgres-lane-coverage.test.ts	check-postgres-lane-coverage.ts	9	readFileSync
-test/scripts/postgres-unit-arms.test.ts	postgres-unit-arms list	9	readFileSync
+test/scripts/postgres-unit-arms.test.ts	postgres-unit-arms list	12	readFileSync
 test/scripts/regen-all.test.ts	regen:all	5	readFileSync
 test/scripts/run-verify-parallel.test.ts	guard registration ⇒ execution coverage	1	readFileSync
 test/scripts/run-verify-parallel.test.ts	run-verify-parallel.sh — no-timeout-binary fallback rc capture (regression)	7	readFileSync
@@ -416,5 +422,6 @@ test/v0_37_gap_fill.serial.test.ts	reinit-pglite — backup + reinit	8	source-su
 test/w13-small-hardening.test.ts	P1.14 paid-consent lint wording	1	exec-scan
 test/worker-supervised-db-probe.test.ts	issue #1801 fix #2 — supervised DB self-defense	5	readFileSync
 test/write-attribution-legacy.test.ts	write attribution inventory	1	readFileSync
+test/yaml-load-bounded-only.test.ts	js-yaml load is imported only by data-frontmatter.ts	2	readFileSync
 # unknown (detectors present, no attributable suite):
 # unknown	test/e2e/postgres-driver-install.test.ts

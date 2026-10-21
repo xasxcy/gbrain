@@ -417,6 +417,14 @@
       "subagent_tool_executions.subagent_tool_executions_job_id_fkey": "f FOREIGN KEY (job_id) REFERENCES minion_jobs(id) ON DELETE CASCADE",
       "subagent_tool_executions.subagent_tool_executions_pkey": "p PRIMARY KEY (id)",
       "subagent_tool_executions.subagent_tool_executions_stable_id": "u UNIQUE (job_id, message_idx, ordinal)",
+      "sync_notifier_leases.sync_notifier_leases_pkey": "p PRIMARY KEY (host_id)",
+      "sync_notifier_sources.sync_notifier_sources_detection_mode_check": "c CHECK ((detection_mode = ANY (ARRAY['watch'::text, 'poll'::text])))",
+      "sync_notifier_sources.sync_notifier_sources_pkey": "p PRIMARY KEY (source_id)",
+      "sync_notifier_sources.sync_notifier_sources_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "sync_notifier_sources.sync_notifier_sources_state_check": "c CHECK ((state = ANY (ARRAY['idle'::text, 'due'::text, 'running'::text, 'retry'::text, 'operator_blocked'::text])))",
+      "sync_wanted_markers.sync_wanted_markers_intent_check": "c CHECK ((intent = ANY (ARRAY['freshness'::text, 'pull'::text, 'full'::text])))",
+      "sync_wanted_markers.sync_wanted_markers_pkey": "p PRIMARY KEY (source_id, intent)",
+      "sync_wanted_markers.sync_wanted_markers_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "synthesis_evidence.synthesis_evidence_pkey": "p PRIMARY KEY (synthesis_page_id, take_page_id, take_row_num)",
       "synthesis_evidence.synthesis_evidence_synthesis_page_id_fkey": "f FOREIGN KEY (synthesis_page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "synthesis_evidence.synthesis_evidence_take_page_id_take_row_num_fkey": "f FOREIGN KEY (take_page_id, take_row_num) REFERENCES takes(page_id, row_num) ON DELETE CASCADE",
@@ -510,6 +518,7 @@
       "gbrain_fts_input(t text)": "RETURNS text kind=f lang=sql volatility=i secdef=false config=[search_path=pg_catalog] body_sha256=c73d0dbc333c6dccc9714a6b8d1b7785f48170556b9024002ddca1c80b25d87d",
       "gbrain_graduation_fence()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=cd4642fe8deee2a3c14ef41f53862f0a449b2d8a10e47177bd4f5d2e05ce8803",
       "gbrain_guard_effect_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e8b5589dafd4a355106104daffdf57c7776d34fe18c5b5f5336a27de188688a1",
+      "gbrain_guard_inserted_facts()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=b794bdc82a9818e1b53738ee7476788cfc05929dd7fcde8b3d07d9a3e221fe59",
       "gbrain_guard_protocol_activation()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f27354966c25d961fcecbffebba0e45747ad3de23575351319f6aee4f9aefd47",
       "gbrain_guard_request_protocol()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=12baf1d365a8aa3009ac0fe6605497e6433304e8d5915a3fc0b0b39ad748f6c2",
       "gbrain_guard_skill_publication()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e854c0d058e75a65c3a90127c5c417380975100e83fc34288f6085e786df10a9",
@@ -525,7 +534,8 @@
       "gbrain_stamp_revision_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=d446ed1145d8bb9c93cb0ca4aa076a5dc7a5fe07b3e79518adaf1b17b0a51216",
       "gbrain_stamp_trust_tier()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=4610c2e064a0d34dbb66981dd49f15fb6b0b85407327983cde76b905cd626598",
       "gbrain_stamp_version_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=1b28a0e5769198d86490dc20b2aee80b7e6595670428a63ac9c6825cd2a35b10",
-      "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=50e9b0e5bf37eeae6555dd16c8104cb0807be6c05a79e0c82237d45162c21dc2",
+      "gbrain_stamp_write_attribution()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=e2dbafe65571fedcadc0441415f58fb5b5209b4c9cefa50e4855f58f0452327c",
+      "gbrain_try_jsonb(input text)": "RETURNS jsonb kind=f lang=plpgsql volatility=i secdef=false config=[search_path=pg_catalog, public] body_sha256=11b96a0400158fcb3dbd84255985cd11e473688c53fff64ebf92602fceccbedf",
       "notify_minion_job_change()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=17f7c36408688409c80befd0a9ef9314e597d78a195418d1b94426e3d0b662f8",
       "update_chunk_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=b870de46705a62891bb318ecdeca1d0d5ea1f8da9a9a79c4cec6569e515dbdeb",
       "update_page_search_vector()": "RETURNS trigger kind=f lang=plpgsql volatility=v secdef=false config=[search_path=pg_catalog, public] body_sha256=f354d9571ef5de74a98cfd1661e09aebca711541cbdd6eb86effa48aae8822cc"
@@ -928,6 +938,15 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "subagent_tool_executions": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "sync_notifier_leases": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "sync_notifier_sources": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "sync_wanted_markers": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "synthesis_evidence": [
@@ -1395,6 +1414,9 @@
       "subagent_rate_leases_pkey": "CREATE UNIQUE INDEX subagent_rate_leases_pkey ON public.subagent_rate_leases USING btree (id)",
       "subagent_tool_executions_pkey": "CREATE UNIQUE INDEX subagent_tool_executions_pkey ON public.subagent_tool_executions USING btree (id)",
       "subagent_tool_executions_stable_id": "CREATE UNIQUE INDEX subagent_tool_executions_stable_id ON public.subagent_tool_executions USING btree (job_id, message_idx, ordinal)",
+      "sync_notifier_leases_pkey": "CREATE UNIQUE INDEX sync_notifier_leases_pkey ON public.sync_notifier_leases USING btree (host_id)",
+      "sync_notifier_sources_pkey": "CREATE UNIQUE INDEX sync_notifier_sources_pkey ON public.sync_notifier_sources USING btree (source_id)",
+      "sync_wanted_markers_pkey": "CREATE UNIQUE INDEX sync_wanted_markers_pkey ON public.sync_wanted_markers USING btree (source_id, intent)",
       "synthesis_evidence_pkey": "CREATE UNIQUE INDEX synthesis_evidence_pkey ON public.synthesis_evidence USING btree (synthesis_page_id, take_page_id, take_row_num)",
       "tags_page_id_tag_key": "CREATE UNIQUE INDEX tags_page_id_tag_key ON public.tags USING btree (page_id, tag)",
       "tags_pkey": "CREATE UNIQUE INDEX tags_pkey ON public.tags USING btree (id)",
@@ -3231,7 +3253,9 @@
           "41 preparation_attempts integer/int4 NOT NULL DEFAULT 0",
           "42 client_request_id text/text NULL",
           "43 admitter_segment_reader boolean/bool NULL",
-          "44 consumer_segment_reader boolean/bool NULL"
+          "44 consumer_segment_reader boolean/bool NULL",
+          "45 transient_interruptions integer/int4 NOT NULL DEFAULT 0",
+          "46 next_attempt_at timestamp with time zone/timestamptz NULL"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -3716,6 +3740,59 @@
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
+      "sync_notifier_leases": {
+        "columns": [
+          "1 host_id text/text NOT NULL",
+          "2 owner_id text/text NOT NULL",
+          "3 fence bigint/int8 NOT NULL DEFAULT 1",
+          "4 resident_kind text/text NOT NULL",
+          "5 pid integer/int4 NULL",
+          "6 renewed_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 expires_at timestamp with time zone/timestamptz NOT NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "sync_notifier_sources": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 source_incarnation text/text NULL",
+          "3 syncer_host_id text/text NULL",
+          "4 syncer_recorded_at timestamp with time zone/timestamptz NULL",
+          "5 state text/text NOT NULL DEFAULT 'idle'::text",
+          "6 reason text/text NULL",
+          "7 first_due_at timestamp with time zone/timestamptz NULL",
+          "8 attempts integer/int4 NOT NULL DEFAULT 0",
+          "9 next_retry_at timestamp with time zone/timestamptz NULL",
+          "10 last_progress_at timestamp with time zone/timestamptz NULL",
+          "11 last_error_code text/text NULL",
+          "12 last_error text/text NULL",
+          "13 last_error_at timestamp with time zone/timestamptz NULL",
+          "14 trace_path text/text NULL",
+          "15 observed_head text/text NULL",
+          "16 observed_at timestamp with time zone/timestamptz NULL",
+          "17 detection_mode text/text NULL",
+          "18 owner_host_id text/text NULL",
+          "19 owner_kind text/text NULL",
+          "20 owner_pid integer/int4 NULL",
+          "21 owner_seen_at timestamp with time zone/timestamptz NULL",
+          "22 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
+      "sync_wanted_markers": {
+        "columns": [
+          "1 source_id text/text NOT NULL",
+          "2 intent text/text NOT NULL",
+          "3 source_incarnation text/text NULL",
+          "4 wanted_head text/text NULL",
+          "5 generation bigint/int8 NOT NULL DEFAULT 1",
+          "6 first_due_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "8 requested_by text/text NOT NULL",
+          "9 job_id bigint/int8 NULL"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
+      },
       "synthesis_evidence": {
         "columns": [
           "1 synthesis_page_id integer/int4 NOT NULL",
@@ -4009,8 +4086,10 @@
       "config.trust_generation_update": "CREATE CONSTRAINT TRIGGER trust_generation_update AFTER UPDATE ON public.config DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((((old.key ~~ 'trust.%'::text) OR (new.key ~~ 'trust.%'::text)) AND ((old.key IS DISTINCT FROM new.key) OR (old.value IS DISTINCT FROM new.value)))) EXECUTE FUNCTION gbrain_bump_trust_generation()",
       "content_chunks.chunk_search_vector_trigger": "CREATE TRIGGER chunk_search_vector_trigger BEFORE INSERT OR UPDATE OF chunk_text, doc_comment, symbol_name_qualified ON public.content_chunks FOR EACH ROW EXECUTE FUNCTION update_chunk_search_vector()",
       "fact_purges.trust_generation_insert": "CREATE CONSTRAINT TRIGGER trust_generation_insert AFTER INSERT ON public.fact_purges DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (true) EXECUTE FUNCTION gbrain_bump_trust_generation()",
+      "facts.facts_guard_inserted": "CREATE TRIGGER facts_guard_inserted AFTER INSERT ON public.facts REFERENCING NEW TABLE AS inserted_facts FOR EACH STATEMENT EXECUTE FUNCTION gbrain_guard_inserted_facts()",
       "facts.facts_preserve_withdrawal": "CREATE TRIGGER facts_preserve_withdrawal BEFORE INSERT OR UPDATE OF fact, source_id, visibility, entity_slug, expired_at ON public.facts FOR EACH ROW EXECUTE FUNCTION gbrain_preserve_fact_withdrawal()",
-      "facts.facts_refuse_purged": "CREATE TRIGGER facts_refuse_purged BEFORE INSERT OR UPDATE OF fact, source_id, visibility, entity_slug ON public.facts FOR EACH ROW EXECUTE FUNCTION gbrain_refuse_purged_fact()",
+      "facts.facts_preserve_withdrawal_insert": "CREATE TRIGGER facts_preserve_withdrawal_insert BEFORE INSERT ON public.facts FOR EACH ROW WHEN (((new.expired_at IS NULL) AND (COALESCE(current_setting('gbrain.fact_withdrawal_stamp_deferred'::text, true), ''::text) <> 'on'::text))) EXECUTE FUNCTION gbrain_preserve_fact_withdrawal()",
+      "facts.facts_refuse_purged": "CREATE TRIGGER facts_refuse_purged BEFORE UPDATE OF fact, source_id, visibility, entity_slug ON public.facts FOR EACH ROW EXECUTE FUNCTION gbrain_refuse_purged_fact()",
       "facts.gbrain_write_attribution": "CREATE TRIGGER gbrain_write_attribution BEFORE INSERT OR UPDATE ON public.facts FOR EACH ROW EXECUTE FUNCTION gbrain_stamp_write_attribution()",
       "facts.managed_writer_guard": "CREATE TRIGGER managed_writer_guard BEFORE INSERT OR DELETE OR UPDATE ON public.facts FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()",
       "facts.trust_generation_update": "CREATE CONSTRAINT TRIGGER trust_generation_update AFTER UPDATE ON public.facts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((old.trust_tier IS DISTINCT FROM new.trust_tier)) EXECUTE FUNCTION gbrain_bump_trust_generation()",

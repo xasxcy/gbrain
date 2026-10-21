@@ -102,19 +102,24 @@ const VOLATILE = new Set(['id', 'created_at', 'updated_at', 'snapshot_at', 'last
   'principal_id', 'revision_principal_id', 'write_principal_id', 'last_write_principal_id', 'archived_principal_id', 'knowledge_revision', 'text_projection_revision',
   'revision', 'expected_revision', 'salience_touched_at', 'last_retrieved_at', 'links_extracted_at', 'emotional_weight_recomputed_at', 'embedding',
   'embedding_image', 'embedding_multimodal', 'edges_backfilled_at', 'search_vector', 'content_hash', 'revision_write_request_id', 'coordination_path',
-  'lastAt', 'startedAt']);
+  'lastAt', 'startedAt', 'duration_ms', 'timings_ms']);
+
+const FOLD_BASE_IDS = new Set(['.intent.stamp.fold.base.xmin', '.intent.stamp.fold.base.snapshot', '.intent.stamp.fold.base.own']);
 
 /** Every page-derived row the sync wrote, with ids, times, UUIDs and the checkout path replaced by labels. */
 async function dump(e: BrainEngine, root: string): Promise<Record<string, string[]>> {
   const pages = await e.executeRaw<{ id: number; slug: string }>('SELECT id,slug FROM pages WHERE source_id=$1', [SOURCE]);
   const slugOf = new Map(pages.map(p => [Number(p.id), p.slug]));
-  const norm = (value: unknown, key = ''): unknown => {
+  const norm = (value: unknown, key = '', path = ''): unknown => {
     if (value === null || value === undefined) return null;
     if (value instanceof Date) return '<time>';
-    if (Array.isArray(value)) return value.map(v => norm(v, key));
+    // #6712 PR 4b: a folded stamp records the Postgres snapshot it read its base under (its xmin, the snapshot and its own
+    // transaction id, GBRA-108), transaction ids as run-specific as a UUID.
+    if (FOLD_BASE_IDS.has(path)) return `<${key}>`;
+    if (Array.isArray(value)) return value.map(v => norm(v, key, path));
     if (typeof value === 'object') {
       return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([k]) => !VOLATILE.has(k)).sort(([a], [b]) => a < b ? -1 : 1)
-        .map(([k, v]) => [k, /(^|_)page_id$|^pageId$/.test(k) && v != null ? `page(${slugOf.get(Number(v)) ?? 'other'})` : norm(v, k)]));
+        .map(([k, v]) => [k, /(^|_)page_id$|^pageId$/.test(k) && v != null ? `page(${slugOf.get(Number(v)) ?? 'other'})` : norm(v, k, `${path}.${k}`)]));
     }
     if (typeof value === 'string') {
       const text = value.replaceAll(root, '<root>');
@@ -142,9 +147,10 @@ async function dump(e: BrainEngine, root: string): Promise<Record<string, string
         'outcome',r.outcome,'slug',r.slug,'page_id',r.page_id,'publication_started',r.publication_started,'compacted',r.compacted) AS r
       FROM persistence_requests r WHERE r.source_id=$1`),
     sources: await rows('SELECT to_jsonb(s) - ARRAY[\'last_sync_at\',\'newest_content_at\'] AS r FROM sources s WHERE id=$1'),
-    // A provenance record is keyed by page id, which Postgres bulk groups may assign in another order.
-    checkpoints: await rows(`SELECT jsonb_build_object('op',op,'fingerprint',regexp_replace(regexp_replace(fingerprint,'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}','<uuid>','g'),'[0-9a-f]{32,}','<key>','g'),
-        'page_id',CASE WHEN op='sync-import-provenance' THEN substring(fingerprint from ':([0-9]+)$')::integer END,'record',completed_keys) AS r
+    // A provenance record (and a #7130 sync deletion record, keyed by the bare page id) is keyed by page id, which Postgres
+    // bulk groups may assign in another order.
+    checkpoints: await rows(`SELECT jsonb_build_object('op',op,'fingerprint',regexp_replace(regexp_replace(CASE WHEN op='sync-delete-tombstone' THEN 'page:' || fingerprint ELSE fingerprint END,'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}','<uuid>','g'),'[0-9a-f]{32,}','<key>','g'),
+        'page_id',CASE WHEN op='sync-import-provenance' THEN substring(fingerprint from ':([0-9]+)$')::integer WHEN op='sync-delete-tombstone' THEN fingerprint::integer END,'record',completed_keys) AS r
       FROM op_checkpoints WHERE completed_keys::text LIKE '%' || $1 || '%' OR fingerprint LIKE '%' || $1 || '%'`)
       .then(list => list.map(row => row.replace(/("fingerprint":"[^"]*):\d+"(.*"page_id":"(page\([^)]*\))")/, '$1:$3"$2'))),
   };

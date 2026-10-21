@@ -6,7 +6,7 @@ import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { fileContentHash } from './large-file.ts';
-import { PARK_AFTER_FAILURES, REMOTE_AUTO_LINKS_KEY, REMOTE_MENTION_OPERATIONS, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
+import { PARK_AFTER_FAILURES, REMOTE_AUTO_LINKS_KEY, REMOTE_MENTION_OPERATIONS, WITHHELD_BY_MIRROR, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { recordChronicleDecision } from '../chronicle/ledger.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
@@ -34,8 +34,8 @@ function physicalFilePath(root: string, file: string): string {
 
 /**
  * `snapshot` is the publication's final read of the page, including deleted rows, in this transaction.
- * A remote put_page/capture/edit_page also queues a `links` effect, in one statement that inserts
- * nothing while `auto_link` or `mcp.remote_auto_links` is off (unset is on).
+ * A remote put_page/capture/edit_page also queues a `links` effect (an append_page to the compiled truth, one scoped
+ * to its appended bytes), in one statement that inserts nothing while `auto_link` or `mcp.remote_auto_links` is off (unset is on).
  */
 export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest & Partial<Pick<WriteRequest, 'operation' | 'intent' | 'authority' | 'principal_kind' | 'principal_id'>>, snapshot: PageSnapshot | null,
   outcome: Record<string, unknown>, prepared?: PreparedMutation,
@@ -73,7 +73,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
       else queue('facts-backstop', { visibility: await resolveDefaultVisibility(tx) });
     }
     // The links effect is inserted with the others, gated in SQL on auto_link and mcp.remote_auto_links.
-    if (queuesMentionLinks(row)) queued.push({ kind: 'links', data: { ...data }, gated: true });
+    if (queuesMentionLinks(row, prepared)) queued.push({ kind: 'links', data: { ...data, ...(prepared?.mentionRange ? { range: prepared.mentionRange } : {}) }, gated: true });
     // #5876: the Life Chronicle decision is a ledger row, not an effect; the `chronicle` cycle phase executes it.
     await recordChronicleDecision(tx, row, snapshot, outcome);
   }
@@ -89,10 +89,13 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   }
 }
 
-/** Whether a publication of this request queues a mention `links` effect: a remote page write without trusted auto-linking. */
-export function queuesMentionLinks(row: Partial<Pick<WriteRequest, 'operation' | 'authority'>>): boolean {
-  return !!row.authority && !!row.operation && REMOTE_MENTION_OPERATIONS.includes(row.operation)
-    && !(row.authority.autoLinkTrusted ?? !row.authority.remote);
+/**
+ * Whether a publication of this request queues a mention `links` effect: a remote page write without trusted
+ * auto-linking. #7122: an append_page queues one only when it appended to the compiled truth (`mentionRange`).
+ */
+export function queuesMentionLinks(row: Partial<Pick<WriteRequest, 'operation' | 'authority'>>, prepared?: Pick<PreparedMutation, 'mentionRange'>): boolean {
+  if (!row.authority || !row.operation || (row.authority.autoLinkTrusted ?? !row.authority.remote)) return false;
+  return REMOTE_MENTION_OPERATIONS.includes(row.operation) || (row.operation === 'append_page' && !!prepared?.mentionRange);
 }
 
 /**
@@ -153,7 +156,7 @@ export async function claimPersistenceEffect(engine: BrainEngine, hostId: string
       AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked
         WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
       AND (e.kind='withdrawal-mirror' OR NOT EXISTS (SELECT 1 FROM persistence_effects mirror
-        WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state<>'committed'))
+        WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state IN ('queued','running')))
       ORDER BY e.next_attempt_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`, [hostId]);
     if (!candidate) return null;
     const [claimed] = await tx.executeRaw<PersistenceEffect>(`UPDATE persistence_effects SET state='running',execution_token=$2::uuid,
@@ -166,6 +169,76 @@ export async function claimPersistenceEffect(engine: BrainEngine, hostId: string
 export function singleFileGitEffect(effect: PersistenceEffect): boolean {
   return effect.kind === 'git' && typeof effect.data.relative_path === 'string' && effect.data.version === undefined
     && !effect.data.source_scan && effect.data.targets === undefined;
+}
+
+/**
+ * GBRA-130 A-12: what a request's withdrawal mirror proves about its pages, read
+ * when a Git or embedding attempt executes. `pending`: the mirror is queued or
+ * running (a retry-effects requeue lands between the claim and the attempt), so
+ * the attempt waits. `published`: pages whose file the mirror rewrote (its
+ * recovery records each one, `data.published`); a cursor position is no proof,
+ * since the mirror also passes pages it skipped or found without a file.
+ * `passed`: pages the mirror moved past without parking or awaiting a retry; it
+ * never revisits them. `files`: the hash of the bytes the mirror wrote to each
+ * published page's file and the revision it rendered (`data.published_files`).
+ */
+export interface MirrorGate { state: 'pending' | 'failed' | 'committed'; published: Set<string>; passed: Set<string>; files: Map<string, { hash: string; revision: string }> }
+
+/**
+ * Per request id, the gate of its withdrawal mirror: every mirror that has not
+ * committed, and a committed one that recorded its publications. A request
+ * without such a mirror is absent and its work is unrestricted.
+ */
+export async function mirrorGates(engine: SqlEngine, requestIds: readonly string[]): Promise<Map<string, MirrorGate>> {
+  if (!requestIds.length) return new Map();
+  const rows = await engine.executeRaw<{ request_id: string; state: PersistenceEffect['state']; data: PersistenceEffect['data'] }>(
+    `SELECT request_id::text AS request_id,state,data FROM persistence_effects WHERE kind='withdrawal-mirror' AND (state<>'committed' OR data ? 'published')
+      AND request_id=ANY($1::uuid[])`, [[...new Set(requestIds)]]);
+  return new Map(rows.map(({ request_id, state, data }) => {
+    const after = data.after_slug;
+    const unfinished = new Set([...(data.parked ?? []).flatMap(entry => entry.slug ? [entry.slug] : []), ...(data.retry_slugs ?? [])]);
+    const passed = (data.targets ?? []).filter(target => after !== undefined && target.slug <= after && !unfinished.has(target.slug)).map(target => target.slug);
+    return [request_id, { state: state === 'queued' || state === 'running' ? 'pending' : state, published: new Set(data.published ?? []), passed: new Set(passed),
+      files: new Map(Object.entries(data.published_files ?? {})) }];
+  }));
+}
+
+/**
+ * GBRA-130 A-12: once a request's withdrawal mirror has committed, the Git and
+ * embedding targets parked behind it (`withdrawal_mirror_failed`) get another
+ * attempt with no operator retry: a scan revisits them first
+ * (`data.retry_slugs`), a single-target effect runs again. Other parked targets
+ * stay parked, and a claimed effect is left to its claim. The mirror's commit
+ * calls this in its own transaction; each effect pass calls it again for the
+ * requests it touched, for a park that settled after a concurrent mirror commit.
+ */
+const REARMABLE = `e.request_id=ANY($1::uuid[])
+    AND e.kind IN ('git','embedding') AND e.state IN ('queued','failed') AND e.execution_token IS NULL AND e.recovery IS NULL
+    AND EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(e.data->'parked','[]'::jsonb)) AS p(target) WHERE p.target->>'error_code'=$2)
+    AND EXISTS (SELECT 1 FROM persistence_effects m WHERE m.request_id=e.request_id AND m.kind='withdrawal-mirror' AND m.state='committed')`;
+
+/** Whether any of these requests has a target rearmWithheldTargets would re-arm; a pass opens its re-arm transaction only then. */
+export async function hasRearmableTargets(engine: SqlEngine, requestIds: readonly string[]): Promise<boolean> {
+  if (!requestIds.length) return false;
+  return (await engine.executeRaw(`SELECT 1 FROM persistence_effects e WHERE ${REARMABLE} LIMIT 1`, [[...new Set(requestIds)], WITHHELD_BY_MIRROR])).length > 0;
+}
+
+export async function rearmWithheldTargets(engine: SqlEngine, requestIds: readonly string[]): Promise<number> {
+  if (!requestIds.length) return 0;
+  const rows = await engine.executeRaw<PersistenceEffect>(`SELECT e.* FROM persistence_effects e WHERE ${REARMABLE}
+    ORDER BY e.id FOR UPDATE OF e SKIP LOCKED`, [[...new Set(requestIds)], WITHHELD_BY_MIRROR]);
+  for (const effect of rows) {
+    const { parked = [], ...data } = effect.data;
+    const kept = parked.filter(entry => entry.error_code !== WITHHELD_BY_MIRROR);
+    const scanning = data.targets !== undefined || data.source_scan === true;
+    const slugs = scanning ? parked.flatMap(entry => entry.error_code === WITHHELD_BY_MIRROR && entry.slug ? [entry.slug] : []) : [];
+    const retrying = [...new Set([...(data.retry_slugs ?? []), ...slugs])];
+    await engine.executeRaw(`UPDATE persistence_effects SET state='queued',data=$2::text::jsonb,error_code=NULL,claim_expires_at=NULL,
+      next_attempt_at=now(),updated_at=now() WHERE id=$1 AND execution_token IS NULL AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE}`,
+    [effect.id, JSON.stringify({ ...data, ...(kept.length ? { parked: kept } : {}), ...(retrying.length ? { retry_slugs: retrying } : {}),
+      ...(effect.kind === 'embedding' ? { embedding_attempt_base: effect.attempts } : {}) })]);
+  }
+  return rows.length;
 }
 
 /**
@@ -190,7 +263,7 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
       AND (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
       AND e.recovery IS NULL
       AND NOT EXISTS (SELECT 1 FROM persistence_effects mirror
-        WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state<>'committed')
+        WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state IN ('queued','running'))
       ORDER BY e.next_attempt_at,e.id LIMIT $3 FOR UPDATE OF e SKIP LOCKED)
       UPDATE persistence_effects p SET state='running',execution_token=gen_random_uuid(),
       claim_expires_at=now()+interval '2 minutes',attempts=attempts+1,updated_at=now()
@@ -304,17 +377,21 @@ export async function failEffect(engine: SqlEngine, effect: PersistenceEffect, r
 }
 
 /** Only public kind/state/reason, aggregated so withdrawal page counts cannot leak. */
-export async function publicEffectsForRequest(engine: SqlEngine, requestId: string): Promise<Array<{ kind: EffectKind; state: string; reason?: string; push?: string; added?: number; removed?: number }>> {
+export async function publicEffectsForRequest(engine: SqlEngine, requestId: string): Promise<Array<{ kind: EffectKind; state: string; reason?: string; push?: string; added?: number; removed?: number;
+  invalid_targets?: Array<{ slug: string; reason: 'invalid_slug' }> }>> {
   const rows = await engine.executeRaw<{ kind: EffectKind; state: string; error_code: string | null; recovering: boolean; outcome: Record<string, unknown> | null }>(
     'SELECT kind,state,error_code,outcome,recovery IS NOT NULL AS recovering FROM persistence_effects WHERE request_id=$1::uuid ORDER BY kind', [requestId]);
   return rows.filter(row => ['git', 'embedding', 'withdrawal-mirror', 'facts-backstop', 'links'].includes(row.kind)).map(row => {
     const reason = row.error_code ?? row.outcome?.reason;
     const push = row.outcome?.push;
+    const invalid = Array.isArray(row.outcome?.skipped_targets) ? (row.outcome.skipped_targets as Array<{ slug: string; reason: string }>)
+      .filter(target => target.reason === 'invalid_slug').map(target => ({ slug: target.slug, reason: 'invalid_slug' as const })) : [];
     return { kind: row.kind, state: row.recovering ? 'recovering' : row.outcome?.git === 'skipped' || row.outcome?.facts === 'skipped' || row.outcome?.embedding === 'skipped' || row.outcome?.links === 'skipped' ? 'skipped'
       : row.outcome?.facts === 'queued' ? 'dispatched' : row.state,
       ...(typeof reason === 'string' && /^[a-z_]{1,80}$/.test(reason) ? { reason } : {}),
       ...(row.kind === 'git' && (push === 'committed' || push === 'skipped') ? { push } : {}),
       ...(row.kind === 'links' && row.outcome?.links === 'committed' ? { added: Number(row.outcome.added), removed: Number(row.outcome.removed) } : {}),
+      ...(invalid.length ? { invalid_targets: invalid } : {}),
     };
   });
 }

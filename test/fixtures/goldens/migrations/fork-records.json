@@ -8,7 +8,7 @@
       "PAGE_LINKS_SECURITY_INVOKER_SQL": "2f5e70a43c32ed9b892cc2d7a69de7d28a98f8cba2c0a3bc1c703fc4882c079d",
       "configuredEmbeddingDimensions": "baed06ea90bff06f6564c2188c107ed6b56585e4fb64ffc39fec7b35a8d6e6ac",
       "getFtsLanguage": "0d790b4c4af1f67a2a1bbd59470beb13f434917b381931baf8404a41c5d903db",
-      "isRetryableConnError": "e54ad9ad693b065c3001ec6bc9d6d9ecafe1f0d2fd7fb1c15ac23ae66507101e",
+      "isRetryableConnError": "37340edbeb766f6bd8803a34eb2fc7db7f2789ca1b84d9bff3a4f6b780a4f1bd",
       "isStatementTimeoutError": "73f34c5c41a586f55ba47e9a503fe2377937276effbe0141cccea731d5635ab3",
       "noticeIdleBlockers": "ea8c2a5d5b14ce1df0fecd2d9f7687f751c6aed8ac717458171584cdf87cf104",
       "noticePageLinksSecurityInvoker": "e5b27381b64bd4d890fbd37e6abbf7ad326b3fa916a3e071face4878eb542c24",

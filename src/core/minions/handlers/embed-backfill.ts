@@ -45,6 +45,7 @@ import {
 import { pricingSetCommand } from '../../budget/no-pricing.ts';
 import { getEmbeddingModel, withBudgetTracker } from '../../ai/gateway.ts';
 import { embedStaleForSource } from '../../embed-stale.ts';
+import type { ContentDriftSweepStatus } from '../../content-drift-sweep.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
 import { currentEmbeddingSignature } from '../../embedding.ts';
 import { readEmbedBackfillBlockers } from '../../embed-backfill-stall.ts';
@@ -60,6 +61,8 @@ import { registerShutdownWork } from '../../process-cleanup.ts';
 import { recordMinionJobSpend } from '../../minion-spend.ts';
 
 import { embedBackfillLockId, EMBED_BACKFILL_LOCK_TTL_MIN } from '../../embed-backfill-lock.ts';
+import { keylessEmbedBackfill, reportKeylessNotice } from '../../embed-backfill-submit.ts';
+import type { RenderedNotice } from '../../agent-output.ts';
 
 const DEFAULT_MAX_USD_PER_JOB = 10;
 
@@ -71,7 +74,11 @@ export interface EmbedBackfillJobData {
 }
 
 export interface EmbedBackfillResult {
-  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted' | 'deferred';
+  status: 'success' | 'already_in_progress' | 'budget_exhausted' | 'aborted' | 'deferred' | 'skipped';
+  /** Set when status === 'skipped': the brain is keyless by choice, so nothing was read or embedded. */
+  outcome?: 'embed_backfill_skipped';
+  /** The embed_backfill_skipped notice, on the first skip for this brain state only. */
+  notice?: RenderedNotice;
   sourceId: string;
   reason?: string;
   embedded: number;
@@ -85,6 +92,8 @@ export interface EmbedBackfillResult {
   invalidated: number;
   /** #4283: set when drifted chunks existed but the embedder probe failed. */
   invalidationSkipped?: 'embedder_probe_failed';
+  /** #7117: this run's content-drift sweep: counts, cursor, pass state, error. */
+  contentDrift?: ContentDriftSweepStatus;
   /** $USD spent inside this job (from BudgetTracker.totalSpent). */
   spentUsd: number;
   /** Set when status === 'budget_exhausted'. */
@@ -247,6 +256,12 @@ export function makeEmbedBackfillHandler(
   ): Promise<EmbedBackfillResult> {
     const { sourceId, batchSize } = parseParams(job.data);
 
+    const keyless = await keylessEmbedBackfill(engine);
+    if (keyless) {
+      return { status: 'skipped', outcome: 'embed_backfill_skipped', reason: 'embedding_disabled', sourceId, embedded: 0, chunksProcessed: 0,
+        pagesProcessed: 0, invalidated: 0, spentUsd: 0, ...(keyless.notice ? { notice: reportKeylessNotice(keyless.notice) } : {}) };
+    }
+
     // D2: per-source lock at handler entry. The submit-side cooldown (D19)
     // prevents most contention but this is the run-side safety net.
     const lockKey = embedBackfillLockId(sourceId);
@@ -378,6 +393,7 @@ export function makeEmbedBackfillHandler(
           pagesProcessed: result.pagesProcessed,
           invalidated: result.invalidated,
           ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+          ...(result.contentDrift && { contentDrift: result.contentDrift }),
           spentUsd: tracker.totalSpent,
         };
       }
@@ -440,6 +456,7 @@ export function makeEmbedBackfillHandler(
         pagesProcessed: result.pagesProcessed,
         invalidated: result.invalidated,
         ...(result.invalidationSkipped && { invalidationSkipped: result.invalidationSkipped }),
+        ...(result.contentDrift && { contentDrift: result.contentDrift }),
         spentUsd: tracker.totalSpent,
         ...(await budgetLimitedField(engine, sourceId, currentEmbeddingSignature())),
       };

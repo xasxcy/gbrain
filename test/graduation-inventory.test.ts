@@ -60,8 +60,8 @@ describe('graduation inventory', () => {
     expect(new Set(names).size).toBe(names.length);
     const counts: Record<string, number> = {};
     for (const e of GRADUATION_INVENTORY.entries) counts[e.class] = (counts[e.class] ?? 0) + 1;
-    // FORK: carry includes the embed_failures retry ledger (135 upstream carry rows + 1).
-    expect(counts).toEqual({ carry: 136, rebind: 2, rebuild: 3, discard: 7, schema_owned: 4 });
+    // FORK: carry includes the embed_failures retry ledger (136 upstream carry rows + 1).
+    expect(counts).toEqual({ carry: 137, rebind: 2, rebuild: 3, discard: 9, schema_owned: 4 });
     for (const e of GRADUATION_INVENTORY.entries) {
       expect({ relation: e.relation, reason: e.reason.length > 5, present: e.engines.pglite || e.engines.postgres })
         .toEqual({ relation: e.relation, reason: true, present: true });

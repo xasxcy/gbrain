@@ -737,6 +737,8 @@ export interface FactListOpts {
    * semantics only.
    */
   grep?: string;
+  /** Intersect entity reads with this exact source_session before LIMIT/OFFSET. Also honored by listFactsSince. */
+  sessionId?: string;
   /**
    * When true, `listFactsSince`'s `since` comparison and ORDER BY use
    * COALESCE(valid_from, created_at) — event time — instead of creation
@@ -771,6 +773,9 @@ export interface FactListOpts {
   /** Hide facts whose provenance page (`source_markdown_slug`) is private. Resolved by the trusted operation layer (resolveExcludePrivatePages), never from MCP parameters. */
   excludePrivate?: boolean;
 }
+
+/** FactListOpts plus the entity the recall cursor reads (listFactsSince, listFactsKeyset) narrow to before LIMIT. */
+export type RecallFactReadOpts = FactListOpts & { entitySlug?: string };
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
 export interface FactsHealth {
@@ -1405,14 +1410,13 @@ export interface BrainEngine {
   /**
    * #4246: NULL out the embeddings (embedding + embedded_at +
    * embedded_text_hash) of every chunk whose stored `embedded_text_hash` no
-   * longer matches `md5(chunk_text)` — i.e. the chunk's text was rewritten
-   * after its vector was computed, so the vector describes a previous
-   * content revision. Feeds the NULL-embedding cursor exactly like
-   * invalidateStaleSignatureEmbeddings. GRANDFATHER: NULL hash (rows
-   * embedded before v133 stamped provenance) is never invalidated — no
-   * upgrade re-embed spike; the hash lands on each row's next re-embed.
-   * embed_skip pages are excluded (listStaleChunks can't re-embed them, so
-   * NULLing would strand them). Returns the chunk count invalidated.
+   * longer matches `md5(chunk_text)` (text rewritten after its vector was
+   * computed). Feeds the NULL-embedding cursor like
+   * invalidateStaleSignatureEmbeddings. GRANDFATHER: NULL hash (pre-v133
+   * rows) is never invalidated — no upgrade re-embed spike. embed_skip pages
+   * are excluded (listStaleChunks can't re-embed them). #7117: bounded
+   * batches in id order, one transaction each, no saved cursor (the embed
+   * paths run content-drift-sweep.ts). Returns the chunk count invalidated.
    */
   invalidateContentDriftEmbeddings(opts?: { sourceId?: string }): Promise<number>;
   /**
@@ -2401,19 +2405,19 @@ export interface BrainEngine {
   listFactsSince(
     source_id: string,
     since: Date,
-    opts?: FactListOpts & { entitySlug?: string; sessionId?: string },
+    opts?: RecallFactReadOpts,
   ): Promise<FactRow[]>;
 
   /**
    * delta's facts arm: facts strictly after a `(created_at, id)` keyset
    * (`id: null` = strictly after the timestamp), OLDEST first, each row with
    * `created_at_iso` at column precision. Honors activeOnly, visibility,
-   * fingerprint and limit only.
+   * fingerprint, limit, and the opt-in recall narrowing (entitySlug, sessionId, grep, excludeAuditRows) that --since-last-run paging uses.
    */
   listFactsKeyset(
     source_id: string,
     after: { createdAt: string; id: number | null } | null,
-    opts?: FactListOpts,
+    opts?: RecallFactReadOpts,
   ): Promise<FactRow[]>;
 
   /** List facts captured under a session id within a source. */

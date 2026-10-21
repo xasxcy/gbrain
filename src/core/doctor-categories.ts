@@ -57,7 +57,11 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
   'atom_provenance_drift',
+  // #7013: atoms an empty managed re-extraction retired that atoms-restore can bring back (doctor/checks/atom-retirements.ts).
+  'atom_retirements_restorable',
   'captured_facts_active',
+  // #7125: facts whose stored text holds a pre-fix sanitizer redaction marker (doctor/checks/facts-redaction-marker.ts).
+  'facts_redaction_marker',
   'conversation_label_facts',
   'conversation_outcomes_stale',
   'connector_checkpoints',
@@ -182,6 +186,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'sync_freshness',
   // #6858 ask 6: p95 commit→searchable of managed sources over 24 h (doctor/checks/managed-sync-latency.ts).
   'managed_sync_latency',
+  // GBRA-133 PR 2a: the resident that syncs each local source on commit, or none with the fix (doctor/checks/commit-notifier.ts).
+  'commit_notifier',
   // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
   'git_convergence',
   // #5186: an ownership marker committed to a source checkout's Git index.
@@ -208,6 +214,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'rename_identity_downgrades',
   // #6609: live pages of a classic checkout whose recorded file a full sync would not find (doctor/checks/missing-recorded-files.ts).
   'missing_recorded_files',
+  // #7130: soft-deleted pages a managed sync removed although Git never held their file (doctor/checks/uncommitted-sync-deletions.ts).
+  'uncommitted_sync_deletions',
   // #6865: committed files of a managed Git source with no page and no hold, from the stored detector result (doctor/checks/unindexed-files.ts).
   'unindexed_files',
   // #6712: live pages whose database-only edit an incremental sync overwrote without a hold (doctor/checks/overwritten-edits.ts).
@@ -279,6 +287,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'google_file_modes',
   // #5012 item 9: a Google source's configured calendar was unreadable at its last sync (doctor/checks/google-calendar.ts).
   'google_calendar_readable',
+  // #7073: a Google source's last sync could not reach a service (API disabled, scope not granted) (doctor/checks/google-api-access.ts).
+  'google_api_access',
   'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
@@ -307,6 +317,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'managed_sync_blocked',
   // #6712 PR 4a: the read-only convergence shadow's counts (doctor/checks/managed-sync-convergence.ts).
   'managed_sync_convergence',
+  // #6712 PR 4b: sync.admission is not normal, so managed sync admits less than it classifies (doctor/checks/sync-admission.ts).
+  'sync_admission_restricted',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
   'two_consumers_on_host',
@@ -340,6 +352,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   // GBRA-130 C-6: no completed brain-wide pass while jobs fail or a phase keeps blocking it.
   'global_maintenance_stalled',
   'embed_backfill_stalled',
+  // #7117: the content-drift sweep's latest batch failed.
+  'content_drift_sweep',
   'connector_account_mismatch',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',

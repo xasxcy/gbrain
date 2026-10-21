@@ -425,11 +425,27 @@
           {
             "lane": "tx",
             "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config($1, 'on', true)",
+            "textSha256": "aceeddeac0f7c41d75529fb2a4e442f6451b1adf15c5fba1f0570c240b91f705"
+          },
+          {
+            "lane": "tx",
+            "params": [
               "string",
               "string"
             ],
             "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) SELECT $1, r.entity_slug, r.fact, r.kind, r.visibility, r.notability, r.context, r.valid_from::timestamptz, r.valid_until::timestamptz, r.expired_at::timestamptz, r.source, r.source_session, r.confidence, r.embedding::vector, r.embedded_at::timestamptz, r.embedding_model, md5(r.hash_text), r.row_num, r.source_markdown_slug, r.claim_metric, r.claim_value, r.claim_unit, r.claim_period, r.event_type, r.attributed_to FROM jsonb_to_recordset($2::text::jsonb) AS r( entity_slug text, fact text, kind text, visibility text, notability text, context text, valid_from text, valid_until text, expired_at text, source text, source_session text, confidence real, embedding text, embedded_at text, embedding_model text, hash_text text, row_num integer, source_markdown_slug text, claim_metric text, claim_value double precision, claim_unit text, claim_period text, event_type text, attributed_to text, ord integer) ORDER BY r.ord ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id, source_markdown_slug, row_num",
             "textSha256": "2601865e0cfed0d3ffb1da93396ad860ffe7981e0808c4f22ef99a11bcf88442"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config($1, '', true)",
+            "textSha256": "ec8307c16510c3e9113b6cbbd6d70c39ddd38f43b35b52b31eebde8a13853cc9"
           },
           {
             "event": "commit",
@@ -460,11 +476,27 @@
           {
             "lane": "tx",
             "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config($1, 'on', true)",
+            "textSha256": "aceeddeac0f7c41d75529fb2a4e442f6451b1adf15c5fba1f0570c240b91f705"
+          },
+          {
+            "lane": "tx",
+            "params": [
               "string",
               "string"
             ],
             "sql": "INSERT INTO facts ( source_id, entity_slug, fact, kind, visibility, notability, context, valid_from, valid_until, expired_at, source, source_session, confidence, embedding, embedded_at, embedding_model, embedded_text_hash, row_num, source_markdown_slug, claim_metric, claim_value, claim_unit, claim_period, event_type, attributed_to ) SELECT $1, r.entity_slug, r.fact, r.kind, r.visibility, r.notability, r.context, r.valid_from::timestamptz, r.valid_until::timestamptz, r.expired_at::timestamptz, r.source, r.source_session, r.confidence, r.embedding::vector, r.embedded_at::timestamptz, r.embedding_model, md5(r.hash_text), r.row_num, r.source_markdown_slug, r.claim_metric, r.claim_value, r.claim_unit, r.claim_period, r.event_type, r.attributed_to FROM jsonb_to_recordset($2::text::jsonb) AS r( entity_slug text, fact text, kind text, visibility text, notability text, context text, valid_from text, valid_until text, expired_at text, source text, source_session text, confidence real, embedding text, embedded_at text, embedding_model text, hash_text text, row_num integer, source_markdown_slug text, claim_metric text, claim_value double precision, claim_unit text, claim_period text, event_type text, attributed_to text, ord integer) ORDER BY r.ord ON CONFLICT (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL DO NOTHING RETURNING id, source_markdown_slug, row_num",
             "textSha256": "2601865e0cfed0d3ffb1da93396ad860ffe7981e0808c4f22ef99a11bcf88442"
+          },
+          {
+            "lane": "tx",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT set_config($1, '', true)",
+            "textSha256": "ec8307c16510c3e9113b6cbbd6d70c39ddd38f43b35b52b31eebde8a13853cc9"
           },
           {
             "event": "commit",
@@ -586,14 +618,14 @@
               "string",
               "string",
               "array<string>",
-              "array<string>",
-              "array<string>",
               "string",
+              "array<string>",
+              "array<string>",
               "number",
               "number"
             ],
-            "sql": "SELECT * FROM facts WHERE source_id = $1 AND COALESCE(valid_from, created_at) >= $2 AND entity_slug = $3 AND source_session = $4 AND consolidated_at IS NULL AND kind = ANY($5::text[]) AND visibility = ANY($6::text[]) AND source != ALL($7::text[]) AND fact ILIKE $8 ESCAPE '\\' ORDER BY COALESCE(valid_from, created_at) DESC, id DESC LIMIT $9 OFFSET $10",
-            "textSha256": "a635199e1e8bc1742eaa0209a8bc5b296098640ab38aa287635fe9195fa696ae"
+            "sql": "SELECT * FROM facts WHERE source_id = $1 AND COALESCE(valid_from, created_at) >= $2 AND entity_slug = $3 AND source_session = $4 AND source != ALL($5::text[]) AND fact ILIKE $6 ESCAPE '\\' AND consolidated_at IS NULL AND kind = ANY($7::text[]) AND visibility = ANY($8::text[]) ORDER BY COALESCE(valid_from, created_at) DESC, id DESC LIMIT $9 OFFSET $10",
+            "textSha256": "1b9e94f79ae9ab62cb04bc9501d94a5b3c7e02b6b208f25f3ec7c840e9d2e978"
           }
         ],
         "default": [
@@ -606,7 +638,7 @@
               "number"
             ],
             "sql": "SELECT * FROM facts WHERE source_id = $1 AND created_at >= $2 AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now()) ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
-            "textSha256": "3f0a5fa0e5e1a4338c4d9a10f70015aef0d1d34504c0161ce43eae3a104f6beb"
+            "textSha256": "b91c27c57a63ae4eeed4b01a43c5b9c43bc16d06e7960e87a68898d91577d0ac"
           }
         ]
       },

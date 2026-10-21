@@ -63,13 +63,14 @@ import { warnOncePerProcess, validateSlug, contentHash, contentHashLegacy, ATOMS
 import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
 import { runGuardrails } from './guardrails.ts';
-import { fenceBody } from './page-body/page-shape.ts';
+import { fenceBody, pageBodySegmentedError } from './page-body/page-shape.ts';
 import { abortSegmentedStaging, bodyStorageOf, demoteSegmentedPage, materializedPage, materializedSnapshot, sealSegmentedPage, stageSegmentedImport,
   stringWriteStorage, type SegmentedImport } from './persistence/segmented-apply.ts';
 import type { SegmentedStagingOwner } from './page-body/ingest.ts';
 import type { PageBodyPolicy } from './page-body/limits.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
 import { assertOriginUnclaimed, isOriginClaimRefusal } from './persistence/origin-guard.ts';
+import { fileBodyMatchesStored, readStoredBody } from './facts/file-body-guard.ts';
 
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
@@ -152,8 +153,10 @@ export interface ImportResult {
   /** Which flag tier fired, when `flagged` (`instruction_like`: the #5575 write gate). */
   flag_reason?: 'markup_heavy' | 'oversized' | 'instruction_like';
   gate?: WriteGateAssessment; // #5575: the write-gate assessment, when the caller passed writeGate
-  /** Wave B, a segmented write imported outside the coordinator: whether search sees it on return (searchable.ts). */
+  /** Wave B: whether search sees a segmented write on return (searchable.ts), outside the coordinator or through a managed import. */
   searchable?: boolean | 'pending';
+  /** #7106: a managed import of a new segmented page over 4 MiB replies at commit; read receipt `request_id` again after `searchable_retry_after_ms` (`searchable_fix`) until `searchable` is true. */
+  projection?: 'pending'; request_id?: string; searchable_retry_after_ms?: number; searchable_fix?: Record<string, unknown>;
   /** #5050: unchanged content below the safe-chunk fence was re-sealed; chunks left to embed. */
   resealed?: { pendingChunks: number; pendingChars: number };
   /**
@@ -528,12 +531,17 @@ export async function importFromContent(
 
   const originUri = fileOriginUri(existing?.source_uri, opts.sourceRoot, opts.sourcePath);
   const persistUnchanged = async (refreshBody = false) => {
-    await maintenanceTransaction(engine, async tx => {
+    return maintenanceTransaction(engine, async tx => {
       await assertImportBase(tx, slug, sourceId ?? 'default', existing);
-      if (refreshBody) await tx.refreshPageBody(slug, sourceId ?? 'default', parsed.compiled_truth, parsed.timeline || '', hash);
+      if (refreshBody) {
+        const stored = await readStoredBody(tx, sourceId ?? 'default', slug, true);
+        if (!stored || !fileBodyMatchesStored(content, slug, stored)) return false;
+        await tx.refreshPageBody(slug, sourceId ?? 'default', parsed.compiled_truth, parsed.timeline || '', hash);
+      }
       await refreshSourcePath(tx, slug, sourceId, opts.sourcePath, existing, originUri);
       if (opts.beforeCommit) await verifyPageReadable(tx, slug, refreshBody ? hash : existing?.content_hash ?? hash, sourceId, 'importFromContent');
       await opts.beforeCommit?.(tx, slug);
+      return true;
     });
   };
 
@@ -574,8 +582,8 @@ export async function importFromContent(
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}), ...fences.fields };
   }
 
-  if (existing && legacyHashMatch) {
-    await persistUnchanged(true);
+  if (existing && legacyHashMatch && bodyStorageOf(existing) === 'segmented') throw pageBodySegmentedError(existing, 'legacy hash reconciliation');
+  if (existing && legacyHashMatch && fileBodyMatchesStored(content, slug, existing) && await persistUnchanged(true)) {
     const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}), ...fences.fields };
   }

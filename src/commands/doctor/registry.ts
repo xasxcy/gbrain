@@ -86,6 +86,7 @@ import { imageEmbeddingCoverageEntry } from './checks/image-embedding-coverage.t
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { globalMaintenanceStalledEntry } from './checks/global-maintenance-stalled.ts';
 import { embedBackfillStalledEntry } from './checks/embed-backfill-stalled.ts';
+import { contentDriftSweepEntry } from './checks/content-drift-sweep.ts';
 import { connectorAccountMismatchEntry } from './checks/connector-account-mismatch.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
@@ -123,11 +124,14 @@ import { renameIdentityDowngradesEntry } from './checks/rename-identity-downgrad
 import { unindexedFilesEntry } from './checks/unindexed-files.ts';
 import { purgeParkedPagesEntry } from './checks/purge-parks.ts';
 import { missingRecordedFilesEntry } from './checks/missing-recorded-files.ts';
+import { uncommittedSyncDeletionsEntry } from './checks/uncommitted-sync-deletions.ts';
 import { overwrittenEditsEntry } from './checks/overwritten-edits.ts';
 import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { managedSyncLatencyEntry } from './checks/managed-sync-latency.ts';
+import { commitNotifierEntry } from './checks/commit-notifier.ts';
 import { managedSyncConvergenceEntry } from './checks/managed-sync-convergence.ts';
 import { managedSyncBlockedEntry } from './checks/managed-sync-blocked.ts';
+import { syncAdmissionEntry } from './checks/sync-admission.ts';
 import { atomHeldFailedEntry } from './checks/atom-holds.ts';
 import { extractionInputTruncatedEntry } from './checks/extraction-input.ts';
 import {
@@ -176,6 +180,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   terminalFailuresEntry,
   managedSyncMovementEntry,
   managedSyncBlockedEntry,
+  syncAdmissionEntry,
   persistenceCompactionEntry,
   soakCountersEntry,
   serveBuildDriftEntry,
@@ -221,6 +226,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   globalMaintenanceTimeoutsEntry,
   globalMaintenanceStalledEntry,
   embedBackfillStalledEntry,
+  contentDriftSweepEntry,
   connectorAccountMismatchEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
@@ -230,6 +236,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   imageEmbeddingCoverageEntry,
   syncFreshnessEntry,
   managedSyncLatencyEntry,
+  commitNotifierEntry,
   gitConvergenceEntry,
   decideHealthEntry,
   unlinkedFactsEntry,
@@ -254,6 +261,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   renameIdentityDowngradesEntry,
   purgeParkedPagesEntry,
   missingRecordedFilesEntry,
+  uncommittedSyncDeletionsEntry,
   unindexedFilesEntry,
   overwrittenEditsEntry,
   syncConfigKeysEntry,

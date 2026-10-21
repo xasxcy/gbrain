@@ -53,8 +53,6 @@ export const DEFAULT_ZOMBIE_CAP = 1;
 /** An effects drain running this long names itself on stderr (serve), then again at this cadence. */
 const DRAIN_NOTICE_AFTER_MS = 5_000;
 const DRAIN_NOTICE_EVERY_MS = 10_000;
-/** #6696 C7: at most one storage.keep_db policy pass (KEEP_DB_BATCH requests) per this interval. */
-const KEEP_DB_POLICY_INTERVAL_MS = 10 * 60_000;
 /** #6712 (convergence mode f): how long a pass whose connection died keeps trying to release its unpublished claims. */
 const CONNECTION_LOSS_RELEASE_MS = 30_000;
 /** #6650: how often a consumer looks for claims held by an owner it can prove dead. */
@@ -101,6 +99,8 @@ function previousToken(stamp: unknown): string | null {
 export const RESIDENT_PROJECTION_PAGES = 100;
 export const RESIDENT_PROJECTION_BUDGET_MS = 250;
 export const WRITE_WAITING_PROJECTION_PAGES = 2;
+/** #7106: projection builds a consumer runs after replying (new pages over SEGMENTED_CREATE_SEAL_MAX_BYTES) at once; more wait in order. */
+export const DETACHED_PROJECTION_BUILDS = 1;
 
 export async function runResidentProjectionInvocation(engine: BrainEngine, hostId: string, excludeRoots: string[],
   now: () => number = Date.now, signal?: AbortSignal) {
@@ -191,6 +191,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private besideLanes = new Set<string>();
   /** #5984 lanes: running lane tasks per worktree. */
   private laneTasks = new Map<string, number>();
+  /** #6278: roots an abandoned preparation still holds, by the number of holds; nothing on them is claimed until each settles or passes the ceiling. */
+  private barredRoots = new Map<string, number>();
   private foregroundCounts = new Map<string, number>();
   /** #5984 Phase 4.5: the newest sequence when this process last claimed a head of each lane run (one head per foreground commit). */
   private laneHeadSeen = new Map<string, string>();
@@ -210,9 +212,6 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private settleCursor: NoopSettleCursor | undefined;
   private topologyWorker: Promise<unknown> | undefined;
   private maintenanceWorker: Promise<unknown> | undefined;
-  /** #6696 C7: the storage.keep_db policy pass (resident owners only, at most one per KEEP_DB_POLICY_INTERVAL_MS while idle). */
-  private keepDbWorker: Promise<unknown> | undefined;
-  private nextKeepDb = 0;
   private nextMaintenance = 0;
   private publishedSinceMaintenance = 0;
   private maintenanceVolume = 50;
@@ -234,6 +233,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private preparationAttempts = 0;
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
   private executing = new Set<string>();
+  private detachedBuilds = 0;
+  private detachedQueue: Array<() => void> = [];
   private abandonedReleased = false;
   /** #6317: the engine the tick's own statements run through (the direct route when the engine has one; consumer-lane.ts). */
   private readonly statements: BrainEngine;
@@ -253,9 +254,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       /** #6278: abandoned preparations past the ceiling before this process stops claiming (default DEFAULT_ZOMBIE_CAP). */
       zombieCap?: number;
       /** Write the long-drain progress line on stderr (serve; never a CLI command that may print --json). */
-      drainNotice?: boolean;
-      /** #6696 C7: run the storage.keep_db policy (repair/keep-db-policy.ts) for the sources this host owns while idle. */
-      keepDbPolicy?: boolean } = {}) {
+      drainNotice?: boolean } = {}) {
     this.hostId = opts.hostId ?? localHostId();
     this.statements = consumerStatementEngine(engine);
   }
@@ -313,7 +312,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
    */
   private async hasWork(): Promise<boolean> {
     const now = Date.now();
-    const excluded = [...this.activeRoots, ...[...this.rootRetryAfter].filter(([, at]) => at > now).map(([root]) => root)];
+    const excluded = [...this.activeRoots, ...this.barredRoots.keys(), ...[...this.rootRetryAfter].filter(([, at]) => at > now).map(([root]) => root)];
     for (const [id, at] of this.topologyRetryAfter) if (at <= now) this.topologyRetryAfter.delete(id);
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
     // On the direct route the probe needs no reserved pool lane: the direct pool is small and keeps its connections.
@@ -425,8 +424,11 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
    */
   private async publishSingle(row: WriteRequest, prepared: PreparedMutation): Promise<{ done: WriteRequest; settled: boolean }> {
     // A waiter learns of the commit before the recovery record is cleared (the clear still runs under the worktree lock).
+    // #7106: a new page whose projection is built after commit settles at commit; the build runs through the bounded
+    // detached-build queue and holds neither the reply nor the source's next write.
     let settled = false;
-    const hooks = { committed: (rows: WriteRequest[]) => { settled = true; this.settled(rows[0]!); } };
+    const hooks = { committed: (rows: WriteRequest[]) => { settled = true; this.settled(rows[0]!); },
+      projectionPending: (done: WriteRequest, afterCommit: () => Promise<void>) => { settled = true; this.settled(done); this.detachBuild(afterCommit); } };
     const published = await this.onLane(transaction => publishSingleWrite(this.engine, row, prepared, this.hostId, hooks, transaction));
     const done = published === LANE_BUSY ? await publishSingleWrite(this.engine, row, prepared, this.hostId, hooks) : published;
     return { done, settled: settled && done.state === 'committed' };
@@ -524,11 +526,6 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
           // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
           this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(yieldToEventLoop).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
             .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
-        }
-        if (this.opts.keepDbPolicy && !this.opts.requestsOnly && !this.keepDbWorker && Date.now() >= this.nextKeepDb) {
-          this.nextKeepDb = Date.now() + KEEP_DB_POLICY_INTERVAL_MS;
-          this.keepDbWorker = import('../repair/keep-db-policy.ts').then(({ runKeepDbPolicy }) => runKeepDbPolicy(this.engine, { hostId: this.hostId }))
-            .catch(error => this.report(error)).finally(() => { this.keepDbWorker = undefined; });
         }
         return;
       }
@@ -631,7 +628,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     const concurrency = this.opts.concurrency ?? 2;
     // #5984: on a root whose lane groups run here, only a foreground write is claimed, to publish beside them.
     const laneRootKeys = [...this.laneTasks.keys()];
-    const attemptedRoots = new Set([...this.activeRoots, ...this.rootRetryAfter.keys()]);
+    const attemptedRoots = new Set([...this.activeRoots, ...this.barredRoots.keys(), ...this.rootRetryAfter.keys()]);
     while (!this.stopping && this.active.size - this.laneTaskCount() < concurrency) {
       const claimed = laneClaim();
       try {
@@ -684,7 +681,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
   private async claimLanes(): Promise<void> {
     for (const { worktreeId, run, capacity } of laneRoots()) {
-      if (this.rootRetryAfter.has(worktreeId) || this.activeRoots.has(worktreeId) && !this.besideLanes.has(worktreeId)) continue;
+      if (this.rootRetryAfter.has(worktreeId) || this.barredRoots.has(worktreeId) || this.activeRoots.has(worktreeId) && !this.besideLanes.has(worktreeId)) continue;
       while (!this.stopping && (this.laneTasks.get(worktreeId) ?? 0) < capacity) {
         const claimed = laneClaim();
         try {
@@ -713,9 +710,16 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       if (!progressed) this.rootRetryAfter.set(key, Date.now() + (root.retryAfterMs ?? this.opts.pollMs ?? 250));
       else { this.progressWake = true; this.publishedSinceMaintenance++; }
       this.active.delete(task);
-      // The slot is free now; the root (or lane slot) waits for an abandoned preparation so nothing on it overtakes that work.
-      if (root.until) void root.until.then(() => { done(); this.schedule(0); });
-      else done();
+      // The slot is free now; the root waits for an abandoned preparation so nothing on it overtakes that work. A lane task frees
+      // only its own lane slot, so the root is barred from claims too: another lane would claim the abandoned member again.
+      if (root.until) {
+        this.barredRoots.set(key, (this.barredRoots.get(key) ?? 0) + 1);
+        void root.until.then(() => {
+          const holds = (this.barredRoots.get(key) ?? 1) - 1;
+          if (holds > 0) this.barredRoots.set(key, holds); else this.barredRoots.delete(key);
+          done(); this.schedule(0);
+        });
+      } else done();
       this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
     });
     this.active.add(task);
@@ -784,14 +788,14 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   }
   status() {
     const drain = this.draining;
-    const { deadlines, syncMs, maintenanceMs, ceilingMs, maxAttempts } = this.policy;
+    const { deadlines, syncMs, maintenanceMs, ceilingMs, maxAttempts, transientRetries } = this.policy;
     return { accepting: !this.stopping, active_preparations: this.active.size, active_worktrees: this.activeRoots.size,
       sampled_at: new Date().toISOString(), observation_scope: 'current_process_reset_on_restart',
       preparation_attempts: this.preparationAttempts,
       phase: this.phaseObservation ? { ...this.phaseObservation, ...this.phaseTiming(this.phaseObservation, this.phaseStartedAt) } : null,
       preparations: [...this.preparing.values()].map(value => ({ ...value })),
       // #6278: deadlines in effect, preparations whose claim was released while they still ran, and the zombies past the ceiling.
-      preparation_policy: { deadlines, sync_preparation_ms: syncMs, maintenance_preparation_ms: maintenanceMs, preparation_ceiling_ms: ceilingMs, max_preparation_attempts: maxAttempts },
+      preparation_policy: { deadlines, sync_preparation_ms: syncMs, maintenance_preparation_ms: maintenanceMs, preparation_ceiling_ms: ceilingMs, max_preparation_attempts: maxAttempts, max_transient_retries: transientRetries },
       abandoned_preparations: this.abandoned.size,
       outlived_ceiling: [...this.zombies.values()].map(value => ({ ...value })),
       restart_required: this.restartRequired(),
@@ -892,6 +896,19 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       + '; unfinished work remains tracked; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
   }
   /** #5373: tracks work that outlived its claim until it settles; the returned promise never rejects. */
+  /**
+   * #7106: runs a detached projection build (PublicationHooks.projectionPending) at most DETACHED_PROJECTION_BUILDS at
+   * a time, queued builds in order; each is tracked until it ends, so stop() waits for queued and running builds.
+   */
+  private detachBuild(build: () => Promise<void>): void {
+    this.keepUntilSettled(new Promise<void>(resolve => {
+      const start = () => {
+        this.detachedBuilds++;
+        void build().finally(() => { this.detachedBuilds--; resolve(); this.detachedQueue.shift()?.(); });
+      };
+      if (this.detachedBuilds < DETACHED_PROJECTION_BUILDS) start(); else this.detachedQueue.push(start);
+    }));
+  }
   private keepUntilSettled(work: Promise<unknown>): Promise<void> {
     const settled = work.then(() => undefined, () => undefined);
     this.outlived.add(settled);
@@ -1070,8 +1087,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       // A managed import batch also groups on PGLite: its members share one transaction's guards there too.
       if (!group || this.engine.kind !== 'postgres' && !group.startsWith('import:')) return this.execute(row, root);
       // #6007: a put_pages or import batch publishes in groups of at most PAGE_BATCH_GROUP_MAX pages.
-      const followers = await claimGroupFollowers(this.engine, row, group, syncGroup(group) ? 63 : PAGE_BATCH_GROUP_MAX - 1);
-      if (!followers.length && !lane) return this.execute(row, root);
+      const charged = (row.transient_interruptions ?? 0) > 0;
+      const followers = charged ? [] : await claimGroupFollowers(this.engine, row, group, syncGroup(group) ? 63 : PAGE_BATCH_GROUP_MAX - 1);
+      if (!followers.length && !lane && !charged) return this.execute(row, root);
       claimed.push(...followers);
       const rows = [row, ...followers];
       for (const member of rows) this.executing.add(member.id);
@@ -1141,7 +1159,6 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     await this.effectsWorker;
     await this.topologyWorker;
     await this.maintenanceWorker;
-    await this.keepDbWorker;
     this.unobserveCheckout?.();
     this.unobserveCheckout = undefined;
     try { this.loopDelay?.disable(); } catch { /* fail-open */ }

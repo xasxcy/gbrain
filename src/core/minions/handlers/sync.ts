@@ -11,7 +11,6 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
   return async (job) => {
     const { performSync } = await import('../../../commands/sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
-    const noPull = !resolveJobPull(job.data);
     // noEmbed defaults to true (embed is a separate job — submit `embed --stale`
     // after sync, OR run via the autopilot cycle which has its own embed phase).
     // Caller can opt in by passing { noEmbed: false } in job params.
@@ -35,6 +34,13 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
         // global config.sync.* anchor in performSync.
       }
     }
+    // GBRA-133: a job that does not say whether to pull gets the CLI's managed default (no pull); an explicit pull: true is still refused.
+    const pullFlags = { noPull: !resolveJobPull(job.data), dryRun: false };
+    if (typeof job.data.pull !== 'boolean' && typeof job.data.noPull !== 'boolean') {
+      const { implyManagedNoPull } = await import('../../../commands/sync/managed-no-pull.ts');
+      await implyManagedNoPull(engine, pullFlags, sourceId ?? 'default');
+    }
+    const noPull = pullFlags.noPull;
     // #4399: a queued automatic freshness sync re-reads the source when it runs, so a source
     // disabled after enqueue is not synced. Explicit jobs still run; a failed lookup falls through.
     if (job.data.embed_reason === 'autopilot_freshness') {
@@ -102,6 +108,10 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
           next: { command: `gbrain jobs get ${live.id} --json`, safe_to_loop: true, retry_after_ms: 30_000, why: `Sync job #${live.id} is draining source ${sourceId ?? 'default'}; it resumes the cursor, so nothing else needs to run.` } };
       }
     }
+    // GBRA-133 PR 2a: the wanted markers this run can satisfy, read before it starts; after the run each is cleared
+    // only if nobody re-recorded it meanwhile (generation), and anything still due gets one follow-up job.
+    const { readMarkersForRun, settleRunMarkers, recordBusyMarker } = await import('../../notifier/handoff.ts');
+    const markersRead = await readMarkersForRun(engine, sourceId ?? 'default');
     let result;
     try {
       result = await performSync(engine, {
@@ -129,6 +139,8 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
         const holder = read && read.kind !== 'unknown' ? read : null;
         const runningJob = holder?.kind === 'job' && holder.id && /^\d+$/.test(holder.id) ? Number(holder.id) : null;
         console.error(`[sync] skipped: sync already in progress for ${id} (lock ${err.lockKey} held${holder ? ` by a ${holder.kind} drainer` : ''}).`);
+        // GBRA-133 PR 2a: the newer commit this job was for is recorded as wanted; the holder's run re-checks it.
+        await recordBusyMarker(engine, id, { pull: !noPull });
         // A job result is readable by remote callers (get_job), so it carries the public holder: kind and times only.
         return { skipped: true, reason: 'sync_in_progress', source_id: id, ...(holder ? { holder: publicDrainHolder(holder) } : {}),
           ...(runningJob !== null ? { running_job_id: runningJob, next: { command: `gbrain jobs get ${runningJob} --json`, safe_to_loop: true, retry_after_ms: 30_000,
@@ -154,12 +166,17 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
     const autoEmbed = job.data.auto_embed_backfill !== false;
     let embedJobId: number | null = null;
     let embedSkipReason: string | null = null;
+    let embedNotice: import('../../agent-output.ts').RenderedNotice | null = null;
     const { syncProducedEmbeddableContent } = await import('../../sync-embed-backfill.ts');
     if (autoEmbed && sourceId && result.status !== 'up_to_date' && result.status !== 'dry_run' && syncProducedEmbeddableContent(result)) {
       try {
         const { isFederatedV2Enabled } = await import('../../feature-flags.ts');
-        if (await isFederatedV2Enabled(engine)) {
-          const { submitEmbedBackfill } = await import('../../embed-backfill-submit.ts');
+        const { keylessEmbedBackfill, reportKeylessNotice, submitEmbedBackfill } = await import('../../embed-backfill-submit.ts');
+        const keyless = await keylessEmbedBackfill(engine);
+        if (keyless) {
+          embedSkipReason = 'embedding_disabled';
+          if (keyless.notice) embedNotice = reportKeylessNotice(keyless.notice);
+        } else if (await isFederatedV2Enabled(engine)) {
           const submission = await submitEmbedBackfill(engine, sourceId, {
             reason: typeof job.data.embed_reason === 'string'
               ? (job.data.embed_reason as string)
@@ -169,6 +186,9 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
             embedJobId = submission.jobId;
           } else if (submission.status === 'cooldown' || submission.status === 'spend_capped' || submission.status === 'no_worker_surface' || submission.status === 'stalled') {
             embedSkipReason = submission.status;
+          } else if (submission.status === 'embedding_disabled') {
+            embedSkipReason = submission.status;
+            if (submission.notice) embedNotice = reportKeylessNotice(submission.notice);
           } else {
             submission satisfies never;
           }
@@ -198,6 +218,8 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
       throw new UnrecoverableError(`Managed sync of source ${sourceId ?? 'default'} is ${result.status === 'blocked_by_failures' ? 'blocked' : 'stopped'}`
         + ` (${drain?.stop_reason ?? result.status}${drain?.remaining != null ? `, ${drain.remaining} entries left` : ''}). ${next?.why ?? ''}${next?.command ? ` Next: ${next.command}` : ''}`.trim());
     }
-    return { ...result, ...drained, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason };
+    const followUp = drained.incomplete === true ? null : await settleRunMarkers(engine, sourceId ?? 'default', markersRead, { pulled: !noPull, full: false });
+    return { ...result, ...drained, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason, ...(embedNotice ? { notice: embedNotice } : {}),
+      ...(followUp ? { marker_follow_up: followUp } : {}) };
   };
 }

@@ -212,6 +212,7 @@ test/git-listing-memo.serial.test.ts	R1	R1: puts a git-counting shim on process.
 test/git-remote-durable.serial.test.ts	R1	R1: mutates process.env (GBRAIN_GIT_ALLOW_FILE_TRANSPORT)
 test/git-remote-pull-file-transport.serial.test.ts	R1	R1: mutates process.env (GBRAIN_GIT_ALLOW_FILE_TRANSPORT)
 test/google-connect-cmd.serial.test.ts	global-state	global-state: spyOn console.error; patches process stdout/stderr/console
+test/google-api-access-cmd-7073.serial.test.ts	global-state	global-state: replaces globalThis.fetch and patches process stdout/stderr for google status and setup
 test/google-loops-recovery.serial.test.ts	global-state	global-state: process-wide test seams __setChatTransportForTests; configureGateway changes the process-wide AI gateway; patches process stdout/stderr/console
 test/graduation-serve-guard.serial.test.ts	global-state	global-state: spawns real gbrain serve children and holds GBRAIN_HOME (withEnv) across awaited CLI runs
 test/graph-query-thin-client-source-flag.serial.test.ts	R2	R2: mock.module(../src/core/config.ts, ../src/core/mcp-client.ts) replaces modules for every file in the process
@@ -306,6 +307,8 @@ test/openclaw-context-engine-native.serial.test.ts	global-state	global-state: bi
 test/ops-run-onboard-scope-gate.serial.test.ts	R2	R2: mock.module(../src/core/onboard/checks.ts, ../src/core/remediation/index.ts, ../src/core/onboard/render.ts) replaces modules for every file in the process
 test/oversized-backfill.serial.test.ts	global-state	global-state: installs the process-global embedding transport seam (__setEmbedTransportForTests) and gateway config (configureGateway); swaps GBRAIN_HOME through withEnv
 test/page-summary-length.serial.test.ts	R1	R1: mutates process.env (GBRAIN_AUDIT_DIR)
+test/pathological/a31-migrate-loop-rows.serial.test.ts	global-state	global-state: runMigrateEngine sets the process-wide CLI exit verdict and writes the config under a withEnv-scoped GBRAIN_HOME
+test/pathological/w1-write-through-staging-window.serial.test.ts	R2	R2: mock.module(../../src/core/atomic-write.ts) replaces modules for every file in the process
 test/pending-write-exit.serial.test.ts	global-state	global-state: binds local servers/ports
 test/persistence-drain-latency.serial.test.ts	global-state	global-state: configureGateway changes the process-wide AI gateway; patches process stdout/stderr/console; times event-loop gaps against a bound, so a parallel neighbour would distort the measurement
 test/persistence-image-import.serial.test.ts	R2	R2: mock.module(../src/core/embedding.ts) replaces modules for every file in the process
@@ -439,3 +442,4 @@ test/backup-preflight-6649.serial.test.ts	global-state	global-state: R3: constru
 test/windows-ipc-long-path-6573.serial.test.ts	R1	R1: mutates process.env (USERPROFILE) to place the per-user run dir under a non-ASCII profile path; native windows-latest only
 test/coordination-lock.serial.test.ts	global-state	global-state: withEnv holds GBRAIN_HOME and GBRAIN_COORDINATION_HOME across awaited PGLite claims and transfers, and real native lock files are held across them
 test/context-assemble-load-warning.serial.test.ts	R2	R2: mock.module(../src/core/engine-factory.ts) replaces modules for every file in the process; R1: mutates process.env (GBRAIN_HOME, DATABASE_URL, GBRAIN_DATABASE_URL)
+test/search-tune-apply-truthful.serial.test.ts	R2	R2: mock.module(../src/core/search/tune-recommendations.ts) replaces modules for every file in the process

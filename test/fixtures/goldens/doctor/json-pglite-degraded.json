@@ -6,12 +6,12 @@
       "--skills-dir",
       "<home>/skills"
     ],
-    "exit_code": 0,
+    "exit_code": 1,
     "report": {
-      "brain_checks_score": 90,
+      "brain_checks_score": 70,
       "budget_ms": "<volatile>",
       "category_scores": {
-        "brain": 90,
+        "brain": 70,
         "meta": 100,
         "ops": 100,
         "skill": 95
@@ -642,6 +642,20 @@
         {
           "category": "ops",
           "details": {
+            "age_seconds": null,
+            "docs": "docs/guides/error-codes.md#sync_admission_restricted",
+            "set_at": null,
+            "stored": null,
+            "value": "normal"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "sync.admission is normal: managed sync admits everything it classifies.",
+          "name": "sync_admission_restricted",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
             "docs": "docs/guides/repair.md#receipt-compaction",
             "last_compaction": {
               "at": "<ts>",
@@ -787,7 +801,7 @@
           "category": "brain",
           "details": {
             "archived": 0,
-            "as_of": "<ts>+00",
+            "as_of": "<ts>+08",
             "failed": 0,
             "ocr_required": 0,
             "oldest_age_seconds": "<volatile>",
@@ -822,6 +836,7 @@
           "details": {
             "effects": [],
             "exact": true,
+            "git_push_holds": [],
             "inspected": 0,
             "parked_effects": 0,
             "truncated": false
@@ -898,14 +913,14 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1272 column(s) verified against live schema",
+          "message": "1310 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "All 150 table(s) the applied migrations create exist.",
+          "message": "All 153 table(s) the applied migrations create exist.",
           "name": "schema_missing_tables",
           "status": "ok"
         },
@@ -1263,6 +1278,7 @@
             "preparation_policy": {
               "maintenance_preparation_ms": "<volatile>",
               "max_preparation_attempts": 2,
+              "max_transient_retries": 5,
               "preparation_ceiling_ms": "<volatile>",
               "sync_preparation_ms": "<volatile>"
             },
@@ -1513,6 +1529,36 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/google-connect.md#api-access",
+            "sources": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No Google source recorded a disabled API or missing scope at its last sync.",
+          "name": "google_api_access",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "by_source": [],
+            "count": 0,
+            "docs": "docs/guides/repair.md#atoms-restore",
+            "hold_until": null,
+            "newest_retired_at": null,
+            "oldest_retired_at": null,
+            "origins": 0,
+            "repair": "atoms-restore",
+            "source_ids": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No atom retired by an empty re-extraction is waiting to be restored.",
+          "name": "atom_retirements_restorable",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "ambiguous": 0,
@@ -1568,6 +1614,18 @@
           "elapsed_ms": "<volatile>",
           "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
           "name": "captured_facts_active",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "affected": 0,
+            "docs": "docs/guides/repair.md#redacted-facts",
+            "repair": "redacted-facts"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No active fact holds a redaction marker.",
+          "name": "facts_redaction_marker",
           "status": "ok"
         },
         {
@@ -1870,6 +1928,18 @@
         },
         {
           "category": "ops",
+          "details": {
+            "code": "content_drift_sweep",
+            "docs": "docs/guides/troubleshooting.md#content-drift-sweep",
+            "scopes": []
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "The content-drift sweep has not run yet; it runs inside embed --stale and the embed jobs.",
+          "name": "content_drift_sweep",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "elapsed_ms": "<volatile>",
           "message": "No connector source is waiting for its account to be repinned.",
           "name": "connector_account_mismatch",
@@ -1979,27 +2049,78 @@
         {
           "category": "brain",
           "details": {
-            "stale_count": 0,
+            "code": "content_receipt_stale",
+            "no_successful_sync": [
+              {
+                "code": "content_receipt_stale",
+                "fix": {
+                  "actor": "agent",
+                  "argv": [
+                    "gbrain",
+                    "repair",
+                    "content-receipt-root",
+                    "--source",
+                    "default"
+                  ],
+                  "consent": [],
+                  "docs": "docs/guides/repair.md#content-receipt-root",
+                  "requires_exclusive": false,
+                  "verify": {
+                    "argv": [
+                      "gbrain",
+                      "doctor",
+                      "--only",
+                      "sync_freshness",
+                      "--json"
+                    ]
+                  },
+                  "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
+                },
+                "held": 0,
+                "job_id": null,
+                "last_attempt_at": null,
+                "reason": "receipt_root_moved",
+                "result": null,
+                "source_id": "default"
+              }
+            ],
+            "stale_count": 1,
             "synced_recently_count": 0,
-            "unchanged_count": 0,
-            "writer_owned_count": 1
+            "unchanged_count": 0
           },
           "elapsed_ms": "<volatile>",
-          "message": "1 writer-owned canonical content source(s): upstream sync is not applicable; see canonical_content_writes for publication status.",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "repair",
+              "content-receipt-root",
+              "--source",
+              "default",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain repair content-receipt-root --source default --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#content-receipt-root",
+            "next": "run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "sync_freshness",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
+          },
+          "message": "Source 'default': no successful sync recorded; it is a gbrain-owned content directory whose content receipt names an old root, so sync does not apply and doctor cannot exempt it; run `gbrain repair content-receipt-root --source default`",
           "name": "sync_freshness",
-          "status": "ok"
-        },
-        {
-          "category": "ops",
-          "details": {
-            "pending_count": 0,
-            "recovering_count": 0,
-            "writer_owned_count": 1
-          },
-          "elapsed_ms": "<volatile>",
-          "message": "1 writer-owned content source(s); no pending canonical publication or recovery.",
-          "name": "canonical_content_writes",
-          "status": "ok"
+          "status": "fail"
         },
         {
           "category": "ops",
@@ -2016,6 +2137,7 @@
               "no_remote": 0,
               "pages_at_risk": 0,
               "recoverable_repos": 0,
+              "remote_timeouts": 0,
               "unpushed": 0
             }
           },
@@ -2137,6 +2259,28 @@
           "elapsed_ms": "<volatile>",
           "message": "No commit→searchable samples in the last 24 h (no managed sync imported a new commit).",
           "name": "managed_sync_latency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/on-commit-sync.md",
+            "sources": [
+              {
+                "pending_markers": 0,
+                "reason": null,
+                "resident": null,
+                "source_id": "default",
+                "stalled": false,
+                "state": null
+              }
+            ],
+            "sync_on_commit": false
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "sync.on_commit is off; residents still run explicit sync requests. notifier for default: none running; idle.",
+          "name": "commit_notifier",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -2432,6 +2576,7 @@
             "facts": {
               "missing": 0,
               "other_model": 0,
+              "partially_embedded": 0,
               "stale": 0
             },
             "model": "voyage:voyage-4",
@@ -2798,6 +2943,34 @@
         {
           "category": "brain",
           "details": {
+            "by_source": [
+              {
+                "checked": 0,
+                "other_writer": 0,
+                "source_id": "default",
+                "status": "known",
+                "sync_deleted": 0,
+                "tombstones": 0,
+                "truncated": false,
+                "unknown": 0
+              }
+            ],
+            "count": 0,
+            "docs": "docs/guides/repair.md#uncommitted-deletions",
+            "exact": true,
+            "other_writer_count": 0,
+            "purged": "Pages already purged cannot be restored by this command; only a backup (pg_dump, or gbrain backup create taken before the purge) can bring them back.",
+            "samples": [],
+            "truncated": false
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No soft-deleted page was removed by a sync while Git never held its file (0 tombstone(s) checked).",
+          "name": "uncommitted_sync_deletions",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "docs": "docs/guides/repair.md#unindexed-files",
             "sources": [
               {
@@ -3003,7 +3176,7 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
-          "message": "No retrieval-affecting files changed in working tree.",
+          "message": "3 retrieval-affecting file(s) changed since HEAD: src/core/operations.ts, src/core/search/projection-statistics.ts, src/core/search/vector-statement.ts. Re-run `gbrain eval run-all` after committing these changes.",
           "name": "eval_drift",
           "status": "ok"
         },
@@ -3255,7 +3428,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.5.0+4604112a is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
@@ -3278,11 +3451,46 @@
       "db_url_source": null,
       "elapsed_ms": "<volatile>",
       "engine": "pglite",
-      "health_score": 85,
+      "health_score": 65,
       "schema_version": 2,
-      "status": "warnings",
+      "status": "unhealthy",
       "tier": "standard",
       "top_issues": [
+        {
+          "action": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "repair",
+              "content-receipt-root",
+              "--source",
+              "default",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain repair content-receipt-root --source default --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/repair.md#content-receipt-root",
+            "next": "run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "sync_freshness",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "The content receipt of default names another root than the source and its owner binding (a writer transfer or relocation moved it). The preview checks the owner's tree against the recorded manifest and prints the apply command with its hash, or names what to fix first; writes nothing."
+          },
+          "fix": "Source 'default': no successful sync recorded; it is a gbrain-owned content directory whose content receipt names an old root, so sync does not apply and doctor cannot exempt it; run `gbrain repair content-receipt-root --source default`",
+          "name": "sync_freshness",
+          "status": "fail",
+          "tier": "root"
+        },
         {
           "fix": "embedding: declared dims=3072 but actual is vector(1024). Fix one side: update config OR ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(3072);",
           "name": "embedding_column_registry",
