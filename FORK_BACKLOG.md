@@ -390,3 +390,7 @@ The third earlier local failure (`import --json`) was the macOS `/var` symlink a
 Seen once in fork CI and not reproduced locally (Postgres A-11 breaker 14/14; IPC test 3 of 3 runs green), treated as
 runner timing until they recur: `test/pathological/a11-effect-retry-budget.test.ts` (postgres; a seed `put_page`
 answered `write_pending` after 10.1 s) and `test/resolve-ipc-v2.test.ts` turn_context (`IPC_UNAVAILABLE`).
+CI r3 added two of the same kind in the `persistence-validation` Postgres arms (Bun 1.4.0), each green 3 of 3 locally on
+the sync branch and on `2c049521e`: `test/large-pages/streamed-sync-origin-b14.test.ts` (the setup sync did not report
+`filesImported: 2`) and `test/large-pages/segmented-delete-restore-file.slow.test.ts` (the 90 MiB delete counted
+`bytesCopied` at exactly 4x the file, a run of 117 s).
