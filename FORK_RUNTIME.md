@@ -106,6 +106,7 @@ cron 包装脚本自带两道闸,知道它们在,别重复造:
   - `fork-theirs`：生成文件（`*.generated.ts`、`llms*.txt`、`plugin*/**`、`structural-suites.tsv`、权重 metadata）和 `test/fixtures/goldens/**` 直接取上游版本，合并后由 after-merge 重新生成。
   - `fork-tsv`：ratchet / baseline TSV 按行做三方合并。两边都改了同一行时，数字列 = 上游值 + fork 增量，理由列 = 上游文本 + fork 追加的部分。合不了的行加冲突标记；同一个键出现两行时，回退到 git 的文本合并。
   - `fork-json-union`：`scripts/*-weights.json` 取上游版本，加上 fork 新增的键，去掉 fork 删掉的键。
+- **驱动和 rerere 对这个 clone 里的每一次 merge / rebase / cherry-pick 都生效**，不只是同步上游。fork 内部合并分支时，`fork-theirs` 同样会直接采用合入方的生成文件和 goldens，所以合并完也要跑 `after-merge.sh`，否则本分支对这些文件的改动会被覆盖掉（测试会失败，生产数据不受影响）。
 - **先试合并**：`bash scripts/fork/merge/trial.sh [--keep] [tag]`，默认用最新的上游 release tag。在一次性 worktree 里真合并一次，报告冲突文件数和冲突块数；`--keep` 会保留现场。只拉 `master` 和 `v*` tag，因为上游有一个会移动的 `latest-stable` tag，`fetch --tags` 会被它拒绝。
 - **演练和正式合并是“同一次合并做两遍”**：在 `--keep` 的现场里解完冲突后执行 `git rerere`，把解法记进共享的 `rr-cache`；正式合并时这些块会被自动预填（`rerere.autoupdate=false`，仍要人复核后 `git add`）。rerere 对没见过的新冲突块不起作用。
 - **解完冲突、提交之前**：`bash scripts/fork/merge/after-merge.sh`（要刷新 Postgres goldens 就带上测试库的 `DATABASE_URL`）。它依次执行：检查本次合并涉及的文件里有没有残留冲突标记；跑 regen；刷新 goldens；再跑一次 regen；跑 module-size / function-size / chunk-visibility / engine-sql 四个 ratchet；最后列出和合并前 fork 版本不同的 goldens。
