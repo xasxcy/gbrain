@@ -79,6 +79,14 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
 - **回滚**:在 WSL 里执行 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command '[Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE",$null,"User")'`,再发一次 `{"model":"qwen3-embedding:4b","keep_alive":0}` 到 `/api/embed`,模型立即卸载。
 - **怎么进去**:`ssh root@192.168.50.124 -p2222` 登进的是 WSL2 Ubuntu。reranker 在 WSL 里,是 systemd 服务 `llama-reranker.service`(llama-server,`qwen3-reranker-0.6b`,`--ctx-size 16384 --parallel 8`,占约 10GB),启动时加载、之后常驻;ollama 在 Windows 那一侧,从 WSL 用上面那个 `powershell.exe` 路径操作(root 的 PATH 里没有 Windows 命令)。
 
+本机接 gbrain MCP 的客户端，两个都跑编译产物 `bin/gbrain`，所以生产合并后要重建：
+
+- **Hermes secretary**：`~/.hermes/profiles/secretary/config.yaml` 的 `mcp_servers.gbrain`，配置为 `serve`、`GBRAIN_HOME=/Users/xasxcy`、`GBRAIN_SOURCE=lifeos-vault`。重启命令是 `hermes -p default gateway restart`，由用户自己执行。
+- **Claude Code**（2026-10-22 接入）：注册在 user 级的 `~/.claude.json`，所有项目都能用。命令是 `bin/gbrain serve --surface full`，环境变量和 Hermes 相同，另外把 `HTTP_PROXY`、`HTTPS_PROXY` 置空。原因是本机 Surge 代理 `127.0.0.1:6152` 的 `NO_PROXY` 不包含 `192.168.50.x`。每个会话会单独起一个 stdio serve 进程，Postgres 支持多个连接并存。没有安装 `gbrain setup claude-code` 写的 SessionStart、UserPromptSubmit hooks。
+  - 核对：`claude mcp get gbrain` 显示 Connected。
+  - 删除：`claude mcp remove gbrain -s user`。
+  - 注册前的配置备份在 `~/.claude.json.bak-20261022-mcp`。
+
 日志:`~/Library/Logs/gbrain-sync.log`。注意**只有「跳过」的轮次才带时间戳**,正常开跑的轮次不带,所以不能靠时间戳行数数轮次。
 
 ---
