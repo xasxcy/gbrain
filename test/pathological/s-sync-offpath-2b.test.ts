@@ -202,10 +202,21 @@ describe('GBRA-133 2b.3: commit-triggered syncs stay off the resident\'s path', 
       const deadline = performance.now() + 20_000;
       while ((await drainDecisions()).at(-1) !== 'drained' && performance.now() < deadline) await Bun.sleep(25);
       record({ case: '2b.3-retry', backend, calls, decisions: await drainDecisions() });
+      // FORK v0.60.517.0: the failed chunk enters the embed_failures ledger (15 min backoff), which owns its retry:
+      // the drain's next pass finds nothing eligible and ends, leaving the page for the pass after the backoff.
+      expect(await drainDecisions()).toEqual(['retry', 'drained']);
+      expect(await embedded(engine)).toBe(false);
+      expect(await engine.listEmbedFailures({ sourceId: 'alpha', slug: 'notes/example' })).toHaveLength(1);
+      // Once the backoff is over (released here), the next drain embeds it and clears the ledger.
+      await engine.releaseEmbedFailures({ sourceId: 'alpha', slug: 'notes/example' });
+      runner.scheduleDeferredSyncEmbeds(engine, 'alpha');
+      await runner.maybeDrainDeferredEmbeds(engine);
+      const second = performance.now() + 20_000;
+      while ((await drainDecisions()).length < 4 && performance.now() < second) await Bun.sleep(25);
       expect(await embedded(engine)).toBe(true);
       expect(runner.__deferredEmbedsPendingForTests(engine)).toBe(false);
-      // The failed pass backs off, the pass that embedded re-checks, and the pass that finds nothing left ends it.
-      expect(await drainDecisions()).toEqual(['retry', 'retry', 'drained']);
+      expect(await engine.listEmbedFailures({ sourceId: 'alpha', slug: 'notes/example' })).toHaveLength(0);
+      expect(await drainDecisions()).toEqual(['retry', 'drained', 'retry', 'drained']);
     }), 60_000);
 
     test(`a running sync defers the drain a bounded number of times, then it drains beside it (${backend})`, () => embedBrain(databaseUrl, true, async engine => {
