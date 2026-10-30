@@ -128,3 +128,7 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
 - **解完冲突、提交之前**：`bash scripts/fork/merge/after-merge.sh`（要刷新 Postgres goldens 就带上测试库的 `DATABASE_URL`）。它依次执行：检查本次合并涉及的文件里有没有残留冲突标记；跑 regen；刷新 goldens；再跑一次 regen；跑 module-size / function-size / chunk-visibility / engine-sql 四个 ratchet；最后列出和合并前 fork 版本不同的 goldens。
 - **git 看不出来的冲突靠 typecheck 发现**：两边给同一个类型加了同名但类型不同的字段（v0.60.323.0 演练里的 `embed-backfill` `reason`）。驱动合并出来的上限如果放不下合并后的代码，ratchet 会报出来；这时要人带着理由调整上限，不能直接放宽。
 - 记录：v0.60.323.0（881 个上游提交）只开 git 时有 22 个冲突文件；开驱动后剩 10 个文件、11 块；用演练的 rerere 预填后是 0 块。细节在 vault 的 `tasks/2026-10-20_fork-merge-speedup/PLAN-V1.md`。
+- 记录：v0.60.517.0（2564 个上游提交）开驱动后 28 个文件、44 块，rerere 没有命中。
+- **typecheck 也看不出来的：自动合并进 fork 改写过的函数里的 `await using`。** 上游的页级 embedding 租约用 `await using lease` 绑定，作用域一结束就释放。它被 git 无冲突地合进了 `embedStaleForSource` 的 heal `try` 块，而 fork 的分片安装在这个块之后，于是租约在安装前就已释放。凡是上游加了 `await using` 的函数，若 fork 改过其结构，都要人工确认作用域是否覆盖到写入。
+- **上游最低 Bun 版本会变。** v0.60.517.0 起 `package.json` 要求 `bun >=1.4.4`，CLI 低于该版本直接拒跑（cron 也会拒跑）。合并后上线前先升级本机 Bun；本地验证可以先旁装一份，不动 cron 在用的全局 bun：`npm install --no-save bun@<版本>`，再把 `node_modules/bun/bin/bun.exe` 软链进一个放在 PATH 前面的目录。
+- **fork 仓库的 GitHub Actions 平时全部禁用**（防止上游的定时工作流空耗额度）。同步 CI 的做法：推 `ci/sync-<版本>-rN` 分支（fork-only 提交把 ubicloud runner 换成 `ubuntu-24.04[-arm]`、把 `pgvector/pgvector:pg16` 换成 fork 的 PGroonga 镜像），临时 `gh workflow enable` Test 与 E2E Tests，`gh workflow run … --ref <分支>` 触发，再立刻 `gh workflow disable`；已排队的 run 不受影响。
