@@ -100,6 +100,8 @@ export function cronGbrainHomeCheck(crontab: string | null, customHome: string |
 
 /** `crontab -l` on a local machine; null when there is no crontab or it cannot be read in 5 s. */
 export function readCrontab(): string | null {
+  // FORK: fork tooling refreshes the committed doctor goldens on a dev box; this keeps its crontab out of them, as on CI.
+  if (process.env.GBRAIN_TEST_DOCTOR_NO_CRONTAB === '1') return null;
   try { return execFileSync('crontab', ['-l'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).toString(); }
   catch { return null; }
 }

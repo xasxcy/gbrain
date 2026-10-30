@@ -11,6 +11,9 @@ cd "$(git rev-parse --show-toplevel)"
 # (doctor reports receipt_root_moved) or a refused symlinked import root, which pollutes the goldens.
 TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"; export TMPDIR
 log="${TMPDIR:-/tmp}/fork-after-merge-$$.log"
+# doctor's cron_gbrain_home check reads `crontab -l`; this machine's crontab and the scripts it names would land
+# in the committed goldens (a public repo). The golden tests pin PATH, so the fork seam reports no crontab instead, as on CI.
+GBRAIN_TEST_DOCTOR_NO_CRONTAB=1; export GBRAIN_TEST_DOCTOR_NO_CRONTAB
 step() { printf '\n== %s\n' "$*"; }
 fail=0
 
