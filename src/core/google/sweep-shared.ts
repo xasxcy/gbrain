@@ -14,9 +14,16 @@ import { connectorRender } from '../connectors/connector-text.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { mkdirPrivate } from '../atomic-write.ts';
 import { replaceableFile } from '../facts/file-body-guard.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, replaceOrInsertFactsFence } from '../facts-fence.ts';
+import { TAKES_FENCE_BEGIN } from '../takes-fence.ts';
+import { conceptPreservationHold, preserveCanonicalFences } from '../cycle/concept-publication.ts';
+import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import type { Page } from '../types.ts';
 import { assertInlineBody } from '../page-body/page-shape.ts';
 import { OperationError } from '../ops/contract.ts';
 import { slugifyPath } from '../sync.ts';
+import { isPrivatePage } from '../search/private-visibility.ts';
+import { withPrivateVisibility } from './google-render.ts';
 import { isWriteThroughDisabled } from '../write-through.ts';
 import { isSourceDbOnlySlug } from '../persistence/source-storage.ts';
 import type { GoogleSourceConfig, GoogleSourceState } from './types.ts';
@@ -117,6 +124,38 @@ function writePrivateTemp(tmpPath: string, markdown: string): void {
   }
 }
 
+const hasFence = (text: string | null | undefined) => [FACTS_FENCE_BEGIN, TAKES_FENCE_BEGIN].some(begin => (text ?? '').includes(begin));
+
+/**
+ * GBRA-133 (#7292): facts and takes fences added on the brain (loop extraction, `remember`) are not part of the
+ * provider's render. The managed connector carries them into each re-render (connector-sync.ts); the unmanaged one
+ * replaced the page with the bare render, so a re-render dropped the fence from the file and the database and the next
+ * `extract_facts` expired its facts. Carry them the same way: a render that brings its own fence owns it, and a stored
+ * fence the render cannot carry verbatim (below the timeline sentinel, duplicated, unbalanced, unparseable) refuses
+ * `connector_fence_below_timeline` instead of expiring its rows.
+ */
+async function carryStoredFences(sourceId: string, slug: string, relPath: string, existing: Page | null, markdown: string): Promise<string> {
+  if (!existing) return markdown;
+  assertInlineBody(existing, 'Google connector fence carry');
+  if (!(hasFence(existing.compiled_truth) || hasFence(existing.timeline))) return markdown;
+  const parsed = parseMarkdown(markdown, relPath);
+  if (hasFence(parsed.compiled_truth)) return markdown;
+  const hold = conceptPreservationHold(existing);
+  if (hold) throw (await import('../persistence/connector-sync.ts')).connectorFenceRefusal(sourceId, slug, hold);
+  return serializePageToMarkdown({ ...existing, ...parsed, compiled_truth: preserveCanonicalFences(existing, parsed.compiled_truth),
+    type: parsed.typeExplicit ? parsed.type : existing.type }, parsed.tags);
+}
+
+/** GBRA-133 (#7292): the checkout file with the live page's `## Facts` fence put back, for `replaceableFile`; null when it has a fence of its own. */
+function withStoredFactsFence(existing: Page): (fileBytes: string) => string | null {
+  assertInlineBody(existing, 'Google connector file comparison');
+  const body = existing.compiled_truth ?? '';
+  const start = body.indexOf(FACTS_FENCE_BEGIN);
+  const stop = start === -1 ? -1 : body.indexOf(FACTS_FENCE_END, start + FACTS_FENCE_BEGIN.length);
+  const block = stop === -1 ? null : body.slice(start, stop + FACTS_FENCE_END.length);
+  return fileBytes => block === null || hasFence(fileBytes) ? null : replaceOrInsertFactsFence(fileBytes, block);
+}
+
 export async function importRendered(
   deps: GoogleSyncDeps,
   relPath: string,
@@ -127,6 +166,10 @@ export async function importRendered(
   identity: Record<string, string | readonly string[]> = {},
 ): Promise<string> {
   markdown = connectorRender(markdown, { path: relPath, account: deps.cfg.account, ...identity });
+  const slug = slugifyPath(relPath);
+  const [labels] = await deps.engine.executeRaw<{ type: string; frontmatter: unknown }>(
+    'SELECT type, frontmatter FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [deps.sourceId, slug]);
+  if (labels && isPrivatePage(labels)) markdown = withPrivateVisibility(markdown);
   if (deps.managed) {
     const result = await deps.managed.importMarkdown(relPath, markdown);
     if (result.status === 'imported') {
@@ -141,11 +184,11 @@ export async function importRendered(
   }
   const filePath = join(deps.cfg.dir, relPath);
   assertContained(deps.cfg.dir, filePath);
-  const slug = slugifyPath(relPath);
   const existing = await deps.engine.getPage(slug, { sourceId: deps.sourceId });
   if (existing) assertInlineBody(existing, 'Google connector materialization');
+  markdown = await carryStoredFences(deps.sourceId, slug, relPath, existing, markdown);
   const databaseOnly = await isWriteThroughDisabled(deps.engine) || isSourceDbOnlySlug(deps.cfg.dir, slug, 'refuse');
-  const guard = databaseOnly ? null : await replaceableFile(deps.engine, deps.sourceId, slug, filePath);
+  const guard = databaseOnly ? null : await replaceableFile(deps.engine, deps.sourceId, slug, filePath, existing ? withStoredFactsFence(existing) : undefined);
   const drift = () => new OperationError('file_database_drift',
     `${slug}: the checkout file has an edit not retained in the database, or changed during import. The file was not replaced. If the file is newer, run gbrain sync --source ${deps.sourceId}; if the database is newer, re-save its page with write-through on; if both changed, ask the user which version to keep before retrying.`,
     'Import the newer file with gbrain sync, or ask the user which version to keep; the item is held until then.');
@@ -166,7 +209,7 @@ export async function importRendered(
       ...(activePack ? { activePack } : {}),
     };
     const result = databaseOnly
-      ? await importFromContent(deps.engine, slug, markdown, { ...opts, sourcePath: relPath, preserveGateMarkers: true })
+      ? await importFromContent(deps.engine, slug, markdown, { ...opts, sourcePath: relPath, preserveGateMarkers: true, holdNoncanonicalPrivate: true })
       : await importFile(deps.engine, tmpPath, relPath, opts);
     if (result.status === 'error' || result.error) {
       throw new Error(result.error ?? `Import failed for ${relPath}`);

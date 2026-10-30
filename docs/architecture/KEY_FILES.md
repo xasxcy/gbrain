@@ -3,7 +3,7 @@
 Read a file's entry before editing it. This page routes to bounded subsystem
 references; **do not load the whole directory**.
 
-Find a path's entry and its surrounding contract:
+Find a path's entry:
 
 ```bash
 rg -n -F 'src/core/ops/pages.ts' docs/architecture/key-files/
@@ -24,7 +24,7 @@ link it here rather than raising the cap.
 | Subsystem | Entry range / scope |
 |---|---|
 | [Page identity and writer administration](key-files/page-identity-and-administration.md) | Opaque result IDs, current grants, state-bound ownership changes |
-| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, derived atom state, sync discovery and the origin rule (`sync-origin.ts`, `file-claims.ts`) |
+| [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, retained originals, [derived generations](key-files/generations.md), sync discovery and the origin rule (`sync-origin.ts`, `file-claims.ts`) |
 | [Company-brain ingestion](key-files/company-brain.md) | Inspection, admission, receipts, derived relationships and schema; [operator guide](../guides/company-brain-ingestion.md) |
 | [Agent operator contract](key-files/agent-contract.md) | `agent-output.ts`, error registry + docs, notice ledger, `isCallable`, `--json` guard, contract scanner |
 | [Commands (1/6)](key-files/commands-1.md) | `src/commands/agent-logs.ts` through `src/commands/db-repair.ts` |
@@ -32,8 +32,8 @@ link it here rather than raising the cap.
 | [Commands (2/6, continued)](key-files/commands-2-continued.md) | `doctor/checks/routing-federation.ts`, `git-convergence.ts`, `keyword-plan.ts`, `dream-retriage.ts` to `embed.ts` |
 | [Commands (3/6)](key-files/commands-3.md) | `src/commands/engine-status.ts` through `src/commands/extract.ts` |
 | [Commands (3/6, continued)](key-files/commands-3-continued.md) | `src/commands/extract-timeline-db.ts` through `src/commands/frontmatter-install-hook.ts` |
-| [Commands (4/6)](key-files/commands-4.md) | `src/commands/frontmatter.ts` through `persistence-admin.ts` |
-| [Commands (4/6, continued)](key-files/commands-4-continued.md) | `persistence-delegate.ts` to `reindex-search-vector.ts`, `init-mode-picker.ts`, `core/embedding-migration-cli.ts` |
+| [Commands (4/6)](key-files/commands-4.md) | `src/commands/frontmatter.ts` through `pages-status.ts` |
+| [Commands (4/6, continued)](key-files/commands-4-continued.md) | `persistence-admin.ts` to `reindex-search-vector.ts`, `init-mode-picker.ts`, `core/embedding-migration-cli.ts` |
 | [Commands (5/6)](key-files/commands-5.md) | `src/commands/reindex.ts` through `src/commands/storage.ts` |
 | [Commands (6/6)](key-files/commands-6.md) | `src/commands/sync.ts` through `src/commands/whoknows.ts` |
 | [Core Ai](key-files/core-ai.md) | `src/core/ai/` gateway, embedding, dims, errors, fallbacks |
@@ -53,8 +53,8 @@ link it here rather than raising the cap.
 | [Core Persistence (engine graduation)](key-files/core-persistence-graduation.md) | `engine-graduation*.ts`, `graduation-*.ts`, `commands/migrate-graduation.ts` |
 | [Managed sync and persistence stalls](key-files/persistence-stalls.md) | preparation budgets, `claim-phase.ts`, `consumer.ts`, `group-publish.ts`, `diagnostics.ts`, `worktree-manifest.ts` |
 | [Managed sync bookkeeping](key-files/managed-sync-bookkeeping.md) | `sync-failures.ts`, `managed-sync-orphans.ts`, `sync-checkpoint-replaced.ts` |
-| [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `src/core/search/read-policy-sql.ts` |
-| [Core Search (2/2)](key-files/core-search-2.md) | `search/rerank.ts` through `search/vector-pool.ts`, relational and multi-hop modules, `hub-dampening.ts`, `crag.ts`; [CJK keyword](key-files/core-search-cjk.md) |
+| [Core Search (1/2)](key-files/core-search-1.md) | `src/core/search/` through `search/read-policy-sql.ts` |
+| [Core Search (2/2)](key-files/core-search-2.md) | `search/rerank.ts` through `search/vector-pool.ts`, relational, multi-hop, `hub-dampening.ts`, `crag.ts`; [CJK](key-files/core-search-cjk.md), [evidence](key-files/core-search-evidence.md) |
 | [Core Services (1/3)](key-files/core-services-1.md) | `src/core/advisor/*.ts` through `src/core/connectors/` |
 | [Core Services (1/3, continued)](key-files/core-services-1-continued.md) | `src/core/context/` through `src/core/context/ipc-path.ts` |
 | [Core Services (2/3)](key-files/core-services-2.md) | `src/core/conversation-parser/` through `src/core/ops/sources.ts`, except `src/core/persistence/` |
@@ -63,8 +63,8 @@ link it here rather than raising the cap.
 | [Core Services (3/3)](key-files/core-services-3.md) | `src/core/think/index.ts` through `src/core/verbs/usage-log.ts` |
 | [Core Utilities (1/2)](key-files/core-utilities-1.md) | `archive-crawler-config.ts` through `remediation-checkpoint.ts`; [`cycle.ts`](key-files/core-cycle-primitive.md) |
 | [Core Utilities (2/2)](key-files/core-utilities-2.md) | `src/core/repair/` through `src/core/utils.ts` |
-| [Engines (1/2)](key-files/engines-1.md) | `src/core/connection-manager.ts` through `src/core/pglite-repair.ts` |
-| [Engines (2/2)](key-files/engines-2.md) | `src/core/pglite-resetwal.ts` through `src/core/worker-pool.ts` |
+| [Engines (1/2)](key-files/engines-1.md) | `src/core/connection-manager.ts` through `pglite-repair.ts` |
+| [Engines (2/2)](key-files/engines-2.md) | `src/core/pglite-resetwal.ts` through `worker-pool.ts` |
 | [Entrypoints And Docs](key-files/entrypoints-and-docs.md) | `.agents/gbrain-launcher` through `templates/` |
 | [Evaluation](key-files/evaluation.md) | `evals/brainbench/` through `src/eval/shared/judge-runner.ts` |
 | [Files And Sync (1/2)](key-files/files-and-sync-1.md) | `src/core/audit-week-file.ts` through `src/core/sync-embed-backfill.ts` |
@@ -72,7 +72,7 @@ link it here rather than raising the cap.
 | [Graph And Facts](key-files/graph-and-facts.md) | `src/core/check-resolvable.ts` through `src/core/trajectory-format.ts` |
 | [Entity recall](key-files/entity-recall.md) | `src/core/mentions/*`, `src/core/ops/backlinks-paged.ts`, `extract mentions --explain`, migration v206 |
 | [Mcp](key-files/mcp.md) | `src/mcp/dispatch.ts` through `src/mcp/validate-params.ts` |
-| [Providers](key-files/providers.md) | `src/core/anthropic-pricing.ts` through `src/core/transcription.ts` |
+| [Providers](key-files/providers.md) | Embedding, models, pricing; [part 2](key-files/providers-2.md) |
 | [Runtime](key-files/runtime.md) | `src/core/abort-check.ts` through `src/core/zombie-reap.ts` |
 | [Security](key-files/security.md) | `src/core/destructive-guard.ts` through `src/core/write-gate-scan.ts`; [purge](key-files/memory-purge.md) |
 | [Shared brain skills](key-files/shared-skills.md) | Canonical catalog, enrollment, migration, publication and harness integration |
@@ -87,7 +87,7 @@ link it here rather than raising the cap.
 | [Google connector + open-loop engine](key-files/google-and-loops.md) | Cross-file contract; [more](key-files/google-and-loops-continued.md), [API](key-files/google-api-access.md) |
 | [Open loops](key-files/open-loops-engine.md) | detect, extract, store |
 | [Always-loaded core memory](key-files/core-memory.md) | Core tier, write-path guard and lock order, delivery lanes, pressure notice |
-| [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts |
+| [Workspace push and backup coverage](key-files/workspace-push-and-backup.md) | Workspace push, hook push backstops, backup verdicts, git writer |
 | [Secret and sensitivity scanning](key-files/secret-scan.md) | `secret-scan*.ts`: detection, allowlist, scan counters |
 | [Ambient capture consent gate](key-files/ambient-capture.md) | `memory.auto_writeback` capture lanes |
 | [Belief ledger](key-files/belief-ledger.md) | `src/core/belief/`, `gbrain beliefs`, doctor coverage |

@@ -24,12 +24,12 @@ import type { SlugRootMode } from '../../core/sync-anchor.ts';
 import { buildLosslessWorkingTreeManifest, computeLosslessSyncDelta, mergeSyncManifests, type LosslessDelta } from '../../core/sync-delta.ts';
 import { confirmRenameIdentities, redecideHeldRename, type ConfirmedManifest } from '../../core/sync-rename-identity.ts';
 import {
-  git,
+  gitAsync,
   isWithinRoot,
   gitRelativePath,
-  discoverGitRoot,
+  discoverGitRootAsync,
   createSyncBaselineCommit,
-  isDetachedHead,
+  isDetachedHeadAsync,
   hasOriginRemote,
   unique,
 } from '../../core/sync-git.ts';
@@ -43,8 +43,11 @@ import {
   unsyncableReason,
   isPoisonedPath,
   sanitizePathForDisplay,
+  isNestedSkipMetafile,
+  readMetafilePagesMode,
 } from '../../core/sync.ts';
-import type { SyncManifest } from '../../core/sync.ts';
+import type { MetafilePagesMode, SyncManifest } from '../../core/sync.ts';
+import { diskMetafileHeads, firstMetafileHead, gitMetafileHeads, listMetafileNamedBlobs, metafileBackfillDue, metafilePagePredicate } from '../../core/sync-metafile-pages.ts';
 import type { SyncResult, SyncOpts } from '../sync.ts';
 import { syncCheckpointKeys, resolveSyncCheckpointEvery } from './checkpoint.ts';
 import { runConnectorSync } from './connector.ts';
@@ -87,7 +90,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
   if (lastCommit) {
     let objectPresent = true;
     try {
-      git(gitContextRoot, ['cat-file', '-t', lastCommit]);
+      await gitAsync(gitContextRoot, ['cat-file', '-t', lastCommit]);
     } catch {
       objectPresent = false;
     }
@@ -104,7 +107,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     // failure mode (#1970) is visible in the logs.
     let isAncestor = true;
     try {
-      git(gitContextRoot, ['merge-base', '--is-ancestor', lastCommit, headCommit]);
+      await gitAsync(gitContextRoot, ['merge-base', '--is-ancestor', lastCommit, headCommit]);
     } catch {
       isAncestor = false;
     }
@@ -132,10 +135,14 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
 
   const { ckpt, checkpointEvery, pin, completedPaths } = await resolveCheckpointPin(engine, opts, company, gitContextRoot, lastCommit, headCommit);
 
+  // GBRA-150: a typed nested metafile is a page; the source backfills its existing ones once per mode it has not applied.
+  const metafilePages = await readMetafilePagesMode(engine);
+  const metafileBackfill = !company && await metafileBackfillDue(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, metafilePages);
   const {
     storedVersion, currentVersion, versionMismatch, versionNeverSet, importWorkingTree, workingTreeManifest, workingTreeBytes,
     hasWorkingTreeChanges, uncommittedDrift, inScope, scopeRel, isSelectedForRun, excluded, syncOpts,
-  } = await resolveWorkingTreeScope(engine, opts, { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable: !!holds?.active });
+  } = await resolveWorkingTreeScope(engine, opts, { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable: !!holds?.active,
+    metafilePages, commits: [pin, lastCommit] });
 
   // #5988: held files re-screen even when Git did not touch them; a run with
   // nothing else to do still re-screens them, and clears holds of gone files.
@@ -148,7 +155,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
   }
   const holdWork = !!holds && holds.rescreen.length + holds.gone.length + holds.retryTaken.length > 0;
 
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !(importWorkingTree && hasWorkingTreeChanges) && !holdWork) {
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !(importWorkingTree && hasWorkingTreeChanges) && !holdWork && !metafileBackfill) {
     // #3068: the pull failed and nothing local advanced — this run imported
     // NOTHING and the remote may hold commits we could not fetch. Reporting
     // `up_to_date` here (and bumping the heartbeat below) is exactly the
@@ -226,6 +233,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
   const delta = await computeFilteredDelta(engine, opts, {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
     workingTreeManifest, workingTreeBytes, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
+    metafileBackfill, syncScopeRelPath,
   });
   if ('done' in delta) return delta;
   const { manifest, filtered, malformedSkipped, syncImportRoot, modePath, heldRenames, bytePaths } = delta;
@@ -254,7 +262,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     plan: {
       opts, company, repoPath, gitContextRoot, anchorPath, syncImportRoot, syncActivePack, lastCommit, headCommit, pin,
       pullFailed, ckpt, completedPaths, checkpointEvery, manifest, filtered, malformedSkipped, totalChanges,
-      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath, holds, gitlinks: bytePaths.gitlinks,
+      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath, holds, gitlinks: bytePaths.gitlinks, metafilePages,
     },
   };
 }
@@ -290,12 +298,11 @@ async function resolveSyncRepo(engine: BrainEngine, opts: SyncOpts): Promise<{ d
       : `No repo path specified. Use --repo or run gbrain init with --repo first.`;
     throw new Error(hint);
   }
-  // #3696: resolve to ABSOLUTE at entry. A relative path (legacy relative
-  // sources.local_path row, or a caller-passed `--repo .`) breaks the moment
-  // any consumer runs from a different cwd (launchd daemon at cwd=/). Since
-  // writeSyncAnchor('repo_path', anchorPath) re-persists this value below,
-  // one successful sync from the right cwd self-heals a legacy relative row
-  // to absolute.
+  // #3696: resolve to ABSOLUTE at entry. A caller-passed relative path
+  // (`--repo .`) breaks the moment any consumer runs from a different cwd
+  // (launchd daemon at cwd=/). A relative STORED anchor never reaches here:
+  // performSync refuses it `sync_anchor_relative` (#7630), because from an
+  // unrelated cwd it would make that folder the brain repo.
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rawRepoPath is the local operator's --repo CLI arg or the operator-written sync anchor (sync.repo_path / sources.local_path); the sync_brain op is localOnly:true so no remote caller reaches this path, and absolutizing it here IS the #3696 fix
   const repoPath = pathResolve(rawRepoPath);
 
@@ -492,7 +499,7 @@ async function discoverSyncGitRoot(
   // function's docstring. `!opts.dryRun`: a preview must never write.
   let gitContextRoot: string;
   try {
-    gitContextRoot = realpathSync(discoverGitRoot(repoPath));
+    gitContextRoot = realpathSync(await discoverGitRootAsync(repoPath));
   } catch (err) {
     if (company) throw err;
     if (
@@ -524,7 +531,7 @@ async function discoverSyncGitRoot(
     // this ever reaches a baseline on a repo that turns out to have commits.
     let reprobedRoot: string | null = null;
     try {
-      reprobedRoot = discoverGitRoot(repoPath);
+      reprobedRoot = await discoverGitRootAsync(repoPath);
     } catch {
       reprobedRoot = null;
     }
@@ -535,9 +542,9 @@ async function discoverSyncGitRoot(
       throw err;
     } else {
       serr(`[gbrain] auto-recovery: git-initializing brain dir ${repoPath} (no git repo found).`);
-      git(repoPath, ['init', '--quiet']);
+      await gitAsync(repoPath, ['init', '--quiet']);
       createSyncBaselineCommit(repoPath);
-      gitContextRoot = realpathSync(discoverGitRoot(repoPath));
+      gitContextRoot = realpathSync(await discoverGitRootAsync(repoPath));
     }
   }
   return gitContextRoot;
@@ -556,7 +563,7 @@ async function pullAndResolveHead(
   // Detect detached HEAD up front so the working-tree fallback fires for both
   // the default sync and `--no-pull` callers. Only the actual git pull is
   // gated on opts.noPull or opts.dryRun.
-  const detachedHead = !company && isDetachedHead(gitContextRoot);
+  const detachedHead = !company && await isDetachedHeadAsync(gitContextRoot);
   if (detachedHead && !opts.noPull) {
     // Print the caller's repoPath spelling (not the realpathed git root) —
     // it's what the operator recognizes, and tests pin it.
@@ -662,7 +669,7 @@ async function pullAndResolveHead(
   // Get current HEAD
   let headCommit: string;
   try {
-    headCommit = company?.plan.revision?.commit ?? git(gitContextRoot, ['rev-parse', 'HEAD']);
+    headCommit = company?.plan.revision?.commit ?? await gitAsync(gitContextRoot, ['rev-parse', 'HEAD']);
   } catch {
     // #2964: unborn-HEAD recovery. `.git` exists (discoverGitRoot succeeded
     // above) but there are zero commits — e.g. a prior self-heal `git init`
@@ -688,7 +695,7 @@ async function pullAndResolveHead(
     }
     serr(`[gbrain] auto-recovery: repo has no commits yet, creating baseline commit ${gitContextRoot}.`);
     createSyncBaselineCommit(gitContextRoot);
-    headCommit = git(gitContextRoot, ['rev-parse', 'HEAD']);
+    headCommit = await gitAsync(gitContextRoot, ['rev-parse', 'HEAD']);
   }
 
   // #2964: self-heal deliberately does NOT special-case db_only/.gitignore
@@ -805,7 +812,7 @@ async function resolveCheckpointPin(
       let pinReachable = false;
       try {
         if (company && storedTarget !== company.plan.revision!.commit) throw new Error('Approved revision mismatch');
-        if (!company) git(gitContextRoot, ['merge-base', '--is-ancestor', storedTarget, headCommit]);
+        if (!company) await gitAsync(gitContextRoot, ['merge-base', '--is-ancestor', storedTarget, headCommit]);
         pinReachable = true;
       } catch {
         pinReachable = false;
@@ -847,9 +854,12 @@ async function resolveWorkingTreeScope(
     syncScopeRelPath: string;
     /** GBRA-133 S-51: the run can hold a rename pair whose identity the database refused to read. */
     holdUnreadable: boolean;
+    metafilePages: MetafilePagesMode;
+    /** Where a metafile gone from the checkout was last committed: the pinned target, then the bookmark. */
+    commits: Array<string | null>;
   },
 ) {
-  const { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable } = input;
+  const { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath, holdUnreadable, metafilePages, commits } = input;
   // v0.20.0 Cathedral II Layer 12 (codex SP-1 fix): before returning
   // 'up_to_date' on git-HEAD equality, check the chunker version gate.
   // If sources.chunker_version mismatches CURRENT_CHUNKER_VERSION, force
@@ -890,7 +900,7 @@ async function resolveWorkingTreeScope(
   let workingTreeManifest: ConfirmedManifest;
   let workingTreeBytes: BytePaths = NO_BYTE_PATHS;
   try {
-    const tree: LosslessDelta = company ? { manifest: { added: [], modified: [], deleted: [], renamed: [] }, ...NO_BYTE_PATHS } : buildLosslessWorkingTreeManifest(gitContextRoot);
+    const tree: LosslessDelta = company ? { manifest: { added: [], modified: [], deleted: [], renamed: [] }, ...NO_BYTE_PATHS } : await buildLosslessWorkingTreeManifest(gitContextRoot);
     workingTreeManifest = tree.manifest;
     workingTreeBytes = tree;
   } catch (e) {
@@ -934,7 +944,11 @@ async function resolveWorkingTreeScope(
   // #4027: includeHidden must ride along wherever isSyncable() consults these
   // opts — dropping it here silently disables --include-hidden on the whole
   // delta path (and the #3974 drift counter) while the flag still parses.
-  const syncOpts = { strategy: opts.strategy, includeHidden: opts.includeHidden };
+  // GBRA-150: manifest paths are Git-root relative; a metafile is judged by the bytes the importer reads (the checkout),
+  // or, gone from it, by its last committed blob, at its depth below the source root.
+  const metafilePage = metafilePagePredicate(metafilePages,
+    firstMetafileHead(diskMetafileHeads(gitContextRoot), gitMetafileHeads(gitContextRoot, commits).read), scopeRel);
+  const syncOpts = { strategy: opts.strategy, includeHidden: opts.includeHidden, metafilePage };
 
   // Filtered working-tree counts. Renames decompose as add(to) + delete(from)
   // — the same decomposition the import path applies — so a rename-only dirty
@@ -997,6 +1011,9 @@ async function computeFilteredDelta(
     isSelectedForRun: SyncPlan['isSelectedForRun'];
     syncOpts: SyncPlan['syncOpts'];
     holds: LegacyHolds | null;
+    /** GBRA-150: the source has not applied `sync.metafile_pages typed`: its tree's metafile-named files join the delta once. */
+    metafileBackfill: boolean;
+    syncScopeRelPath: string;
   },
 ): Promise<
   | { done: SyncResult }
@@ -1006,6 +1023,7 @@ async function computeFilteredDelta(
   const {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
     workingTreeManifest, workingTreeBytes, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
+    metafileBackfill, syncScopeRelPath,
   } = input;
   // Diff using git diff (net result, not per-commit). v0.42.x (#1794): diff
   // against the PINNED target, not live HEAD. With a fixed (lastCommit, pin)
@@ -1026,7 +1044,7 @@ async function computeFilteredDelta(
   // #6729: inexact renames keep their page identity only when confirmed, before the company fold, the unsyncable fold
   // and the hold replay read the manifest; the already-confirmed working-tree manifest merges after.
   // GBRA-133: read as bytes (diff --raw -z), so a name is exactly Git's; names that are not page paths and gitlinks ride beside the manifest.
-  const delta = computeLosslessSyncDelta(gitContextRoot, lastCommit, pin);
+  const delta = await computeLosslessSyncDelta(gitContextRoot, lastCommit, pin);
   if (delta.status === 'unavailable') {
     serr(
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
@@ -1040,6 +1058,13 @@ async function computeFilteredDelta(
     manifest.added.push(...manifest.renamed.map(rename => rename.to));
     manifest.deleted.push(...manifest.renamed.map(rename => rename.from));
     manifest.renamed = [];
+  }
+  if (metafileBackfill) {
+    // A Git delta never names an unchanged file, so the nested metafiles already in the tree join it once; the filters
+    // below keep the typed ones, and an unchanged page re-imports as a content-hash no-op.
+    const named = new Set([...manifest.added, ...manifest.modified, ...manifest.deleted, ...manifest.renamed.flatMap(rename => [rename.from, rename.to])]);
+    manifest.added.push(...listMetafileNamedBlobs(gitContextRoot, pin, scoped ? syncScopeRelPath : '')
+      .map(blob => blob.path).filter(path => !named.has(path) && isNestedSkipMetafile(scopeRel(path))));
   }
 
   // Scope/exclude/isSyncable filter lambdas (`inScope`/`scopeRel`/`excluded`/

@@ -25,15 +25,17 @@ function encloses(root: string, path: string): boolean {
 export async function refreshManagedFilesystemRoots(engine: SqlEngine, databasePath = datastorePaths.get(engine), signal?: AbortSignal): Promise<void> {
   // Mode and epoch come from one snapshot, so roots are never recorded under the epoch of a concurrent deactivation.
   const brain = await readPersistenceBrain(engine, { signal });
-  const roots = brain.enabled ? await engine.executeRaw<ManagedRootRecord>(`SELECT DISTINCT ON (local_path) * FROM (
-      SELECT h.local_path,s.source_id,s.source_incarnation,s.worktree_id,s.topology_generation
+  if (!brain.enabled) { managedRoots.set(brain.brain_id, new Map()); return; }
+  // Rows are deduplicated by filesystem identity in recordManagedRoots, never by the stored spelling (#7203).
+  const rows = await engine.executeRaw<ManagedRootRecord>(`SELECT h.local_path,s.source_id,s.source_incarnation,s.worktree_id,s.topology_generation
       FROM persistence_host_bindings h JOIN persistence_source_bindings s ON s.worktree_id=h.worktree_id WHERE h.host_id=$1::uuid
-      UNION SELECT local_path,id,incarnation,NULL,NULL FROM sources WHERE local_path IS NOT NULL
-      ) roots ORDER BY local_path,worktree_id NULLS LAST,source_id,source_incarnation,topology_generation`, [localHostId()], { signal }) : [];
+      UNION SELECT local_path,id,incarnation,NULL,NULL FROM sources WHERE local_path IS NOT NULL`, [localHostId()], { signal });
   signal?.throwIfAborted();
-  if (brain.enabled && databasePath) roots.push({ local_path: databasePath });
-  if (brain.enabled) recordManagedRoots(brain.brain_id, roots, brain.mode_epoch == null ? undefined : Number(brain.mode_epoch));
-  managedRoots.set(brain.brain_id, new Map(roots.map(row => [resolve(row.local_path), row.source_id])));
+  // #7630: a relative local_path (a legacy ".") names whatever directory gbrain runs from; it is never a managed root.
+  const owned = rows.filter(row => isAbsolute(row.local_path));
+  if (databasePath) owned.push({ local_path: databasePath, datastore: true });
+  const roots = recordManagedRoots(brain.brain_id, owned, brain.mode_epoch == null ? undefined : Number(brain.mode_epoch));
+  managedRoots.set(brain.brain_id, new Map(roots.map(row => [row.local_path, row.source_id])));
 }
 export function hasFilesystemPublication(path: string): boolean {
   const held = active.getStore();

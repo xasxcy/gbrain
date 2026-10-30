@@ -21,10 +21,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installFaultHook } from '../src/core/persistence/fault-points.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { readIndexLevel } from '../src/core/persistence/sync-git-stream.ts';
 import { readShadowLevel } from '../src/core/persistence/sync-pass.ts';
 import { resolveManagedSyncContext } from '../src/core/persistence/sync-discovery.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { spinCpuMs, watchLoopLag } from './helpers/cpu-time.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
 import { testBackends } from './helpers/test-backends.ts';
 
@@ -40,7 +42,6 @@ const setup = ({ root }: { root: string }) => {
   for (let i = 0; i < NOTES; i++) writeFileSync(join(root, `notes/n${i}.md`), `---\ntype: concept\ntitle: notes/n${i}\n---\n\nNote ${i}.\n`);
   git(root, 'add', '-A'); git(root, '-c', 'user.name=Example', '-c', 'user.email=example@example.invalid', 'commit', '-qm', 'notes');
 };
-const busy = (ms: number) => { const end = performance.now() + ms; while (performance.now() < end) { /* a stretch the loop cannot break */ } };
 
 afterEach(() => installFaultHook(undefined));
 
@@ -59,24 +60,25 @@ for (const backend of testBackends()) {
   describe(`#6712 PR 4b: a level's Git and I⋈P reads share one loop budget (${backend})`, () => {
     test('a fetch result that lands in a Git chunk\'s turn waits a turn before its take; no stretch passes the bound', () => managedBrain(async ({ engine }) => {
       expect((await performManagedSync(engine, { sourceId: 'default', noPull: true, noEmbed: true, noExtract: true })).status).toBe('first_sync');
+      // The consumer the sync started is not part of the level: its timer's query would run in the turn the take resumes in.
+      await disposePersistenceConsumer(engine);
       const context = await resolveManagedSyncContext(engine, { sourceId: 'default', noPull: true, dryRun: true });
       let open: () => void = () => {};
       const chunk = new Promise<void>(resolve => { open = resolve; });
       const seen = { chunk: false, result: false, take: false };
       installFaultHook(async (point, detail) => {
-        if (point === 'sync:level_chunk' && detail.read === 'ls-files' && !seen.chunk) { seen.chunk = true; open(); busy(STRETCH_MS); }
+        if (point === 'sync:level_chunk' && detail.read === 'ls-files' && !seen.chunk) { seen.chunk = true; open(); spinCpuMs(STRETCH_MS); }
         if (point === 'sync:level_result' && !seen.result) { seen.result = true; await Promise.race([chunk, new Promise(resolve => setTimeout(resolve, 10_000))]); }
-        if (point === 'sync:level_take' && !seen.take) { seen.take = true; busy(STRETCH_MS); }
+        if (point === 'sync:level_take' && !seen.take) { seen.take = true; spinCpuMs(STRETCH_MS); }
       });
-      let last = performance.now(), maxLag = 0;
-      const timer = setInterval(() => { const now = performance.now(); maxLag = Math.max(maxLag, now - last - 5); last = now; }, 5);
+      // Lag as the thread's own CPU between timer runs: the stretches the read holds, not what a loaded VM adds.
       let level: Awaited<ReturnType<typeof readShadowLevel>>;
+      let maxLag = 0;
+      const lag = watchLoopLag({ reportAtMs: MAX_LAG_MS });
       try {
-        last = performance.now();
         level = await readShadowLevel(engine, { sourceId: 'default', context });
       } finally {
-        maxLag = Math.max(maxLag, performance.now() - last - 5);
-        clearInterval(timer);
+        maxLag = lag.stop().maxLag;
         installFaultHook(undefined);
       }
       expect(seen).toEqual({ chunk: true, result: true, take: true });

@@ -113,7 +113,7 @@ describe('sync Git reads take no optional lock (GIT_OPTIONAL_LOCKS=0)', () => {
       const realGit = execFileSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
       mkdirSync(bin); mkdirSync(repo);
       writeFileSync(join(bin, 'git'), '#!/bin/sh\nsub=""\nskip=0\nfor a in "$@"; do\n  if [ $skip = 1 ]; then skip=0; continue; fi\n  case "$a" in -c|-C) skip=1; continue;; esac\n  sub="$a"; break\ndone\n'
-        + 'printf \'%s %s\\n\' "${GIT_OPTIONAL_LOCKS:-unset}" "$sub" >> "$PROBE_GIT_LOG"\nexec ' + realGit + ' "$@"\n');
+        + 'printf \'%s %s\\n\' "${GIT_OPTIONAL_LOCKS:-unset}" "$sub" >> "$PROBE_GIT_LOG"\nPATH=\'' + process.env.PATH + '\' exec ' + realGit + ' "$@"\n');
       chmodSync(join(bin, 'git'), 0o755);
       gitIn(repo, 'init', '-q', '-b', 'main'); gitIn(repo, 'config', 'user.name', 'Example'); gitIn(repo, 'config', 'user.email', 'example@example.invalid');
       writeFileSync(join(repo, 'a.md'), md('a')); gitIn(repo, 'add', '-A'); gitIn(repo, 'commit', '-qm', 'a');
@@ -233,7 +233,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await withClassic(databaseUrl, async r => {
         r.write('notes/trail.md ', md('trail')); r.commitAll('odd');
         const { computeLosslessSyncDelta } = await import('../../src/core/sync-delta.ts');
-        const delta = computeLosslessSyncDelta(r.root, (await r.lastCommit())!, r.head());
+        const delta = await computeLosslessSyncDelta(r.root, (await r.lastCommit())!, r.head());
         expect(delta.status === 'ok' && delta.manifest.added.sort()).toEqual(['notes/trail.md ', 'ok/healthy-1.md']);
         const obs = await observe(r, 'ok/healthy-1');
         expect({ thrown: obs.thrown, healthy: obs.healthy, cursorAtHead: obs.cursorAtHead, ledger: obs.ledger }).toEqual({ thrown: null, healthy: true, cursorAtHead: true, ledger: [] });

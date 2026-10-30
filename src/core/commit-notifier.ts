@@ -59,7 +59,8 @@ export interface NotifierSource {
 }
 export interface SkippedSource { sourceId: string; reason: string }
 export type StartResult = { jobId: string } | { busy: true } | { refused: string };
-export interface JobStatus { state: 'running' | 'aborting' | 'done' | 'error'; outcome?: 'synced' | 'resumable' | 'blocked'; reason?: string; error?: string }
+/** `committed`: the run wrote pages or advanced its cursor (GBRA-133 PR 3a), which is progress even while `last_commit` stays put. */
+export interface JobStatus { state: 'running' | 'aborting' | 'done' | 'error'; outcome?: 'synced' | 'resumable' | 'blocked'; reason?: string; error?: string; committed?: boolean }
 export interface StartRequest { intent: MarkerIntent; sliceSeconds: number | null; first: boolean }
 
 /** A recorded scheduling decision (tests and the notifier block read these instead of wall-clock timing). */
@@ -109,7 +110,8 @@ export interface CommitNotifierOptions {
   revParse: (root: string) => Promise<string>;
   quiet?: (source: NotifierSource) => boolean;
   syncRunning?: () => boolean | Promise<boolean>;
-  drainHeld?: (sourceId: string) => Promise<boolean>;
+  /** Whether another process holds the source's drain lease; `stalled` when that holder made no commit or cursor save for the stall window. */
+  drainHeld?: (sourceId: string) => Promise<boolean | 'stalled'>;
   startSync: (sourceId: string, req: StartRequest) => Promise<StartResult>;
   jobStatus: (jobId: string) => JobStatus | null;
   watch?: (source: NotifierSource, onChange: () => void) => (() => void) | null;
@@ -210,6 +212,8 @@ function notifierKit(opts: CommitNotifierOptions) {
     logged.add(key);
     log(line);
   };
+  /** A source that made progress logs its next stall again. */
+  const forgetLog = (key: string) => { logged.delete(key); };
   const guard = async <T>(what: string, fn: () => Promise<T>, fallback: T): Promise<T> => {
     try { return await fn(); } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -222,7 +226,7 @@ function notifierKit(opts: CommitNotifierOptions) {
     decisions.push({ at: now(), source, decision, ...extra });
     if (decisions.length > DECISIONS_CAP) decisions.splice(0, decisions.length - DECISIONS_CAP);
   };
-  return { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, guard, decisions, decide };
+  return { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, forgetLog, guard, decisions, decide };
 }
 
 const closeWatch = (rt: Rt) => { if (rt.watchClose) { try { rt.watchClose(); } catch { /* best effort */ } rt.watchClose = null; } };
@@ -285,8 +289,20 @@ function snapshotSource(rt: Rt, now: number): NotifierSourceSnapshot {
     markers: rt.markers.map(m => ({ intent: m.intent, generation: m.generation })) };
 }
 
+/** Each source's wanted markers that no live queued job already covers; an unreadable marker table keeps the last read. */
+async function readOwedMarkers(opts: CommitNotifierOptions, guard: ReturnType<typeof notifierKit>['guard'], sources: Map<string, Rt>): Promise<void> {
+  const ids = [...sources.keys()];
+  const markers = ids.length ? await guard('reading wanted markers', () => opts.store.dueMarkers(ids), null) : [];
+  if (!markers) return;
+  const jobIds = markers.flatMap(m => m.job_id === null ? [] : [m.job_id]);
+  const live = jobIds.length ? await guard('reading queued sync jobs', () => opts.store.liveJobs(jobIds), new Set<number>()) : new Set<number>();
+  // A managed source never pulls: its pull markers (a push webhook) wait for gbrain sources refresh, not for this loop.
+  for (const rt of sources.values()) rt.markers = markers.filter(m => m.source_id === rt.sourceId && (m.job_id === null || !live.has(m.job_id))
+    && !(m.intent === 'pull' && rt.kind === 'managed'));
+}
+
 export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier {
-  const { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, guard, decisions, decide } = notifierKit(opts);
+  const { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, forgetLog, guard, decisions, decide } = notifierKit(opts);
 
   let enabled = false;
   let excluded = new Set<string>();
@@ -360,6 +376,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
   };
 
   const ownership = async () => {
+    if (stopped) return;
     const r = await guard('claiming the notifier lease', () => opts.store.claimLease({ hostId: opts.hostId, ownerId, kind: opts.resident, pid, leaseMs }), undefined);
     if (r === undefined) return;
     if (r === null) { leased = false; if (!owner) { owner = true; log(`owner of this host's notifier (${opts.resident})`); } return; }
@@ -403,7 +420,8 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
     if (!rt) return;
     const lastCommit = await guard(`reading the last synced commit of ${rt.sourceId}`, () => opts.lastCommit(rt.sourceId), rt.lastCommit);
     rt.lastCommit = lastCommit;
-    const progressed = lastCommit !== job.lastCommit;
+    const progressed = lastCommit !== job.lastCommit || st?.committed === true;
+    if (progressed) forgetLog(`stalled\u0000${rt.sourceId}`);
     if (st?.state === 'done' && st.outcome === 'blocked') {
       rt.blockedKey = markerKey(rt);
       const tracePath = trace(rt, { event: 'blocked', reason: st.reason ?? null });
@@ -462,7 +480,9 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
         decide(rt.sourceId, 'converged', { detail: 'covered by another run' });
         continue;
       }
-      if (opts.drainHeld && await guard(`reading the drain lease of ${rt.sourceId}`, () => opts.drainHeld!(rt.sourceId), true)) { decide(rt.sourceId, 'defer_drain_lease'); continue; }
+      // GBRA-133 PR 3a: a holder that commits nothing is a failed attempt, so the retry tiers run to notifier_stalled (a foreground sync follows it and takes over).
+      const held = opts.drainHeld ? await guard(`reading the drain lease of ${rt.sourceId}`, () => opts.drainHeld!(rt.sourceId), true) : false;
+      if (held) { if (held === 'stalled') await failure(rt, 'drain_holder_stalled', 'the process holding the drain lease has made no commit or cursor save for 5 minutes', false); else decide(rt.sourceId, 'defer_drain_lease'); continue; }
       if (opts.syncRunning && await opts.syncRunning()) { decide(rt.sourceId, 'defer_busy'); return; }
       if (leased && fence !== null && !await guard('checking the notifier lease', () => opts.store.holdsLease(opts.hostId, ownerId, fence!), false)) {
         owner = false; fence = null; decide(rt.sourceId, 'not_owner');
@@ -531,15 +551,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
     if (wasNudged || firstPass || t - markersAt >= MARKER_SCAN_MS) {
       markersAt = t;
       firstPass = false;
-      const ids = [...sources.keys()];
-      const markers = ids.length ? await guard('reading wanted markers', () => opts.store.dueMarkers(ids), null) : [];
-      if (markers) {
-        const jobIds = markers.flatMap(m => m.job_id === null ? [] : [m.job_id]);
-        const live = jobIds.length ? await guard('reading queued sync jobs', () => opts.store.liveJobs(jobIds), new Set<number>()) : new Set<number>();
-        // A managed source never pulls: its pull markers (a push webhook) wait for gbrain sources refresh, not for this loop.
-        for (const rt of sources.values()) rt.markers = markers.filter(m => m.source_id === rt.sourceId && (m.job_id === null || !live.has(m.job_id))
-          && !(m.intent === 'pull' && rt.kind === 'managed'));
-      }
+      await readOwedMarkers(opts, guard, sources);
     }
     for (const job of [...running.values()]) {
       const st = opts.jobStatus(job.id);
@@ -577,11 +589,15 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
         if (nudgeTimer !== null) clearTimer(nudgeTimer);
         closeAllWatches();
       }
+      // Hand the lease over before settling: a stop on a termination signal has a short cleanup deadline, and a step
+      // still in flight re-checks the lease before any start (and claims nothing once stopped).
+      const release = () => owner && leased ? guard('releasing the notifier lease', () => opts.store.releaseLease(opts.hostId, ownerId), undefined) : undefined;
+      await release();
       if (inflight) {
         await settleWithin(inflight, STOP_SETTLE_MS);
         closeAllWatches();
+        await release();
       }
-      if (owner && leased) await guard('releasing the notifier lease', () => opts.store.releaseLease(opts.hostId, ownerId), undefined);
     },
   };
 }

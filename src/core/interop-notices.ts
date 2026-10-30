@@ -15,6 +15,7 @@ import type { ExplicitReadBinding } from './ops/contract.ts';
 import { configReadiness } from './readiness.ts';
 import { affectsRecall, type DegradedStage } from './types.ts';
 import type { RerankFailedReason } from './search/rerank.ts';
+import type { RetrievalCoverage } from './search/retrieval-coverage.ts';
 import { localTranscriptsFix } from './transcripts.ts';
 
 // ── degraded recall (F3) ───────────────────────────────────────────────────
@@ -52,7 +53,7 @@ export const DEGRADED_STAGE_GUIDANCE: Readonly<Record<RecallStage, StageGuidance
   keyword_relaxed_carried: { why: 'keyword matching was relaxed to find anything at all', fix: null },
   safe_index_pending: { why: 'some pages in scope are still being safety-indexed for agent readers and are withheld until that finishes', fix: 'doctor' },
   vector_candidates_incomplete: { why: 'vector search hit its candidate limit or deadline, so some semantic matches can be missing', fix: null },
-  keyword_candidates_incomplete: { why: 'CJK keyword matching hit its deadline or its candidate cap on a large corpus, so some keyword matches can be missing; narrow the search with source_id (the CLI source-id flag), or ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
+  keyword_candidates_incomplete: { why: 'keyword matching returned a bounded result on a large corpus (the CJK deadline or candidate cap, or common words ranked from a sample), so some keyword matches can be missing; add a rarer word or an exact phrase, narrow with source_id (the CLI source-id flag) or types, or for CJK text ask the user to raise search.cjk_keyword_deadline_ms (milliseconds, default 3000)', fix: null },
   projection_pending: { why: 'recently written pages are not in the search index yet', fix: 'doctor' },
   projection_by_design: { why: 'some image pages in scope hold protected OCR content and stay out of the search index by design; nothing is pending', fix: null },
   projection_status_unknown: { why: 'whether recent writes are in the search index could not be checked', fix: 'doctor' },
@@ -155,14 +156,19 @@ function embeddingsFix(cfg: GBrainConfig | null | undefined, transport: 'stdio' 
  * A `rerank_failed` stage names its reason, the fallback (fused order) and, when the caller counts them
  * (`rerankDegradedCalls`), this session's reranker-degraded calls; its fix follows the reason (`retry`
  * is the call to repeat after a transient failure) when no other stage needs a fix.
+ * #7165: with the call's `coverage`, `projection_pending` is left out when no pending page could match the
+ * query, names how many could otherwise, and a notice whose only stage it is escalates (the same pending
+ * count shows once per session).
  */
 export function degradedRecallNotice(
   stages: ReadonlyArray<{ stage?: string; reason?: string } | string>,
-  opts: { config?: GBrainConfig | null; transport: 'stdio' | 'http' | 'cli'; optedOut?: boolean; rerankDegradedCalls?: number; retry?: { op: string; args: Record<string, unknown> } },
+  opts: { config?: GBrainConfig | null; transport: 'stdio' | 'http' | 'cli'; optedOut?: boolean; rerankDegradedCalls?: number; retry?: { op: string; args: Record<string, unknown> }; coverage?: RetrievalCoverage },
 ): Notice | null {
   const entries = stages.map(s => (typeof s === 'string' ? { stage: s } : s));
+  const pendingTotal = opts.coverage?.pending_projection, pendingCould = opts.coverage?.could_affect?.pending_projection;
+  const pendingCounted = typeof pendingTotal === 'number' && typeof pendingCould === 'number';
   const names = [...new Set(entries
-    .filter(s => affectsRecall(s) && (s.stage as string) in DEGRADED_STAGE_GUIDANCE)
+    .filter(s => affectsRecall(s) && (s.stage as string) in DEGRADED_STAGE_GUIDANCE && !(s.stage === 'projection_pending' && pendingCould === 0))
     .map(s => s.stage as RecallStage))];
   if (names.length === 0) return null;
   const pairs = [...new Set(entries.filter(s => names.includes(s.stage as RecallStage)).map(s => `${s.stage}:${s.reason ?? ''}`))].sort();
@@ -172,7 +178,9 @@ export function degradedRecallNotice(
   const labels = names.map(n => (n === 'rerank_failed' ? `rerank_failed: ${rerank}` : n === 'keyword_arm_failed' && keywordSkipped ? 'keyword_arm_failed: skipped_after_timeout' : n));
   const whys = names.map(n => (n === 'rerank_failed'
     ? `reranking failed because ${RERANK_REASON_WHY[rerank!]}, so results keep their fused order (fallback: fused_order${opts.rerankDegradedCalls ? `; reranker-degraded calls this session: ${opts.rerankDegradedCalls}` : ''})`
-    : n === 'keyword_arm_failed' && keywordSkipped ? KEYWORD_SKIPPED_WHY : DEGRADED_STAGE_GUIDANCE[n].why));
+    : n === 'keyword_arm_failed' && keywordSkipped ? KEYWORD_SKIPPED_WHY
+    : n === 'projection_pending' && pendingCounted ? `${DEGRADED_STAGE_GUIDANCE[n].why} (${pendingCould} of ${pendingTotal}${opts.coverage?.capped ? '+' : ''} pending page(s) could match this query)`
+    : DEGRADED_STAGE_GUIDANCE[n].why));
   const guidance = names.map(n => DEGRADED_STAGE_GUIDANCE[n]);
   const fixKind: StageFix = guidance.some(g => g.fix === 'embeddings') ? 'embeddings' : guidance.some(g => g.fix === 'doctor') ? 'doctor' : null;
   const byChoice = opts.optedOut || entries.some(s => s.reason === 'embedding_disabled');
@@ -189,6 +197,7 @@ export function degradedRecallNotice(
     ...(fix ? { fix } : {}),
     ...(fix?.user_message ? { user_message: fix.user_message } : {}),
     ...(persistent ? { dedupe_key: pairs.join('|') } : {}),
+    ...(pendingCounted && names.every(n => n === 'projection_pending') ? { escalation: { key: 'projection_pending', level: pendingTotal } } : {}),
   };
 }
 
@@ -196,7 +205,7 @@ export function degradedRecallNotice(
 
 const BINDING_READ_OPS: ReadonlySet<string> = new Set(['search', 'query', 'recall', 'list_pages']);
 
-function emptyRead(op: string, result: unknown): boolean {
+export function emptyRead(op: string, result: unknown): boolean {
   if (Array.isArray(result)) return result.length === 0;
   if (op !== 'recall' || !result || typeof result !== 'object') return false;
   const r = result as { facts?: unknown[]; results?: unknown[] };
@@ -357,7 +366,8 @@ export function recallInteropNotices(
     const entries = (meta.retrieval as { degraded?: Array<{ stage?: string; reason?: string }> } | undefined)?.degraded ?? [];
     const stages = recallStagesFor(op, result, meta, opts.config).map(stage => entries.find(d => d.stage === stage) ?? stage);
     const { _meta: _ignored, ...args } = params;
-    const degraded = degradedRecallNotice(stages, { ...opts, optedOut: embeddingOptedOutFor(op, result, meta), retry: { op, args } });
+    const coverage = (meta.retrieval as { coverage?: RetrievalCoverage } | undefined)?.coverage;
+    const degraded = degradedRecallNotice(stages, { ...opts, optedOut: embeddingOptedOutFor(op, result, meta), retry: { op, args }, coverage });
     if (degraded) out.push(degraded);
     const narrowed = opts.transport === 'stdio' ? sourceBindingNarrowedNotice(op, params, result, opts.binding) : null;
     if (narrowed) out.push(narrowed);

@@ -25,6 +25,12 @@ import { TERMINAL_FIXED_IN } from '../src/core/persistence/terminal-classify.ts'
 import { terminalFailuresCheck } from '../src/commands/doctor/checks/persistence-requests.ts';
 import { categorizeCheck } from '../src/core/doctor-categories.ts';
 import { WAVE_CHECKS } from '../src/commands/doctor/wave-checks.ts';
+import { runRemoteDoctorTier } from '../src/commands/doctor/remote-tier.ts';
+import { renderWriterFailures } from '../src/commands/sources-writer-failures.ts';
+import { parsePersistenceAdminArgs } from '../src/commands/persistence-admin.ts';
+import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
+import type { TerminalFailureListing } from '../src/core/persistence/terminal-failures.ts';
+import type { OperationContext } from '../src/core/ops/contract.ts';
 
 let engine: BrainEngine;
 
@@ -171,6 +177,56 @@ for (const kind of testBackends()) describe(`the aggregate, doctor and the drill
     const defect = (await terminalFailuresCheck(engine))!;
     expect(defect.status).toBe('warn');
     expect(defect.message).toContain('owner_exception/storage_error ×1');
+  });
+
+  test('#7146: doctor ranks the rows: blocking with what it blocks and its fix, then unresolved groups with drill-downs, then historical', async () => {
+    const blocker = await seed({ slug: 'notes/held', state: 'committed', recovery: { version: 1, path: '/nonexistent/x.md', root: '/nonexistent', beforeHash: null, afterHash: 'a' } });
+    for (let i = 0; i < 3; i++) await seed({ slug: `notes/r${i}`, state: 'conflict', code: 'revision_conflict', hoursAgo: 30 + i });
+    await seed({ slug: 'notes/drift', state: 'conflict', code: 'source_changed', message: 'The canonical file contains an uncoordinated local edit.', hoursAgo: 60 });
+    await seed({ slug: 'notes/boom', state: 'failed', code: 'storage_error', detail: { origin: 'owner_exception', error_class: 'TypeError' }, hoursAgo: 10 });
+    for (let i = 0; i < 2; i++) await seed({ slug: `sync/k${i}`, operation: 'submit_job', state: 'cancelled', code: 'cancelled', detail: knockOnDetail('lane_fault', null), build: '0.60.200.0', hoursAgo: 30 });
+    const check = (await terminalFailuresCheck(engine))!;
+    expect(check.status).toBe('warn');
+    const ranked = (check.details as { ranked: { blocking: Array<Record<string, unknown>>; unresolved: { rows: number; pages: number; groups: Array<Record<string, unknown>>; group_by: string[][] }; historical: { rows: number } } }).ranked;
+    expect(ranked.blocking).toEqual([{ kind: 'recovery', request_id: blocker, source_id: SOURCE, slug: 'notes/held', category: 'recovery_pending', needs_human: false, blocks: 'source',
+      fix: ['gbrain', 'sync', '--source', SOURCE, '--no-pull', '--json'] }]);
+    // Defect classes lead the unresolved groups, then by row count; each names its exact drill-down.
+    expect(ranked.unresolved).toMatchObject({ rows: 5, pages: 5, group_by: [['gbrain', 'sources', 'writer', 'failures', SOURCE, '--group-by', 'category', '--json']] });
+    expect(ranked.unresolved.groups.map(g => [g.category, g.rows, g.defect])).toEqual([['owner_exception', 1, true], ['caller_conflict', 3, false], ['file_conflict', 1, false]]);
+    expect(ranked.unresolved.groups[0]!.drill_down).toEqual(['gbrain', 'sources', 'writer', 'failures', SOURCE, '--category', 'owner_exception', '--code', 'storage_error', '--origin', 'owner_exception', '--json']);
+    expect(ranked.historical).toEqual({ rows: 2 });
+    const blockingAt = check.message.indexOf('Blocking now (1)');
+    const unresolvedAt = check.message.indexOf('Unresolved, not blocking: 5 row(s) on 5 page(s) in 3 group(s): owner_exception/storage_error ×1 on tf-a (gbrain defect)');
+    const historicalAt = check.message.indexOf('Historical: 2 row(s)');
+    expect(blockingAt).toBeGreaterThanOrEqual(0);
+    expect(unresolvedAt).toBeGreaterThan(blockingAt);
+    expect(historicalAt).toBeGreaterThan(unresolvedAt);
+    expect(check.message).toContain(`recovery record ${blocker} (notes/held) on source ${SOURCE} blocks every queued write on the source's root; fix: gbrain sync --source ${SOURCE} --no-pull --json`);
+    expect(check.message).toContain(`Group them: gbrain sources writer failures ${SOURCE} --group-by category --json`);
+
+    // A remote caller sees the ranking, never a page slug or file path, and is sent to the brain host.
+    const remote = (await terminalFailuresCheck(engine, undefined, { remote: true }))!;
+    expect(remote.status).toBe('warn');
+    expect(JSON.stringify({ message: remote.message, details: remote.details, fix: remote.fix })).not.toMatch(/notes\/|sync\/k|nonexistent/);
+    expect((remote.details as { ranked: { blocking: unknown[] } }).ranked.blocking).toEqual([expect.objectContaining({ request_id: blocker, blocks: 'source', fix: null })]);
+    expect(remote.fix).toMatchObject({ argv: ['gbrain', 'doctor', '--only', 'persistence_terminal_failures', '--json'], actor: 'user' });
+
+    // Only historical rows left: ok, as information.
+    await engine.executeRaw("DELETE FROM persistence_requests WHERE slug NOT LIKE 'sync/k%'");
+    const quiet = (await terminalFailuresCheck(engine))!;
+    expect(quiet).toMatchObject({ status: 'ok', severity: 'info' });
+    expect(quiet.message).toContain('Historical: 2 row(s)');
+  });
+
+  if (kind === 'postgres') test('#7146: run_doctor (tier ops, remote caller) confines the ranked rows: no page slug or file path', async () => {
+    const blocker = await seed({ slug: 'notes/held', state: 'committed', recovery: { version: 1, path: '/nonexistent/x.md', root: '/nonexistent', beforeHash: null, afterHash: 'a' } });
+    await seed({ slug: 'notes/r0', state: 'conflict', code: 'revision_conflict', hoursAgo: 30 });
+    const ctx = { engine, remote: true, transport: 'http', sourceId: SOURCE, config: {} as never, logger: { info() {}, warn() {}, error() {} } } as unknown as OperationContext;
+    const report = await runRemoteDoctorTier(ctx, { only: ['persistence_terminal_failures'] });
+    const check = report.checks.find(c => c.name === 'persistence_terminal_failures')!;
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain(`recovery record ${blocker} on source ${SOURCE}`);
+    expect(JSON.stringify(check)).not.toMatch(/notes\/|nonexistent/);
   });
 
   // #6824: the old tests only replace page writes or repeat an identical digest. Connector retries
@@ -339,6 +395,82 @@ for (const kind of testBackends()) describe(`the aggregate, doctor and the drill
     const filtered = await readTerminalFailures(engine, { sourceId: SOURCE, category: 'diagnosis_required', code: 'storage_error', origin: 'none' });
     if (filtered.status !== 'ok') throw new Error('unknown');
     expect(filtered.rows!.map(r => r.request_id)).toEqual([opaque]);
+  });
+
+  // #7630: a stalled sync receipt retries through sync while a stalled foreground write is resubmitted by its caller, so the
+  // grouped view splits a sync-fault group by operation and every group's fix fits each of its rows.
+  test('a preparation_stalled group splits sync receipts from foreground writes, each with its own fix', async () => {
+    await seed({ slug: 'notes/s', operation: 'submit_job', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/p', operation: 'put_page', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/r', operation: 'remember', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/t1', operation: 'takes_supersede', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/t2', operation: 'takes_resolve', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/rc', operation: 'put_page', state: 'failed', code: 'preparation_stalled', kind: 'canonical_reconcile' });
+    await seed({ slug: 'notes/mi', operation: 'put_page', state: 'failed', code: 'preparation_stalled', kind: 'managed_file_import' });
+    await seed({ slug: 'notes/ef', operation: 'extract_facts', state: 'failed', code: 'preparation_stalled', kind: 'managed_facts_entity' });
+    const grouped = await readTerminalFailures(engine, { sourceId: SOURCE, groupBy: 'category' });
+    if (grouped.status !== 'ok') throw new Error('unknown');
+    const stalled = grouped.groups!.filter(g => g.code === 'preparation_stalled');
+    expect(stalled.map(g => g.operation ?? '').sort()).toEqual(['canonical_reconcile', 'extract_facts', 'managed_file_import', 'put_page', 'remember', 'submit_job', 'takes_resolve', 'takes_supersede']);
+    for (const op of ['submit_job', 'canonical_reconcile']) expect(stalled.find(g => g.operation === op)!.fix.argv?.slice(0, 2)).toEqual(['gbrain', 'sync']);
+    expect(stalled.find(g => g.operation === 'managed_file_import')!.fix.why).toContain('rerun the command that wrote it');
+    expect(stalled.find(g => g.operation === 'extract_facts')!.fix.why).not.toContain('request_id');
+    expect(stalled.find(g => g.operation === 'extract_facts')!.fix.why).not.toContain('rerun the command');
+    const flat = await readTerminalFailures(engine, { sourceId: SOURCE, limit: 50 });
+    if (flat.status !== 'ok') throw new Error('unknown');
+    for (const g of stalled) for (const s of g.samples) expect(flat.rows!.find(r => r.request_id === s.request_id)!.fix).toEqual(g.fix);
+    expect(flat.rows!.find(r => r.slug === 'notes/mi')!.operation).toBe('managed_file_import');
+    const putPages = await readTerminalFailures(engine, { sourceId: SOURCE, operation: 'put_page', limit: 50 });
+    if (putPages.status !== 'ok') throw new Error('unknown');
+    expect(putPages.rows!.map(r => r.slug)).toEqual(['notes/p']);
+    for (const op of ['put_page', 'remember', 'takes_supersede', 'takes_resolve']) {
+      const g = stalled.find(x => x.operation === op)!;
+      expect(g.rows).toBe(1);
+      expect(g.fix.argv).toEqual(['gbrain', 'sources', 'writer', 'status', '--source', SOURCE, '--json']);
+      expect(g.fix.why).toContain(`resubmit the same ${op}`);
+    }
+    for (const g of stalled) {
+      expect(g.drill_down).toContain('--operation');
+      const parsed = parsePersistenceAdminArgs('writer', g.drill_down.slice(3));
+      expect(parsed.params.operation).toBe(g.operation);
+      const rows = await runPersistenceAdministration(engine, parsed.operation, parsed.params) as TerminalFailureListing;
+      if (rows.status !== 'ok') throw new Error('unknown');
+      expect(rows.rows!.map(r => r.request_id)).toEqual(g.samples.map(s => s.request_id));
+    }
+    const table = renderWriterFailures(grouped, false).split('\n');
+    await seed({ slug: 'notes/big1', operation: 'submit_job', state: 'failed', code: 'file_too_large' });
+    await seed({ slug: 'notes/big2', operation: 'put_page', state: 'failed', code: 'file_too_large' });
+    const regrouped = await readTerminalFailures(engine, { sourceId: SOURCE, groupBy: 'category' });
+    if (regrouped.status !== 'ok') throw new Error('unknown');
+    const big = regrouped.groups!.filter(g => g.code === 'file_too_large');
+    expect(big.map(g => g.operation).sort()).toEqual(['put_page', 'submit_job']);
+    for (const g of big) {
+      expect(g.fix.argv).toEqual(['gbrain', 'sources', 'writer', 'status', '--source', SOURCE, '--json']);
+      const parsed = parsePersistenceAdminArgs('writer', g.drill_down.slice(3));
+      const rows = await runPersistenceAdministration(engine, parsed.operation, parsed.params) as TerminalFailureListing;
+      if (rows.status !== 'ok') throw new Error('unknown');
+      expect(rows.rows!.map(r => r.request_id)).toEqual(g.samples.map(s => s.request_id));
+    }
+    for (const op of ['submit_job', 'takes_supersede', 'takes_resolve']) expect(table.some(l => /^\s+\d+\s/.test(l) && l.includes(' preparation_stalled ') && l.includes(` ${op} `))).toBe(true);
+  });
+
+  // #7630: --operation narrows every category, so every group's drill-down carries it and lists exactly the group's rows.
+  test('--group-by category with --operation keeps the operation in every group drill-down', async () => {
+    await seed({ slug: 'notes/a', operation: 'put_page', state: 'failed', code: 'storage_error' });
+    await seed({ slug: 'notes/b', operation: 'submit_job', state: 'failed', code: 'storage_error' });
+    await seed({ slug: 'notes/c', operation: 'put_page', state: 'failed', code: 'preparation_stalled' });
+    await seed({ slug: 'notes/d', operation: 'submit_job', state: 'failed', code: 'preparation_stalled' });
+    const grouped = await readTerminalFailures(engine, { sourceId: SOURCE, groupBy: 'category', operation: 'put_page' });
+    if (grouped.status !== 'ok') throw new Error('unknown');
+    expect(grouped.groups!.map(g => g.code).sort()).toEqual(['preparation_stalled', 'storage_error']);
+    for (const g of grouped.groups!) {
+      expect(g.drill_down[g.drill_down.indexOf('--operation') + 1]).toBe('put_page');
+      const parsed = parsePersistenceAdminArgs('writer', g.drill_down.slice(3));
+      const rows = await runPersistenceAdministration(engine, parsed.operation, parsed.params) as TerminalFailureListing;
+      if (rows.status !== 'ok') throw new Error('unknown');
+      expect(rows.rows!.length).toBe(g.rows);
+      expect(rows.rows!.map(r => r.operation)).toEqual(['put_page']);
+    }
   });
 
   test('a read past its statement deadline is unknown, and doctor says health is unknown', async () => {

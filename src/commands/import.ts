@@ -26,8 +26,10 @@ import {
   pruneDir,
   isPathPruned,
   isSyncMetafile,
+  DEFAULT_METAFILE_PAGES_MODE, readMetafilePagesMode, type MetafilePagesMode,
   type SyncStrategy,
 } from '../core/sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from '../core/sync-metafile-pages.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
 import {
   loadCheckpoint,
@@ -77,10 +79,10 @@ export async function listConfiguredRoots(
       `SELECT local_path FROM sources WHERE id = $1`,
       [destinationSourceId],
     );
-    for (const row of rows) if (row.local_path) roots.push(resolve(row.local_path)); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- resolves REGISTERED roots to build the containment allowlist (#4388 guard)
+    for (const row of rows) if (row.local_path && isAbsolute(row.local_path)) roots.push(resolve(row.local_path)); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- resolves REGISTERED roots to build the containment allowlist (#4388 guard)
     if (destinationSourceId === 'default') {
       const legacyRoot = await engine.getConfig('sync.repo_path');
-      if (legacyRoot) roots.push(resolve(legacyRoot)); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- same: registered root canonicalization for the guard allowlist
+      if (legacyRoot && isAbsolute(legacyRoot)) roots.push(resolve(legacyRoot)); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- same: registered root canonicalization for the guard allowlist
     }
   } catch (error) {
     throw new Error(
@@ -582,7 +584,7 @@ export async function runImport(
   let allFiles = company ? company.plan.manifest.filter(entry => entry.disposition === 'included').map(entry => join(dir, entry.path))
     : singleFile ? [dir] : collectSyncableFiles(dir, {
     strategy, excludePaths: opts.excludePaths, includeGitignored,
-    includeHidden: opts.includeHidden,
+    includeHidden: opts.includeHidden, metafilePages: await readMetafilePagesMode(engine),
     onExcluded: (rel) => { malformedExcluded.push(rel); },
   });
   console.error(
@@ -1158,7 +1160,7 @@ export async function runImport(
       // only an import whose canonical target IS the registered local_path
       // may stamp. `dir` is already the canonical realpath (#1728).
       let coversRegisteredRoot = false;
-      if (row?.local_path) {
+      if (row?.local_path && isAbsolute(row.local_path)) {
         try {
           const { realpathSync } = await import('fs');
           coversRegisteredRoot = realpathSync(row.local_path) === dir;
@@ -1266,6 +1268,7 @@ interface CollectOpts {
   onExcluded?: (relPath: string) => void;
   /** See `RunImportOpts.includeHidden` — same repeatable-glob semantics. */
   includeHidden?: string[];
+  metafilePages?: MetafilePagesMode; // GBRA-150: `sync.metafile_pages`, whether a typed nested metafile under `dir` is collected
 }
 
 /**
@@ -1291,6 +1294,7 @@ function isCollectibleForWalker(
   strategy: SyncStrategy,
   multimodalOn: boolean,
   includeHidden?: string[],
+  metafilePage?: (relPath: string) => boolean, relPath = path,
 ): boolean {
   // #2607: apply the SAME segment-level prune gate as incremental sync's
   // `classifySync` (core/sync.ts) — via the shared `isPathPruned`, so this
@@ -1314,8 +1318,8 @@ function isCollectibleForWalker(
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
   // resolver, and the root AGENTS.md / CLAUDE.md harden writes), not typed
   // brain pages — same exclusion `sync`'s `isSyncable` applies. Guards both
-  // the FS-walk and the git-fast-path collection routes.
-  if (isSyncMetafile(path)) return false;
+  // the FS-walk and the git-fast-path collection routes. GBRA-150: a nested typed one is a page (dir-relative depth).
+  if (isSyncMetafile(path) && !metafilePage?.(relPath)) return false;
 
   switch (strategy) {
     case 'code':
@@ -1366,6 +1370,7 @@ function gitListSyncableFiles(
   multimodalOn: boolean,
   onExcluded?: (relPath: string) => void,
   includeHidden?: string[],
+  metafilePage?: (relPath: string) => boolean,
 ): string[] | null {
   const stdout = gitLsFiles(dir, ['--cached', '--others', '--exclude-standard', '-z']);
   if (stdout === null) return null; // not a git work tree, or git not on PATH → FS-walk fallback
@@ -1379,7 +1384,7 @@ function gitListSyncableFiles(
     // exclusion is reportable — other filters (strategy, prune, metafile)
     // are silent by design; this one hides renameable content.
     if (hasMalformedPathSegment(rel)) { onExcluded?.(rel); continue; }
-    if (!isCollectibleForWalker(rel, strategy, multimodalOn, includeHidden)) continue;
+    if (!isCollectibleForWalker(rel, strategy, multimodalOn, includeHidden, metafilePage)) continue;
     const full = join(dir, rel);
     let st;
     try {
@@ -1420,6 +1425,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
     const n = rel.replace(/\\/g, '/');
     return excludeNorm.some(ep => n === ep || n.startsWith(ep + '/'));
   };
+  const metafilePage = metafilePagePredicate(opts.metafilePages ?? DEFAULT_METAFILE_PAGES_MODE, diskMetafileHeads(dir));
 
   // v0.42.x (#1159 --respect-gitignore / #1483 .gbrainignore): when `dir` is a
   // git work tree, enumerate via `git ls-files` so the walk honors
@@ -1431,7 +1437,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
   if (!opts.includeGitignored) {
-    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded, opts.includeHidden);
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded, opts.includeHidden, metafilePage);
     if (gitFiles) return excludeNorm.length > 0 ? gitFiles.filter(f => !isExcluded(relative(dir, f))) : gitFiles;
   }
 
@@ -1496,7 +1502,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         // bracket directory segment above a clean-named markdown file).
         const rel = relative(dir, full);
         if (hasMalformedPathSegment(rel)) { opts.onExcluded?.(rel); continue; }
-        if (!isCollectibleForWalker(entry, strategy, multimodalOn)) continue;
+        if (!isCollectibleForWalker(entry, strategy, multimodalOn, undefined, metafilePage, rel.split(sep).join('/'))) continue;
         files.push(full);
       }
     }

@@ -353,6 +353,8 @@ export interface CalendarEventData {
   htmlLink: string | null;
   status: string;
   account: string;
+  /** Google marks the event `private` or `confidential`: its page is `visibility: private`. */
+  private?: boolean;
 }
 
 export interface ContactData {

@@ -24,7 +24,7 @@
 # the packages are already installed, so apt is skipped and the image pulls
 # only confirm the baked images are current.
 #
-# Knobs: SLOTS (default nproc), BUN_VERSION (default 1.4.3), GITLEAKS=0|1,
+# Knobs: SLOTS (default nproc), BUN_VERSION (default 1.4.4), GITLEAKS=0|1,
 # CHECKOUT (default .), CHECKOUT_MARKER (default: none, checkout present),
 # PG_IMAGE (default pgvector/pgvector:pg16; ci-ubicloud.ts --pg-image, e.g.
 # pgvector/pgvector:pg15 for the #7112 compatibility audit),
@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SLOTS="${SLOTS:-$(nproc)}"
-BUN_VERSION="${BUN_VERSION:-1.4.3}"
+BUN_VERSION="${BUN_VERSION:-1.4.4}"
 GITLEAKS="${GITLEAKS:-0}"
 CHECKOUT="${CHECKOUT:-.}"
 CHECKOUT_MARKER="${CHECKOUT_MARKER:-}"
@@ -101,7 +101,7 @@ fi
   install_system
   sudo docker network create gbrain-ci >/dev/null 2>&1 || true
   for i in $(seq 1 "$SLOTS"); do
-    sudo docker run -d --name "pg-$i" --network gbrain-ci \
+    sudo docker run -d --name "pg-$i" --network gbrain-ci --shm-size=1g \
       -p "127.0.0.1:$((15432 + i)):5432" \
       -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=gbrain_test \
       "$PG_IMAGE" -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null

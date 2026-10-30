@@ -37,10 +37,13 @@ import { accessSync, constants, readdirSync, readFileSync, writeFileSync, rename
 import { readFile, stat } from 'node:fs/promises';
 import { spawnSync } from '../spawn.ts';
 import { JobDeferredError, UnrecoverableError } from './types.ts';
+import { JobRefusedError, type JobRefusal } from './errors.ts';
+import { jobRefusal } from './refusal.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
 import { SpendGroupRefusedError, type SpendRefusalEnvelope } from './spend-authorization.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import { basename, delimiter, resolve, win32 } from 'node:path';
+import { readProcessRss } from './proc-rss.ts';
 
 /** Grace between group-SIGTERM and group-SIGKILL on abort. Deliberately
  *  inside the worker's 30s force-evict window so the evict path stays a
@@ -91,7 +94,7 @@ export function childConfigurationError(reason: typeof CHILD_CONFIGURATION_REASO
   return new LocalConfigurationError(reason, `${messages[reason]} Verify worker and child readiness, then restart. See docs/guides/minions-fix.md#configuration-blocked.`);
 }
 
-export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
+export type ChildErrorKind = 'unrecoverable' | 'refused' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
 
 export type ChildOutcome =
   | { outcome: 'success'; result: unknown }
@@ -104,6 +107,8 @@ export type ChildOutcome =
       /** A group spend refusal's envelope (code, fix, group amounts). */
       spend?: SpendRefusalEnvelope;
       deferral?: { reason: string; retryInMs: number };
+      /** #7239: a deterministic refusal (refusal.ts), rebuilt as JobRefusedError on the worker side. */
+      refusal?: JobRefusal;
       protocolVersion?: number;
       reasonCode?: typeof CHILD_CONFIGURATION_REASONS[number];
     };
@@ -129,6 +134,7 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
   if (err instanceof JobDeferredError) {
     return { outcome: 'error', errorKind: 'deferred', message: err.message, deferral: { reason: err.reason, retryInMs: err.retryInMs } };
   }
+  if (err instanceof JobRefusedError) return { outcome: 'error', errorKind: 'refused', message: err.message, refusal: err.refusal };
   if (err instanceof UnrecoverableError) {
     return {
       outcome: 'error',
@@ -138,6 +144,8 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       ...(err instanceof SpendGroupRefusedError ? { spend: err.envelope } : {}),
     };
   }
+  const refusal = jobRefusal(err);
+  if (refusal) return { outcome: 'error', errorKind: 'refused', message: refusal.message, refusal };
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   return { outcome: 'error', errorKind: 'generic', message, ...(stack ? { stack } : {}) };
@@ -156,6 +164,7 @@ export function reconstructHandlerError(o: Extract<ChildOutcome, { outcome: 'err
   if (o.errorKind === 'rate_lease' && o.lease) {
     return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max, o.lease.retryInMs);
   }
+  if (o.errorKind === 'refused' && o.refusal) return new JobRefusedError(o.refusal);
   if (o.errorKind === 'unrecoverable') {
     return o.spend ? new SpendGroupRefusedError(o.spend) : new UnrecoverableError(o.message);
   }
@@ -221,8 +230,13 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
     // policy as the errorKind whitelist.
     const rawDeferral = (o as { deferral?: unknown }).deferral as { reason?: unknown; retryInMs?: unknown } | undefined;
     const deferralValid = rawDeferral != null && typeof rawDeferral.reason === 'string' && Number.isFinite(rawDeferral.retryInMs as number);
+    const rawRefusal = (o as { refusal?: unknown }).refusal as { code?: unknown; reason?: unknown; message?: unknown; fix?: unknown; docs_cmd?: unknown } | undefined;
+    const refusalValid = rawRefusal != null && typeof rawRefusal === 'object' && typeof rawRefusal.code === 'string' && typeof rawRefusal.message === 'string'
+      && (rawRefusal.reason === undefined || typeof rawRefusal.reason === 'string')
+      && Array.isArray(rawRefusal.docs_cmd) && rawRefusal.docs_cmd.every(a => typeof a === 'string');
     const errorKind =
       kind === 'unrecoverable' ? 'unrecoverable'
+      : kind === 'refused' && refusalValid ? 'refused'
       : kind === 'rate_lease' && leaseValid ? 'rate_lease'
       : kind === 'deferred' && deferralValid ? 'deferred'
       : 'generic';
@@ -238,6 +252,7 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
           ...(Number.isFinite(rawLease.retryInMs as number) && (rawLease.retryInMs as number) >= 0 ? { retryInMs: rawLease.retryInMs as number } : {}) } }
         : {}),
       ...(errorKind === 'unrecoverable' && spendValid ? { spend: rawSpend as SpendRefusalEnvelope } : {}),
+      ...(errorKind === 'refused' && refusalValid ? { refusal: rawRefusal as JobRefusal } : {}),
       ...(errorKind === 'deferred' && deferralValid
         ? { deferral: { reason: rawDeferral.reason as string, retryInMs: rawDeferral.retryInMs as number } }
         : {}),
@@ -373,6 +388,16 @@ export function captureChildCleanup(pid: number, groups: Set<number>): ChildClea
     groups: new Set(groups), observed,
     supported: groups.size > 0 && observed.every(entry => groups.has(entry.group)),
   };
+}
+
+/**
+ * GBRA-133: RssAnon + RssShmem summed over a job child's whole tree (the tini wrapper, the handler process and anything it
+ * spawned), in bytes; null where the process table cannot be read (non-Linux), so the caller applies no cap it cannot measure.
+ */
+export function childTreeRss(pid: number, groups: Set<number>, readRss: (pid: number) => number | null = readProcessRss): number | null {
+  const tree = captureChildCleanup(pid, groups).observed.filter(entry => entry.state !== 'Z' && entry.state !== 'X');
+  if (!tree.length) return null;
+  return tree.reduce((sum, entry) => sum + (readRss(entry.pid) ?? 0), 0);
 }
 
 export function confirmChildCleanup(snapshot: ChildCleanupSnapshot): boolean {

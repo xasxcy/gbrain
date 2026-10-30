@@ -1,26 +1,21 @@
 import postgres from '#postgres'
-import { claimOwner } from './persistence/claim-phase.ts';
+import { claimOwner, isOneShotCommand } from './persistence/claim-phase.ts';
 import { traceSqlOptions } from './sql-trace.ts';
+import { beginReadWrite } from './postgres-engine/read-write-transactions.ts';
+import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
 import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.ts';
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
+import { POOL_END_TIMEOUT_SECONDS } from './pool-end-timeout.ts';
 import { isConnectTimeoutError, isRetryableConnError } from './retry-matcher.ts';
-import { loadSharedParameterTypes, sharedParameterTypes, type SharedParameterTypes } from './pg-type-cache.ts';
+import { loadSharedParameterTypes, sharedArrayTypes, sharedParameterTypes, type SharedArrayTypes, type SharedParameterTypes } from './pg-type-cache.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
 
-/**
- * #1972: hard upper bound (seconds) on a single pool `.end()` drain. postgres.js
- * accepts `{ timeout }` but applies it internally — against PgBouncer
- * transaction-mode the drain can still hang, and a stubbed `.end()` ignores it
- * entirely. So `endPoolBounded` ALSO wraps each end in a gbrain-owned
- * Promise.race and passes this value as the postgres.js hint so a healthy drain
- * still finishes fast.
- */
-export const POOL_END_TIMEOUT_SECONDS = 2;
+export { POOL_END_TIMEOUT_SECONDS };
 
 /**
  * #1972: end a postgres.js pool with a gbrain-owned hard bound. Resolves as soon
@@ -150,6 +145,21 @@ export function readPoolPipelineOptions(url: string): { max_pipeline?: number } 
   return value === null ? {} : { max_pipeline: value };
 }
 
+/** Pipeline depth inside a transaction on a pool that does not pipeline across transactions (#6930). */
+export const TRANSACTION_PIPELINE_DEPTH = 100;
+
+/**
+ * #6930: a read-side pool that `resolveReadPoolPipeline` keeps from pipelining (a transaction-mode pooler) still
+ * pipelines the statements of one transaction on the connection its owner holds (sql.begin, sql.reserve): the pooler
+ * pins one server connection from BEGIN until the transaction ends, and the driver never sends a statement behind one
+ * that may end the transaction, so #6543's boundary stays closed. Prepared statements stay off (`resolvePrepare`).
+ * `GBRAIN_PG_TXN_PIPELINE=0` restores one round trip per statement.
+ */
+export function transactionPipelineOptions(url: string): { transaction_pipeline?: number } {
+  const off = process.env.GBRAIN_PG_TXN_PIPELINE === '0' || process.env.GBRAIN_PG_TXN_PIPELINE === 'false';
+  return !off && resolveReadPoolPipeline(url).value === 0 ? { transaction_pipeline: TRANSACTION_PIPELINE_DEPTH } : {};
+}
+
 /**
  * Seconds a pool waits for a connection before giving up with CONNECT_TIMEOUT
  * when its URL names no `connect_timeout` of its own.
@@ -174,9 +184,17 @@ const MAX_CONNECT_TIMEOUT_S = Math.floor(0x7fffffff / 1000);
 export function resolveSharedTypes(url?: string): SharedParameterTypes | false {
   return sharedParameterTypes(url);
 }
-/** Forgets the shared parameter types of these pools; a schema change may have changed them. */
+/** #6930: the array types every pool for this database target shares, so only the process's first connection fetches them. */
+export function resolveArrayTypes(url?: string): SharedArrayTypes | null {
+  return sharedArrayTypes(url);
+}
+/** Forgets the shared parameter and array types of these pools; a schema change may have changed them. */
 export function clearSharedTypes(...pools: unknown[]): void {
-  for (const pool of pools) (pool as { options?: { shared_types?: Map<string, number[]> | null } } | null)?.options?.shared_types?.clear();
+  for (const pool of pools) {
+    const options = (pool as { options?: { shared_types?: Map<string, number[]> | null; array_types?: SharedArrayTypes | null } } | null)?.options;
+    options?.shared_types?.clear();
+    if (options?.array_types) options.array_types.rows = null;
+  }
 }
 
 /**
@@ -501,7 +519,7 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
     const prepare = resolvePrepare(url);
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
-      max: resolvePoolSize(),
+      max: resolvePoolSize(config.pool_max),
       idle_timeout: 20,
       connect_timeout: resolveUrlConnectTimeout(url),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
@@ -517,19 +535,20 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       ...poolHealthOptions(hooks, timeouts.statement_timeout),
       shared_types: resolveSharedTypes(url),
+      array_types: resolveArrayTypes(url),
       ...readPoolPipelineOptions(url),
+      ...transactionPipelineOptions(url),
     };
     opts.connection = { ...timeouts, application_name: gbrainApplicationName() };
     if (typeof prepare === 'boolean') {
       opts.prepare = prepare;
-      if (!prepare) {
-        console.warn(
-          '[gbrain] Prepared statements and statement pipelining disabled (transaction-mode pooler convention: port 6543, ?prepare=false or GBRAIN_PREPARE=0). If your pooler runs in session mode, connect on its session port (Supabase: 5432); GBRAIN_PREPARE=true re-enables prepared statements only, and ?max_pipeline= or PGMAX_PIPELINE sets the pipeline depth.',
-        );
-      }
+      if (!prepare) warnPoolerPrepareOffOnce(url);
     }
     sql = postgres(url, traceSqlOptions(opts, 'module'));
 
+    // GBRA-156: a one-shot command's startup reads its retired-marker state beside its persistence row, which opened the
+    // pool's second connection on the critical path (about three round trips behind a pooler); it opens beside the first.
+    if (isOneShotCommand() && Number(opts.max) >= 3) sql`SELECT 1`.catch(() => undefined);
     // Test connection
     await checkPoolAndLoadSharedTypes(sql, url);
     connectedUrl = url;
@@ -592,10 +611,7 @@ export async function initSchema(): Promise<void> {
 export { verifySchema } from './schema-verify.ts';
 
 export async function withTransaction<T>(fn: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
-  const conn = getConnection();
-  return conn.begin(async (tx) => {
-    return fn(tx as unknown as ReturnType<typeof postgres>);
-  }) as Promise<T>;
+  return beginReadWrite(getConnection(), async (tx) => fn(tx as unknown as ReturnType<typeof postgres>));
 }
 
 // issue #1720 (proposal 4): the startup connect matcher and the runtime

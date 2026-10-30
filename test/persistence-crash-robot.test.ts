@@ -14,14 +14,14 @@
  * Seams: none (the fault hook stays uninstalled); PGLite.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { descriptor, executeOp, parseDescriptor, SessionDrops } from '../scripts/persistence/ops.ts';
+import { descriptor, executeOp, parseDescriptor, SessionDrops, type OpObservation } from '../scripts/persistence/ops.ts';
 import { ReferenceModel } from '../scripts/persistence/model.ts';
 import { crossBoundarySequences, pageBody, randomSchedule } from '../scripts/persistence/generator.ts';
-import { FULL_ROBOT_SECONDS, ROBOT_TOPOLOGY, restrict, runRobotPhase, type RobotRun } from '../scripts/persistence/robot-driver.ts';
-import { robotFailure, robotFullGate, runValidation, spawnWorker } from '../scripts/persistence/validate.ts';
+import { ROBOT_CONCURRENCY, ROBOT_RANDOM_SEEDS, ROBOT_ROTATION_SEEDS, ROBOT_TOPOLOGY, explorationSeeds, restrict, runRobotPhase, type RobotRun } from '../scripts/persistence/robot-driver.ts';
+import { robotCeilingUse, robotFailure, robotFullGate, robotOverBudget, runValidation, spawnWorker } from '../scripts/persistence/validate.ts';
 import { faultPoint, installFaultHook, type FaultDetail, type FaultPoint } from '../src/core/persistence/fault-points.ts';
 import { shrinkRun } from '../scripts/persistence/shrink.ts';
 import { finish, fixedChunks, LEVEL_CHUNK_BYTES, runSchedule, runSteps, seamCounter } from '../scripts/persistence/crash-robot.ts';
@@ -63,7 +63,7 @@ describe('generator', () => {
   test('the cross-boundary sequences are always generated', () => {
     expect(crossBoundarySequences(ROBOT_TOPOLOGY).map(s => s.label)).toEqual(['withdrawal_then_stale_publication',
       'overlapping_slugs_two_sources', 'competing_writers_one_page', 'caller_bound_replay', 'authority_change_pending_effects',
-      'sync_and_connector_race_direct_write']);
+      'sync_and_connector_race_direct_write', 'fence_dropped_then_restored']);
   });
   test('a random schedule is a function of its seed and covers every write op', () => {
     expect(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9))).toBe(JSON.stringify(randomSchedule(ROBOT_TOPOLOGY, 9)));
@@ -130,6 +130,57 @@ describe('concurrent connector publish and direct write', () => {
       model.beginStep(true);
       await model.settleGroup([again, racing], [connector, put]);
       expect(model.violations.map(v => v.class)).toEqual(['lost_write']);
+    });
+  }, 120_000);
+});
+
+describe('a sync op whose user commit did not land (run 41092788952)', () => {
+  // The robot ignored git's exit status: a user commit that never landed still ran the sync and was folded as a
+  // committed write of the user's marker, so the group check called the page lost. Another Git process holding the
+  // index lock is the stand-in for whatever refused the commit (CI kept no stderr).
+  const raceOps = () => {
+    const schedule = crossBoundarySequences(ROBOT_TOPOLOGY).find(s => s.label === 'sync_and_connector_race_direct_write')!;
+    const keep = new Set(['sy0', 'sy1', 'sy2']);
+    return { ...schedule, ops: schedule.ops.filter(d => keep.has(d.id)), groups: schedule.groups.filter(g => g.includes('sy1')) };
+  };
+  const gitIn = (root: string) => (...args: string[]) => Bun.spawnSync(['git', '-C', root, ...args], { stdout: 'pipe', stderr: 'pipe' });
+  const gitPath = (root: string, name: string) => gitIn(root)('rev-parse', '--path-format=absolute', '--git-path', name).stdout.toString().trim();
+
+  test('a commit held off by an index lock lands before the sync runs, and the race leaves no violation', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const sync = schedule.ops.find(d => d.id === 'sy1')!;
+      const root = world.roots![sync.source]; const lock = gitPath(root, 'index.lock');
+      world.onSubmit = d => { if (d.id === 'sy1') { writeFileSync(lock, ''); setTimeout(() => rmSync(lock, { force: true }), 300); } };
+      const model = new ReferenceModel(world);
+      world.descriptors = new Map(schedule.ops.map(d => [d.id, d]));
+      await runSteps(world, model, schedule);
+      expect(model.violations).toEqual([]);
+      expect(world.observations.get('sy1')!.status).toBe('committed');
+      expect(gitIn(root)('show', 'HEAD:./notes/alpha.md').stdout.toString()).toContain('Marker: mk-sy1');
+    });
+  }, 120_000);
+
+  test('a commit that cannot land fails the run; the sync is never reported committed', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const sync = schedule.ops.find(d => d.id === 'sy1')!;
+      const root = world.roots![sync.source]; const hook = join(gitPath(root, 'hooks'), 'pre-commit');
+      writeFileSync(hook, '#!/bin/sh\necho "pre-commit refused" >&2\nexit 1\n'); chmodSync(hook, 0o755);
+      await expect(executeOp(world, sync)).rejects.toThrow(/sy1: the user's commit of notes\/alpha did not land \(git commit exit 1\): pre-commit refused/);
+      expect(world.observations.has('sy1')).toBe(false);
+    });
+  }, 120_000);
+
+  test('a committed sync whose marker the page lacks is still a lost write', async () => {
+    await robotBrain(async ({ world }) => {
+      const schedule = raceOps(); const [put, sync] = schedule.ops;
+      const model = new ReferenceModel(world);
+      world.descriptors = new Map(schedule.ops.map(d => [d.id, d]));
+      await runSteps(world, model, { ...schedule, ops: [put], groups: [] });
+      const claimed: OpObservation = { id: sync.id, kind: sync.kind, actor: sync.actor, source: sync.source, requestId: sync.requestId, status: 'committed', values: {}, raw: { status: 'synced' } };
+      model.beginStep(true);
+      await model.observe(sync, claimed);
+      await model.settleGroup([sync], [claimed]);
+      expect(model.violations.map(v => [v.class, v.detail])).toEqual([['lost_write', 'no committed whole-page write of the group is visible in robot-0/notes/alpha']]);
     });
   }, 120_000);
 });
@@ -542,7 +593,7 @@ await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never })
     expect(robot.runs[0]).toMatchObject({ crashed: false, fault_not_reached: true });
     expect({ crashed: robot.crashed_runs, unreached: robot.faults_not_reached.length, failing: robot.failing_runs.length })
       .toEqual({ crashed: 0, unreached: 1, failing: 1 });
-    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(false);
+    expect(robotFullGate(robot, 'full')).toBe(false);
     expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_not_reached');
   });
 
@@ -552,7 +603,7 @@ await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never })
     expect(spawned).toEqual([{ role: 'run', killed: true }]);
     expect(robot.fault_hook_errors.map(r => r.hook_error)).toEqual(['JSON.stringify cannot serialize BigInt.']);
     expect(robot.failing_runs).toHaveLength(1);
-    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(false);
+    expect(robotFullGate(robot, 'full')).toBe(false);
     expect(robotFailure(robot.failing_runs, { engine: 'pglite' })).toContain('fault_hook_error: JSON.stringify cannot serialize BigInt.');
   });
 
@@ -561,7 +612,7 @@ await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never })
     const robot = await phase(spawn, { point: 'effect:git:mid', nth: 1 });
     expect(spawned).toEqual([{ role: 'run', killed: true }, { role: 'recover', killed: false }]);
     expect({ crashed: robot.crashed_runs, failing: robot.failing_runs.length }).toEqual({ crashed: 1, failing: 0 });
-    expect(robotFullGate(robot, FULL_ROBOT_SECONDS)).toBe(true);
+    expect(robotFullGate(robot, 'full')).toBe(true);
   });
 
   test('validation exits nonzero when a replayed fault is never reached by a real worker', async () => {
@@ -576,4 +627,88 @@ await faultPoint('effect:git:mid', { requestId: 'r1', signal: cyclic as never })
       rmSync(JSON.parse(readFileSync(`${out}.retained.json`, 'utf8')).scratch_root, { recursive: true, force: true });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 180_000);
+});
+
+describe('every robot run covers a fixed schedule list (reuse of a passed run is sound)', () => {
+  const COUNTS = { 'consumer:claiming': 2, 'effect:git:mid': 1 };
+  const clean = { violations: [], deferred: [] };
+  async function plan(o: { engine?: 'pglite' | 'postgres'; seconds: number; scope?: 'pr' | 'full'; extraSeeds?: number[]; concurrency?: number; workerMs?: number }) {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-crash-robot-plan-'));
+    const calls: { schedule: string; role: string; point?: string; process?: string }[] = [];
+    let inFlight = 0; let widest = 0;
+    const spawn = ((path: string, _home: string, _mode: string, [role]: string[]) => {
+      const config = JSON.parse(readFileSync(path, 'utf8'));
+      calls.push({ schedule: config.schedule.label, role, ...(config.fault ? { point: config.fault.point } : {}), ...(config.process ? { process: config.process } : {}) });
+      if (role !== 'recover') widest = Math.max(widest, ++inFlight);
+      const events: Record<string, unknown> = role === 'count' ? { done: { result: { ...clean, counts: COUNTS } } }
+        : role === 'run' && config.fault ? { fault: config.fault } : { done: { result: clean } };
+      const event = async (name: string) => {
+        if (!(name in events)) return new Promise<never>(() => {});
+        await Bun.sleep(o.workerMs ?? 0);
+        if (name === 'done' && role !== 'recover' || name === 'fault') inFlight--;
+        return { event: name, ...(events[name] as object) };
+      };
+      return { child: { pid: 0 }, event, done: () => event('done'), failureDiagnostics: () => [], async kill() {} };
+    }) as unknown as typeof spawnWorker;
+    try {
+      const robot = await runRobotPhase({ engine: o.engine ?? 'pglite', seed: 0, seconds: o.seconds, scope: o.scope, extraSeeds: o.extraSeeds,
+        concurrency: o.concurrency, scratch, home: scratch, databases: [], spawn, track: () => {}, log: () => {} });
+      return { robot, calls, widest };
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  }
+  const randomLabels = (calls: { schedule: string; role: string }[]) => [...new Set(calls.filter(c => c.schedule.startsWith('random-')).map(c => c.schedule))];
+
+  test('the random sequences are ROBOT_RANDOM_SEEDS, each counted and crashed (and recovered) once, whatever the ceiling', async () => {
+    const short = await plan({ seconds: 1 });
+    const long = await plan({ seconds: 600 });
+    expect(randomLabels(short.calls)).toEqual(ROBOT_RANDOM_SEEDS.map(seed => `random-${seed}`));
+    expect(short.calls).toEqual(long.calls);
+    for (const label of randomLabels(short.calls)) expect(short.calls.filter(c => c.schedule === label).map(c => c.role)).toEqual(['count', 'run', 'recover']);
+  });
+
+  test('a full PGLite run crashes every seam of every sequence; a pr run and Postgres crash each seam once', async () => {
+    const fixed = crossBoundarySequences(ROBOT_TOPOLOGY, 0).map(s => s.label);
+    const fixedCrashes = (calls: { schedule: string; role: string; point?: string; process?: string }[]) => calls.filter(c => fixed.includes(c.schedule) && c.role === 'run' && c.point && !c.process);
+    expect(fixedCrashes((await plan({ seconds: 1 })).calls)).toHaveLength(fixed.length * Object.keys(COUNTS).length);
+    expect(fixedCrashes((await plan({ seconds: 1, scope: 'pr' })).calls)).toHaveLength(Object.keys(COUNTS).length);
+    expect(fixedCrashes((await plan({ engine: 'postgres', seconds: 1 })).calls)).toHaveLength(Object.keys(COUNTS).length);
+  });
+
+  test('Postgres random crashes avoid the lease-bound seams; a pr run skips them in the fixed sequences', async () => {
+    const full = await plan({ engine: 'postgres', seconds: 1 });
+    expect(full.calls.filter(c => c.schedule.startsWith('random-') && c.role === 'run').map(c => c.point)).toEqual(ROBOT_RANDOM_SEEDS.map(() => 'consumer:claiming'));
+    expect((full.robot as { lease_bound_seams_skipped?: string[] }).lease_bound_seams_skipped).toEqual([]);
+    expect(((await plan({ engine: 'postgres', seconds: 1, scope: 'pr' })).robot as { lease_bound_seams_skipped?: string[] }).lease_bound_seams_skipped).toEqual(['effect:git:mid']);
+  });
+
+  test('runs execute ROBOT_CONCURRENCY at a time and cover exactly the runs, faults and manifest order of one at a time (#8036)', async () => {
+    const key = (r: RobotRun) => JSON.stringify([r.schedule, r.seed, r.fault ?? null, r.process ?? null]);
+    for (const o of [{ engine: 'pglite' as const }, { engine: 'postgres' as const }, { engine: 'postgres' as const, scope: 'pr' as const }]) {
+      const serial = await plan({ ...o, seconds: 600, extraSeeds: explorationSeeds(20_000), concurrency: 1, workerMs: 1 });
+      const parallel = await plan({ ...o, seconds: 600, extraSeeds: explorationSeeds(20_000), workerMs: 1 });
+      expect({ serial: serial.widest, parallel: parallel.widest }).toEqual({ serial: 1, parallel: ROBOT_CONCURRENCY });
+      expect(parallel.robot.runs.map(key)).toEqual(serial.robot.runs.map(key));
+      expect([...parallel.calls].map(c => JSON.stringify(c)).sort()).toEqual([...serial.calls].map(c => JSON.stringify(c)).sort());
+    }
+  });
+
+  test('a run past its ceiling is over_budget, and validation fails it loudly', async () => {
+    expect((await plan({ seconds: 0.001 })).robot).toMatchObject({ over_budget: true });
+    expect((await plan({ seconds: 600 })).robot).toMatchObject({ over_budget: false });
+    expect(robotOverBudget(1_234_000, 960)).toMatch(/over its ceiling: ran 1234 s against --robot-seconds=960/);
+  });
+
+  test('each cell reports its elapsed time as a share of its ceiling for the job summary', () => {
+    expect(robotCeilingUse('pglite', 'full', 880_400, 1200)).toBe('Crash robot pglite (full): 880 s of its 1200 s ceiling (73%)\n');
+    expect(robotCeilingUse('postgres', 'pr', 1_900_000, 1800)).toBe('Crash robot postgres (pr): 1900 s of its 1800 s ceiling (106%)\n');
+  });
+
+  test('the nightly adds one rotation seed (each within four nights) and one never-run seed after the fixed list', async () => {
+    const days = [0, 1, 2, 3].map(d => explorationSeeds(20_000 + d));
+    expect(new Set(days.map(([rotation]) => rotation))).toEqual(new Set(ROBOT_ROTATION_SEEDS));
+    expect(new Set(days.map(([, fresh]) => fresh)).size).toBe(4);
+    for (const [, fresh] of days) expect(fresh).toBeGreaterThan(Math.max(...ROBOT_RANDOM_SEEDS, ...ROBOT_ROTATION_SEEDS));
+    const { calls } = await plan({ seconds: 1, extraSeeds: days[0] });
+    expect(randomLabels(calls)).toEqual([...ROBOT_RANDOM_SEEDS, ...days[0]!].map(seed => `random-${seed}`));
+  });
 });

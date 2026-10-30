@@ -33,7 +33,7 @@ import { fileContentHash } from './large-file.ts';
 import { readBlobBytes, readTreeBlobs } from './sync-blobs.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
-import { syncLockId } from '../db-lock.ts';
+import { fenceLockRow, syncLockId } from '../db-lock.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { findOpenPassWork } from './checkpoint-validation.ts';
 import { countsMatch, proveConfirm, type LevelMark } from './sync-pass-confirm.ts';
@@ -86,9 +86,10 @@ export function foldPassCheckpoint<T extends PreparedMutation>(prepared: T, inpu
 /**
  * The round after a folded writeback stamp, when HEAD left the stamp's target (durability on: the import's Git effect
  * committed meanwhile): whether `from..head` changes exactly the files of the stamp's writebacks (`converged.writeback`),
- * each to the bytes its import wrote (the Git effect's `expected_hash`), with every one of those effects committed. Then
- * the level at HEAD is the one the stamp proved plus the pass's own bytes, and the pass ends on its stamp; anything else
- * reads the level in full.
+ * each to the bytes its import wrote (the Git effect's `expected_hash`), with every one of those effects committed or
+ * still running (its commit lands before its row records it, so HEAD can show the commit first). Then the level at HEAD
+ * is the one the stamp proved plus the pass's own bytes, and the pass ends on its stamp; anything else reads the level
+ * in full.
  */
 export async function ownWritebackCommit(engine: Pick<BrainEngine, 'executeRaw'>, input: { gitRoot: string; localPath: string; from: string; writeIds: readonly string[] }): Promise<boolean> {
   if (!input.writeIds.length) return false;
@@ -98,7 +99,7 @@ export async function ownWritebackCommit(engine: Pick<BrainEngine, 'executeRaw'>
   if (!head || changed === null) return false;
   const effects = await engine.executeRaw<{ path: string | null; hash: string | null; state: string }>(`SELECT data->>'relative_path' AS path, data->>'expected_hash' AS hash, state
     FROM persistence_effects WHERE request_id = ANY($1::uuid[]) AND kind='git'`, [input.writeIds]);
-  if (!effects.length || effects.some(effect => effect.state !== 'committed' || !effect.path || !effect.hash)) return false;
+  if (!effects.length || effects.some(effect => !['committed', 'running'].includes(effect.state) || !effect.path || !effect.hash)) return false;
   const root = realpathSync(input.localPath);
   const want = new Map(effects.map(effect => [relative(input.gitRoot, join(root, effect.path!)).split(sep).join('/'), effect.hash!]));
   // `:<mode> <mode> <oid> <oid> <status>\0<path>\0` per changed path: each must be a file of `want`, now a blob.
@@ -140,7 +141,7 @@ async function provenStamp(tx: BrainEngine, { row, p, root }: { row: WriteReques
   const scope = { worktreeId: row.worktree_id!, sourceId: row.source_id, incarnation: row.source_incarnation };
   await faultPoint('sync:pass_fold', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id });
   const [lease, pass, blocker, watermark, sources, proof, refused] = await pipelined(tx, [
-    () => tx.executeRaw('SELECT 1 FROM gbrain_cycle_locks WHERE id=$1 AND acquisition_token=$2::uuid AND ttl_expires_at > now() FOR SHARE', [syncLockId(row.source_id), stamp.leaseToken]),
+    () => fenceLockRow(tx, syncLockId(row.source_id), stamp.leaseToken),
     () => readPassRow(tx, row.source_id, stamp.incarnation),
     () => findOpenPassWork(tx, row.worktree_id!, row.request_id, !!writeback),
     () => readConvergedWatermark(tx, scope, row.request_id, OPEN_AT_STAMP_CAP, writeback ? { own: writeback } : undefined),

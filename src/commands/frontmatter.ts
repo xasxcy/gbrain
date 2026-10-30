@@ -36,7 +36,7 @@ import {
   autoFixFrontmatter,
   repairRecoverableFrontmatter,
   createFrontmatterBackup,
-  isFrontmatterScannablePath,
+  frontmatterScannableUnder,
   makeFrontmatterBackupRunId,
   scanBrainSources,
   type AuditReport,
@@ -244,7 +244,7 @@ function checkContent(content: string, slugPath: string | undefined, importable:
   const errors = (parsed.errors ?? []).map(e => ({ code: e.code, message: e.message, line: e.line, ...(e.recoverable ? { recoverable: true } : {}) }));
   const warnings = (parsed.warnings ?? []).map(w => ({ code: w.code, message: w.message, key: w.key, line: w.line,
     ...(w.original !== undefined ? { original: w.original } : {}), ...(w.replacement !== undefined ? { replacement: w.replacement } : {}) }));
-  const screen = importable ? screenImportContent({ content, path: slugPath ?? 'stdin.md', expectedSlug }) : null;
+  const screen = importable ? screenImportContent({ content, path: slugPath ?? 'stdin.md', expectedSlug, holdNoncanonicalPrivate: true }) : null;
   const hold = screen?.status === 'refused' ? screen.refusal : null;
   return {
     errors, warnings, hold,
@@ -609,7 +609,8 @@ export function collectFiles(
     return isMarkdownFilePath(basename(target)) ? [target] : [];
   }
 
-  const gitFiles = collectGitVisibleFiles(target, isFrontmatterScannablePath);
+  const scannable = frontmatterScannableUnder(target);
+  const gitFiles = collectGitVisibleFiles(target, scannable);
   if (gitFiles) {
     if (visitDir) visitDir(target);
     return gitFiles;
@@ -643,7 +644,7 @@ export function collectFiles(
         stack.push(full);
       } else if (entryStat.isFile()) {
         const rel = relative(target, full);
-        if (isFrontmatterScannablePath(rel)) {
+        if (scannable(rel)) {
           out.push(full);
         }
       }
@@ -766,6 +767,7 @@ async function runGenerate(args: string[]): Promise<void> {
   }
 
   const results: GenerateResult[] = [];
+  const scannable = frontmatterScannableUnder(brainRoot);
   let scanned = 0;
   let skipped = 0;
   let skippedCatchAll = 0;
@@ -775,7 +777,7 @@ async function runGenerate(args: string[]): Promise<void> {
 
   function processFile(absPath: string, relPath: string) {
     scanned++;
-    if (!isFrontmatterScannablePath(relPath)) return;
+    if (!scannable(relPath)) return;
 
     // Skip symlinks
     try { if (lstatSync(absPath).isSymbolicLink()) return; } catch { return; }

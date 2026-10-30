@@ -21,8 +21,7 @@ import {
   resolveSelfUpgradeMode,
   justUpgradedPath,
 } from '../core/self-upgrade.ts';
-import { stashConfigEnv } from '../core/config-env-stash.ts';
-import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, isThinClient, getDbUrlSource, envShadowDetected } from '../core/config.ts';
+import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, isThinClient, getDbUrlSource, envShadowDetected, MERGED_CONFIG_BY_ENGINE } from '../core/config.ts';
 import {
   classifyPgAccessError as classifyDbAccessError,
   diagnoseDbConfig as diagnoseDbConfigForMarker,
@@ -35,36 +34,38 @@ import type { AIGatewayConfig } from '../core/ai/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { OperationError, type OperationMeta } from '../core/ops/contract.ts';
 import { OPERATION_MANIFEST, cliOps } from './op-manifest.ts';
-import { loadOperation } from '../core/operation-load.ts';
+import { openRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { resolveSourceIdEngineFree } from '../core/source-resolver.ts';
 import { installCliRoutingFor } from './fix-routing-provider.ts';
-import { formatVolunteeredPage } from '../core/context/volunteer.ts';
 import type { Operation, OperationContext } from '../core/operations.ts';
 import { currentCliWriteWait } from '../core/persistence/write-wait.ts';
 import { isScopeErrorCode } from '../core/error-catalogue.ts';
 import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { printCuratedHelp } from './help/render.ts';
+import { OWN_EQUALS_PARSERS, READER_ALIASES, findUnknownFlag, splitFlagEquals } from './flag-equals.ts';
 import { printHelp } from './top-help.ts';
 import { curatedFlagError } from './help/validate.ts';
 import { cliCommandOf, exitCliError, exitOnRepairFailed, unknownFlagError, usageError, writeCliError, writeCliNotice, writeFatalCliError } from './cli-error.ts';
 import type { Notice } from '../core/agent-output.ts';
 import { opError, opOwnsSource } from '../core/ops/contract.ts';
 import { PAGE_MAX_BYTES } from '../core/page-size-policy.ts';
-import { opParamValue } from './op-param-values.ts';
-import { SEGMENTED_STREAMED, formatGetPage, printPagedPage, remoteErrorCode, streamSegmentedGet, wantsWholePage } from './page-render.ts';
+import { opFlagValue, opParamValue, opStructuredValue } from './op-param-values.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from '../core/cli-options.ts';
 import { runCliPreflight } from '../core/cli-preflight.ts';
 import { isBooleanLiteral, isKnownOpFlag } from '../core/op-flag-tokens.ts';
 import { conceptNudge } from '../core/search/query-intent.ts';
 import { redactRetrievalOutput } from '../core/search/output-redaction.ts';
+import { pageCapLine } from '../core/search/remote-page-cap.ts';
+import { formatSearchExact } from './search-exact-format.ts';
+import { routeCommand } from './command-route.ts';
 import type { CliOptions } from '../core/cli-options.ts';
 import { RemoteMcpError, extractResponseMeta } from '../core/remote-mcp-error.ts';
 import { assertSingleSourceScopeFlag, checkHostHonoredParams, hintAmbientNarrowing, type AmbientSourceBinding } from './source-scope.ts';
 import { maybePromptForUpgrade } from '../core/thin-client-upgrade-prompt.ts';
 import { CLI_FLAG_REGISTRY } from '../core/cli-flag-registry.generated.ts';
-import { cliHelpRequested } from './subcommands.ts';
+import { SEARCH_SUBCOMMANDS, cliHelpRequested } from './subcommands.ts';
 import { printRouterHelp } from './router-help.ts';
-import { strictArgsRefusal } from './strict-args.ts';
+import { strictArgsRefusal, strictSpecFor } from './strict-args.ts';
 import { migrationCliArgumentError } from '../core/embedding-migration-cli.ts';
 import { VERSION } from '../version.ts';
 import { bigintToStringReplacer } from '../core/utils.ts';
@@ -77,7 +78,10 @@ import {
   type CliDispatchContext,
 } from './command-table.ts';
 import { formatRememberResult } from './remember-format.ts';
-import { applyCliOpNotices, captureCapacityNotices, captureOpNotice } from './op-notices.ts';
+import { formatEntityResult, markEntityMiss } from './entity-format.ts';
+import { applyCliOpNotices, captureCapacityNotices, captureOpNotice, captureRetrievalNotices, retrievalIncompleteLine } from './op-notices.ts';
+import { admitAcrossCliCalls } from '../core/notice-ledger.ts';
+import { searchTimingsDocument, searchTimingsLine, timeCliPhase } from './search-timings.ts';
 
 // db-availability loop: best-effort brain-id for the GBRAIN_DB_ACCESS marker,
 // so a MOUNT's DB failure reads as `brain=<id>` instead of masquerading as a
@@ -251,20 +255,15 @@ function maybeEmitUpdateMarker(command: string): void {
       if (latest) {
         // notify mode honors a per-version snooze; auto mode ignores it.
         if (mode === 'notify' && isSnoozeActive(readSnooze(), latest, now)) return;
-        // The raw `UPGRADE_AVAILABLE <cur> <latest>` line is a MACHINE marker
-        // (parsed by the self-upgrade skill / MCP via parseMarker). A human at
-        // an interactive terminal should never see the token as the literal
-        // first line of output — so emit it only when stderr is NOT a TTY
-        // (agent harnesses capture stderr non-interactively and still get it).
-        // GBRAIN_FORCE_UPGRADE_MARKER=1 forces it for the rarer agent harness
-        // that allocates a PTY yet still parses the token. The human sentence
-        // prints on both.
-        if (!process.stderr.isTTY || process.env.GBRAIN_FORCE_UPGRADE_MARKER === '1') {
-          process.stderr.write(`UPGRADE_AVAILABLE ${VERSION} ${latest}\n`);
-        }
-        process.stderr.write(
-          `gbrain ${VERSION} -> ${latest} available. Run: gbrain self-upgrade\n`,
-        );
+        // One line, once per COVERAGE_NOTICE_WINDOW_MS across calls under
+        // GBRAIN_HOME (a newer latest prints at once, #7147). An agent harness
+        // (stderr not a TTY, or GBRAIN_FORCE_UPGRADE_MARKER=1 under a PTY) gets
+        // the raw `UPGRADE_AVAILABLE <cur> <latest>` MACHINE marker the
+        // self-upgrade skill parses; a human at a terminal gets the sentence.
+        if (!admitAcrossCliCalls(`upgrade_available|${VERSION}|${latest}`, 1)) return;
+        process.stderr.write(!process.stderr.isTTY || process.env.GBRAIN_FORCE_UPGRADE_MARKER === '1'
+          ? `UPGRADE_AVAILABLE ${VERSION} ${latest}\n`
+          : `gbrain ${VERSION} -> ${latest} available. Run: gbrain self-upgrade\n`);
       }
       return;
     }
@@ -358,13 +357,19 @@ async function main() {
     if (command !== 'hook') (await import('../core/ai/key-warnings.ts')).warnShadowedProviderKeys();
   }
 
-  const subArgs = args.slice(1);
-
   // DX alias: `ask` is a natural-language alias for `query`
   if (command === 'ask') {
     command = 'query';
   }
+  // #7191: `search --exact` -> search-exact, before any ranked-search flag is parsed (cli/command-route.ts).
+  const routed = routeCommand(command, args.slice(1));
+  command = routed.command;
+  let subArgs = routed.subArgs;
   dispatchedCommand = command;
+  {
+    const { directPoolProfileForCommand, setDirectPoolProfile } = await import('../core/direct-pool-profile.ts');
+    setDirectPoolProfile(directPoolProfileForCommand(command, subArgs));
+  }
 
   // Local patch 2026-06-11 — mark one-shot CLI processes so the facts
   // backstop routes absorb work to the durable jobs worker instead of the
@@ -395,6 +400,12 @@ async function main() {
       printCliOnlyHelp(command);
       return;
     }
+  }
+  // #7619: after the help printers that run no handler, so a handler never sees an = token the gate refuses.
+  const flagArgs = await cliOnlyFlagArgs(command, subArgs);
+  if ('refusal' in flagArgs) exitCliError(flagArgs.refusal, command);
+  subArgs = flagArgs.args;
+  if (helpRequested) {
     // Self-help members whose handler answers --help before it touches the
     // engine. Without this they fall through to the normal dispatch, which
     // connects first — so `gbrain models --help` on a machine with no brain
@@ -507,9 +518,10 @@ async function main() {
     return;
   }
 
+  if (['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)) return; // warm serve socket (opt-in)
   // CLI-only commands
   if (CLI_ONLY.has(command)) {
-    await handleCliOnly(command, subArgs);
+    const endRead = (await import('./slow-read.ts')).beginCommandRead(command, subArgs); try { await handleCliOnly(command, subArgs); } finally { endRead(); }
     return;
   }
 
@@ -523,9 +535,11 @@ async function main() {
  * Split out of main() (refactor wave 1, W4 cli); order and exits unchanged.
  */
 async function runSharedOperation(command: string, subArgs: string[], cliOpts: CliOptions): Promise<void> {
+  (await import('../core/persistence/claim-phase.ts')).markOneShotCommand();
   // Shared operations (fall through to aliases, e.g. link-add -> add_link)
   const meta = cliOps.get(command) ?? cliAliases.get(command);
   if (!meta) exitCliError(usageError(`Unknown command: ${command}`, 'Run `gbrain --help` for available commands.', { code: 'unknown_command' }), command);
+  const { loadOperation } = await import('../core/operation-load.ts');
   const op = (await loadOperation(meta.name))!;
 
   // v0.31.1 (Issue #734, CDX-1): parse CLI args BEFORE engine connect so
@@ -620,7 +634,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
   }
 
   // No live serve owns the selected brain; connect through the normal lock path.
-  const engine = await connectEngine({ oneShotRead: op.scope === 'read' });
+  const engine = await timeCliPhase('connect', () => connectEngine({ oneShotRead: op.scope === 'read' }));
   // #2084: the teardown contract (bounded drain of every background-work sink,
   // bounded disconnect, computed-deadline backstop) lives in finishCliTeardown
   // — see src/core/cli-force-exit.ts for the full design. The hard-deadline
@@ -641,9 +655,11 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
   // timeout the abandoned handler may hold ref'd sockets — harmless here,
   // because the import.meta.main seam exits explicitly on every one-shot path.
   const READ_OP_TIMEOUT_MS = 180_000;
+  const configSnapshot = op.scope === 'read' ? takeStartupConfigSnapshot(engine) ?? openRequestConfigSnapshot(engine) : null;
 
   try {
     const { withTimeout, OperationTimeoutError } = await import('../core/timeout.ts');
+    const { withRequestIdentityMemo } = await import('../core/persistence/identity.ts');
     const wallclockMs = getCliOptions().timeoutMs ?? READ_OP_TIMEOUT_MS;
     const onWallclockTimeout = (e: InstanceType<typeof OperationTimeoutError>) => {
       const hint = getCliOptions().timeoutMs
@@ -662,7 +678,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     let ctx: Awaited<ReturnType<typeof makeContext>>;
     try {
       ctx = await withTimeout(
-        makeContext(engine, params, op),
+        timeCliPhase('context', () => (configSnapshot ? configSnapshot.run(() => makeContext(engine, params, op)) : makeContext(engine, params, op))),
         wallclockMs,
         `gbrain ${command}: context`,
       );
@@ -678,8 +694,10 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     if (op.scope === 'read') {
       try {
         rawResult = await withTimeout(
-          op.handler(ctx, params).catch(async (e: unknown) => { // large pages: a segmented page streams to stdout
-            if (op.name === 'get_page' && await streamSegmentedGet(engine, params, e, writeStdoutFinal)) return SEGMENTED_STREAMED;
+          configSnapshot!.run(() => withRequestIdentityMemo(() => op.handler(ctx, params))).catch(async (e: unknown) => { // large pages: a segmented page streams to stdout
+            if (op.name !== 'get_page') throw e;
+            const { streamSegmentedGet, SEGMENTED_STREAMED } = await import('./page-render.ts');
+            if (await streamSegmentedGet(engine, params, e, writeStdoutFinal)) return SEGMENTED_STREAMED;
             throw e;
           }),
           wallclockMs,
@@ -693,10 +711,11 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
         throw e;
       }
     } else {
-      rawResult = await op.handler(ctx, params);
+      rawResult = await withRequestIdentityMemo(() => op.handler(ctx, params));
       if (op.mutating) await captureCapacityNotices(engine); // #6696 (A4)
     }
-    if (rawResult === SEGMENTED_STREAMED) return;
+    if (op.name === 'get_page' && rawResult === (await import('./page-render.ts')).SEGMENTED_STREAMED) return;
+    captureRetrievalNotices(op.name, rawResult, lastRetrievalMeta, params, ctx.config);
     // ENG-2 (renderer parity by data shape): JSON-round-trip the local-engine
     // path's return value so renderers see the same shape they'd see on the
     // routed path. Date → ISO string; bigint → string (postgres.js shape);
@@ -724,6 +743,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
       );
       setCliExitVerdict(1);
     }
+    markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     // v0.42.20.0 (codex D4): on error, set exitCode + return so the `finally`
@@ -742,6 +762,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     // 1s per-sink drain budget: read paths with no pending work pay the ~0ms
     // fast path; capture/import that DO enqueue pay up to 1s (+ facts shutdown
     // grace) while in-flight Haiku finishes (#1762 drain-before-disconnect).
+    configSnapshot?.close();
     await finishCliTeardown({ engine, drainTimeoutMs: 1000 });
   }
 }
@@ -797,15 +818,17 @@ async function runThinClientRouted(
 
   try {
     const { callRemoteTool, unpackToolResult } = await import('../core/mcp-client.ts');
-    const raw = await callRemoteTool(cfg, op.name, params, {
+    const raw = await timeCliPhase('remote', () => callRemoteTool(cfg, op.name, params, {
       timeoutMs,
       signal: sigintController.signal,
       ...(op.mutating ? { writeWaitMs: currentCliWriteWait().waitMs } : {}),
     }).catch(async (e: unknown) => { // large pages: a page too big for one response is paged to its end, verified, then printed
-      if (op.name !== 'get_page' || remoteErrorCode(e) !== 'page_too_large_for_inline' || !wantsWholePage(params)) throw e;
+      if (op.name !== 'get_page') throw e;
+      const { printPagedPage, remoteErrorCode, wantsWholePage } = await import('./page-render.ts');
+      if (remoteErrorCode(e) !== 'page_too_large_for_inline' || !wantsWholePage(params)) throw e;
       await printPagedPage(async p => unpackToolResult(await callRemoteTool(cfg, 'get_page', p, { timeoutMs, signal: sigintController.signal })), params, writeStdoutFinal);
       return null;
-    });
+    }));
     if (raw === null) return;
     // T15/FOV-1: lift the server's retrieval meta off the envelope before
     // unpacking (old servers lack _meta — capture is simply skipped).
@@ -819,6 +842,7 @@ async function runThinClientRouted(
     const output = formatResult(op.name, result, params);
     // Awaited delivery (#3423) — same contract as the local-engine path.
     if (output) await writeStdoutFinal(output);
+    markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
     if (e instanceof RemoteMcpError) {
@@ -1036,9 +1060,9 @@ export function resolveQueryImage(
   return { path: imagePath, base64, mime };
 }
 
-export function parseOpArgs(op: Operation, args: string[]): Record<string, unknown> {
+export function parseOpArgs(op: OperationMeta, args: string[]): Record<string, unknown> {
   // `gbrain search --explain`: the CLI-local formatter flag also asks the op for score attribution.
-  const params: Record<string, unknown> = op.name === 'search' && args.includes('--explain') ? { explain: true } : {};
+  const params: Record<string, unknown> = (op.name === 'search' || op.name === 'query') && (getCliOptions().explain || args.includes('--explain')) ? { explain: true } : {};
   const positional = op.cliHints?.positional || [];
   let posIdx = 0;
 
@@ -1064,7 +1088,7 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
         const def = op.params[key];
         if (def) {
           const raw = arg.slice(eq + 1);
-          params[key] = def.type === 'boolean' ? raw !== 'false' : opParamValue(op, key, def, raw);
+          params[key] = def.type === 'boolean' ? raw !== 'false' : opFlagValue(op, key, def, raw, params[key]);
           continue;
         }
       }
@@ -1111,8 +1135,8 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
         // positionally, then --content clobbered it). Warn to stderr; when
         // the discarded value names an existing file, point at capture --file.
         const prevValue = params[key];
-        params[key] = opParamValue(op, key, paramDef, args[++i]);
-        if (prevValue !== undefined && prevValue !== params[key]) {
+        params[key] = opFlagValue(op, key, paramDef, args[++i], prevValue);
+        if (prevValue !== undefined && prevValue !== params[key] && !paramDef?.cliKeyValue) {
           let fileHint = '';
           try {
             if (typeof prevValue === 'string' && prevValue && existsSync(prevValue)) {
@@ -1132,12 +1156,7 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
   }
 
   for (const [key, def] of Object.entries(op.params)) {
-    if ((def.type !== 'object' && def.type !== 'array') || typeof params[key] !== 'string') continue;
-    let value: unknown;
-    const jsonError = () => usageError(`--${key.replace(/_/g, '-')} requires a JSON ${def.type}.`, `Pass JSON, e.g. --${key.replace(/_/g, '-')} '${def.type === 'array' ? '["a","b"]' : '{"key":"value"}'}'.`);
-    try { value = JSON.parse(params[key] as string); } catch { throw jsonError(); }
-    if (def.type === 'array' ? !Array.isArray(value) : value === null || typeof value !== 'object' || Array.isArray(value)) throw jsonError();
-    params[key] = value;
+    if (params[key] !== undefined) params[key] = opStructuredValue(key, def, params[key]);
   }
   return params;
 }
@@ -1310,25 +1329,19 @@ export function validateCommandFlags(command: string, subArgs: string[]): string
   return null; // unknown command — the dispatcher's own error handles it
 }
 
-/** CLI_ONLY lane: token scan against the generated legal set. */
-export function findUnknownFlag(args: string[], legal: ReadonlySet<string>): string | null {
-  for (const a of args) {
-    if (a === '--') break;
-    const m = /^--([a-z0-9][a-z0-9-]*)(?:=.*)?$/i.exec(a);
-    if (!m) continue;
-    // Casing typo = unknown flag: every handler in the repo is
-    // case-sensitive-lowercase, so `--MIGRATE-ONLY` passing validation would
-    // just be silently ignored downstream — the exact class this validator
-    // exists to kill.
-    if (/[A-Z]/.test(m[1])) return `--${m[1]}`;
-    const name = `--${m[1]}`;
-    if (legal.has(name)) continue;
-    // --no-<flag> negation of a known flag is legal.
-    if (name.startsWith('--no-') && legal.has(`--${name.slice(5)}`)) continue;
-    return name;
-  }
-  return null;
+/** #7619: the argv a CLI_ONLY handler receives, `--flag=value` split or refused (cli/flag-equals.ts); commands with their own `=`-aware parser keep it. */
+export async function cliOnlyFlagArgs(command: string, subArgs: string[]): Promise<{ args: string[] } | { refusal: OperationError }> {
+  const handParsedSearch = command === 'search' && (SEARCH_SUBCOMMANDS as readonly string[]).includes(subArgs[0] ?? ''), keyed = READER_ALIASES[command] ?? command;
+  if (!CLI_ONLY.has(command) && !handParsedSearch || equalsExempt(command, subArgs) || strictSpecFor(command, subArgs) || OWN_EQUALS_PARSERS.has(keyed) || OWN_EQUALS_PARSERS.has(`${keyed} ${subArgs[0]}`)) return { args: subArgs };
+  return splitFlagEquals(command, subArgs);
 }
+
+/** call and config set take arbitrary values, and eval brainbench refuses unknown tokens with its own exit code; every other validation-exempt path (jobs submit, config get and unset) reads exact tokens, apart from the consent values EQUALS_READERS keeps for jobs submit. */
+function equalsExempt(command: string, subArgs: string[]): boolean {
+  return command === 'call' || command === 'config' && subArgs[0] === 'set' || command === 'eval' && subArgs[0] === 'brainbench';
+}
+
+export { findUnknownFlag };
 
 /** Op lane: mirrors parseOpArgs so flag VALUES starting with '--' are skipped. */
 export function findUnknownOpFlag(op: OperationMeta, args: string[]): string | null {
@@ -1382,16 +1395,6 @@ export function findUnknownOpFlag(op: OperationMeta, args: string[]): string | n
   return null;
 }
 
-/**
- * #1475 — the DB-plane merge `connectEngine` performs after connect, published
- * for `makeContext` so the operation context carries it too.
- *
- * Why a map rather than a module-level variable: a process can hold more than
- * one engine (`--brain <mount>` connects a second one), and the host brain's
- * merged config must never be served for a mounted brain's context. Weak so a
- * disconnected engine does not pin its config for the life of the process.
- */
-const MERGED_CONFIG_BY_ENGINE = new WeakMap<BrainEngine, GBrainConfig>();
 const SELECTED_CONFIG_BY_ENGINE = new WeakMap<BrainEngine, GBrainConfig>();
 
 /**
@@ -1455,10 +1458,14 @@ export async function makeContext(engine: BrainEngine, params: Record<string, un
   const explicit = op && opOwnsSource(op) ? null : (params.source as string | undefined) ?? null;
   const { resolveSourceWithTier, localFederatedSourceIds, SourceTargetError } = await import('../core/source-resolver.ts');
   try {
-    const resolved = await resolveSourceWithTier(engine, explicit);
-    sourceId = resolved.source_id;
-    sourceImplicit = resolved.tier !== 'flag' && resolved.tier !== 'env' && resolved.tier !== 'dotfile';
-    localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    // GBRA-156: the source resolution reads config through the table the connect-time merge already read.
+    const { commandStartupConfig, withRequestConfigSnapshot } = await import('../core/config-snapshot.ts');
+    await withRequestConfigSnapshot(engine, async () => {
+      const resolved = await resolveSourceWithTier(engine, explicit);
+      sourceId = resolved.source_id;
+      sourceImplicit = resolved.tier !== 'flag' && resolved.tier !== 'env' && resolved.tier !== 'dotfile';
+      localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    }, commandStartupConfig(engine));
   } catch (err) {
     // #1712: an EXPLICIT --source that fails to resolve (invalid id, or a
     // source that doesn't exist) must error loudly — the blanket swallow
@@ -1637,9 +1644,11 @@ export function formatResult(
       }
       const pages = (r?.pages ?? []) as any[];
       if (!pages.length) return 'Nothing volunteered (no entity cleared the confidence gate).\n';
+      const { formatVolunteeredPage } = require('../core/context/volunteer.ts');
       return pages.map((p) => formatVolunteeredPage(p)).join('\n') + '\n';
     }
-    case 'get_page': return formatGetPage(result as Record<string, any>);
+    case 'get_page': return require('./page-render.ts').formatGetPage(result as Record<string, any>);
+    case 'search_exact': return formatSearchExact(result as Parameters<typeof formatSearchExact>[0]);
     case 'list_pages': {
       const pages = result as any[];
       if (pages.length === 0) return 'No pages found.\n';
@@ -1654,25 +1663,22 @@ export function formatResult(
     case 'search':
     case 'query': {
       const { results, meta } = redactRetrievalOutput(result as any[], lastRetrievalMeta);
-      const incompleteStages = Array.isArray(meta?.degraded)
-        ? [...new Set((meta.degraded as Array<{ stage?: string }>).map(d => d.stage)
-          .filter(stage => stage === 'vector_candidates_incomplete' || stage === 'projection_pending' || stage === 'projection_status_unknown'))]
-        : [];
-      const incompleteNotice = incompleteStages.length > 0
-        ? `Retrieval incomplete: ${incompleteStages.join(', ')}.\n`
-        : '';
       const answerId = typeof meta?.answer_id === 'string' ? meta.answer_id : undefined;
       if (answerId && results.length > 0) process.stderr.write(`answer: ${answerId} (rate with: gbrain rate ${answerId} 1-5)\n`);
+      const capLine = pageCapLine(meta, '--limit');
+      if (capLine) process.stderr.write(capLine + '\n');
       if (params.json === true) {
+        const incompleteNotice = retrievalIncompleteLine(meta);
         if (incompleteNotice) process.stderr.write(incompleteNotice);
         // --explain --json: the same per-row score_details object MCP `explain: true` returns.
         if (getCliOptions().explain) for (const r of results) r.score_details ??= require('../core/search/explain-formatter.ts').buildScoreDetails(r);
-        return JSON.stringify(answerId ? results.map(r => ({ ...r, answer_id: answerId })) : results, null, 2) + '\n';
+        return JSON.stringify(searchTimingsDocument(answerId ? results.map(r => ({ ...r, answer_id: answerId })) : results, meta), null, 2) + '\n';
       }
       // T15/FOV-1: an empty result names its cause when the pipeline told us
       // (degradation stages from _meta.retrieval / the local meta capture) —
       // a bare "No results." was indistinguishable from a degraded pipeline.
       const cliOpts = getCliOptions();
+      process.stderr.write(searchTimingsLine(meta));
       const timingsLine = cliOpts.explain && meta?.timings ? require('../core/search/stage-timings.ts').formatTimingsSummary(meta.timings) + '\n' : '';
       if (results.length === 0) return `No results.${describeEmptyRetrieval()}\n` + timingsLine;
       // v0.40.4 — --explain switches to per-stage attribution formatter.
@@ -1684,8 +1690,8 @@ export function formatResult(
         // (autocut decision, `degraded: reranker_skipped (no_key)`) render.
         return formatResultsExplain(results, meta ?? undefined);
       }
-      return incompleteNotice + results.map(r =>
-        `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
+      return retrievalIncompleteLine(meta) + results.map(r =>
+        `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${require('../core/search/transcript-quote.ts').rowPreview(r, 100)}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
     }
     case 'get_tags': {
@@ -1782,38 +1788,7 @@ export function formatResult(
     }
     case 'entity': {
       if (process.argv.includes('--json')) break;
-      const r = result as any;
-      if (!r.found) {
-        const lines = [`No entity found. (${r.latency_ms}ms)${r.coverage && r.coverage.state !== 'complete' ? ` Mention coverage: ${r.coverage.state}, ${r.coverage.pending_pages} page(s) pending.` : ''}`];
-        if (Array.isArray(r.suggestions) && r.suggestions.length) {
-          lines.push('Did you mean:');
-          for (const s of r.suggestions) lines.push(`  ${s.slug} — ${s.title} [${s.create_safety}]`);
-        }
-        return lines.join('\n') + '\n';
-      }
-      const c = r.card;
-      const lines = [`${c.entity.title} (${c.entity.slug})${c.entity.type ? ` [${c.entity.type}]` : ''}  (${r.latency_ms}ms)`];
-      if (c.summary) lines.push(`  ${c.summary}`);
-      if (c.aka?.length) lines.push(`  aka: ${c.aka.join(', ')}`);
-      const lt = c.last_touched || {};
-      const touched = lt.updated_at || lt.last_retrieved_at || lt.last_timeline_date;
-      if (touched) lines.push(`  last touched: ${String(touched).slice(0, 10)}`);
-      if (c.open_threads?.length) {
-        lines.push('  open threads:');
-        for (const t of c.open_threads) lines.push(`    [${t.kind}] ${t.text}${t.date ? ` (${String(t.date).slice(0, 10)})` : ''}`);
-      }
-      if (c.edges?.length) {
-        lines.push('  edges:');
-        for (const e of c.edges) lines.push(`    ${e.direction === 'out' ? '→' : '←'} ${e.type} ${e.slug}`);
-      }
-      lines.push(`  backlinks: ${c.backlink_count} | active facts: ${c.active_fact_count}`);
-      if (c.referenced_by_count) lines.push(`  referenced by ${c.referenced_by_count} page(s):`, ...c.referenced_by.map((g: any) => `    ${g.canonical_type} (${g.total}): ${g.rows.map((x: any) => x.slug).join(', ')}${g.next ? ', ...' : ''}`));
-      if (c.coverage && c.coverage.state !== 'complete') lines.push(`  mention coverage: ${c.coverage.state}, ${c.coverage.pending_pages} page(s) pending`);
-      if (Array.isArray(r.suggestions) && r.suggestions.length) {
-        lines.push('  other matches:');
-        for (const s of r.suggestions) lines.push(`    ${s.slug} — ${s.title}`);
-      }
-      return lines.join('\n') + '\n';
+      return formatEntityResult(result);
     }
     case 'synthesize': {
       if (process.argv.includes('--json')) break;
@@ -1992,9 +1967,11 @@ async function handleCliOnly(command: string, args: string[]) {
   if (!prepared) return;
   const engine = await connectCliOnlyEngine(command, prepared.args);
   if (!engine) return;
+  const configSnapshot = takeStartupConfigSnapshot(engine);
   try {
-    await dispatchConnectedCommand(command, engine, prepared.args);
+    await (configSnapshot ? configSnapshot.run(() => dispatchConnectedCommand(command, engine, prepared.args)) : dispatchConnectedCommand(command, engine, prepared.args));
   } finally {
+    configSnapshot?.close();
     prepared.syncWatchdog?.dispose(); // #1633: tear down the hard-deadline watchdog on clean exit
     // #2084 — the CLI_ONLY fall-through teardown (drain every background-work
     // sink, THEN disconnect, under a computed-deadline backstop) lives in
@@ -2402,8 +2379,9 @@ async function runReadOnlyTimeoutDispatch(command: string, args: string[]): Prom
       }
       throw e;
     }
+    const configSnapshot = takeStartupConfigSnapshot(engine);
     try {
-      await withTimeout(dispatchReadOnlyCommand(engine, command, args), readOnlyTimeoutMs, label);
+      await withTimeout(configSnapshot ? configSnapshot.run(() => dispatchReadOnlyCommand(engine, command, args)) : dispatchReadOnlyCommand(engine, command, args), readOnlyTimeoutMs, label);
     } catch (e) {
       if (e instanceof OperationTimeoutError) {
         const hint = userTimeoutMs ? '' : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
@@ -2414,6 +2392,7 @@ async function runReadOnlyTimeoutDispatch(command: string, args: string[]): Prom
       }
       throw e;
     } finally {
+      configSnapshot?.close();
       await finishCliTeardown({ engine });
     }
     return true;
@@ -2515,7 +2494,7 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
     const cfgJobs = loadConfig();
     if (isThinClient(cfgJobs)) {
       const jobsSub = args[0];
-      if (jobsSub === 'list' || jobsSub === 'get') {
+      if (jobsSub === 'list' || jobsSub === 'get' || jobsSub === 'wait') {
         const { runJobs } = await import('../commands/jobs.ts');
         await runJobs(null, args);
         return null;
@@ -2619,7 +2598,10 @@ async function connectCliOnlyEngine(command: string, args: string[]): Promise<Br
   }
   try {
     // A4: an observational command connects probe-only and completes startup only after consent.
-    engine = await connectEngine({ probeOnly: findCliCommand(command)?.startup === 'observational' || (command === 'jobs' && args[0] === 'supervisor' && args[1] === 'status') });
+    // A one-shot `recall` only reads the brain (its --since-last-run cursor is a file); --watch polls for minutes.
+    let oneShotRead = false;
+    if (command === 'recall') oneShotRead = !args.includes('--watch');
+    engine = await connectEngine({ probeOnly: findCliCommand(command)?.startup === 'observational' || (command === 'jobs' && args[0] === 'supervisor' && args[1] === 'status'), oneShotRead });
   } catch (serveConnectError) {
     if (command === 'jobs' && args[0] === 'child-readiness') {
       const { writeChildReadinessFailure } = await import('../core/minions/child-readiness.ts');
@@ -2686,8 +2668,8 @@ async function connectCliOnlyEngine(command: string, args: string[]): Promise<Br
           return connectEngine();
         },
       });
-      const { runServe } = await import('../commands/serve.ts');
-      await runServe(degraded, args);
+      (await import('../core/serve-log.ts')).installServeLogSink({ http: args.includes('--http') });
+      await (await import('../commands/serve.ts')).runServe(degraded, args);
       return null; // serve doesn't disconnect
     }
     throw serveConnectError;
@@ -2752,7 +2734,7 @@ async function dispatchReadOnlyCommand(engine: BrainEngine, command: string, arg
 // re-exported) so cli.ts's own connectEngine() call sites bind it locally.
 import { buildGatewayConfig } from '../core/ai/build-gateway-config.ts';
 export { buildGatewayConfig };
-import { connectEngineForServe, noBrainError, type EngineConnectHooks, type EngineConnectOptions } from '../core/engine-connect.ts';
+import { connectEngineForServe, noBrainError, takeStartupConfigSnapshot, type EngineConnectHooks, type EngineConnectOptions } from '../core/engine-connect.ts';
 
 /**
  * Which brain this process's engine targets. Set by connectEngine after brain
@@ -2842,7 +2824,7 @@ function migrationsNotice(why: string): Notice {
 }
 
 /** Startup after the probe-only connect: migrations, retired-marker cleanup, DB-plane config merge. Mounts: none. */
-async function completeEngineStartup(engine: BrainEngine): Promise<void> {
+async function completeEngineStartup(engine: BrainEngine, opts: EngineConnectOptions = {}): Promise<void> {
   const config = SELECTED_CONFIG_BY_ENGINE.get(engine);
   if (!config || MOUNT_ENGINES.has(engine)) return;
 
@@ -2857,7 +2839,7 @@ async function completeEngineStartup(engine: BrainEngine): Promise<void> {
     // migrate.ts loads every migration module; only a brain that is behind needs it.
     const { hasPendingMigrations } = await import('../core/migrate-pending.ts');
     const result = await hasPendingMigrations(engine)
-      ? await (await import('../core/migrate.ts')).tryRunPendingMigrations(engine)
+      ? await withoutRequestConfigSnapshot(async () => (await import('../core/migrate.ts')).tryRunPendingMigrations(engine))
       : { status: 'not_needed' as const };
     if (result.status === 'persistent') {
       writeCliNotice(migrationsNotice('Schema migrations are pending: another process attempted them but they did not complete within the retry window (usually transient). If it persists, check `gbrain doctor` for stale advisory locks and `gbrain jobs supervisor status` for crashed migration workers.'));
@@ -2872,59 +2854,10 @@ async function completeEngineStartup(engine: BrainEngine): Promise<void> {
     writeCliNotice(migrationsNotice(`Schema probe failed (unexpected): ${(err as Error).message}`));
   }
 
-  // #5628: drop this host's markers of a retired managed epoch before any filesystem guard check.
-  try { await (await import('../core/persistence/deactivation.ts')).cleanupRetiredManagedMarkers(engine); } catch { /* status reports pending markers */ }
+  // #5628: drop this host's markers of a retired managed epoch before any filesystem guard check. A one-shot read runs no guard check.
+  if (!opts.oneShotRead) try { await (await import('../core/persistence/deactivation.ts')).cleanupRetiredManagedMarkers(engine); } catch { /* status reports pending markers */ }
 
-  // v0.27.1 (F3 fix): re-merge DB-plane config now that the engine is up.
-  // Flags like `embedding_multimodal` are user-mutable via `gbrain config set`
-  // (DB plane) and need to flow into the gateway after connect. Schema-sizing
-  // fields (embedding_dimensions etc.) keep their pre-connect file/env values
-  // — those drove initSchema and the merged config respects file/env first.
-  try {
-    const merged = await loadConfigWithEngine(engine, config);
-    if (merged) {
-      // #1475 — hand the merged config to makeContext instead of letting it
-      // re-derive one. See MERGED_CONFIG_BY_ENGINE: the op-side gates read
-      // ctx.config, and re-running the merge there would double this
-      // function's per-key config reads on every command (the cost #3980 is
-      // about). Keyed on the engine so a mounted brain cannot be served the
-      // host brain's merge.
-      MERGED_CONFIG_BY_ENGINE.set(engine, merged);
-      // Stash gate flags on process.env for downstream readers (import-file.ts
-      // dispatches on GBRAIN_EMBEDDING_MULTIMODAL, gates OCR on GBRAIN_EMBEDDING_IMAGE_OCR).
-      // The OCR *model* reaches the gateway via the re-configure below (#4107); its
-      // env stash stays so subprocesses re-fold it through loadConfig's env merge.
-      if (merged.embedding_multimodal !== undefined) {
-        process.env.GBRAIN_EMBEDDING_MULTIMODAL = String(merged.embedding_multimodal);
-      }
-      if (merged.embedding_multimodal_model !== undefined) {
-        stashConfigEnv('GBRAIN_EMBEDDING_MULTIMODAL_MODEL', merged.embedding_multimodal_model);
-      }
-      if (merged.embedding_model !== undefined) {
-        stashConfigEnv('GBRAIN_EMBEDDING_MODEL', merged.embedding_model);
-      }
-      if (merged.embedding_image_ocr !== undefined) {
-        process.env.GBRAIN_EMBEDDING_IMAGE_OCR = String(merged.embedding_image_ocr);
-      }
-      if (merged.embedding_image_ocr_model !== undefined) {
-        process.env.GBRAIN_EMBEDDING_IMAGE_OCR_MODEL = merged.embedding_image_ocr_model;
-      }
-      // Always re-configure with merged values when DB merge succeeded. The
-      // trigger used to be field-name-gated (only when embedding_multimodal_model
-      // was set); that coupled the gate to the field set and would silently
-      // miss future DB-mutable gateway fields. One extra cache+shrinkState
-      // clear per startup is microseconds, no hot path.
-      (await import('../core/ai/gateway.ts')).configureGateway(buildGatewayConfig(merged));
-    }
-    // v0.31.12: re-resolve gateway defaults through resolveModel so
-    // `models.tier.*` and `models.default` overrides apply to expansion +
-    // chat. Per Codex F3 — configureGateway is sync; this is the async
-    // re-stamp seam after engine.connect() makes config reads possible.
-    const { reconfigureGatewayWithEngine } = await import('../core/ai/gateway.ts');
-    await reconfigureGatewayWithEngine(engine);
-  } catch {
-    // Non-fatal. Pre-v39 brains may not have a usable config table yet.
-  }
+  await (await import('./db-plane-config.ts')).mergeDbPlaneConfig(engine, config, MERGED_CONFIG_BY_ENGINE);
 
   // The one-time behavior-change disclosure on the CLI channel (stderr). `serve`
   // delivers it per MCP channel; `doctor` reads it without marking it shown.
@@ -2950,6 +2883,9 @@ const OP_HELP_EXAMPLES: Record<string, string[]> = {
     'gbrain backlinks companies/acme-example --source-id business',
     'gbrain backlinks companies/acme-example --all-sources --json',
   ],
+  search: ['gbrain search "acme-example pricing" --types company,deal --where stage=seed  # --where key=value, repeat for AND; key=a,b matches any', 'gbrain search "acme-example pricing" --json --timings  # {results, timings_ms, cost}'],
+  query: ['gbrain query "what changed at acme-example" --types meeting --since 2026-01-01 --until 2026-03-31', 'gbrain query "open deals" --where stage=seed,series-a --json --timings'],
+  list_pages: ['gbrain list --type deal --slug-prefix deals/ --where stage=seed --updated-after 2026-01-01 --sort updated_asc'],
   // #6255: the receipt command's routing flags and states.
   get_write_request: ['gbrain write-request --brain host -- <request_id> [--json]  # queued/running: pending, read again after retry_after_ms; committed/conflict/failed/cancelled: final'],
   traverse_graph: [

@@ -45,7 +45,7 @@
 
 import { withAdmissionOrigin } from './persistence/admission-origin.ts';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, realpathSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import { gbrainPath, loadConfig } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import { createProgress, type ProgressReporter } from './progress.ts';
@@ -524,6 +524,8 @@ export interface CycleOpts {
    * + refreshes the cycle-lock-table TTL.
    */
   yieldBetweenPhases?: () => Promise<void>;
+  /** #7241: awaited as each selected phase starts its work (index and count within this cycle's selection); errors are logged, never fatal. */
+  onPhaseStart?: (phase: CyclePhase, index: number, count: number) => Promise<void> | void;
   /**
    * Generic in-phase keepalive (v0.23). Long-running phases (synthesize
    * waiting on a fan-out aggregator, patterns rolling up reflections)
@@ -1222,7 +1224,7 @@ export async function resolveSourceForDir(
     const matched: string[] = [];
     for (const row of candidates) {
       try {
-        if (realpathSync(row.local_path) === realDir) matched.push(row.id);
+        if (isAbsolute(row.local_path) && realpathSync(row.local_path) === realDir) matched.push(row.id);
       } catch {
         // Stale/unreadable registered path — not a match, keep scanning.
       }
@@ -1283,6 +1285,8 @@ async function runPhaseSync(
     // instead of the global config key. The global key can drift out of
     // git history (force push, GC) causing a full reimport of all files.
     const sourceId = await resolveSourceForDir(engine, brainDir);
+    // #7630: with no matching source, a relative default local_path would leave this sync on the global anchors; refuse like sync does.
+    if (!sourceId) await (await import('./sync-applicability.ts')).assertSyncAnchorAbsolute(engine, { sourceId: 'default' });
     // #5255: managed sync refuses `git pull`; a cycle syncs local HEAD and reports it (explicit sync keeps refusing).
     const managedPullSkipped = pull && await isManagedBrain(engine);
     const result = await performSync(engine, {
@@ -1351,6 +1355,11 @@ async function runPhaseSync(
     if (e instanceof SyncLockBusyError) {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: 'sync already in progress elsewhere — skipped', details: { syncStatus: 'lock_busy' } };
     }
+    if ((e as { code?: unknown } | null)?.code === 'sync_anchor_relative') {
+      const { renderAction, cliRenderContext } = await import('./agent-output.ts');
+      const fix = (e as { fix?: Parameters<typeof renderAction>[0] }).fix;
+      return { phase: 'sync', status: 'fail', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_anchor_relative' }, error: makeErrorFromException(e), code: 'sync_anchor_relative', ...(fix ? { fix: renderAction(fix, cliRenderContext()) } : {}) };
+    }
     if ((e as { code?: unknown } | null)?.code === 'sync_not_applicable') {
       return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_not_applicable' } };
     }
@@ -1410,6 +1419,8 @@ async function runPhaseExtract(
       signal,
       sourceId,
       includeFrontmatter,  // honored on the incremental (slugs) path only
+      // GBRA-133: with no slug list a managed brain's pass covers every stale page of the source; bound it like the drain below.
+      timeBudgetMs: changedSlugs === undefined ? CYCLE_STALE_DRAIN_BUDGET_MS : undefined,
     }).catch((error: unknown) => { if (!(error instanceof ExtractBatchWriteError)) throw error; lostWrites = `; ${error.message}`; return null; });
     const linksCreated = result?.links_created ?? 0;
     const timelineCreated = result?.timeline_entries_created ?? 0;
@@ -1925,6 +1936,9 @@ export async function runCycle(
   return notices.length ? { ...report, notices } : report;
 }
 
+/** #7241: tell `opts.onPhaseStart` a selected phase is starting; a hook error is logged, never fatal. */
+const notifyPhaseStart = (opts: CycleOpts, phase: CyclePhase, phases: readonly CyclePhase[]): Promise<void> => Promise.resolve().then(() => opts.onPhaseStart?.(phase, phases.indexOf(phase), phases.length)).then(() => undefined, (e: unknown) => { console.warn(`[cycle] onPhaseStart hook error (non-fatal): ${e instanceof Error ? e.message : String(e)}`); });
+
 async function runCycleUnscoped(
   engine: BrainEngine | null,
   opts: CycleOpts,
@@ -2185,7 +2199,7 @@ async function runCycleUnscoped(
   // synthesize_concepts still can't carry one (W6). Steal-free cycles behave
   // byte-identically to timePhase.
   // Phase containment (#5484): a failing phase returns a `fail` result so later phases run; abort, lease loss and budget exhaustion still stop the job.
-  const timePhase = <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => timeContainedPhase({ engine, sourceId: cycleSourceId ?? 'default', signal: cycleSignal }, phase, fn);
+  const timePhase = async <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => { await notifyPhaseStart(opts, phase, phases); return timeContainedPhase({ engine, sourceId: cycleSourceId ?? 'default', signal: cycleSignal }, phase, fn); };
   const racedTimePhase = <T extends PhaseResult,>(fn: () => Promise<T>, phase: CyclePhase) => raceStolen(timePhase(fn, phase));
 
   // #1972: reap dead-holder sync/cycle locks at cycle start — before the sync

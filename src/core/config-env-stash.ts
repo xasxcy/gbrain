@@ -1,7 +1,7 @@
 /**
  * FORK: process.env keys that gbrain itself stashed from the merged config.
  *
- * `connectEngine` (src/cli/main.ts) copies the merged embedding model(s) into
+ * `mergeDbPlaneConfig` (src/cli/db-plane-config.ts) copies the merged embedding model(s) into
  * `process.env` so child processes and the image-embed path re-fold them through
  * `loadConfig`'s env merge. That makes the value look like a user-set environment
  * variable to anything that asks "is an env override present?" (the doctor's

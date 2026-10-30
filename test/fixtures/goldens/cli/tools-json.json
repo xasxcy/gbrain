@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 252798,
-    "stdoutSha256": "71b348f0e16ec33eeb7b856a2fa24821a5f971503416d541e00226572381ab56",
+    "stdoutBytes": 264563,
+    "stdoutSha256": "0d71d7f1367627c5f9c27d3d7a9b09513131117000012eed0d35ab9ede69095f",
     "toolNames": [
       "remember",
       "entity",
@@ -36,6 +36,7 @@
       "search_modes",
       "search_tune",
       "cache_stats",
+      "search_exact",
       "rate_answer",
       "search_by_image",
       "add_tag",
@@ -82,6 +83,7 @@
       "get_raw_data",
       "resolve_slugs",
       "get_chunks",
+      "whois",
       "log_ingest",
       "get_ingest_log",
       "get_usage",
@@ -90,6 +92,7 @@
       "file_url",
       "submit_job",
       "get_job",
+      "wait_job",
       "list_jobs",
       "cancel_job",
       "retry_job",
@@ -102,6 +105,7 @@
       "get_agent_job",
       "get_job_stats",
       "find_orphans",
+      "rank_entities",
       "get_calibration_profile",
       "takes_list",
       "takes_search",
@@ -120,6 +124,7 @@
       "sources_remove",
       "sources_status",
       "sources_inspect",
+      "sources_resolve_path",
       "request_tools",
       "get_recent_salience",
       "find_anomalies",
@@ -186,7 +191,7 @@
     ],
     "tools": [
       {
-        "description": "MEMORY VERB (v1): save facts with provenance. Set `entity` (the subject) or recall misses it. Branch on `status` (inserted|duplicate|superseded); write_pending: poll get_write_request.",
+        "description": "Save facts with provenance; set `entity` (the subject) or recall misses it. Branch on `status`; write_pending: poll get_write_request.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -297,7 +302,7 @@
         "scope": "write"
       },
       {
-        "description": "MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches (create_safety). Facts: recall.",
+        "description": "Person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches (create_safety). Facts: recall.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -306,7 +311,8 @@
           "name": "string?",
           "names": "array?",
           "prefer_source_id": "string?",
-          "source_id": "string?"
+          "source_id": "string?",
+          "variants": "boolean?"
         },
         "required_scopes": [],
         "schema": {
@@ -329,6 +335,10 @@
             "source_id": {
               "description": "Read only this source. Default: your source first, then every source you can read.",
               "type": "string"
+            },
+            "variants": {
+              "description": "false: exact names only. Default true: with no exact match, one unambiguous name variant (card.match says which).",
+              "type": "boolean"
             }
           },
           "required": [],
@@ -337,7 +347,7 @@
         "scope": "read"
       },
       {
-        "description": "[EXPENSIVE / SLOW: LLM calls, costs money] MEMORY VERB (v1): answer a broad question across pages with citations. For lookups use recall or entity.",
+        "description": "[EXPENSIVE / SLOW: LLM calls] Cited answer to a broad question across pages. Lookups: recall or entity.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -371,7 +381,7 @@
         "scope": "read"
       },
       {
-        "description": "MEMORY VERB (v1): expire a remembered fact by its fact_id (never a page slug). Idempotent; the audit trail is kept.",
+        "description": "Expire a remembered fact by its fact_id (never a page slug). Idempotent; the audit trail is kept.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -410,7 +420,7 @@
         "scope": "write"
       },
       {
-        "description": "Read a page by slug. To edit: include_content:true, send `content` to put_page; or edit_page. >256 KB: outline+window, then `next`.",
+        "description": "Read a page; `section` or `grep` reads one part. Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -420,10 +430,12 @@
           "body": "string?",
           "bytes": "object?",
           "content_only": "boolean?",
+          "context": "number?",
           "context_lines": "number?",
           "cursor": "string?",
           "fuzzy": "boolean?",
           "grammar_diagnostics": "boolean?",
+          "grep": "string?",
           "include_content": "boolean?",
           "include_deleted": "boolean?",
           "include_quarantined": "boolean?",
@@ -433,6 +445,7 @@
           "max_bytes": "number?",
           "min_trust": "string?",
           "outline_from": "number?",
+          "section": "string?",
           "slug": "string",
           "source_id": "string?",
           "view": "string?"
@@ -473,8 +486,12 @@
               "type": "object"
             },
             "content_only": {
-              "description": "Round-trip fields only.",
+              "description": "Round-trip fields.",
               "type": "boolean"
+            },
+            "context": {
+              "description": "With grep: paragraphs of context either side (default 1, max 5).",
+              "type": "number"
             },
             "context_lines": {
               "description": "Lines around around_chunk_id (20).",
@@ -485,15 +502,19 @@
               "type": "string"
             },
             "fuzzy": {
-              "description": "Fuzzy slug match.",
+              "description": "Fuzzy match.",
               "type": "boolean"
             },
             "grammar_diagnostics": {
               "description": "Also return every line-grammar finding for the page.",
               "type": "boolean"
             },
+            "grep": {
+              "description": "Only the paragraphs containing this text (case-insensitive substring, not a regex), with line numbers and total_matches.",
+              "type": "string"
+            },
             "include_content": {
-              "description": "Markdown + revision, to edit.",
+              "description": "Markdown + revision.",
               "type": "boolean"
             },
             "include_deleted": {
@@ -505,7 +526,7 @@
               "type": "boolean"
             },
             "include_timeline_entries": {
-              "description": "Timeline rows too.",
+              "description": "Timeline rows.",
               "type": "boolean"
             },
             "known_as_of": {
@@ -548,6 +569,10 @@
             "outline_from": {
               "description": "Outline next_from_index.",
               "type": "number"
+            },
+            "section": {
+              "description": "Only the section under this heading (case-insensitive, first match), with its heading_path.",
+              "type": "string"
             },
             "slug": {
               "description": "Page slug.",
@@ -718,7 +743,7 @@
         "scope": "write"
       },
       {
-        "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; truncated: continue with updated_after + updated_after_slug from the last row.",
+        "description": "List pages by type, slug_prefix, frontmatter where; what did I touch this week: sort=updated_desc. Default 50; truncated: continue with updated_after + updated_after_slug from the last row.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -727,12 +752,14 @@
           "include_deleted": "boolean?",
           "limit": "number?",
           "offset": "number?",
+          "slug_prefix": "string?",
           "sort": "string?",
           "source_id": "string?",
           "tag": "string?",
           "type": "string?",
           "updated_after": "string?",
-          "updated_after_slug": "string?"
+          "updated_after_slug": "string?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -742,12 +769,16 @@
               "type": "boolean"
             },
             "limit": {
-              "description": "Max rows (default 50; remote max 100).",
+              "description": "Remote max 100.",
               "type": "number"
             },
             "offset": {
               "description": "Rows to skip.",
               "type": "number"
+            },
+            "slug_prefix": {
+              "description": "Literal slug prefix, e.g. 'deals/'.",
+              "type": "string"
             },
             "sort": {
               "description": "Default updated_desc.",
@@ -772,12 +803,16 @@
               "type": "string"
             },
             "updated_after": {
-              "description": "Pages updated after this ISO time.",
+              "description": "ISO time.",
               "type": "string"
             },
             "updated_after_slug": {
               "description": "Last row's slug (with updated_after).",
               "type": "string"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [],
@@ -803,7 +838,7 @@
         "schema": {
           "properties": {
             "detach": {
-              "description": "Restore a page whose recorded canonical file is gone from the checkout as a database-only page: it forgets the file, so sync never deletes it again. Only accepted when a plain restore refuses with canonical_file_absent; ask the user first.",
+              "description": "Restore a page whose recorded canonical file is gone from the checkout as a database-only page: it forgets the file, so sync never deletes it again. Only accepted when a plain restore refuses with canonical_file_absent, or for a page under a declared storage.db_only dir whose recorded file left the checkout; ask the user first.",
               "type": "boolean"
             },
             "expected_revision": {
@@ -1030,7 +1065,7 @@
         "schema": {
           "properties": {
             "edits": {
-              "description": "1 to 50 {old_text, new_text} replacements.",
+              "description": "1-50 replacements.",
               "items": {
                 "additionalProperties": false,
                 "properties": {
@@ -1458,11 +1493,16 @@
         "mutating": false,
         "name": "get_write_request",
         "parameters": {
+          "applied": "boolean?",
           "request_id": "string"
         },
         "required_scopes": [],
         "schema": {
           "properties": {
+            "applied": {
+              "description": "Also return applied: searchable yet, the gap, the write watermark.",
+              "type": "boolean"
+            },
             "request_id": {
               "description": "The id you sent, or the receipt's.",
               "type": "string"
@@ -1586,8 +1626,10 @@
           "salience": "string?",
           "snippet_chars": "number?",
           "source_id": "string?",
+          "source_ids": "array?",
           "token_budget": "number?",
-          "types": "array?"
+          "types": "array?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -1681,6 +1723,13 @@
               "description": "One source, or '__all__'.",
               "type": "string"
             },
+            "source_ids": {
+              "description": "Narrow to these sources (omit or [] for all you can read).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "token_budget": {
               "description": "Default 6000.",
               "type": "number"
@@ -1691,6 +1740,10 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [
@@ -1701,7 +1754,7 @@
         "scope": "read"
       },
       {
-        "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
+        "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; adds fact rows. expand: one LLM call (expansion recovers synonyms; rarely helps). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper. Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -1733,11 +1786,13 @@
           "since": "string?",
           "snippet_chars": "number?",
           "source_id": "string?",
+          "source_ids": "array?",
           "symbol_kind": "string?",
           "token_budget": "number?",
           "types": "array?",
           "until": "string?",
-          "walk_depth": "number?"
+          "walk_depth": "number?",
+          "where": "object?"
         },
         "required_scopes": [],
         "schema": {
@@ -1769,7 +1824,7 @@
               "type": "string"
             },
             "expand": {
-              "description": "Default off; search.expansion overrides.",
+              "description": "Default off; one LLM call, rarely helps.",
               "type": "boolean"
             },
             "explain": {
@@ -1881,6 +1936,13 @@
               "description": "One source, or '__all__'.",
               "type": "string"
             },
+            "source_ids": {
+              "description": "Narrow to these sources (omit or [] for all you can read).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "symbol_kind": {
               "description": "Code symbol type.",
               "type": "string"
@@ -1903,6 +1965,10 @@
             "walk_depth": {
               "description": "Code walk depth 1-2.",
               "type": "number"
+            },
+            "where": {
+              "description": "Frontmatter equality, e.g. {status: \"active\"}; a list matches any.",
+              "type": "object"
             }
           },
           "required": [],
@@ -2048,6 +2114,81 @@
           "type": "object"
         },
         "scope": "admin"
+      },
+      {
+        "description": "Find every page containing a literal phrase or identifier, exhaustively: use instead of grep. Unranked; returns every match in page order with snippets, and complete: true only when every page you can read was scanned. Literal: words in order with any whitespace between them, case-insensitive unless case_sensitive; no stemming, punctuation literal (ranked search treats quotes as a stemmed phrase). When complete is false, incomplete_reasons says why: deadline or limit (call again with after: resume_after), or unreadable_pages (pages whose text is not indexed yet, listed under unreadable).",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "search_exact",
+        "parameters": {
+          "after": "number?",
+          "case_sensitive": "boolean?",
+          "limit": "number?",
+          "max_seconds": "number?",
+          "min_trust": "string?",
+          "phrase": "string",
+          "slug_prefix": "string?",
+          "source_id": "string?",
+          "types": "array?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "after": {
+              "description": "Resume a bounded scan: the resume_after of the previous call.",
+              "type": "number"
+            },
+            "case_sensitive": {
+              "description": "Match case exactly (default false).",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Matching pages to return (default 100, max 1000).",
+              "type": "number"
+            },
+            "max_seconds": {
+              "description": "Scan budget in seconds (default 30, max 120).",
+              "type": "number"
+            },
+            "min_trust": {
+              "description": "Lowest trust tier to return (the connection floor still applies).",
+              "enum": [
+                "user_confirmed",
+                "operator_curated",
+                "tool_observed",
+                "agent_written",
+                "unknown",
+                "external_untrusted"
+              ],
+              "type": "string"
+            },
+            "phrase": {
+              "description": "The literal text, e.g. 'INV-2024-0042' or 'quarterly board pack'.",
+              "type": "string"
+            },
+            "slug_prefix": {
+              "description": "Only slugs starting with this, e.g. 'meetings/'.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Only this source; '__all__' spans every source you can read.",
+              "type": "string"
+            },
+            "types": {
+              "description": "Only these page types, e.g. ['meeting'].",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "phrase"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
       },
       {
         "description": "Rate how useful an answer's retrieved evidence was, so this brain ranks better next time (zero LLM calls). Pass the answer_id from a query/search/think/synthesize/recall response and rating 1-5, or rate single pages with pages: [{ ref: \"source_id:slug\", rating }]. Example: { answer_id: \"ans_01J…\", pages: [{ ref: \"default:people/alice-example\", rating: 1 }] }. Returns a receipt with each weight before/after; it never edits stored facts.",
@@ -2259,7 +2400,7 @@
       },
       {
         "description": "Create a typed link (edge) from one page to another in the same source. Use when recording a relationship (works_at, invested_in, mentions); remote page writes already link [[wikilinks]] to existing pages as mentions (receipt auto_links), so add only typed links or ones the text lacks. Needs write scope; an explicit link_type must be declared by the active schema pack. On page_not_found: resolve both slugs with resolve_slugs.",
-        "idempotent": false,
+        "idempotent": true,
         "local_only": false,
         "mutating": true,
         "name": "add_link",
@@ -2268,6 +2409,7 @@
           "from": "string",
           "link_source": "string?",
           "link_type": "string?",
+          "request_id": "string?",
           "to": "string",
           "valid_from": "string?",
           "valid_until": "string?"
@@ -2289,6 +2431,10 @@
             },
             "link_type": {
               "description": "Link type (e.g., invested_in, works_at). When the active schema pack declares a link vocabulary, an explicit link_type must be one of its declared verbs (undeclared verbs are rejected, also under dry_run). Omitted = untyped edge.",
+              "type": "string"
+            },
+            "request_id": {
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "to": {
@@ -2314,7 +2460,7 @@
       },
       {
         "description": "Remove a link between two pages (optionally only one link_type or link_source). Use when a relationship was recorded wrongly. Needs write scope. On page_not_found: resolve both slugs with resolve_slugs.",
-        "idempotent": false,
+        "idempotent": true,
         "local_only": false,
         "mutating": true,
         "name": "remove_link",
@@ -2322,6 +2468,7 @@
           "from": "string",
           "link_source": "string?",
           "link_type": "string?",
+          "request_id": "string?",
           "to": "string"
         },
         "required_scopes": [],
@@ -2337,6 +2484,10 @@
             },
             "link_type": {
               "description": "Only remove edges of this link type (omit = all types)",
+              "type": "string"
+            },
+            "request_id": {
+              "description": "Reuse only to retry.",
               "type": "string"
             },
             "to": {
@@ -3932,6 +4083,43 @@
         "scope": "read"
       },
       {
+        "description": "Exact identity lookup: entity pages whose email, title or declared alias equals an email address or name, ignoring case, accents and quotes. Never fuzzy: empty matches means no exact match; ambiguous means several.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "whois",
+        "parameters": {
+          "query": "string",
+          "source_id": "string?",
+          "types": "array?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "query": {
+              "description": "Email address or name, e.g. 'alice@acme-example.com'.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "One source; '__all__' spans your sources.",
+              "type": "string"
+            },
+            "types": {
+              "description": "Page types; default: the schema pack's entity types.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
         "description": "Record one ingestion event (source type, reference, pages updated, summary) in the brain's ingest log. Use after importing or enriching content. Needs write scope.",
         "idempotent": false,
         "local_only": false,
@@ -4178,13 +4366,44 @@
         "scope": "admin"
       },
       {
+        "description": "Wait until a job is completed, failed, dead or cancelled (at most 55 s per call), then return it like get_job plus terminal. terminal: false means it is still running: call again. Agent-scoped tokens (no admin) wait only on jobs they own.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "wait_job",
+        "parameters": {
+          "id": "number",
+          "timeout_s": "number?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            },
+            "timeout_s": {
+              "description": "Seconds to wait (default 30, at most 55).",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "scope": "admin"
+      },
+      {
         "description": "List background jobs with optional status/queue/name filters; pass fields to project each job to the columns you need. Use when checking queued or failed work. Needs admin scope (agent-scoped tokens see only jobs they own).",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "list_jobs",
         "parameters": {
+          "cursor": "string?",
           "fields": "array?",
+          "finished_since": "string?",
           "limit": "number?",
           "name": "string?",
           "queue": "string?",
@@ -4193,6 +4412,10 @@
         "required_scopes": [],
         "schema": {
           "properties": {
+            "cursor": {
+              "description": "next_cursor from the last job of the previous page (it carries truncated: true): returns the next older jobs.",
+              "type": "string"
+            },
             "fields": {
               "description": "Return only these job fields (e.g. [\"id\",\"name\",\"status\"]) to save tokens; omit for every field.",
               "items": {
@@ -4200,8 +4423,12 @@
               },
               "type": "array"
             },
+            "finished_since": {
+              "description": "Terminal-event cursor: an ISO time or the next_cursor of the previous call. Returns {jobs, next_cursor}: jobs that finished after it, oldest first.",
+              "type": "string"
+            },
             "limit": {
-              "description": "Max results (default: 50)",
+              "description": "Max results (default 50); MCP callers are capped at 500 per call.",
               "type": "number"
             },
             "name": {
@@ -4486,7 +4713,7 @@
         "scope": "agent"
       },
       {
-        "description": "Job queue statistics. PER-BLOCK scoping: by_status and queue_health are GLOBAL (unfiltered); by_type is windowed by since_hours; only the wedge block is scoped to the queue param. wedged: true is the silent-halt signal (a worker is alive but claiming nothing while work waits) — suggest restarting the jobs supervisor on the brain host. no_worker: true means work is waiting and NO worker is running for the queue (always on PGLite unless a gbrain jobs work drain is live); wedged is then false and the no_worker notice names the fix. private_queue: true means the queue is a parent-owned dream-inline queue: wedged is NEVER true for it and a worker restart cannot help — recovery runs automatically at worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.",
+        "description": "Job queue statistics. PER-BLOCK scoping: by_status and queue_health are GLOBAL (unfiltered); by_type is windowed by since_hours; only the wedge block is scoped to the queue param. wedged: true is the silent-halt signal (a worker is alive but claiming nothing while work waits) — suggest restarting the jobs supervisor on the brain host. no_worker: true means work is waiting and NO worker is running for the queue (always on PGLite unless a gbrain jobs work drain is live); wedged is then false and the no_worker notice names the fix. private_queue: true means the queue is a parent-owned dream-inline queue: wedged is NEVER true for it and a worker restart cannot help — recovery runs automatically at worker spawn / dream-cycle start; suggest gbrain doctor for the per-queue verdict. by_queue has one row per queue (every dream-inline-* queue folded into one dream-inline row). Host-process diagnostics (renice, backpressure hints) stay on the gbrain jobs stats CLI.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -4520,6 +4747,7 @@
         "name": "find_orphans",
         "parameters": {
           "count_only": "boolean?",
+          "cursor": "string?",
           "include_pseudo": "boolean?",
           "limit": "number?",
           "mode": "string?",
@@ -4533,12 +4761,16 @@
               "description": "Return the totals with no rows.",
               "type": "boolean"
             },
+            "cursor": {
+              "description": "next_cursor from the previous page, with the same filters (instead of offset).",
+              "type": "string"
+            },
             "include_pseudo": {
               "description": "Include auto-generated and pseudo pages (default: false)",
               "type": "boolean"
             },
             "limit": {
-              "description": "Rows per page (default 100, max 1000); total_orphans counts every orphan and next_offset names the next page.",
+              "description": "Rows per page (default 100, max 1000); total_orphans counts every orphan, complete says whether this page holds the rest, and next_cursor (or next_offset) names the next page.",
               "type": "number"
             },
             "mode": {
@@ -4552,6 +4784,61 @@
             "source_id": {
               "description": "Only orphans from this source (it must be inside your source grant). Each row carries source_id and type.",
               "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
+        "description": "Rank pages by graph connections: the most-linked people, companies or other entities. Use instead of counting link rows yourself. An edge is a distinct (from page, to page, link_type) between live pages in scope: self-links, links to deleted pages, non-ranking types (amends) and, unless include_mentions, mention rows do not count; several provenance rows for one edge count once. inbound/outbound count edges, neighbors counts distinct linked pages. A redirect stub (canonical: false, superseded_by, merged_into) is folded into its live target in the same source (listed under folded) and its edges count once; title-prefixed person duplicates are listed under possible_duplicates, never merged. Ties order by slug, then source_id. coverage.state is behind when link extraction lags, so counts cover only extracted pages.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "rank_entities",
+        "parameters": {
+          "direction": "string?",
+          "include_mentions": "boolean?",
+          "limit": "number?",
+          "link_type": "string?",
+          "source_id": "string?",
+          "types": "array?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "direction": {
+              "description": "Rank by 'in' (inbound edges, default), 'out' (outbound edges) or 'both' (inbound + outbound).",
+              "enum": [
+                "in",
+                "out",
+                "both"
+              ],
+              "type": "string"
+            },
+            "include_mentions": {
+              "description": "Also count mention links (link_source mentions); default false.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Rows to return (default 20, max 100).",
+              "type": "number"
+            },
+            "link_type": {
+              "description": "Count only edges of this link type, e.g. works_at.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Only this source (it must be inside your source grant); '__all__' spans every source you can read. Both ends of a counted edge stay in scope.",
+              "type": "string"
+            },
+            "types": {
+              "description": "Page types to rank, e.g. ['person']. Default: the schema pack's entity types.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [],
@@ -5426,7 +5713,40 @@
         "scope": "read"
       },
       {
-        "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per client or stdio session).",
+        "description": "Read-only: what gbrain did with each file path of a source, by its own rules. Per path: the slug sync gives it, whether sync skips it (metafile, excluded, pruned) and why, its sync hold, its page with chunk and embedding counts, whether search finds it now, and the command that moves it on. A deleted path is checked by the page that records it as its origin, never by slug. Use it in landing checks instead of re-implementing slugging. Confined to the caller's source scope.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "sources_resolve_path",
+        "parameters": {
+          "id": "string",
+          "paths": "array"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "id": {
+              "description": "Source id, as listed by sources_list (e.g. 'default').",
+              "type": "string"
+            },
+            "paths": {
+              "description": "File paths relative to the source root (or to the Git top level), at most 200, e.g. the paths a commit changed.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "paths"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
+      },
+      {
+        "description": "More tools and params: no arguments lists your catalog; {tools: [names]} returns full schemas, every optional param included; {surface} widens it (per client or stdio session).",
         "idempotent": false,
         "local_only": false,
         "mutating": true,
@@ -5439,7 +5759,7 @@
         "schema": {
           "properties": {
             "surface": {
-              "description": "Surface to widen to (stdio: this session only).",
+              "description": "stdio: this session only.",
               "enum": [
                 "verbs",
                 "starter",
@@ -5450,7 +5770,6 @@
             "tools": {
               "description": "Tool names to fetch.",
               "items": {
-                "description": "A tool name from the catalog.",
                 "type": "string"
               },
               "type": "array"
@@ -5477,11 +5796,11 @@
         "schema": {
           "properties": {
             "days": {
-              "description": "Window in days (default 14).",
+              "description": "Default 14.",
               "type": "number"
             },
             "limit": {
-              "description": "Max results (default 20).",
+              "description": "Default 20.",
               "type": "number"
             },
             "recency_bias": {
@@ -6316,7 +6635,7 @@
         "scope": "write"
       },
       {
-        "description": "MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.",
+        "description": "Read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6432,7 +6751,7 @@
         "scope": "read"
       },
       {
-        "description": "MEMORY VERB (v1): core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.",
+        "description": "Core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. Call at session start and after compaction.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6534,7 +6853,7 @@
         "scope": "read"
       },
       {
-        "description": "MEMORY VERB (v1): pages, facts, thread events changed since a cursor, zero LLM. Pass session_id, cursor or since.",
+        "description": "Pages, facts, thread events changed since a cursor, zero LLM. Pass session_id, cursor or since.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6646,6 +6965,7 @@
         "parameters": {
           "all_subjects": "boolean?",
           "confirm": "string?",
+          "continue": "boolean?",
           "dry_run": "boolean?",
           "expected_revision": "string?",
           "id": "number?",
@@ -6666,6 +6986,10 @@
             "confirm": {
               "description": "The confirmation token from the dry run (first 8 hex of the claim fingerprint).",
               "type": "string"
+            },
+            "continue": {
+              "description": "With status: first continue the purge's sweep of stored derivation results (derivation_sweep pending or stalled), then report.",
+              "type": "boolean"
             },
             "dry_run": {
               "description": "Return the receipt with would-remove counts and the confirmation token; changes nothing.",

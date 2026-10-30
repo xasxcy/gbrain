@@ -8,7 +8,8 @@ import { join } from 'path';
 import { promptYesNo } from './confirm-prompt.ts';
 import type { BrainEngine } from './engine.ts';
 import { collectSyncableFiles } from '../commands/import.ts';
-import { isSyncable } from './sync.ts';
+import { DEFAULT_METAFILE_PAGES_MODE, isSyncable, readMetafilePagesMode, type MetafilePagesMode } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
 // v0.42.42.0 (#2139): `buildDetachedWorkingTreeManifest` relocated to
 // `src/core/sync-delta.ts` (re-imported below) so the inline cost estimator
 // prices detached sources through the same code the executor imports them with.
@@ -148,7 +149,7 @@ function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
  * cost paid a few seconds early — a tighter cap would frequently fall back to
  * local HEAD and underestimate the remote delta).
  */
-function resolveEstimateTarget(localPath: string): { target: string; detached: boolean } | null {
+function resolveEstimateTarget(localPath: string, noPull = false): { target: string; detached: boolean } | null {
   let head: string;
   try {
     head = git(localPath, ['rev-parse', 'HEAD']);
@@ -164,7 +165,9 @@ function resolveEstimateTarget(localPath: string): { target: string; detached: b
   } catch {
     branch = null;
   }
-  if (branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
+  // GBRA-133 2b.3: a --no-pull run syncs local HEAD and never fetches, so its estimate prices local HEAD and the gate
+  // spends no network round trip (a fetch can take the shared 30 s git budget on a slow or unreachable remote).
+  if (!noPull && branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
     try {
       // v0.42.42.0 (#2139): route through the SSRF-hardened fetch (same flags +
       // no-prompt env as pullRepo) — a cost preview / dry-run must NOT hit a
@@ -232,7 +235,7 @@ export function estimateInlineNewTokens(
     chunker_version: string | null;
   }>,
   currentChunkerVersion: string,
-  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean } = {},
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean; noPull?: boolean; metafilePages?: MetafilePagesMode } = {},
 ): InlineEstimate {
   let tokens = 0;
   let changedSources = 0;
@@ -285,7 +288,7 @@ export function estimateInlineNewTokens(
       continue;
     }
 
-    const resolved = resolveEstimateTarget(localPath);
+    const resolved = resolveEstimateTarget(localPath, opts.noPull === true);
     if (!resolved) {
       // HEAD unresolvable (not a git repo / gone) — can't compute a delta. CEILING.
       ceiling(localPath, strategy, 'git_unavailable');
@@ -316,7 +319,7 @@ export function estimateInlineNewTokens(
       ceiling(localPath, strategy, 'git_unavailable');
       continue;
     }
-    const syncOpts = { strategy };
+    const syncOpts = { strategy, metafilePage: metafilePagePredicate(opts.metafilePages ?? DEFAULT_METAFILE_PAGES_MODE, diskMetafileHeads(localPath)) };
     const changedPaths = unique([
       ...delta.manifest.added.filter(p => isSyncable(p, syncOpts)),
       ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
@@ -407,6 +410,8 @@ interface CostGateContext {
   yesFlag: boolean;
   full: boolean;
   includeGitignored?: boolean;
+  /** The run will not pull: estimate against local HEAD without fetching. */
+  noPull?: boolean;
   /** Message prefix ('sync --all' | 'sync'). */
   label: string;
   /** Public queue capability resolved at the command boundary. */
@@ -556,7 +561,9 @@ export async function runInlineCostGate(
   if (yesFlag && !dryRun) return { action: 'proceed', autoDeferEmbeds: false };
   const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
     forceFullTree: ctx.includeGitignored === true,
+    noPull: ctx.noPull === true,
     chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
+    metafilePages: await readMetafilePagesMode(engine),
   });
   // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
   // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.

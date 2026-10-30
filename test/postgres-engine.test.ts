@@ -83,7 +83,7 @@ describe('postgres-engine / search path timeout isolation', () => {
     const keyword = stripComments(extractMethod(SRC, 'searchKeyword'));
     const attempt = stripComments(SRC).split('private runVectorAttempt(')[1]!.split('async getEmbeddingsByChunkIds(')[0]!;
     const vector = extractMethod(SRC, 'searchVector');
-    expect(keyword).toMatch(/settings: relaxed \? \{ statement_timeout: statementTimeout, enable_seqscan: 'off' \} : \{ statement_timeout: statementTimeout \}/);
+    expect(keyword).toMatch(/settings: relaxed \? \{ statement_timeout: statementTimeout, enable_seqscan: 'off', \.\.\.KEYWORD_STATEMENT_SETTINGS \} : \{ statement_timeout: statementTimeout, \.\.\.KEYWORD_STATEMENT_SETTINGS \}/);
     // FORK: the vector pool keeps its 15s budget (POSTGRES_VECTOR_POOL_BUDGET_MS).
     expect(vector).toMatch(/searchVectorPool\([\s\S]*?opts\?\.onVectorPoolMeta,\s*POSTGRES_VECTOR_POOL_BUDGET_MS,\s*\);/);
     expect(SRC).toContain('export const POSTGRES_VECTOR_POOL_BUDGET_MS = 15_000;');

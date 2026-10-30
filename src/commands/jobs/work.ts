@@ -11,6 +11,7 @@ import type { MinionQueue } from '../../core/minions/queue.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { loadConfig } from '../../core/config.ts';
 import { startPersistenceConsumer } from '../../core/persistence/service.ts';
+import { describeLanePolicy, resolveLanePolicy } from '../../core/minions/lanes.ts';
 
 export async function maybeRunWorkerStartupRecovery(
   queue: MinionQueue,
@@ -141,9 +142,9 @@ export async function runJobsWork({ args, engine, queue }: JobsCommandContext): 
     childTiniPath = detectTini();
     if (maxRssMb > 0) {
       console.error(
-        '[gbrain jobs] note: with process isolation on, the --max-rss watchdog covers the ' +
-        'WORKER process only — handler memory now lives in job children. Per-child caps are ' +
-        'a filed follow-up; size host memory for concurrency x handler footprint.',
+        `[gbrain jobs] note: with process isolation on, --max-rss ${maxRssMb} MB applies to the worker and to each ` +
+        'job child\'s process tree separately; a child past it is stopped and its attempt fails. ' +
+        'Size host memory for (concurrency + 1) x the cap.',
       );
     }
   }
@@ -190,9 +191,14 @@ export async function runJobsWork({ args, engine, queue }: JobsCommandContext): 
     }
   }
 
+  const { resolveTerminalHook, terminalHookNotifier } = await import('../../core/minions/terminal-hook.ts');
+  const terminalHook = resolveTerminalHook(loadConfig());
+  const lanes = await resolveLanePolicy(engine);
   const worker = new MinionWorker(engine, {
     queue: queueName, concurrency, maxRssMb, healthCheckInterval,
     jobIsolation, childCliInvocation, childTiniPath,
+    longJobNames: lanes.longJobNames, shortJobReservedSlots: lanes.shortJobReservedSlots,
+    ...(terminalHook ? { onJobSettled: terminalHookNotifier(engine, terminalHook).onJobSettled } : {}),
   });
   try {
     await registerBuiltinHandlers(worker, engine);
@@ -229,7 +235,8 @@ export async function runJobsWork({ args, engine, queue }: JobsCommandContext): 
   const isolationNote = jobIsolation === 'process'
     ? `, isolation: process (child cli: ${childCliInvocation?.cmd}${childTiniPath ? ', tini' : ''})`
     : '';
-  console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote}${isolationNote})`);
+  const hookNote = terminalHook ? `, terminal hook: ${terminalHook.argv[0]}` : '';
+  console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}, ${describeLanePolicy(concurrency, lanes.shortJobReservedSlots)}${watchdogNote}${healthNote}${niceNote}${isolationNote}${hookNote})`);
   console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
 
   // Register in the live worker registry (issue #1815) so jobs stats / doctor

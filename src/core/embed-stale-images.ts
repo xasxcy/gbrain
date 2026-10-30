@@ -67,6 +67,9 @@ export interface StaleImageSweepResult extends EmbedCostStopFields {
   failure_samples: string[];
   /** Up to 5 `source:slug: no file at <path tried>` lines for the candidates without a source file. */
   missing_samples: string[];
+  /** #7193: the explicit `--images` sweep rebuilt none of its candidates (exit 1); `reason` says why, by cause. */
+  status?: 'nothing_rebuilt';
+  reason?: string;
   /** FORK: the sweep stopped at the run's `GBRAIN_EMBED_TIME_BUDGET_MS` window; `deferred` candidates wait for the next run. */
   time_budget?: boolean;
   deferred?: number;
@@ -164,9 +167,20 @@ export async function embedStaleImages(
   return result;
 }
 
-/** Every candidate without a file and nothing rebuilt: the explicit `--images` sweep did no work, so it must not read as success. */
-function sweepFoundNoFiles(result: StaleImageSweepResult): boolean {
-  return result.candidates > 0 && result.rebuilt === 0 && result.missingFile === result.candidates;
+/**
+ * Candidates and nothing rebuilt: the explicit `--images` sweep did no work, so it must not read as success (#7193: not
+ * only when every file is missing; files the importer left unchanged or refused for want of OCR count too). Every
+ * unrebuilt candidate becomes a failure, so the exit is 1 (agent operator protocol: failed), and `reason` names the causes.
+ */
+function markNothingRebuilt(result: StaleImageSweepResult): void {
+  if (result.candidates === 0 || result.rebuilt > 0) return;
+  result.status = 'nothing_rebuilt';
+  result.reason = `rebuilt 0 of ${result.candidates} candidate image page(s): ${result.missingFile} missing source file, ${result.skipped} left unchanged by the importer, `
+    + `${result.ocr_required} need a fresh OCR pass (GBRAIN_EMBEDDING_IMAGE_OCR=true), ${result.failures} failed`;
+  const missingOnly = result.missingFile === result.candidates;
+  result.failures = result.candidates;
+  result.failure_samples.push(...result.missing_samples.slice(0, SAMPLE_CAP - result.failure_samples.length));
+  if (!missingOnly) result.failure_samples.push(result.reason);
 }
 
 /**
@@ -209,11 +223,9 @@ export async function runEmbedStaleImagesCli(engine: BrainEngine, args: string[]
   const dryRun = args.includes('--dry-run');
   const result = await embedStaleImages(engine, { sourceId: srcI >= 0 ? args[srcI + 1] : undefined, dryRun, costCap,
     budget: { startedAt: Date.now(), budgetMs: embedTimeBudgetMs(args.includes('--catch-up')) } });
-  if (sweepFoundNoFiles(result)) {
-    result.failures += result.missingFile;
-    result.failure_samples.push(...result.missing_samples.slice(0, SAMPLE_CAP - result.failure_samples.length));
-  }
   const capped = costCap?.hit();
+  // FORK: work the run's time budget or OCR cap deferred to the next run is not "nothing rebuilt", like a cost cap.
+  if (!dryRun && !capped && !result.time_budget && !result.ocr_deferred) markNothingRebuilt(result);
   if (capped) noteEmbedCostStop(result, capped, args);
   if (args.includes('--json')) console.log(JSON.stringify(result));
   else {
@@ -224,6 +236,7 @@ export async function runEmbedStaleImagesCli(engine: BrainEngine, args: string[]
   }
   if (result.missing_samples.length) serr(`[embed] first missing image file: ${result.missing_samples[0]}`);
   if (result.failures > 0) serr(`[embed] first image failure: ${result.failure_samples[0]}`);
+  if (result.reason) serr(`[embed] images: nothing rebuilt; ${result.reason}.`);
   if (capped) (args.includes('--json') ? serr : console.log)(embedCostStopVerdict(result, capped));
   if (result.ocr_deferred) serr(`[embed] images: ${result.ocr_deferred} image page(s) missing only OCR text wait for the next run (this run's OCR cap is spent; embedding_image_ocr_max_images).`);
   if (result.time_budget) serr(`[embed] images: stopped at the time budget (GBRAIN_EMBED_TIME_BUDGET_MS); ${result.deferred} image page(s) wait for the next run (--catch-up runs without a time cap).`);

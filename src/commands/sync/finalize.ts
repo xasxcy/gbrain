@@ -8,9 +8,10 @@ import { chunkerStamp } from '../../core/chunkers/code.ts';
 import { serr, slog } from '../../core/console-prefix.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { clearOpCheckpoint } from '../../core/op-checkpoint.ts';
-import { commitTimeMs } from '../../core/source-health.ts';
+import { commitTimeMsAsync } from '../../core/source-health.ts';
 import { writeSyncAnchor, writeChunkerVersion } from '../../core/sync-anchor.ts';
-import { git } from '../../core/sync-git.ts';
+import { recordMetafilePagesApplied } from '../../core/sync-metafile-pages.ts';
+import { gitAsync } from '../../core/sync-git.ts';
 import { buildPartialResult } from '../../core/sync-lock.ts';
 import {
   sanitizePathForDisplay,
@@ -23,6 +24,7 @@ import {
   summarizeFailuresByCode,
   isEmbeddingInfraCode,
   formatFailedFileList,
+  readMetafilePagesMode,
 } from '../../core/sync.ts';
 import { shouldLogIngest } from '../import.ts';
 import type { SyncResult } from '../sync.ts';
@@ -34,10 +36,10 @@ import type { SyncPlan, SyncRun } from './sync-run.ts';
 
 export async function finishWithoutChanges(
   engine: BrainEngine,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges' | 'holds' | 'gitlinks'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'malformedSkipped' | 'totalChanges' | 'holds' | 'gitlinks' | 'metafilePages'>,
   swept: number,
 ): Promise<SyncResult | undefined> {
-  const { opts, company, gitContextRoot, lastCommit, pin, pullFailed, ckpt, malformedSkipped, totalChanges } = plan;
+  const { opts, company, gitContextRoot, lastCommit, pin, pullFailed, ckpt, malformedSkipped, totalChanges, metafilePages } = plan;
   if (totalChanges === 0) {
     await settleLegacyHolds(engine, plan.holds);
     // #3068: same guard as the git-HEAD-equality gate above — a failed pull
@@ -66,9 +68,10 @@ export async function finishWithoutChanges(
     // (#1794): advance to the PINNED target, and clear any checkpoint (a resume
     // whose remaining range turned out to have no syncable changes still
     // completes cleanly here).
-    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, await commitTimeMsAsync(gitContextRoot, pin), gitContextRoot);
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
+    if (!company) await recordMetafilePagesApplied(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, metafilePages);
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
     // A commit whose ONLY changes are malformed filenames lands here with
     // totalChanges === 0 — the anchor advances past those files forever, so
@@ -124,7 +127,7 @@ export async function finalizeIncrementalSync(
   // during the success-path git/anchor writes doesn't fire a stale flush.
   run.deregisterCheckpointCleanup();
 
-  const headVerificationSucceeded = verifyPinnedHead(run, plan);
+  const headVerificationSucceeded = await verifyPinnedHead(run, plan);
 
   // #5988: a deleted or renamed-away held file clears its hold; so does one
   // whose file is gone or no longer synced. A failed delete keeps it.
@@ -231,7 +234,7 @@ function identityDowngradesOf(plan: Pick<SyncPlan, 'manifest' | 'inScope' | 'isS
 }
 
 /** v0.42.x (#1794, T3): pin-reachability gate; records a `<head>` sentinel on a rewrite. */
-function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitContextRoot' | 'pin'>): boolean {
+async function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitContextRoot' | 'pin'>): Promise<boolean> {
   const { failedFiles } = run;
   const { company, gitContextRoot, pin } = plan;
   // v0.42.x (#1794, T3): pin-reachability gate, replacing the pre-v0.42 strict
@@ -249,11 +252,11 @@ function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitCon
   //     the tree we imported against is gone. Block; do not advance.
   let headVerificationSucceeded = false;
   try {
-    const currentHead = company ? company.plan.revision!.commit : git(gitContextRoot, ['rev-parse', 'HEAD']);
+    const currentHead = company ? company.plan.revision!.commit : await gitAsync(gitContextRoot, ['rev-parse', 'HEAD']);
     if (currentHead !== pin) {
       let pinStillReachable = false;
       try {
-        git(gitContextRoot, ['merge-base', '--is-ancestor', pin, currentHead]);
+        await gitAsync(gitContextRoot, ['merge-base', '--is-ancestor', pin, currentHead]);
         pinStillReachable = true;
       } catch {
         pinStillReachable = false;
@@ -282,11 +285,11 @@ function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitCon
 
 async function applyBookmarkGate(
   run: SyncRun,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds' | 'metafilePages'>,
   headVerificationSucceeded: boolean,
 ): Promise<{ done: SyncResult } | { gate: Awaited<ReturnType<typeof applySyncFailureGate>> }> {
   const { engine, succeededPaths, failedFiles, pagesAffected } = run;
-  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, ckpt, filtered } = plan;
+  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, ckpt, filtered, metafilePages } = plan;
   // issue #1939 — gate the bookmark through the shared failure ledger.
   //   • Fresh failures still BLOCK (fail-closed): the next sync re-walks the
   //     diff and re-attempts. Escape hatch: --skip-failed.
@@ -305,10 +308,11 @@ async function applyBookmarkGate(
     // "fresh". The checkpoint rows clear here — CONVERGENCE CONTRACT: sync
     // convergence == IMPORT convergence; downstream extract/facts/embed is
     // decoupled (its own resumable stale sweeps).
-    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, await commitTimeMsAsync(gitContextRoot, pin), gitContextRoot);
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
     await writeChunkerVersion(engine, opts.sourceId, chunkerStamp());
+    if (!company) await recordMetafilePagesApplied(engine, opts.sourceId ?? DEFAULT_SOURCE_ID, metafilePages);
     if (!company) { await clearOpCheckpoint(engine, ckpt.paths); await clearOpCheckpoint(engine, ckpt.target); }
   };
 
@@ -556,10 +560,13 @@ async function extractAffectedPages(run: SyncRun, plan: Pick<SyncPlan, 'opts' | 
   if (!opts.noExtract && totalChanges <= 100 && pagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted, slugsSafeToStamp } = await import('../extract.ts');
+      const { indexMarkdownTree } = await import('../extract-tree.ts');
       // #774: pages' source_path is git-root-relative, so extract resolves
       // files from gitContextRoot (== repoPath realpath when unscoped).
-      const linksResult = await extractLinksForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
-      const timelineResult = await extractTimelineForSlugs(engine, gitContextRoot, pagesAffected, extractOpts);
+      // GBRA-133 2b.1: one tree walk per run, shared by both hooks.
+      const tree = await indexMarkdownTree(gitContextRoot, await readMetafilePagesMode(engine));
+      const linksResult = await extractLinksForSlugs(engine, gitContextRoot, pagesAffected, { ...extractOpts, tree });
+      const timelineResult = await extractTimelineForSlugs(engine, gitContextRoot, pagesAffected, { ...extractOpts, tree });
       if (linksResult.created > 0 || timelineResult.created > 0) {
         slog(`  Extracted: ${linksResult.created} links, ${timelineResult.created} timeline entries`);
       }

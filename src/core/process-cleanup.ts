@@ -45,6 +45,8 @@
  *    double-DELETE.
  */
 
+import { noteInterrupted } from './read-heartbeat.ts';
+
 const CLEANUP_DEADLINE_MS = 3_000;
 const SHUTDOWN_DRAIN_DEADLINE_MS = 30_000;
 
@@ -255,6 +257,9 @@ export function installSignalHandlers(opts: { keepServingOnLogEpipe?: boolean } 
 
   const handleSignal = (signal: NodeJS.Signals) => {
     if (forwardToSignalOwner(signal)) return;
+    // A slow read (sync status, doctor, ...) says it was cut off before cleanup runs, so a harness that follows its
+    // SIGTERM with SIGKILL still sees the note.
+    if (signal !== 'SIGPIPE') noteInterrupted(signal);
     // Cooperative only while embedding work is registered (or a cooperative pass is already
     // draining); otherwise the plain pass keeps its original tick order and exit sequencing.
     if ((signal === 'SIGTERM' || signal === 'SIGHUP') && (shutdownWorkRegistry.size > 0 || cooperativeShutdownInFlight)) {

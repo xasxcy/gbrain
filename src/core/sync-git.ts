@@ -5,6 +5,7 @@
  */
 import { lstatSync, realpathSync } from 'fs';
 import { execFileSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
@@ -342,6 +343,30 @@ export function git(
 }
 
 /**
+ * GBRA-133 2b.3: `git()` without blocking the event loop, for the classic sync a resident (serve, the jobs worker,
+ * autopilot) runs in-process on a commit. Same invocation, environment, timeout and buffer. A failure rejects like
+ * `execFileSync` throws (`status`, `signal`, `stdout`, `stderr`), and git's stderr reaches this process's stderr unless
+ * silenced, as `execFileSync` passes it through. `raw` keeps the output untrimmed (NUL-delimited listings).
+ */
+export async function gitAsync(
+  repoPath: string,
+  args: string[],
+  { configs = [], timeoutMs = 30000, silenceStderr = false, raw = false }: { configs?: string[]; timeoutMs?: number; silenceStderr?: boolean; raw?: boolean } = {},
+): Promise<string> {
+  noteGitCommand(args);
+  const r = await execFileBounded('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(readOnlyEnv(args)), timeout: timeoutMs, maxBuffer: 100 * 1024 * 1024,
+  });
+  if (r.stderr && !silenceStderr) process.stderr.write(r.stderr);
+  if (r.error) {
+    const code = (r.error as { code?: unknown }).code;
+    throw Object.assign(new Error(r.error.message), { status: typeof code === 'number' ? code : null, signal: r.error.signal ?? null,
+      code, stdout: r.stdout, stderr: r.stderr });
+  }
+  return raw ? r.stdout : r.stdout.trim();
+}
+
+/**
  * git() minus the trim — REQUIRED for NUL-delimited listings (`ls-files -z`,
  * `ls-tree -z`): a filename that begins with a space is the FIRST entry of
  * the listing, and trim() silently rewrites it into a different path (#3583
@@ -378,11 +403,23 @@ export function discoverGitRoot(inputPath: string): string {
     if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
   } catch (error) {
-    noteGitFailure(inputPath, error);
-    throw new Error(
-      `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
-    );
+    throw notAGitRepository(inputPath, error);
   }
+}
+
+/** `discoverGitRoot` without blocking the event loop (GBRA-133 2b.3). */
+export async function discoverGitRootAsync(inputPath: string): Promise<string> {
+  try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
+    return await gitAsync(inputPath, ['rev-parse', '--show-toplevel'], { silenceStderr: true });
+  } catch (error) {
+    throw notAGitRepository(inputPath, error);
+  }
+}
+
+function notAGitRepository(inputPath: string, error: unknown): Error {
+  noteGitFailure(inputPath, error);
+  return new Error(`Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`);
 }
 
 /**
@@ -502,14 +539,13 @@ export function createSyncBaselineCommit(repoPath: string): void {
   const dbOnlyDirs = storageConfig?.db_only ?? [];
   // Sniff-test fail-closed (round 6, P2): `loadStorageConfig` warns-and-
   // returns an EMPTY config for syntactically-valid-but-unsupported YAML
-  // (e.g. flow-style `db_only: [dir/]`; the narrow custom parser only
-  // handles block-style lists), which would silently resolve zero
+  // (e.g. a flow list split over lines; the narrow custom parser handles
+  // block lists and one-line flow lists), which would silently resolve zero
   // exclusions from a file that clearly intended some. If gbrain.yml has a
   // db_only (or deprecated `supabase_only`) key line but nothing resolved
   // from it, refuse rather than guess; `hasUnresolvedDbOnlyDeclaration`
-  // owns the key-line rules. Accepted trade-off: an intentionally empty
-  // `db_only: []` also refuses (same empty config); silently committing
-  // db_only content into permanent git history is high-cost and hard to undo.
+  // owns the key-line rules (an explicit empty `db_only: []` declares none, #8007);
+  // silently committing db_only content into permanent git history is high-cost and hard to undo.
   if (hasUnresolvedDbOnlyDeclaration(repoPath, storageConfig)) {
     const yamlPath = join(repoPath, 'gbrain.yml');
     throw new Error(
@@ -666,6 +702,11 @@ export function isDetachedHead(repoPath: string): boolean {
   } catch {
     return true;
   }
+}
+
+/** `isDetachedHead` without blocking the event loop (GBRA-133 2b.3). */
+export async function isDetachedHeadAsync(repoPath: string): Promise<boolean> {
+  return gitAsync(repoPath, ['symbolic-ref', '--quiet', 'HEAD']).then(() => false, () => true);
 }
 
 export function unique<T>(items: T[]): T[] {

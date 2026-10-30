@@ -23,7 +23,7 @@ import { hasSourceFilesystemLock, withSourceFilesystemLock, assertSourceFilesyst
  */
 
 import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync, readFileSync, realpathSync } from 'fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from 'path';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import type { BrainEngine } from './engine.ts';
 import { isRelativeFileUri, serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
@@ -31,6 +31,7 @@ import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import { readSlugRootMode, resolveSlugRootMode, type SlugRootMode } from './sync-anchor.ts';
 import { resolveSlugForPath } from './sync.ts';
 import { PUSH_SCAN_MAX_FILE_BYTES } from './page-size-policy.ts';
+import { canonicalFilesystemPath } from './persistence/root-registry.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -79,7 +80,7 @@ export interface WriteThroughResult {
    *     or DB work.
    *   - no_repo_configured: the resolved target (source `local_path` or, for a
    *     sole-source brain, `sync.repo_path`) is unset (DB-only by design).
-   *   - repo_not_found: target set but missing / not a directory.
+   *   - repo_not_found: target set but relative (#7630), missing, or not a directory.
    *   - source_repo_belongs_to_other_source: the assigned source has no
    *     `local_path`, and `sync.repo_path` is another source's own working tree
    *     — #2018: writing here would pollute that sibling's repo, so we skip.
@@ -285,6 +286,32 @@ export async function scannerSlugRootMode(engine: BrainEngine, sourceId: string,
 }
 
 /**
+ * #2018/#7203: the other source whose own working tree is `path` or contains
+ * it, compared by filesystem identity, so a symlink, a trailing slash, or a
+ * macOS case or /private alias still matches. A spelling that cannot be
+ * resolved counts as a match: the leak guard fails closed. `relativeOwns: false`
+ * leaves out live relative rows, for doctor to find an absolute owner beside them.
+ */
+export async function otherSourceOwning(engine: BrainEngine, sourceId: string, path: string, relativeOwns = true): Promise<string | null> {
+  const rows = await engine.executeRaw<{ id: string; local_path: string; archived: boolean }>(
+    `SELECT id, local_path, archived IS TRUE AS archived FROM sources WHERE id <> $1 AND local_path IS NOT NULL AND local_path <> '' ORDER BY id`,
+    [sourceId],
+  );
+  const identity = (spelling: string) => { try { return canonicalFilesystemPath(msysToNativePath(spelling)); } catch { return null; } };
+  const target = identity(path);
+  return rows.find(row => {
+    // #7630: a live source's relative local_path names no known tree, so like any unresolvable spelling it counts as a match.
+    // An absolute path written by another OS (C:\ on POSIX) is not relative, the same reading doctor and --clear use.
+    const native = msysToNativePath(row.local_path);
+    if (!posix.isAbsolute(native) && !win32.isAbsolute(native)) return relativeOwns && !row.archived;
+    const other = identity(row.local_path);
+    if (target === null || other === null) return true;
+    const rel = relative(other, target);
+    return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
+  })?.id ?? null;
+}
+
+/**
  * Compute the ONE file a (source, slug) pair lives in on disk.
  *
  * #2018: pick the disk target so a page is NEVER written into a different
@@ -355,7 +382,8 @@ export async function resolvePageWriteTarget(
   const recordedUri = pathRows[0]?.source_uri ?? null;
 
   if (sourceLocalPath) {
-    if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
+    // #7630: a relative local_path (a legacy ".") names whatever directory gbrain runs from, never the source's tree.
+    if (!isAbsolute(sourceLocalPath) || !existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
     filePath = recordedPath
@@ -369,21 +397,18 @@ export async function resolvePageWriteTarget(
     if (!repoPath) {
       return { ok: false, skipped: 'no_repo_configured' };
     }
-    if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
+    if (!isAbsolute(repoPath) || !existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
-    }
-    // Leak guard: refuse to write into a path that is some OTHER source's
-    // own working tree (#2018).
-    const collide = await engine.executeRaw<{ one: number }>(
-      `SELECT 1 AS one FROM sources WHERE id <> $1 AND local_path = $2 LIMIT 1`,
-      [sourceId, repoPath],
-    );
-    if (collide.length > 0) {
-      return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
     }
     const pageRoot = sourceId === 'default' ? repoPath : join(repoPath, '.sources', sourceId);
     const knownPath = recordedPath ?? recordedPathFromFileUri(recordedUri, pageRoot);
     filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, slug, sourceId);
+    // Leak guard: refuse a file inside some OTHER source's own working tree
+    // (#2018) under any spelling, whether sync.repo_path is that tree, lies
+    // inside it, or contains it (#7203).
+    if (await otherSourceOwning(engine, sourceId, filePath)) {
+      return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
+    }
     writeRoot = repoPath;
     // pageRoot, not repoPath: a later `sources add --path <pageRoot>` scan
     // walks pageRoot, so the bind must speak that scan's convention.

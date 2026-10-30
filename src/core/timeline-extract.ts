@@ -155,33 +155,61 @@ const MARKED = 2;
  * body produces), so one entry per row answers both questions.
  */
 export class TimelineKeySet implements TimelineKeyLookup {
-  private readonly digests = new Map<number, number>();
+  /** Open addressing over two plain number arrays (a Map costs about 80 bytes an entry, these about 25): slot i holds the first hash + 1 (0: empty) and the second hash plus its flags times LOW. */
+  private firsts: number[] = new Array<number>(1024).fill(0);
+  private values: number[] = new Array<number>(1024).fill(0);
+  private count = 0;
   add(key: string): void {
     const [a, b] = keyDigest(key);
-    const at = this.digests.get(a);
-    if (at === undefined) this.digests.set(a, b);
-    else if (at % LOW !== b) this.digests.set(a, at - (at % LOW) + b + (Math.floor(at / LOW) & AMBIGUOUS ? 0 : AMBIGUOUS * LOW));
+    const i = this.slot(a);
+    if (this.firsts[i] === 0) {
+      this.firsts[i] = a + 1;
+      this.values[i] = b;
+      if (++this.count * 4 > this.firsts.length * 3) this.grow();
+      return;
+    }
+    const at = this.values[i]!;
+    if (at % LOW !== b) this.values[i] = at - (at % LOW) + b + (Math.floor(at / LOW) & AMBIGUOUS ? 0 : AMBIGUOUS * LOW);
   }
   has(key: string): boolean {
-    return this.entry(key) !== undefined;
+    return this.entry(key) !== -1;
   }
   /** Flag an added key; false when it was not added. */
   mark(key: string): boolean {
-    const [a] = keyDigest(key);
-    const at = this.entry(key);
-    if (at === undefined) return false;
-    if (!(Math.floor(at / LOW) & MARKED)) this.digests.set(a, at + MARKED * LOW);
+    const i = this.entry(key);
+    if (i === -1) return false;
+    if (!(Math.floor(this.values[i]! / LOW) & MARKED)) this.values[i] = this.values[i]! + MARKED * LOW;
     return true;
   }
   marked(key: string): boolean {
-    const at = this.entry(key);
-    return at !== undefined && (Math.floor(at / LOW) & MARKED) !== 0;
+    const i = this.entry(key);
+    return i !== -1 && (Math.floor(this.values[i]! / LOW) & MARKED) !== 0;
   }
-  get size(): number { return this.digests.size; }
-  private entry(key: string): number | undefined {
+  get size(): number { return this.count; }
+  /** The slot holding first hash `a`, or the empty slot where it goes. */
+  private slot(a: number): number {
+    const mask = this.firsts.length - 1;
+    let i = a % this.firsts.length;
+    while (this.firsts[i] !== 0 && this.firsts[i] !== a + 1) i = (i + 1) & mask;
+    return i;
+  }
+  private entry(key: string): number {
     const [a, b] = keyDigest(key);
-    const at = this.digests.get(a);
-    return at !== undefined && ((Math.floor(at / LOW) & AMBIGUOUS) !== 0 || at % LOW === b) ? at : undefined;
+    const i = this.slot(a);
+    if (this.firsts[i] === 0) return -1;
+    const at = this.values[i]!;
+    return (Math.floor(at / LOW) & AMBIGUOUS) !== 0 || at % LOW === b ? i : -1;
+  }
+  private grow(): void {
+    const { firsts, values } = this;
+    this.firsts = new Array<number>(firsts.length * 2).fill(0);
+    this.values = new Array<number>(firsts.length * 2).fill(0);
+    for (let j = 0; j < firsts.length; j++) {
+      if (firsts[j] === 0) continue;
+      const i = this.slot(firsts[j]! - 1);
+      this.firsts[i] = firsts[j]!;
+      this.values[i] = values[j]!;
+    }
   }
 }
 
@@ -297,13 +325,15 @@ export async function unkeptTimelineRows(engine: Pick<BrainEngine, 'executeRaw'>
  * Returns the orphaned rows; they are deleted unless `dryRun`. `storedRows`
  * is the caller's own read of those rows (a batched walk), used instead of reading them here.
  * `current` is the page text, or its keys when the caller read a segmented body (segmentedTimelineText).
+ * `expectedRevision` is the page revision `current` was read at (GBRA-161 PR 5, T-2): the delete then runs with the page
+ * row locked and only while the page is still at that revision; a page that moved deletes nothing and returns no rows.
  */
 export async function retractRemovedTimelineEntries(
   engine: Pick<BrainEngine, 'executeRaw' | 'readManifest' | 'readSegmentTexts'>,
   slug: string,
   sourceId: string,
   current: string | TimelineTextKeys,
-  opts: { dryRun?: boolean; storedRows?: ReadonlyArray<StoredTimelineTuple>; stop?: () => boolean } = {},
+  opts: { dryRun?: boolean; storedRows?: ReadonlyArray<StoredTimelineTuple>; stop?: () => boolean; expectedRevision?: string } = {},
 ): Promise<Array<TimelineTuple & { id: number }>> {
   const kept = typeof current === 'string' ? markdownTimelineKeys(current, slug) : current.kept;
   const within = typeof current === 'string' ? undefined : current.within;
@@ -342,10 +372,21 @@ export async function retractRemovedTimelineEntries(
   await contestHeldRows(engine as BrainEngine, { sourceId, slug, table: 'timeline_entries', proposer: 'timeline_reconcile', writer,
     rows: [...held].map(([id, tier]) => ({ id, tier, change: 'removed' as const })) });
   if (!orphans.length) return orphans;
-  await engine.executeRaw(
+  const remove = (db: Pick<BrainEngine, 'executeRaw'>) => db.executeRaw(
     `DELETE FROM timeline_entries WHERE id IN (SELECT jsonb_array_elements_text($1::text::jsonb)::int)`,
     [JSON.stringify(orphans.map(row => row.id))]);
-  return orphans;
+  if (opts.expectedRevision === undefined) {
+    await remove(engine);
+    return orphans;
+  }
+  const expected = opts.expectedRevision;
+  return (engine as BrainEngine).transaction(async tx => {
+    const [current] = await tx.executeRaw<{ revision: string }>(
+      'SELECT knowledge_revision::text AS revision FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL FOR SHARE', [sourceId, slug]);
+    if (current?.revision !== expected) return [];
+    await remove(tx);
+    return orphans;
+  });
 }
 
 /**
@@ -353,7 +394,7 @@ export async function retractRemovedTimelineEntries(
  * keys of its stored rows (segmentedTimelineText `within`, a TimelineKeySet), and the rows are streamed, not held.
  */
 async function retractStoredPage(engine: BrainEngine, page: { id: number; slug: string; source_id: string; compiled_truth: string; timeline: string | null; body_storage: string },
-  opts: { dryRun?: boolean }) {
+  opts: { dryRun?: boolean; expectedRevision?: string }) {
   if (page.body_storage !== 'segmented') return retractRemovedTimelineEntries(engine, page.slug, page.source_id, `${page.compiled_truth}\n${page.timeline ?? ''}`, opts);
   const within = new TimelineKeySet();
   await eachStoredTimelineRow(engine, page.id, row => within.add(tupleKey(row)));
@@ -403,8 +444,8 @@ export async function pruneTimelineOrphans(
     if (pageSize <= 0) break;
     const params: unknown[] = [afterId, pageSize];
     if (opts.sourceId) params.push(opts.sourceId);
-    const pages = await engine.executeRaw<{ id: number; slug: string; source_id: string; compiled_truth: string; timeline: string | null; body_storage: string }>(
-      `SELECT p.id, p.slug, p.source_id, p.compiled_truth, p.timeline, p.body_storage FROM pages p
+    const pages = await engine.executeRaw<{ id: number; slug: string; source_id: string; compiled_truth: string; timeline: string | null; body_storage: string; revision: string }>(
+      `SELECT p.id, p.slug, p.source_id, p.compiled_truth, p.timeline, p.body_storage, p.knowledge_revision::text AS revision FROM pages p
         WHERE p.id > $1 AND p.deleted_at IS NULL${opts.sourceId ? ' AND p.source_id = $3' : ''}
           AND EXISTS (SELECT 1 FROM timeline_entries t WHERE t.page_id = p.id AND t.event_page_id IS NULL)
         ORDER BY p.id LIMIT $2`, params);
@@ -412,7 +453,7 @@ export async function pruneTimelineOrphans(
     for (const page of pages) {
       const orphans = opts.coordinated && !opts.dryRun
         ? await retractCoordinated(engine, page.id, page.slug, page.source_id)
-        : await retractStoredPage(engine, page, { dryRun: opts.dryRun });
+        : await retractStoredPage(engine, page, { dryRun: opts.dryRun, expectedRevision: page.revision });
       result.orphans += orphans.length;
       if (!opts.dryRun) result.removed += orphans.length;
       for (const row of orphans.slice(0, Math.max(0, 5 - result.examples.length))) {

@@ -155,6 +155,10 @@ const MATRIX: Row[] = [
   { name: 'list_pages', mode: 'isolated', args: { limit: 100 } },
   { name: 'search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
   { name: 'query', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
+  // search_exact echoes its phrase, so the probe reads the matches and the unreadable-page sample.
+  { name: 'search_exact', mode: 'isolated', args: { phrase: 'BETAMARKER' },
+    controlSees: r => leakToken((r as any).matches) !== null,
+    expectScoped: r => { expect(leakToken({ matches: (r as any).matches, unreadable: (r as any).unreadable })).toBeNull(); } },
   { name: 'assemble_evidence', mode: 'isolated', args: { hits: [{ source_id: 'srcbeta', slug: 'notes/beta-note', chunk_id: 0 }], return_unit: 'page' } },
   { name: 'get_tags', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_links', mode: 'isolated', args: { slug: 'notes/beta-note' } },
@@ -164,9 +168,14 @@ const MATRIX: Row[] = [
   { name: 'get_versions', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_raw_data', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'resolve_slugs', mode: 'isolated', args: { partial: 'beta' } },
+  // whois echoes its query, so the probe reads the matches.
+  { name: 'whois', mode: 'isolated', args: { query: 'BETAMARKER Person' },
+    controlSees: r => leakToken((r as any).matches) !== null,
+    expectScoped: r => { expect(leakToken((r as any).matches)).toBeNull(); } },
   { name: 'get_chunks', mode: 'isolated', args: { slug: 'notes/beta-note' } },
   { name: 'get_ingest_log', mode: 'isolated', args: { limit: 50 } },
   { name: 'find_orphans', mode: 'isolated', args: {} },
+  { name: 'rank_entities', mode: 'isolated', args: {} },
   { name: 'wanted_pages', mode: 'isolated', args: {} },
   { name: 'takes_list', mode: 'isolated', args: { limit: 50 } },
   { name: 'takes_search', mode: 'isolated', args: { query: 'BETAMARKER', limit: 20 } },
@@ -205,6 +214,7 @@ const MATRIX: Row[] = [
     expectScoped: () => {
       throw new Error('sources_status must fail closed (not_found) for out-of-scope ids under any untrusted ctx');
     } },
+  { name: 'sources_resolve_path', mode: 'skip', reason: 'needs a Git checkout of the source; the not_found confinement of an out-of-scope id (assertSourceInCallerScope, as sources_status) is pinned in test/sources-resolve-path.test.ts' },
   { name: 'schema_stats', mode: 'isolated', args: {} },
   { name: 'schema_review_orphans', mode: 'isolated', args: { limit: 50 } },
 

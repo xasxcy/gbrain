@@ -91,6 +91,8 @@ interface RequestSnapshot {
   engine: object;
   open: boolean;
   rows: Promise<Map<string, string> | null> | null;
+  /** Other request-stable reads of the same engine (`requestSnapshotRead`), dropped with `rows`. */
+  reads: Map<string, Promise<unknown>>;
 }
 
 const requestSnapshot = new AsyncLocalStorage<{ held: RequestSnapshot; live: boolean }>();
@@ -101,15 +103,35 @@ function activeSnapshot(engine: object): RequestSnapshot | undefined {
   return store && !store.live && store.held.open && store.held.engine === engine ? store.held : undefined;
 }
 
-/** Run `fn` with one config snapshot of `engine`; an enclosing snapshot of the same engine is reused. */
-export async function withRequestConfigSnapshot<T>(engine: BulkConfigReader, fn: () => Promise<T>): Promise<T> {
+/**
+ * Run `fn` with one config snapshot of `engine`; an enclosing snapshot of the same engine is reused. `seed` (GBRA-156) is
+ * a whole-table read this command already took (`commandStartupConfig`), which the snapshot answers from instead of reading again.
+ */
+export async function withRequestConfigSnapshot<T>(engine: BulkConfigReader, fn: () => Promise<T>, seed?: Record<string, string>): Promise<T> {
   if (activeSnapshot(engine)) return fn();
-  const held: RequestSnapshot = { engine, open: true, rows: null };
+  const snapshot = openRequestConfigSnapshot(engine, seed);
   try {
-    return await requestSnapshot.run({ held, live: false }, fn);
+    return await snapshot.run(fn);
   } finally {
-    held.open = false;
+    snapshot.close();
   }
+}
+
+/**
+ * One snapshot of `engine` shared by separate calls that cannot sit inside one
+ * callback (#7147: a CLI read builds its context, then runs the operation,
+ * each under its own timeout). Each `run(fn)` reads config the way
+ * `withRequestConfigSnapshot` does, all from the same snapshot; `close()`
+ * ends it, so later reads, and work a run left behind, read live.
+ */
+export interface RequestConfigSnapshot { run<T>(fn: () => Promise<T>): Promise<T>; close(): void }
+
+export function openRequestConfigSnapshot(engine: BulkConfigReader, seed?: Record<string, string>): RequestConfigSnapshot {
+  const held: RequestSnapshot = { engine, open: true, rows: seed ? Promise.resolve(new Map(Object.entries(seed))) : null, reads: new Map() };
+  return {
+    run: fn => activeSnapshot(engine) ? fn() : requestSnapshot.run({ held, live: false }, fn),
+    close: () => { held.open = false; },
+  };
 }
 
 /** Run `fn` reading config live (a write operation inside a request); the request's snapshot is retaken after it. */
@@ -120,6 +142,7 @@ export async function withoutRequestConfigSnapshot<T>(fn: () => Promise<T>): Pro
     return await requestSnapshot.run({ held: store.held, live: true }, fn);
   } finally {
     store.held.rows = null;
+    store.held.reads.clear();
   }
 }
 
@@ -150,6 +173,22 @@ export async function requestConfigRows(engine: BulkConfigReader): Promise<Recor
   return rows ? Object.fromEntries(rows) : undefined;
 }
 
+/**
+ * GBRA-156: the whole config table as the CLI's connect-time merge read it (cli/db-plane-config.ts), kept per engine so the
+ * same command's next read-only resolution (makeContext's source resolution) answers from it instead of reading again.
+ * Taken once: a later resolution reads live, as before.
+ */
+const startupRows = new WeakMap<object, { at: number; rows: Record<string, string> }>();
+export const STARTUP_CONFIG_MAX_AGE_MS = 5_000;
+export function keepCommandStartupConfig(engine: object, rows: Record<string, string>, now: number = Date.now()): void {
+  startupRows.set(engine, { at: now, rows });
+}
+export function commandStartupConfig(engine: object, now: number = Date.now()): Record<string, string> | undefined {
+  const kept = startupRows.get(engine);
+  startupRows.delete(engine);
+  return kept && now - kept.at < STARTUP_CONFIG_MAX_AGE_MS ? kept.rows : undefined;
+}
+
 /** Keep an open snapshot of `engine` equal to a write the engine just made (value null = key removed). */
 export function noteRequestConfigWrite(engine: object, key: string, value: string | null): void {
   const held = activeSnapshot(engine);
@@ -160,4 +199,19 @@ export function noteRequestConfigWrite(engine: object, key: string, value: strin
     if (value === null) next.delete(key); else next.set(key, value);
     return next;
   });
+}
+
+/**
+ * `load()` once per request snapshot of `engine` under `key`, for a read that
+ * stays fixed for one request the way the config table does (the sources
+ * rows source resolution reads three ways, #7147). Undefined when no snapshot
+ * applies; the caller then reads live. A write operation inside the request
+ * drops it with the config rows, so a later read loads again.
+ */
+export function requestSnapshotRead<T>(engine: object, key: string, load: () => Promise<T>): Promise<T> | undefined {
+  const held = activeSnapshot(engine);
+  if (!held) return undefined;
+  let read = held.reads.get(key) as Promise<T> | undefined;
+  if (!read) held.reads.set(key, read = requestSnapshot.run({ held, live: true }, load));
+  return read;
 }

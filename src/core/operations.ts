@@ -58,6 +58,7 @@ export {
 import { pagesOperations } from './ops/pages.ts';
 import { persistenceOperations } from './ops/persistence.ts';
 import { searchOperations } from './ops/search.ts';
+import { searchExactOperations } from './ops/search-exact.ts';
 import { takesOperations } from './ops/takes.ts';
 import { tagsOperations } from './ops/tags.ts';
 import { linksOperations } from './ops/links.ts';
@@ -84,11 +85,13 @@ import { brainMembershipOperations } from './ops/brain-membership.ts';
 import { syncStatusOperations } from './ops/sync-status.ts';
 import { rawDataOperations } from './ops/raw-data.ts';
 import { chunksOperations } from './ops/chunks.ts';
+import { whoisOperations } from './ops/whois.ts';
 import { ingestLogOperations } from './ops/ingest-log.ts';
 import { usageOperations } from './ops/usage.ts';
 import { filesOperations } from './ops/files.ts';
 import { jobsOperations } from './ops/jobs.ts';
 import { orphansOperations } from './ops/orphans.ts';
+import { graphRankOperations } from './ops/graph-rank.ts';
 import { calibrationOperations } from './ops/calibration.ts';
 import { salienceOperations } from './ops/salience.ts';
 
@@ -145,8 +148,8 @@ export const operations: Operation[] = [
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
   ...pagesOperations, ...pageEditOperations, ...pageAppendOperations, ...pageBatchOperations, ...pageUploadOperations,
   ...persistenceOperations,
-  // Search (search, query) — ops/search.ts
-  ...searchOperations,
+  // Search (search, query) — ops/search.ts; search_exact — ops/search-exact.ts
+  ...searchOperations, ...searchExactOperations,
   ...feedbackOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
   ...imageOperations,
@@ -168,8 +171,8 @@ export const operations: Operation[] = [
   ...syncStatusOperations,
   // Raw data (put_raw_data, get_raw_data) — ops/raw-data.ts
   ...rawDataOperations,
-  // Resolution & chunks (resolve_slugs, get_chunks) — ops/chunks.ts
-  ...chunksOperations,
+  // Resolution & chunks (resolve_slugs, get_chunks) — ops/chunks.ts; whois — ops/whois.ts
+  ...chunksOperations, ...whoisOperations,
   // Ingest log (log_ingest, get_ingest_log) — ops/ingest-log.ts
   ...ingestLogOperations,
   // Usage accounting (get_usage, #4218) — ops/usage.ts
@@ -180,8 +183,8 @@ export const operations: Operation[] = [
   // get_job_progress, pause_job, resume_job, replay_job, send_job_message)
   // + v0.38 Slice 3 agent lane (submit_agent, get_agent_job) — ops/jobs.ts
   ...jobsOperations,
-  // Orphans (find_orphans) — ops/orphans.ts
-  ...orphansOperations,
+  // Orphans (find_orphans) — ops/orphans.ts; rank_entities — ops/graph-rank.ts
+  ...orphansOperations, ...graphRankOperations,
   // v0.36.1.0 (T7) — Hindsight calibration wave (get_calibration_profile) —
   // ops/calibration.ts
   ...calibrationOperations,

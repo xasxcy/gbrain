@@ -26,6 +26,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { DATABASE_ONLY_SOURCES_KEY } from './unbound-source.ts';
+import { NOT_PAGE_EMBEDDING_LEASE } from '../page-embedding-lease.ts';
 import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
@@ -143,7 +144,7 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
         : carry.state_file ? `move ${carry.state_file} aside, then rerun deactivate; or ${resolve}` : resolve });
   }
   const leases = await engine.executeRaw<{ id: string; holder_host: string; holder_pid: number }>(
-    'SELECT id, holder_host, holder_pid FROM gbrain_cycle_locks WHERE ttl_expires_at > now() ORDER BY id');
+    `SELECT id, holder_host, holder_pid FROM gbrain_cycle_locks WHERE ttl_expires_at > now() AND ${NOT_PAGE_EMBEDDING_LEASE} ORDER BY id`);
   for (const l of leases) blockers.push({ kind: 'lease', id: l.id, detail: `held by host ${l.holder_host}, pid ${l.holder_pid}`,
     exit: 'wait for that connector sync or maintenance run to finish (gbrain doctor shows live locks), then rerun deactivate' });
   return blockers;
@@ -162,7 +163,7 @@ const EFFECT_ROWS = `SELECT e.id::text AS effect_id, e.kind, e.state, COALESCE(e
  * the same vector) or an effect whose source was archived, replaced or removed.
  */
 export async function failedEffectHistory(engine: BrainEngine): Promise<FailedEffectEntry[]> {
-  const rows = await engine.executeRaw<EffectRow>(`${EFFECT_ROWS} WHERE e.state='failed' AND e.recovery IS NULL ORDER BY e.id LIMIT 50`);
+  const rows = await engine.executeRaw<EffectRow>(`${EFFECT_ROWS} WHERE e.state='failed' AND e.recovery IS NULL AND NOT (e.data ? 'settled') ORDER BY e.id LIMIT 50`);
   return rows.map(e => {
     const retry = `gbrain sources writer retry-effects ${e.source_id} --request-id ${e.request_id} --dry-run`;
     const [exit, why] = !e.source_live ? [null, 'its source was archived, replaced or removed, so nothing can run it']
@@ -320,9 +321,11 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
 
 interface RetiredRecord { epochs: Set<number>; worktrees: Set<string>; roots: Set<string> }
 
-async function readRetired(engine: BrainEngine, brainId: string): Promise<RetiredRecord> {
-  const rows = await engine.executeRaw<{ outcome: { brain_id?: string; retired_mode_epoch?: number; worktrees?: Array<{ id: string; roots: string[] }>; source_roots?: string[] } }>(
+/** GBRA-133: `brain` is awaited only after the read is sent, so the caller's persistence_brain read shares its round trip. */
+async function readRetired(engine: BrainEngine, brain: Promise<{ brain_id: string }>): Promise<RetiredRecord> {
+  const rowsRead = engine.executeRaw<{ outcome: { brain_id?: string; retired_mode_epoch?: number; worktrees?: Array<{ id: string; roots: string[] }>; source_roots?: string[] } }>(
     "SELECT outcome FROM persistence_topology_changes WHERE operation='writer_deactivate' AND state='committed'");
+  const [rows, { brain_id: brainId }] = await Promise.all([rowsRead, brain]);
   const retired: RetiredRecord = { epochs: new Set(), worktrees: new Set(), roots: new Set() };
   const canonical = (path: string) => { try { return canonicalFilesystemPath(path); } catch { return path; } };
   for (const { outcome } of rows) {
@@ -351,9 +354,9 @@ export async function cleanupRetiredManagedMarkers(engine: BrainEngine): Promise
   const report: LocalMarkerReport = { state: 'cleared', removed: [], pending: [] };
   const [present] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('persistence_topology_changes') IS NOT NULL AS present");
   if (!present?.present) return report;
-  const brain = await readPersistenceBrain(engine);
+  const brainRead = readPersistenceBrain(engine);
+  const [brain, retired] = await Promise.all([brainRead, readRetired(engine, brainRead)]);
   const current = Number(brain.mode_epoch ?? 1);
-  const retired = await readRetired(engine, brain.brain_id);
   if (!retired.epochs.size && !retired.worktrees.size) return report;
   const activeRoots = new Set(brain.enabled ? (await engine.executeRaw<{ local_path: string }>('SELECT local_path FROM persistence_host_bindings'))
     .map(row => { try { return canonicalFilesystemPath(row.local_path); } catch { return row.local_path; } }) : []);

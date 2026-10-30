@@ -64,6 +64,8 @@ export interface GetPageProjectionOpts {
   timeline_entries?: unknown;
   /** A held source file (sync could not import it); present in both shapes so an editor sees it. */
   file_held?: unknown;
+  /** GBRA-161 PR 2: the page's held facts or takes fence (`fence_absent`), each with its ask-the-user fix; present in both shapes. */
+  fence_held?: unknown;
   /** #6259: the page is quarantined; `body_omitted` drops compiled_truth, timeline and `content`. */
   quarantined?: QuarantinedView | null;
   /** #5575 A6: the page's trust tier and short write origin. */
@@ -80,6 +82,8 @@ export interface GetPageProjectionOpts {
  * and revision included, so the write goes back to the page that was read), without
  * the duplicate compiled_truth / timeline / frontmatter the full shape carries
  * next to `content` (a 30 KB page otherwise comes back as ~62 KB).
+ * Both shapes carry `chars` (#7180): the characters of page text the response
+ * holds (compiled_truth, timeline and `content`), so a caller can budget.
  */
 export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
   const { revision, tags, resolved_slug, content_flag, quarantined } = o;
@@ -92,10 +96,12 @@ export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
     ...(quarantined ? { quarantined } : {}),
     ...(o.timeline_entries !== undefined ? { timeline_entries: o.timeline_entries } : {}),
     ...(o.file_held !== undefined ? { file_held: o.file_held } : {}),
+    ...(o.fence_held !== undefined ? { fence_held: o.fence_held } : {}),
     ...(resolved_slug ? { resolved_slug } : {}), ...(content_flag ? { content_flag } : {}),
   };
   if (o.includeContent && o.contentOnly) {
     const deletedAt = visibleBody.deleted_at;
+    const text = omitted ? undefined : content();
     return {
       slug: visibleBody.slug,
       source_id: visibleBody.source_id,
@@ -103,16 +109,19 @@ export function projectGetPage(page: Page, o: GetPageProjectionOpts) {
       title: visibleBody.title,
       revision,
       tags,
-      ...(omitted ? {} : { content: content() }),
+      ...(text === undefined ? {} : { content: text }),
+      chars: text?.length ?? 0,
       ...(deletedAt ? { deleted_at: deletedAt } : {}),
       ...extras,
     };
   }
+  const text = o.includeContent && !omitted ? content() : undefined;
   return {
     ...visibleBody,
     revision,
     tags,
-    ...(o.includeContent && !omitted ? { content: content() } : {}),
+    ...(text === undefined ? {} : { content: text }),
+    chars: (visibleBody.compiled_truth ?? '').length + (visibleBody.timeline ?? '').length + (text?.length ?? 0),
     // #5575 A6: the reading shape carries the page's trust; the content_only round-trip shape stays minimal.
     ...(o.trust ?? {}),
     ...extras,

@@ -83,6 +83,7 @@ import { cachedQueryEmbedding, clearQueryEmbedCache, queryEmbedCacheKey, queryEm
 import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
 installAiSdkWarningWriter();
 const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
+const guardedExpansion = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS, 'gateway.expand');
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -1767,8 +1768,9 @@ async function embedSubBatch(
   opts?: EmbedOpts,
 ): Promise<{ embeddings: Float32Array[]; reportedTokens: number | null }> {
   try {
+    const maxRetries = hasAIInvocationGuard() ? 0 : opts?.maxRetries ?? __budgetStore.getStore()?.providerRetries; // PR 4 (Wave B incremental derivation, transcripts): an embed in a metered page step makes only the attempts it reserved for
     const callTransport = () => invokeAI({ operation: 'gateway.embed', kind: 'embedding', model: `${recipe.id}:${modelId}`,
-      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0 }, () => _embedTransport({
+      maxInputTokens: embedRequestMaxInputTokens(texts, recipe, modelId), maxOutputTokens: 0, estimatedInputTokens: Math.ceil(texts.reduce((n, text) => n + text.length, 0) / (recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN)) }, () => _embedTransport({
       model,
       values: texts,
       providerOptions: providerOpts,
@@ -1777,7 +1779,7 @@ async function embedSubBatch(
       // per-SDK-call scope). Composes with a caller signal (Fix 3's 6s query
       // deadline) — shorter wins.
       abortSignal: withDefaultTimeout(opts?.abortSignal, AI_EMBED_TIMEOUT_MS),
-      ...(hasAIInvocationGuard() ? { maxRetries: 0 } : opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
+      ...(maxRetries !== undefined ? { maxRetries } : {}),
     }), sdkInvocationUsage, err => isTokenLimitError(err) || isUnbilledEmbeddingRejection(recipe.id, err) ? { inputTokens: 0, outputTokens: 0 } : null);
     // Carry the threaded input_type across the SDK boundary via
     // __embedInputTypeStore (the adapter strips it from providerOptions —
@@ -2541,8 +2543,12 @@ export async function expand(query: string): Promise<string[]> {
     const requestedModelId = getExpansionModel();
     const { model, recipe, modelId } = await resolveExpansionProvider(requestedModelId);
     const modelLabel = `${recipe.id}:${modelId}`;
-    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void =>
-      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, ...normalizeSdkUsage(usage) });
+    // #7176: a successful expansion is also a chat_usage_log row, phase 'expansion'.
+    const recordExpansionUsage = (usage: unknown, countsAsCall: boolean): void => {
+      const { inputTokens, outputTokens } = normalizeSdkUsage(usage);
+      recordOnTracker(tracker, { modelId: modelLabel, requestedModelId, label: 'gateway.expand', countsAsCall, inputTokens, outputTokens });
+      recordChatUsage({ model: modelLabel, provider: recipe.id, phase: 'expansion', usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+    };
     const recordExpansionFailure = (err: unknown, countsAsCall: boolean): void =>
       recordOnTracker(tracker, {
         modelId: modelLabel,
@@ -2561,7 +2567,7 @@ export async function expand(query: string): Promise<string[]> {
     const viaText = async (countsAsCall = true): Promise<string[]> => {
       let textResult: Awaited<ReturnType<GenerateTextFn>>;
       try {
-        textResult = await guardedGeneration(modelLabel, _generateTextTransport, {
+        textResult = await guardedExpansion(modelLabel, _generateTextTransport, {
           model,
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
@@ -2602,7 +2608,7 @@ export async function expand(query: string): Promise<string[]> {
       // generic, so `object` would be `{}`.)
       let result: { object?: unknown; usage?: unknown };
       try {
-        result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Name the schema. On the native-anthropic path the SDK turns the schema
@@ -2636,7 +2642,7 @@ export async function expand(query: string): Promise<string[]> {
       // schema (strict validation), and fall back to the text path if it is
       // rejected at call time so a mis-declared capability never drops expansion.
       try {
-        const result = await guardedGeneration(modelLabel, _generateObjectTransport, {
+        const result = await guardedExpansion(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Same schema name+description as the native branch above: an
@@ -3777,6 +3783,8 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
     abortSignal: withDefaultTimeout(opts.abortSignal, opts.timeoutMs ?? AI_CHAT_TIMEOUT_MS),
     providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     ...(requestHeaders ? { headers: requestHeaders } : {}),
+    // PR 4 (Wave B incremental derivation, transcripts): a metered page step sees every attempt it pays for.
+    ...(tracker?.providerRetries !== undefined ? { maxRetries: tracker.providerRetries } : {}),
   });
 
   try {
@@ -4464,7 +4472,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   try {
     const transport: RerankTransport = _rerankTransport ?? ((u, init) => fetch(u, init));
     const maxInputTokens = rerankRequestMaxInputTokens(input.query, input.documents);
-    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens }, () => transport(url, {
+    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr, maxInputTokens, estimatedInputTokens: Math.ceil(rerankChars / (recipe.touchpoints.embedding?.chars_per_token ?? 4)) }, () => transport(url, {
       method: 'POST',
       headers,
       body,

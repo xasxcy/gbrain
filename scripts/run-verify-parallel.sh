@@ -189,6 +189,9 @@ CHECKS=(
   # Goal (a) (refactor wave 1): engine SQL only shrinks; baseline
   # scripts/engine-sql-baseline.tsv.
   "check:engine-sql-ratchet"
+  # GBRA-161: derived-retire writers only shrink; reviewed ceilings in
+  # docs/architecture/derived-census.tsv.
+  "check:derived-census"
   # Wave B segmented storage (spec 1.5 layer 4): whole-body page readers only
   # shrink; baseline scripts/page-body-readers-baseline.tsv.
   "check:page-body-readers"
@@ -225,6 +228,8 @@ CHECKS=(
   "check:regen-all"
   # v0.50.5.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
+  # The vendored postgres driver's three copies equal pinned upstream plus its patch (networked; a recorded skip offline).
+  "check:vendor-postgres"
 )
 
 # ──────────────────────────────────────────────────────────────────────────

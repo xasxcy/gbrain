@@ -15,19 +15,20 @@
 # Needs only bash, curl, python3, ssh, ssh-keygen, and tar locally, so it works
 # from dev boxes, containers, and cloud sandboxes.
 #
-# Ownership: VMs are named ubirun-<owner>-<epoch>-<suffix>. <owner> is UBI_OWNER
+# Ownership: VMs are named ubirun-<owner>-<epoch>-<suffix>-t<H>. <owner> is UBI_OWNER
 # (lowercased, letters and digits only, at most 12 characters, starting with a
 # letter) or a random per-machine id kept in $STATE_ROOT/owner-id. Ubicloud names
-# allow 63 characters of [a-z0-9-], so a full name stays under 40.
+# allow 63 characters of [a-z0-9-], so a full name stays under 50.
 #
-# Expiry: `up` and `run` with --ttl-hours H name the VM
-# ubirun-<owner>-<epoch>-x<expiry epoch>-<suffix>, expiring H hours after
-# creation (ci:ubicloud names its own VMs this way, 2 hours by default). The
-# operator reaper (scripts/ubicloud/reap-expired.ts) destroys VMs in that
-# format once the expiry has passed, whoever owns them. Without --ttl-hours a
-# VM never expires and is never reaped; use that, or a long TTL, for dev,
-# benchmark and eval VMs. Every parser here reads both formats, and the
-# expiring form stays under 52 characters.
+# Expiry: every name `up` and `run` generate ends in a TTL,
+# ubirun-<owner>-<epoch>-<suffix>-t<H>, expiring H hours after creation: H is
+# --ttl-hours (1 to 999), or 999 without it (about 41 days, for long dev,
+# benchmark and eval VMs). That is gstack's runner grammar, so the operator
+# reaper (scripts/ubicloud/reap-expired.ts) and gstack's reap both destroy a VM
+# once its TTL has ended, whoever owns it; ci:ubicloud names its gate VMs the
+# same way (2 hours by default). Every parser here still reads the older
+# ubirun-<owner>-<epoch>-x<expiry epoch>-<suffix> and TTL-less names, and a
+# generated name stays under 50 characters.
 #
 # Teardown: `up` records each VM's state (location, create status) before it
 # sends the create request, and `down` destroys and polls until the VM is
@@ -39,6 +40,12 @@
 # Stale-VM sweeps are off by default. With UBI_GC_HOURS set to a positive
 # number, every `up` first destroys this owner's VMs older than that; `gc HOURS`
 # runs the same sweep on demand. Neither ever touches another owner's VMs.
+#
+# "This owner's VMs" (`list --mine`, `gc`, the `up` sweep) are the VMs tagged
+# with the caller's owner tag plus every VM this machine created under any tag:
+# `up` keeps a VM's state here until `down` confirms it gone, so a run started
+# with UBI_OWNER=x whose teardown never ran is still found by a later call that
+# did not export the same UBI_OWNER.
 set -Eeuo pipefail
 # Keep heredoc bodies on temp files, not the pipe window (test/heredoc-pipe-deadlock.test.ts).
 BASH_COMPAT=50
@@ -170,15 +177,22 @@ vm_rows() {
   done
 }
 
+# mine_rows: vm_rows for the VMs tagged with this owner or created from this machine (their `up` state is still here).
+mine_rows() {
+  local loc name owner
+  vm_rows | while read -r loc name owner; do
+    if [ "$owner" = "$OWNER" ] || [ -f "$(state_dir "$name")/env" ]; then echo "$loc $name $owner"; fi
+  done
+}
+
 cmd_gc() {
   local hours=${1:-$GC_HOURS} now loc name owner
   if ! [[ "$hours" =~ ^[0-9]+$ ]] || [ "$hours" -eq 0 ]; then die "gc: give HOURS > 0 (or set UBI_GC_HOURS)"; fi
   now=$(date +%s)
-  vm_rows | while read -r loc name owner; do
-    [ "$owner" = "$OWNER" ] || continue
+  mine_rows | while read -r loc name owner; do
     [[ "$name" =~ -([0-9]{10})- ]] || continue
     if [ $(( (now - BASH_REMATCH[1]) / 3600 )) -ge "$hours" ]; then
-      log "destroying stale $loc/$name (owner $OWNER, older than ${hours}h)"
+      log "destroying stale $loc/$name (owner $owner, older than ${hours}h)"
       cmd_down "$name" -l "$loc" || log "failed to destroy $loc/$name"
     fi
   done
@@ -187,7 +201,12 @@ cmd_gc() {
 cmd_list() {
   case ${1:-} in
     "") cli vm list ;;
-    --mine) vm_rows | awk -v o="$OWNER" '$3==o {print $1 "  " $2}' ;;
+    --mine)
+      local rows others
+      rows=$(mine_rows)
+      others=$(printf '%s\n' "$rows" | awk -v o="$OWNER" 'NF && $3!=o {print $3}' | sort -u | paste -sd, -)
+      log "list --mine: owner tag $OWNER plus VMs this machine created${others:+ (also under: $others)}"
+      [ -z "$rows" ] || printf '%s\n' "$rows" | awk '{print $1 "  " $2}' ;;
     *) die "list: unknown option $1 (use --mine)" ;;
   esac
 }
@@ -219,18 +238,16 @@ write_state() {
     "$1" "$2" "$3" "$4" "$5" "$6" "$$" >"$(state_dir "$1")/env"
 }
 
-# new_name [TTL_HOURS]: a fresh name for this owner, carrying an expiry
-# TTL_HOURS after now when given.
+# new_name TTL_HOURS: a fresh name for this owner whose TTL ends TTL_HOURS after now.
 new_name() {
-  local now suffix
-  now=$(date +%s)
+  local suffix
   suffix=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  if [ -n "${1:-}" ]; then echo "$PREFIX-$OWNER-$now-x$(( now + $1 * 3600 ))-$suffix"; else echo "$PREFIX-$OWNER-$now-$suffix"; fi
+  echo "$PREFIX-$OWNER-$(date +%s)-$suffix-t$1"
 }
 
 check_ttl() {
-  [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 8760 ] \
-    || die "--ttl-hours must be a whole number of hours from 1 to 8760 (omit it for a VM that never expires)"
+  [[ "$1" =~ ^[1-9][0-9]{0,2}$ ]] \
+    || die "--ttl-hours must be a whole number of hours from 1 to 999 (omit it for the longest TTL, 999 hours)"
 }
 
 valid_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
@@ -251,7 +268,7 @@ cmd_up() {
     esac
   done
   [ -z "$name" ] || [ -z "$ttl" ] || die "up: --ttl-hours writes the expiry into the generated name, so it cannot be combined with -n"
-  [ -n "$name" ] || name=$(new_name "$ttl")
+  [ -n "$name" ] || name=$(new_name "${ttl:-999}")
   valid_name "$name" || die "invalid VM name '$name' (Ubicloud allows 1-63 of a-z, 0-9 and '-', starting and ending with a letter or digit)"
   if [ "$GC_HOURS" -gt 0 ]; then
     cmd_gc "$GC_HOURS" || log "stale-VM cleanup failed; continuing"
@@ -472,7 +489,7 @@ cmd_run() {
     case ${up_args[i]} in -n|--name) name=${up_args[i+1]} ;; esac
   done
   [ -z "$name" ] || [ -z "$ttl" ] || die "run: --ttl-hours writes the expiry into the generated name, so it cannot be combined with -n"
-  [ -n "$name" ] || { name=$(new_name "$ttl"); up_args+=(-n "$name"); }
+  [ -n "$name" ] || { name=$(new_name "${ttl:-999}"); up_args+=(-n "$name"); }
   RUN_VM=$name
   # Armed before the create request: an interrupted `up` still destroys its VM.
   # A second signal must not cut teardown short, so the EXIT handler ignores them.
@@ -519,8 +536,8 @@ usage: ubi-runner.sh <command> [args]
                          up + sync + setup + command + pull + destroy; exits with COMMAND's status
   up [-s SIZE] [-l LOCATION] [-n NAME | --ttl-hours H] [-S STORAGE_GIB] [-b IMAGE]
                          create a VM and wait for SSH; prints its name. --ttl-hours H
-                         names it to expire H hours from now (the operator reaper
-                         destroys it after that); without it the VM never expires
+                         gives it a TTL of H hours (1-999; default 999), after which
+                         the operator reaper and gstack's reap destroy it
   ssh NAME [COMMAND]     shell or login-shell command on the VM (user ubi, passwordless sudo)
   sync NAME [SRC] [DEST] stream a checkout (tracked + untracked-unignored + .git)
   pack [SRC]             write that checkout tarball to stdout (with a slim .git: HEAD + origin/master)
@@ -534,8 +551,7 @@ usage: ubi-runner.sh <command> [args]
   gc HOURS               destroy this owner's VMs older than HOURS (never other owners')
   cli ARGS...            raw Ubicloud CLI passthrough (e.g. cli vm list)
 
-VMs are named $PREFIX-<owner>-<epoch>-<suffix>, or $PREFIX-<owner>-<epoch>-x<expiry>-<suffix>
-with --ttl-hours; set UBI_OWNER (e.g. your thread code) to tag them, otherwise a
+VMs are named $PREFIX-<owner>-<epoch>-<suffix>-t<ttl hours>; set UBI_OWNER (e.g. your thread code) to tag them, otherwise a
 per-machine id is used.
 defaults: size=$DEFAULT_SIZE location=$DEFAULT_LOCATION (env UBI_SIZE, UBI_LOCATION)
 env: UBI_GC_HOURS (unset/0: no sweep on up), UBI_CREATE_GRACE (${CREATE_GRACE}s),

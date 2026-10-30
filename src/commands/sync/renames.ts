@@ -35,6 +35,7 @@ import { clearLegacyHold, holdRefusedImport, holdRenameDestination, noteScreened
 import { classifyItemFailure } from '../../core/item-failure.ts';
 import { partial, noteTypeWarning, markCompleted } from './sync-run.ts';
 import type { SyncPlan, SyncRun, SyncProgress } from './sync-run.ts';
+import { noteCommittedProgress } from '../../core/forward-progress.ts';
 import { recordFallbackRename } from '../../core/belief/identity.ts';
 import { markBeliefCommits } from '../../core/belief/append.ts';
 
@@ -384,7 +385,7 @@ async function applyRename(
   deletedSlugs.delete(newSlug); // #1284: rename landed on a previously-deleted slug → embeddable again
   // A failed reconcile must NOT checkpoint (permanent duplicate), nor must a
   // failed *import* — see renameImportOk above.
-  if (renameImportOk && renameConverged) await markCompleted(run, to);
+  if (renameImportOk && renameConverged) { await markCompleted(run, to); noteCommittedProgress(); }
   progress.tick(1, newSlug);
   return undefined;
 }

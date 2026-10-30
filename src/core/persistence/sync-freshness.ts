@@ -38,9 +38,23 @@ export interface SourceFreshness {
   commit_to_embedded: LatencyStats & { pending: number };
   /** Distinct run targets dated from git. */
   commits: number;
-  /** Targets in the window git could not date here (no checkout on this host, or the commit is not in it); their pages are not sampled. */
+  /**
+   * Synced run targets in the window git could not date here (no checkout on this host, or the commit is not in it); their
+   * pages are not sampled. Not the backlog: commits still waiting to sync are `waiting_commits` (`behind.commits`).
+   */
   unresolved_commits: number;
+  /** GBRA-133 (#7243): commits on this host's checkout HEAD the source has not synced yet (`behind.commits`), or null when git cannot say. */
+  waiting_commits: number | null;
+  /**
+   * #7189: the current lag, which the latency samples above cannot show (they date only commits that already synced):
+   * commits on this host's checkout HEAD after the source's last synced commit, and the committer age of the oldest
+   * of them. Null when this host has no checkout, the source has not synced yet, or git could not answer.
+   */
+  behind: { commits: number; oldest_seconds: number | null } | null;
 }
+
+/** The commits after `from` up to HEAD of the checkout at `root`, oldest committer time first (unix seconds), or null when git cannot say. */
+export type BehindReader = (root: string, from: string) => Promise<{ commits: number; oldest: number | null } | null>;
 
 /** Commit time (unix seconds) of each sha that the checkout at `root` can resolve. */
 export type CommitTimeReader = (root: string, shas: string[]) => Promise<Map<string, number>>;
@@ -68,23 +82,38 @@ export const readGitCommitTimes: CommitTimeReader = async (root, shas) => {
   return out;
 };
 
+export const readGitBehind: BehindReader = async (root, from) => {
+  if (!SHA.test(from)) return null;
+  const run = (args: string[]) => execFileBounded('git', ['-C', root, ...args], { timeout: 10_000, env: gitChildEnv({ GIT_OPTIONAL_LOCKS: '0' }) });
+  const count = await run(['rev-list', '--count', `${from}..HEAD`]);
+  const commits = Number(count.stdout.trim());
+  if (count.error || !Number.isInteger(commits)) return null;
+  if (!commits) return { commits: 0, oldest: null };
+  const oldest = await run(['log', '--reverse', '--format=%ct', `${from}..HEAD`]);
+  const at = Number(oldest.stdout.slice(0, oldest.stdout.indexOf('\n') >>> 0).trim());
+  return { commits, oldest: !oldest.error && Number.isFinite(at) && at > 0 ? at : null };
+};
+
 const num = (value: unknown): number | null => value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Math.round(Number(value) * 10) / 10;
 
-interface BindingRow { source_id: string; worktree_id: string; source_incarnation: string; root: string | null }
+interface BindingRow { source_id: string; worktree_id: string; source_incarnation: string; root: string | null; last_commit: string | null }
 interface AggregateRow { samples: number | string; s50: unknown; s95: unknown; embedded: number | string; e50: unknown; e95: unknown; pending: number | string }
 
 /** The freshness of every bound managed source (or of `sourceIds`); a source without a binding is omitted. */
-export async function readSyncFreshness(engine: BrainEngine, opts: { sourceIds?: string[]; commitTimes?: CommitTimeReader } = {}): Promise<SourceFreshness[]> {
+export async function readSyncFreshness(engine: BrainEngine, opts: { sourceIds?: string[]; commitTimes?: CommitTimeReader; behind?: BehindReader } = {}): Promise<SourceFreshness[]> {
   const { existingLocalHostId } = await import('./identity.ts');
-  const bindings = await engine.executeRaw<BindingRow>(`SELECT b.source_id, b.worktree_id::text AS worktree_id, b.source_incarnation::text AS source_incarnation, COALESCE(h.local_path, s.local_path) AS root
+  const bindings = await engine.executeRaw<BindingRow>(`SELECT b.source_id, b.worktree_id::text AS worktree_id, b.source_incarnation::text AS source_incarnation, COALESCE(h.local_path, s.local_path) AS root, s.last_commit
     FROM persistence_source_bindings b JOIN sources s ON s.id=b.source_id AND s.incarnation=b.source_incarnation
     LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id::text=$2
     WHERE ($1::text[] IS NULL OR b.source_id=ANY($1::text[])) ORDER BY b.source_id`, [opts.sourceIds ?? null, existingLocalHostId()]);
   const commitTimes = opts.commitTimes ?? readGitCommitTimes;
+  const behindOf = opts.behind ?? readGitBehind;
   const out: SourceFreshness[] = [];
   for (const b of bindings) {
+    const lag = b.root && b.last_commit ? await behindOf(b.root, b.last_commit).catch(() => null) : null;
+    const behind = lag && { commits: lag.commits, oldest_seconds: lag.oldest === null ? null : Math.max(0, Math.round(Date.now() / 1000 - lag.oldest)) };
     const empty: SourceFreshness = { source_id: b.source_id, window_hours: FRESHNESS_WINDOW_HOURS, commit_to_searchable: { samples: 0, p50_seconds: null, p95_seconds: null },
-      commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0 };
+      commit_to_embedded: { samples: 0, p50_seconds: null, p95_seconds: null, pending: 0 }, commits: 0, unresolved_commits: 0, waiting_commits: behind ? behind.commits : null, behind };
     const targets = (await engine.executeRaw<{ target: string }>(`SELECT r.intent->>'target' AS target FROM persistence_requests r WHERE ${SAMPLE_WHERE}
       GROUP BY 1 ORDER BY max(r.completed_at) DESC LIMIT ${FRESHNESS_MAX_TARGETS}`, [b.worktree_id, b.source_incarnation, FRESHNESS_WINDOW_HOURS]))
       .map(row => row.target).filter(target => typeof target === 'string' && SHA.test(target));
@@ -94,9 +123,13 @@ export async function readSyncFreshness(engine: BrainEngine, opts: { sourceIds?:
     const commits = Object.keys(times).length;
     if (!commits) { out.push({ ...empty, unresolved_commits: targets.length }); continue; }
     const [row] = await engine.executeRaw<AggregateRow>(`WITH c AS (SELECT key AS target, to_timestamp(value::double precision) AS committed_at FROM jsonb_each_text($4::text::jsonb)),
-      s AS (SELECT r.completed_at, c.committed_at, COALESCE(r.page_id, (SELECT p.id FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug LIMIT 1)) AS page_id,
-          EXISTS (SELECT 1 FROM persistence_requests later WHERE later.source_id=r.source_id AND later.slug=r.slug AND later.sequence>r.sequence AND later.state='committed') AS superseded
+      sample AS (SELECT r.source_id, r.slug, r.sequence, r.page_id, r.completed_at, c.committed_at
         FROM persistence_requests r JOIN c ON c.target=r.intent->>'target' WHERE ${SAMPLE_WHERE}),
+      later AS MATERIALIZED (SELECT l.source_id, l.slug, max(l.sequence) AS sequence FROM persistence_requests l
+        WHERE l.state='committed' AND l.source_id IN (SELECT source_id FROM sample) AND l.sequence > (SELECT min(sequence) FROM sample) GROUP BY l.source_id, l.slug),
+      s AS (SELECT r.completed_at, r.committed_at, COALESCE(r.page_id, (SELECT p.id FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug LIMIT 1)) AS page_id,
+          COALESCE(later.sequence > r.sequence, false) AS superseded
+        FROM sample r LEFT JOIN later ON later.source_id=r.source_id AND later.slug=r.slug),
       e AS (SELECT s.completed_at, s.committed_at, s.superseded, ch.n, ch.missing, ch.last_at FROM s
         LEFT JOIN LATERAL (SELECT count(*) AS n, count(*) FILTER (WHERE cc.embedded_at IS NULL) AS missing, max(cc.embedded_at) AS last_at FROM content_chunks cc JOIN pages p ON p.id=cc.page_id
           WHERE cc.page_id=s.page_id AND ${chunkVisibleFilter('p', 'cc')}) ch ON true),
@@ -129,10 +162,11 @@ export function formatLatency(value: number | null): string {
 
 /** One human line per source: `commit→searchable p50 8s, p95 14s (12 page(s), last 24 h); commit→embedded ...`. */
 export function formatSyncFreshness(f: SourceFreshness): string {
+  const behind = f.behind?.commits ? `; ${f.behind.commits} commit(s) not synced yet${f.behind.oldest_seconds !== null ? `, oldest ${formatLatency(f.behind.oldest_seconds)} old` : ''}` : '';
   if (!f.commit_to_searchable.samples) {
-    return `no commit→searchable samples in the last ${f.window_hours} h${f.unresolved_commits ? `, ${f.unresolved_commits} commit(s) not datable from this host's checkout` : ''}`;
+    return `no commit→searchable samples in the last ${f.window_hours} h${f.unresolved_commits ? `, ${f.unresolved_commits} commit(s) not datable from this host's checkout` : ''}${behind}`;
   }
   const s = f.commit_to_searchable, e = f.commit_to_embedded;
   return `commit→searchable p50 ${formatLatency(s.p50_seconds)}, p95 ${formatLatency(s.p95_seconds)} (${s.samples} page(s), last ${f.window_hours} h); `
-    + `commit→embedded ${e.samples ? `p50 ${formatLatency(e.p50_seconds)}, p95 ${formatLatency(e.p95_seconds)}` : 'no samples'} (${e.samples} page(s), ${e.pending} pending)`;
+    + `commit→embedded ${e.samples ? `p50 ${formatLatency(e.p50_seconds)}, p95 ${formatLatency(e.p95_seconds)}` : 'no samples'} (${e.samples} page(s), ${e.pending} pending)${behind}`;
 }

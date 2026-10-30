@@ -11,6 +11,8 @@ export interface ManagedRootRecord {
   source_incarnation?: string;
   worktree_id?: string;
   topology_generation?: string | number;
+  /** #7338: the brain's own database path, marked in its own directory: it is not a checkout, so no enclosing repository is marked. */
+  datastore?: true;
 }
 function registryDirectory(): string { return join(configDir(), 'persistence', 'managed-roots'); }
 function gitMetadataDirectory(root: string): string | null {
@@ -111,31 +113,45 @@ function resolveFilesystemPath(path: string, realpath: (path: string) => string)
     }
   }
 }
+const rootRank = (record: ManagedRootRecord) => [record.worktree_id ? 0 : 1, record.worktree_id, record.source_id, record.source_incarnation, record.topology_generation]
+  .map(value => value == null ? '\u{10FFFF}' : String(value));
+/**
+ * #7203: one record per filesystem identity. Aliases of one directory (a
+ * symlink, macOS /var vs /private/var, a case variant) collapse to its
+ * canonical path, and a bound worktree row outranks an unbound source path
+ * regardless of spelling or input order.
+ */
+export function canonicalManagedRoots(records: ManagedRootRecord[]): ManagedRootRecord[] {
+  const byRoot = new Map<string, ManagedRootRecord>();
+  for (const record of records) {
+    const root = canonicalFilesystemPath(record.local_path);
+    const held = byRoot.get(root);
+    if (held) {
+      const [next, current] = [rootRank(record), rootRank(held)];
+      const at = next.findIndex((value, i) => value !== current[i]);
+      if (at < 0 || next[at]! > current[at]!) continue;
+    }
+    byRoot.set(root, { ...record, local_path: root });
+  }
+  return [...byRoot.values()];
+}
 /**
  * One private immutable path identity per brain/root; topology metadata can be
  * refreshed but stale roots stay fenced until an explicit verified drain clears
  * them. Per-root files prevent independent registration from dropping siblings.
+ * Returns the canonical records it holds, one per root.
  */
-export function recordManagedRoots(brainId: string, records: ManagedRootRecord[], modeEpoch?: number): void {
+export function recordManagedRoots(brainId: string, records: ManagedRootRecord[], modeEpoch?: number): ManagedRootRecord[] {
   if (!/^[a-f0-9-]{36}$/i.test(brainId)) {
     throw opError('storage_error', 'Invalid managed-root brain identity.',
       'The managed-root registry was given a brain identity that is not a UUID, so nothing was recorded. This is an internal fault: run gbrain doctor --json and report it to the user.');
   }
-  if (!records.length) return;
+  const canonical = canonicalManagedRoots(records);
+  if (!canonical.length) return canonical;
   const directory = registryDirectory(); mkdirSync(directory, { recursive: true, mode: 0o700 }); ensureMode(directory, 0o700);
   let changed = false;
-  // FORK: SQL path text can carry both /var and /private/var for the same macOS
-  // directory. Collapse by physical root before writing, preferring a complete
-  // worktree binding over the source-only fallback row.
-  const canonicalRecords = new Map<string, ManagedRootRecord>();
-  const score = (record: ManagedRootRecord) => Number(record.worktree_id != null) * 4
-    + Number(record.source_id != null) * 2 + Number(record.source_incarnation != null);
-  for (const record of records) {
-    const root = canonicalFilesystemPath(record.local_path);
-    const existing = canonicalRecords.get(root);
-    if (!existing || score(record) > score(existing)) canonicalRecords.set(root, record);
-  }
-  for (const [root, record] of canonicalRecords) {
+  for (const record of canonical) {
+    const root = record.local_path;
     const key = createHash('sha256').update(root).digest('hex');
     const file = join(directory, `${brainId}.${key}.json`);
     // FORK: keep the record byte-stable: database UNION result key order must not
@@ -148,12 +164,14 @@ export function recordManagedRoots(brainId: string, records: ManagedRootRecord[]
       ...(modeEpoch !== undefined ? { mode_epoch: modeEpoch } : {}) });
     changed = writePrivateRecord(file, value) || changed;
     if (existsSync(root) && statSync(root).isDirectory()) {
-      const metadata = enclosingGitMetadata(root);
+      // #7338: a datastore is marked in its own directory, never in the metadata of a repository that happens to enclose it.
+      const metadata = record.datastore ? null : enclosingGitMetadata(root);
       const marker = metadata ? join(metadata, 'gbrain-managed.json') : join(root, '.gbrain-managed');
       if (!existsSync(marker)) writePrivateRecord(marker, JSON.stringify({ version: 1, managed: true, brain_id: brainId, ...(modeEpoch !== undefined ? { mode_epoch: modeEpoch } : {}) }));
     }
   }
   if (changed) flushDirectory(directory);
+  return canonical;
 }
 /** Available before connect, including while another process owns local PGLite. */
 export function registeredManagedRoots(): string[] {

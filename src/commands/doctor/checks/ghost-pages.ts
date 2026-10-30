@@ -21,8 +21,9 @@
 import type { Check } from '../../doctor.ts';
 import { agentFix, checkError } from '../check-fix.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
-import { readGhostPages } from '../../../core/ghost-pages.ts';
-import { SKILL_PACK_MEMBER_CODE, skillPathDetail } from '../../../core/repair/ghost-pages.ts';
+import { GHOST_CHECK_LIMIT, GHOST_SCAN_LIMIT, readGhostPages } from '../../../core/ghost-pages.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
+import { SKILL_PACK_MEMBER_CODE, UNRESOLVABLE_NOTE, skillPathDetail, unresolvableDetail } from '../../../core/repair/ghost-pages.ts';
 
 const DOCS = 'docs/guides/repair.md#ghost-pages';
 
@@ -32,10 +33,13 @@ async function runGhostPages(ctx: DoctorContext): Promise<Check[]> {
     const summary = await readGhostPages(connectedEngine(ctx), {});
     const details = { count: summary.count, by_source: summary.by_source, samples: summary.samples, inspected: summary.inspected,
       truncated: summary.truncated, exact: summary.exact, docs: DOCS,
-      ...(summary.skill_paths ? { skill_paths: { ...skillPathDetail(undefined, summary.skill_path_samples, summary.skill_paths), samples: summary.skill_path_samples } } : {}) };
-    const skillNote = summary.skill_paths
+      ...(summary.skill_paths ? { skill_paths: { ...skillPathDetail(undefined, summary.skill_path_samples, summary.skill_paths), samples: summary.skill_path_samples } } : {}),
+      ...(summary.unresolvable ? { unresolvable: unresolvableDetail(summary.unresolvable, summary.unresolvable_samples) } : {}) };
+    const skillNote = (summary.skill_paths
       ? ` ${summary.skill_paths} more are files of the shared skillpack missing from the checkout (${SKILL_PACK_MEMBER_CODE}: ${summary.skill_path_samples.map(page => `${page.source_id}:${page.slug}`).join(', ')}); the repair leaves them alone: restore each file on the owner host (git -C <source root> checkout -- <path>, or republish the skill with put_skill).`
-      : '';
+      : '') + (summary.unresolvable
+      ? ` ${summary.unresolvable} page(s) record a path that names no file inside the source (${summary.unresolvable_samples.map(page => `${page.source_id}:${page.slug}`).join(', ')}). ${UNRESOLVABLE_NOTE}`
+      : '');
     const ghostSources = summary.by_source.filter(entry => entry.count > 0);
     const unknown = summary.by_source.filter(entry => entry.status === 'unknown');
     if (ghostSources.length) {
@@ -65,8 +69,15 @@ async function runGhostPages(ctx: DoctorContext): Promise<Check[]> {
           : 'Not applicable: no source has a canonical checkout, so no page owns a file that could be missing.' });
       return checks;
     }
+    // #7145: a scan stopped at its page or candidate bound is not clear past it.
+    if (summary.truncated) {
+      checks.push({ name: 'ghost_pages', status: 'warn', details: { ...details, ...boundUnknownDetails('rows'), limit: GHOST_SCAN_LIMIT, candidate_limit: GHOST_CHECK_LIMIT },
+        message: `Ghost pages unknown: the scan stopped at its bound (${GHOST_SCAN_LIMIT} live pages or ${GHOST_CHECK_LIMIT} unconfirmed candidates per source; no setting) after ${summary.inspected} page(s), `
+          + `so pages past it were not checked; none of those inspected is missing its canonical file.${skillNote}` });
+      return checks;
+    }
     checks.push({ name: 'ghost_pages', status: 'ok', details,
-      message: `No live page is missing its canonical file (${summary.inspected} page(s) inspected${summary.truncated ? '; bounded, more not checked' : ''}).${skillNote}` });
+      message: `No live page is missing its canonical file (${summary.inspected} page(s) inspected).${skillNote}` });
   } catch (error) {
     checks.push(checkError('ghost_pages', 'check live pages for a missing canonical file', error, { details: { count: 'unknown', health: 'unknown', docs: DOCS } }));
   }

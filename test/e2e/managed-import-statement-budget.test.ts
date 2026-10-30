@@ -27,9 +27,9 @@ import { byText, chunkOf, CHUNKED, PAGE_SLUG, prepareManagedImport, publicationO
 import type { YcShapedPage } from '../helpers/yc-shaped-page.ts';
 import { withEnv } from '../helpers/with-env.ts';
 
-/** About 10% over the import's own statements in the publication transaction at 1x (#6712 L6 measured 67 on Postgres; 317 before code references were batched); the folded stamp is budgeted apart. */
+/** About 10% over the import's own statements in the publication transaction at 1x (#6712 L6 measured 67 on Postgres; 317 before code references were batched); the folded stamp is budgeted apart. GBRA-161 PR 2 adds five for the fact fence generation (its lock, its live read, the generation row, its items in one statement, and the held and attempts clear); on a first import its retire read replaces the expire update. */
 // FORK: +2 for the embed_failures retry ledger cleanup the fork publishes per page (two DELETE FROM embed_failures).
-const PUBLICATION_BUDGET = 76;
+const PUBLICATION_BUDGET = 81;
 /**
  * #6712 PR 4b: the folded pass stamp, budgeted on its own inside the same transaction (about 10% over 17 measured on
  * Postgres). A writeback import publishes the source checkpoint here instead of as a separate checkpoint request, so these

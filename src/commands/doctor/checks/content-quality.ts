@@ -14,6 +14,10 @@ import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
 import { agentFix, checkError, doctorVerify, withSkippedSegmented } from '../check-fix.ts';
 import { scanDeadline } from '../budget.ts';
+import { boundUnknownDetails } from '../bounded-unknown.ts';
+
+/** Oversized pages `oversized_pages` lists before it reports a floor. */
+const OVERSIZED_LIST_LIMIT = 100;
 
 async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
   const { args, progress } = ctx;
@@ -63,14 +67,19 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
          AND ${EMBED_SKIP_FILTER_FRAGMENT}
          AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
        ORDER BY bytes DESC
-       LIMIT 100`,
+       LIMIT ${OVERSIZED_LIST_LIMIT + 1}`,
       [bytesBlock],
     );
+    // #7145: a full list means more pages exceed the block; the count is then a floor.
+    const capped = rows.length > OVERSIZED_LIST_LIMIT;
     // Pages an older gbrain stored chunkless for size that now fit under the block: the free backfill re-indexes them.
-    const [skipped] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages p
+    // chunk-visibility-ok: counts pages with no chunk row at all (any generation), the chunk safety net's own test
+    const [skipped] = await engine.executeRaw<{ n: number; chunkless: number }>(`SELECT COUNT(*)::int AS n,
+         COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id))::int AS chunkless FROM pages p
        WHERE p.deleted_at IS NULL AND p.frontmatter->'embed_skip'->>'reason' = 'oversized'
          AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) <= $1`, [bytesBlock]);
     const backfillable = Number(skipped?.n ?? 0);
+    const chunklessMarked = Number(skipped?.chunkless ?? 0);
     // Decision #10: a segmented page's body columns are NULL, so both size scans above pass it by.
     const [segmented] = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM pages p WHERE p.deleted_at IS NULL AND p.body_storage = 'segmented'`).catch(() => []);
     const oversizedCheck = (check: Check) => checks.push(withSkippedSegmented(check, Number(segmented?.n ?? 0)));
@@ -78,8 +87,11 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       oversizedCheck({
         name: 'oversized_pages',
         status: 'warn',
-        message: `${backfillable} page(s) were stored without chunks by an older gbrain because of their size, and now fit under the ${bytesBlock}-byte bytes_block. `
-          + 'They are invisible to search until re-indexed. Fix: gbrain reindex --oversized (free, CPU only; pages over 1 MiB then wait for embedding approval).',
+        // #7184: a marked page keeps its chunks once healed or rewritten, so say how many are truly invisible.
+        message: `${backfillable} page(s) still carry the size-skip marker an older gbrain wrote, and now fit under the ${bytesBlock}-byte bytes_block: `
+          + `${chunklessMarked} have no chunks, so not even keyword search finds them, and ${backfillable - chunklessMarked} are keyword-only with no vectors. `
+          + 'A page whose rewrite fails (an invalid fence, for example) keeps the marker until its content is repaired. Fix: gbrain reindex --oversized (free, CPU only; pages over 1 MiB then wait for embedding approval).',
+        details: { marked: backfillable, chunkless: chunklessMarked },
         fix: agentFix(['gbrain', 'reindex', '--oversized'], 'Re-chunks the size-skipped pages so keyword search finds them; it calls no paid provider and holds large pages for embedding approval.',
           'oversized_pages', { docs: 'docs/guides/memory-boundaries.md#large-pages-upgrade' }),
       });
@@ -97,17 +109,14 @@ async function runContentSanity(ctx: DoctorContext): Promise<Check[]> {
       oversizedCheck({
         name: 'oversized_pages',
         status: 'warn',
-        message: `${rows.length} page(s) exceed the ${bytesBlock}-byte content_sanity.bytes_block. Top: ${top}. A page over the block is stored without chunks on its next write. `
+        details: { count: Math.min(rows.length, OVERSIZED_LIST_LIMIT), exact: !capped, ...(capped ? { limit: OVERSIZED_LIST_LIMIT } : {}) },
+        message: `${capped ? `At least ${OVERSIZED_LIST_LIMIT}` : rows.length} page(s) exceed the ${bytesBlock}-byte content_sanity.bytes_block. Top: ${top}. A page over the block is stored without chunks on its next write. `
           + 'Raise content_sanity.bytes_block (up to the 24 MiB page ceiling) to make them searchable, or exclude them from the source.',
       });
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    checks.push({
-      name: 'oversized_pages',
-      status: 'ok',
-      message: `Skipped (${msg})`,
-    });
+    // #7145: a scan that failed found nothing either way.
+    checks.push(checkError('oversized_pages', 'check for oversized pages', err, { details: { health: 'unknown' } }));
   }
 
   progress.heartbeat('scraper_junk_pages');
@@ -269,6 +278,7 @@ async function runPartialEmbedding(ctx: DoctorContext): Promise<Check[]> {
 export const partialEmbeddingEntry: DoctorEntry = {
   name: 'partial_embedding',
   emits: ['partial_embedding'],
+  tier: 'quick',
   run: runPartialEmbedding,
 };
 
@@ -446,6 +456,9 @@ async function runFrontmatter(ctx: DoctorContext): Promise<Check[]> {
       checks.push({
         name: 'frontmatter_integrity',
         status: 'warn',
+        // #7145: a partial walk is a floor with health unknown past it, readable without parsing the message.
+        details: { count: report.total, partial: report.partial, exact: !report.partial,
+          ...(report.partial ? { ...boundUnknownDetails('time'), limit: fmTimeoutMs } : {}) },
         message:
           `${report.total} frontmatter issue(s)` +
           (report.partial ? ` (PARTIAL SCAN — timeout after ${fmTimeoutMs / 1000}s)` : '') +

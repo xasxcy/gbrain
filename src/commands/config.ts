@@ -68,6 +68,7 @@ const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
   'persistence.write_wait_ms',
   // Engine graduation opt-out: the pre-connect migrate router reads it engine-free.
   'migrate.graduation', 'doctor.default_budget_ms', // #6803: the CLI doctor reads it pre-connect (commands/doctor/default-budget.ts)
+  'minions.terminal_hook', // #7242: a command the worker runs; local file plane only, never the shared DB plane (minions/terminal-hook.ts)
 ]);
 
 /** #5489: every self_upgrade.* reader (cli.ts startup check, autopilot,
@@ -109,7 +110,7 @@ async function unsetFilePlaneKey(key: string): Promise<boolean> {
   const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
   const cfg = loadConfigFileOnly();
   const dot = key.indexOf('.');
-  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor';
+  const top = key.slice(0, dot) as 'push' | 'hooks' | 'backup' | 'mcp' | 'self_upgrade' | 'persistence' | 'migrate' | 'doctor' | 'minions';
   const leaf = key.slice(dot + 1);
   const branch = cfg?.[top] as Record<string, unknown> | undefined;
   if (!cfg || !branch || !(leaf in branch)) return false;
@@ -380,7 +381,8 @@ const setLineGrammarConfig = async (engine: BrainEngine, key: string, value: str
 async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value: string, force = false): Promise<void> {
   if (await setLineGrammarConfig(engine, key, value)) return;
   if (key === 'sync.admission') return (await import('./config/sync-admission-value.ts')).setSyncAdmissionValue(engine, value);
-  if (/^sync\.max_delete(s|_ratio)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
+  if (key === 'sync.metafile_pages') return (await import('./config/sync-metafile-pages-value.ts')).setMetafilePagesValue(engine, value);
+  if (/^sync\.(max_delete(s|_ratio)|apply_held_deletions)(\.source\..+)?$/.test(key) || key === 'purge.retention_hours') {
     const err = (await import('../core/sync-reconcile.ts')).deleteSafetyConfigRefusal(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
@@ -390,6 +392,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
   (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  if (key.startsWith('generations.')) await (await import('./config/generations-values.ts')).refuseGenerationsValue(key, value);
   const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
   if (searchRefusal) {
     const { exitCliError, usageError } = await import('../cli/cli-error.ts');
@@ -405,6 +408,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
   if (key.startsWith('loops.')) (await import('./config/loops-values.ts')).refuseInvalidLoopsConfigValue(key, value);
   if (key === 'sync.slug_conflicts.auto_remove') { const err = (await import('../core/repair/slug-autoheal.ts')).slugAutoRemoveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key === 'sync.origin_twins.auto_resolve') { const err = (await import('../core/repair/origin-twins-heal.ts')).originAutoResolveValueRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
+  if (key === 'sync.repo_path') { const err = (await import('../core/sync-config-keys.ts')).syncRepoPathRefusal(value); if (err) { console.error(`[config] ${err}`); process.exit(1); } }
   if (key.startsWith('search.')) (await import('./config/keyword-timeout-value.ts')).refuseInvalidKeywordTimeoutValue(key, value);
   if (key === 'persistence.max_claim_ms') {
     const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
@@ -555,6 +559,7 @@ async function setFilePlaneKey(key: string, value: string, tail: string[]): Prom
     saveConfig(cfg);
     console.log(`Set ${key} = ${on} (file plane: ~/.gbrain/config.json)`);
   } else if (key === 'persistence.write_wait_ms') { await setFileWriteWait(cfg, value, saveConfig);
+  } else if (key === 'minions.terminal_hook') { (await import('../core/minions/terminal-hook.ts')).setTerminalHookConfig(cfg, value, saveConfig);
   } else if (key === 'doctor.default_budget_ms') { (await import('./doctor/default-budget.ts')).setDoctorDefaultBudget(cfg, value, saveConfig);
   } else if (key === 'migrate.graduation') {
     const on = isConfigTruthy(value);

@@ -20,7 +20,7 @@ import { embedBatchWithBackoff, restampIfDemotedToTitleTier, readCorpusGeneratio
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
 import { healAndReportOverLength } from './embed-overlength-heal.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded, countSignatureDriftedEmbeddings, splitEmbeddingSignature, currentInputChunkPredicate } from './embedding-invalidation.ts';
+import { hasSignatureDrift, invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentInputChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
   quoteIdentifier,
@@ -33,6 +33,7 @@ import { LockStolenError } from './db-lock.ts';
 import { resolveEmbedSubBatchSize } from './embed-slices.ts';
 import { contentDriftSweepLine, runContentDriftSweep, type ContentDriftSweepStatus } from './content-drift-sweep.ts';
 import { meterPageBatch, spendGrant } from './page-embedding-budget.ts';
+import { acquirePageEmbeddingLease, stillPendingChunks, type PageEmbeddingLease } from './page-embedding-lease.ts';
 import { chunkGenerationFilter, chunkVisibleFilter } from './search/safe-chunks.ts';
 import { embedSegmentedPage, embedSegmentedRows, readSegmentedEmbedPage, type SegmentedEmbedOpts } from './page-body/segmented-embedding.ts';
 
@@ -318,8 +319,8 @@ async function embedSegmentedStaleRows(engine: BrainEngine, stale: readonly Stal
   opts: Omit<SegmentedEmbedOpts, 'beforeInstall'> & { stamp?: ProvenanceStamp; pacer: DbPacer; assertOwned?: (tx?: BrainEngine) => Promise<void>; stopped: () => boolean }): Promise<boolean> {
   const page = await observed(opts.pacer, () => readSegmentedEmbedPage(engine, { id: stale[0]!.page_id }));
   if (!page) return false;
-  const installed = await embedSegmentedRows(engine, page, stale, { ...opts,
-    beforeInstall: async tx => { await opts.assertOwned?.(tx); if (opts.stopped()) throw new AbortError(); } });
+  const installed = (await embedSegmentedRows(engine, page, stale, { ...opts,
+    beforeInstall: async tx => { await opts.assertOwned?.(tx); if (opts.stopped()) throw new AbortError(); } }))?.installed;
   if (opts.stamp && installed) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, opts.stamp);
   result.embedded += installed ?? 0;
   if (installed) result.pagesProcessed += 1;
@@ -362,11 +363,15 @@ export async function embedStalePages(
         if (page.embedded) result.pagesProcessed += 1;
         continue;
       }
+      const [page] = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [sourceId, slug]);
+      if (!page) continue;
+      await using lease = await acquirePageEmbeddingLease(engine, page.id, { signal: opts.signal });
+      if (lease.busy) continue;
       // SUP-3874: split legacy oversized rows before embedding so a single
       // pre-cap chunk cannot permanently fail the page.
       await healOversizedPageChunks(engine, slug, { sourceId });
       const prepared = await readProjectionSnapshot(engine, slug, sourceId, { requireLiveSource: true });
-      if (!prepared) continue;
+      if (!prepared || prepared.snapshot.page.id !== page.id) continue;
       const existing = prepared.chunks;
       const staleIdx = new Set(
         (await engine.executeRaw<{ chunk_index: number }>(
@@ -398,6 +403,7 @@ export async function embedStalePages(
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       const install = await engine.transaction(async tx => {
+        await lease.assertHeld(tx);
         const installed = await installPageEmbeddings(tx, prepared, merged,
           opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined);
         if (stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, sourceId);
@@ -484,19 +490,15 @@ export async function embedStaleForSource(
   // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
   // untouched. Best-effort — a failure here must not abort the backfill.
   //
-  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-count
-  // (two cheap COUNTs; probe only fires when drift exists) keeps the probe's
+  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-check
+  // (one page-first EXISTS; probe only fires when drift exists) keeps the probe's
   // one embed call off the no-drift common path; a failed probe skips the
   // invalidation entirely so a misresolved worker can't strip a corpus it
   // can never re-embed.
   if (signature) {
     try {
-      const wide = await engine.countStaleChunks({ sourceId, signature });
-      const nullOnly = await engine.countStaleChunks({ sourceId });
-      // Ledgered NULL chunks lower `wide` (anti-join) but not `nullOnly`, so they can offset real
-      // drift of equal or smaller size in the difference; the exact count closes that gap.
-      const drifted = Math.max(wide - nullOnly, await countSignatureDriftedEmbeddings(engine, { signature, sourceId }));
-      if (drifted > 0) {
+      // One page-first EXISTS: no chunk count before the probe, so a large drifted corpus cannot time the pre-check out (#7117 follow-up).
+      if (await hasSignatureDrift(engine, { signature, sourceId })) {
         await opts.assertOwned?.();
         if (stopped()) return { ...result, aborted: true };
         const probeOk = await probeEmbedder(embedFn, signature, signal);
@@ -516,7 +518,7 @@ export async function embedStaleForSource(
         } else {
           result.invalidationSkipped = 'embedder_probe_failed';
           process.stderr.write(
-            `\n  [embed-stale] ${drifted} chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
+            `\n  [embed-stale] embedded chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
             `SKIPPING invalidation (existing vectors preserved). Check embedding provider config/credentials.\n`,
           );
         }
@@ -602,9 +604,22 @@ export async function embedStaleForSource(
       const assertHealOwned = async (tx?: BrainEngine): Promise<void> => {
         try { await opts.assertOwned?.(tx); } catch (error) { healOwnershipFailure = { error }; throw error; }
       };
+      // Upstream's page embedding lease (gbrain-evals#180) must span the slices' installs below, which run after the
+      // heal's try, so it is held for the whole key and released when this function returns. `pageLeaseLost` marks a
+      // renewal that matched no row: the page is skipped for the next pass, never counted as a failure.
+      let pageLease: PageEmbeddingLease | undefined;
+      let pageLeaseLost = false;
+      await using _pageLeaseRelease = { [Symbol.asyncDispose]: async () => { await pageLease?.[Symbol.asyncDispose](); } };
+      const assertLeaseHeld = async (tx?: BrainEngine): Promise<void> => {
+        if (!tx || !pageLease || pageLease.busy) return;
+        try { await pageLease.assertHeld(tx); } catch (error) { pageLeaseLost = true; throw error; }
+      };
+      const assertOwnedLeased = async (tx?: BrainEngine): Promise<void> => { await opts.assertOwned?.(tx); await assertLeaseHeld(tx); };
       try {
         await assertHealOwned();
         if (stopped() || await embedSegmentedStaleRows(engine, stale, result, { embedFn, signal, signature, stamp, pacer, assertOwned: opts.assertOwned, stopped })) return;
+        pageLease = await acquirePageEmbeddingLease(engine, stale[0].page_id, { signal, deadline: opts.deadline });
+        if (pageLease.busy) return;
         // SUP-3874: split legacy oversized chunk_text before embedding.
         const healed = await observed(pacer, () => engine.transaction(async tx => {
           await assertHealOwned(tx);
@@ -642,8 +657,7 @@ export async function embedStaleForSource(
       if (!prepared) return;
       {
         const selected = new Map(stale.map(c => [c.chunk_index, c]));
-        stale = prepared.chunks.filter(c => selected.get(c.chunk_index)?.chunk_text === c.chunk_text)
-          .map(c => ({ ...selected.get(c.chunk_index)!, ...c }));
+        stale = stillPendingChunks(prepared.chunks, selected);
         if (!stale.length) return;
       }
       const pageRow = prepared.snapshot.page;
@@ -684,7 +698,7 @@ export async function embedStaleForSource(
               activeColumn: stamp ? quoteIdentifier(stamp.column) : undefined,
               expectedCorpusGeneration: observedCorpusGeneration,
               prepared,
-              assertOwned: opts.assertOwned,
+              assertOwned: assertOwnedLeased,
               // A provider call that returned may have been billed, even if the slice's commit then fails.
               embedFn: async (texts, fnOpts) => { const vectors = await embedFn(texts, fnOpts); grantSpent = true; return vectors; },
               signal,
@@ -699,6 +713,7 @@ export async function embedStaleForSource(
             // Only a genuine stop (signal fired or deadline reached) maps to
             // aborted; lease loss recorded as the signal reason stays an error.
             throwIfLeaseLost(error);
+            if (pageLeaseLost) return; // another path took the page's lease; it embeds or the next pass retries
             if (error instanceof Error && error.name === 'AbortError' && stopped()) {
               result.aborted = true;
               return;
@@ -760,9 +775,10 @@ export async function embedStaleForSource(
                 prepared,
                 signal,
                 deadline: opts.deadline,
-                assertOwned: opts.assertOwned && (async tx => {
-                  try { await opts.assertOwned!(tx); } catch (error) { ownershipFailure = { error }; throw error; }
-                }),
+                assertOwned: async tx => {
+                  try { await opts.assertOwned?.(tx); } catch (error) { ownershipFailure = { error }; throw error; }
+                  await assertLeaseHeld(tx);
+                },
               }),
             );
           } catch (error) {
@@ -770,6 +786,7 @@ export async function embedStaleForSource(
             // failure leaves committed vectors in place and is only reported.
             if (ownershipFailure) throw ownershipFailure.error;
             throwIfLeaseLost(error);
+            if (pageLeaseLost) return;
             if (stopped() || signal?.aborted) return;
             result.failures = (result.failures ?? 0) + 1;
             write(`[embed-signature-fail] slug=${slug} err=${error instanceof Error ? error.message : String(error)}`);

@@ -570,6 +570,7 @@ interface RawCalendarEvent {
   location?: string;
   hangoutLink?: string;
   htmlLink?: string;
+  visibility?: string;
 }
 
 function calendarEvent(e: RawCalendarEvent, account: string): CalendarEventData {
@@ -593,6 +594,7 @@ function calendarEvent(e: RawCalendarEvent, account: string): CalendarEventData 
     htmlLink: e.htmlLink ?? null,
     status: e.status ?? 'confirmed',
     account,
+    private: e.visibility === 'private' || e.visibility === 'confidential',
   };
 }
 
