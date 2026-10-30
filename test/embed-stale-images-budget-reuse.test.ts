@@ -16,7 +16,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importImageFile, _resetOcrRunBudgetForTests } from '../src/core/import-file.ts';
-import { embedStaleImages } from '../src/core/embed-stale-images.ts';
+import { embedStaleImages, runEmbedStaleImagesCli } from '../src/core/embed-stale-images.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { parseEmbedding } from '../src/core/utils.ts';
@@ -280,5 +280,28 @@ describe('OCR-only candidates after the run OCR cap', () => {
     expect(next).toMatchObject({ candidates: 2, rebuilt: 2 });
     expect(embedCalls).toBe(0);
     expect(next.ocr_deferred).toBeUndefined();
+  }, 60_000);
+});
+
+// #7193 turns an explicit --images run that rebuilt nothing into a failure (exit 1). Work the run's own caps deferred to
+// the next run is not that: like a cost-capped run, a time-budget or OCR-cap deferral stays a success.
+describe('explicit --images runs whose candidates were deferred are not nothing_rebuilt', () => {
+  const imagesCli = (sourceId: string, env: Record<string, string>) => withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true', ...env }, async () => {
+    const log = console.log;
+    console.log = () => {};
+    try { return await runEmbedStaleImagesCli(engine, ['--stale', '--images', '--source', sourceId, '--json']); }
+    finally { console.log = log; }
+  });
+
+  test('a sealed image left for the next run by the spent OCR cap does not fail the run', async () => {
+    const s = await freshSource();
+    await importImageFile(engine, s.write('photos/only-ocr.png', PNG), 'photos/only-ocr.png', { sourceId: s.id });
+    _resetOcrRunBudgetForTests({ images: 200 });
+    try {
+      const swept = await imagesCli(s.id, { GBRAIN_EMBEDDING_IMAGE_OCR: 'true' });
+      expect(swept).toMatchObject({ candidates: 1, rebuilt: 0, ocr_deferred: 1 });
+      expect(swept.status).toBeUndefined();
+      expect(swept.failures).toBe(0);
+    } finally { _resetOcrRunBudgetForTests(); }
   }, 60_000);
 });

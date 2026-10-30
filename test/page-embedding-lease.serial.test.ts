@@ -27,6 +27,7 @@ import { resolveActiveEmbeddingColumnFromEngine } from '../src/core/search/embed
 import { chunkGenerationFilter } from '../src/core/search/safe-chunks.ts';
 import { acquirePageEmbeddingLease, pageEmbeddingLeaseId, pageEmbeddingLeaseProbe } from '../src/core/page-embedding-lease.ts';
 import { embedStaleForSource, embedStalePages } from '../src/core/embed-stale.ts';
+import { runEmbedCore } from '../src/commands/embed.ts';
 import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
 import { installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
@@ -217,6 +218,59 @@ for (const kind of testBackends()) {
         expect((await leaseRows(pageId)).length).toBe(1);
       }
       expect(contended).toBe(0);
+    }, 30_000);
+
+    // FORK: both stale drains persist through the fork's slices (persistStaleSlice); the page lease must span them.
+    // An auto-merged `await using` inside the heal's try released it before the first slice (v0.60.517.0 sync).
+    /** Whether another path could take `pageId`'s lease right now (a busy answer means some holder has it). */
+    const leaseFree = async (pageId: number) => {
+      await using probe = await acquirePageEmbeddingLease(brain.engine, pageId, { deadline: Date.now() });
+      return !probe.busy;
+    };
+    const drainStale = (sourceId: string) => withEnv({ GBRAIN_HOME: home }, () =>
+      runEmbedCore(brain.engine, { stale: true, catchUp: true, quiet: true, sourceId }));
+
+    test('FORK: embedStaleForSource holds the page lease through its slice install', async () => {
+      const { sourceId, pageId } = await pending();
+      let freeDuringCall: boolean | undefined;
+      const result = await embedStaleForSource(brain.engine, sourceId, { concurrency: 1,
+        embedFn: async texts => { freeDuringCall ??= await leaseFree(pageId); return embedFn(texts); } });
+      expect(freeDuringCall).toBe(false);
+      expect(result.embedded).toBe(CHUNKS.length);
+      expect(await vectorless(sourceId)).toEqual([]);
+      expect(await leaseRows(pageId)).toEqual([]);
+    }, 30_000);
+
+    test('FORK: embedStaleForSource whose lease is taken over during the provider call installs nothing, counts no failure and does not stop', async () => {
+      const { sourceId, pageId } = await pending();
+      const result = await embedStaleForSource(brain.engine, sourceId, { concurrency: 1,
+        embedFn: async texts => { await steal(pageId); return embedFn(texts); } });
+      expect(sent.length).toBe(CHUNKS.length);
+      expect(result.embedded).toBe(0);
+      expect(result.failures ?? 0).toBe(0);
+      expect(result.aborted ?? false).toBe(false);
+      expect(await vectorless(sourceId)).toEqual(CHUNKS);
+    }, 30_000);
+
+    test('FORK: embed --stale (embedAllStale) holds the page lease through its slice install', async () => {
+      const { sourceId, pageId } = await pending();
+      let freeDuringCall: boolean | undefined;
+      transport(async () => { freeDuringCall ??= await leaseFree(pageId); });
+      const result = await drainStale(sourceId);
+      expect(freeDuringCall).toBe(false);
+      expect(result.embedded).toBe(CHUNKS.length);
+      expect(await vectorless(sourceId)).toEqual([]);
+      expect(await leaseRows(pageId)).toEqual([]);
+    }, 30_000);
+
+    test('FORK: embed --stale (embedAllStale) whose lease is taken over during the provider call installs nothing and counts no failure', async () => {
+      const { sourceId, pageId } = await pending();
+      transport(async () => { await steal(pageId); });
+      const result = await drainStale(sourceId);
+      expect(sent.length).toBe(CHUNKS.length);
+      expect(result.embedded).toBe(0);
+      expect(result.failures ?? 0).toBe(0);
+      expect(await vectorless(sourceId)).toEqual(CHUNKS);
     }, 30_000);
   });
 }
