@@ -31,6 +31,7 @@ import { join } from 'node:path';
 import { collectMigration } from '../src/core/advisor/collect-migration.ts';
 import { collectUninstalledBrainPack } from '../src/core/advisor/collect-uninstalled-brain-pack.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 import { saveState, SKILLPACK_STATE_SCHEMA_VERSION, type SkillpackStateEntry } from '../src/core/skillpack/state.ts';
 import { saveNagState, SKILLPACK_NAG_SCHEMA_VERSION, DEFAULT_NAG_CEILING, type NagEntry } from '../src/core/skillpack/nag-state.ts';
 import { deriveBrainId } from '../src/core/skillpack/brain-resident-locate.ts';
@@ -54,7 +55,8 @@ function ctx(engine: unknown, over: Partial<AdvisorContext> = {}): AdvisorContex
 describe('collect-migration', () => {
   function versionEngine(version: string | null): BrainEngine {
     return {
-      getConfig: async (key: string) => (key === 'version' ? version : null),
+      // FORK: the fork counter is current, so only the upstream `version` decides (a missing fork key reads as pending).
+      getConfig: async (key: string) => (key === 'version' ? version : key === FORK_COUNTER_KEY ? String(FORK_LATEST_VERSION) : null),
     } as unknown as BrainEngine;
   }
 

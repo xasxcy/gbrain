@@ -1064,7 +1064,6 @@
   "test/embed-stale-images-managed-6529.test.ts": 1535,
   "test/embed-stale-images.test.ts": 409,
   "test/embed-stale-pool-default.test.ts": 4624,
-  "test/embed-stale.test.ts": 3818,
   "test/embed-stall.test.ts": 470,
   "test/embedding-context.test.ts": 6,
   "test/embedding-dim-check-facts.test.ts": 7,
