@@ -283,7 +283,7 @@ cursor sites.
 ## FB-005 · `advisor-cli` tests see an unexpected `pending_migration` finding
 
 - **Recorded**: 2026-10-21
-- **Status**: reproduced; root cause NOT established.
+- **Status**: resolved in the v0.60.517.0 sync (2026-10-31).
 - **Origin**: present on `95cc82201` (before the merge-speedup branch) and unchanged on `3b8dc0005`, so not
   caused by that branch.
 
@@ -301,11 +301,13 @@ In fork CI the same three failed in a Test shard on `ci/merge-speedup-r2` but no
 `ci/baseline-95cc8-r1`, whose shard layout differed; the CI outcome is order- or shard-dependent, the local
 single-file run is not.
 
-### Not yet checked
+### Resolution
 
-Whether the advisor's pending-migration collector reads upstream's `config.version` only, or also the fork's
-`fork_schema_version` (`src/core/fork-migrations.ts`), on the test's fresh brain. That is a hypothesis, not a
-finding.
+The hypothesis held. The test's engine stub answers only `getConfig('version')`; the fork's
+`hasPendingMigrations` (`src/core/migrate-pending.ts`) also reads `fork_schema_version` and treats a missing key
+as a brain the counter has not adopted yet, so it reports a pending migration. The stub now reports the fork
+counter as current. `collect-migration` (FB-009) had the same cause and the same fix. The shard dependence came
+from which shards loaded the file, not from ordering.
 
 ---
 
@@ -378,7 +380,7 @@ The third earlier local failure (`import --json`) was the macOS `/var` symlink a
 - `test/managed-writer-guard-null-source-5983.test.ts` "upgrading a v196 brain": its FORK guard expects fork
   migrations inside `MIGRATIONS` above `LATEST_SCHEMA_VERSION`. Since the fork counter split (fork migrations live in
   `FORK_MIGRATIONS`) that set is empty, so `expect(forkOwned.length).toBeGreaterThan(0)` fails. Established.
-- `collect-migration` (3 tests) and `advisor-cli` (3 tests, FB-005): unexpected pending-migration findings.
+- ~~`collect-migration` (3 tests) and `advisor-cli` (3 tests, FB-005)~~: fixed in the v0.60.517.0 sync (FB-005).
 - `line falls back to the last log lines`: not investigated.
 - `test/scripts/test-shard.slow.test.ts` "runs the shard files in the planned order": fails locally on macOS only,
   passes in fork CI.
@@ -386,6 +388,22 @@ The third earlier local failure (`import --json`) was the macOS `/var` symlink a
   NOSUPERUSER role cannot create the `pgroonga` extension), the PGLite ↔ Postgres index-parity check (the
   Postgres-only `idx_content_chunks_pgroonga`), and the "Postgres 15 compatibility" lane (its `pgvector:pg15` image
   has no PGroonga, so fork migration 1 fails).
+
+Also seen in the v0.60.517.0 sync CI (2026-10-31), each passing on the pure-upstream baseline run of the same day:
+
+- `persistence-validation / Read latency / postgres`: failed in every fork sync CI since v0.60.299.0 (one or more of
+  its three runs invalid, loaded p99 230–450 ms against an idle p99 above 80 ms). Root cause not established; the
+  PGroonga keyword path is the first suspect, since upstream's idle p99 on the same runners is about 23 ms.
+- `test/e2e/postgres-engine-pgroonga.test.ts`: a read-only baseline that expects a populated database (no schema
+  setup, no seed), so it fails with `relation "content_chunks" does not exist` whenever a diff selects it in CI.
+  The six other CJK e2e files passed.
+- `test/large-pages/segmented-sweep-budget.test.ts` "a segmented page that fits" (PGLite arm): reproduced locally
+  when the whole file runs, heap held 23.2 MiB against the 10 MiB bound; pure upstream and the pre-merge fork hold
+  6.3 MiB. A file-swap bisect lands on `src/core/migrate.ts`, i.e. on the fork pass itself: skipping fork
+  migrations 9–15 (the `repair_masked_*` replays of old upstream migrations) restores 6.3 MiB, while no single one
+  does. A fresh brain's catalog (functions, triggers, indexes, columns) and config/row counts are identical to
+  upstream's, reads stay at 3.00 per page and the Postgres arm holds 3.8 MiB, so the extra heap is JS-side and
+  PGLite-only. Not established further.
 
 Seen once in fork CI and not reproduced locally (Postgres A-11 breaker 14/14; IPC test 3 of 3 runs green), treated as
 runner timing until they recur: `test/pathological/a11-effect-retry-budget.test.ts` (postgres; a seed `put_page`
