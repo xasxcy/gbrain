@@ -32,6 +32,7 @@ import { join } from 'node:path';
 
 import { runAdvisorCli } from '../src/commands/advisor.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
+import { FORK_COUNTER_KEY, FORK_LATEST_VERSION } from '../src/core/fork-migrations.ts';
 import { DEFAULT_EMBEDDING_MODEL } from '../src/core/ai/defaults.ts';
 import { getRecipe } from '../src/core/ai/recipes/index.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -72,6 +73,8 @@ function fakeEngine(opts: FakeEngineOpts = {}): BrainEngine {
   const engine = {
     getConfig: async (key: string): Promise<string | null> => {
       if (key === 'version') return opts.schemaVersion ?? String(LATEST_VERSION);
+      // FORK (FB-005): the fork counter is current, so only the upstream `version` decides (a missing key reads as pending).
+      if (key === FORK_COUNTER_KEY) return String(FORK_LATEST_VERSION);
       return null; // schema_pack → default resolution; everything else unset
     },
     executeRaw: async (sql: string): Promise<unknown[]> => {

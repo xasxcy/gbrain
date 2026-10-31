@@ -46,6 +46,17 @@ delete process.env.DATABASE_URL; delete process.env.GBRAIN_DATABASE_URL;
 
 const git = (...a: string[]) => execFileSync('git', ['-C', root, '-c', 'commit.gpgsign=false', ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 }).trim();
 const dbUrl = (name: string) => { const u = new URL(adminUrl); u.pathname = '/' + name; return u.toString(); };
+// FORK: a TEMPLATE clone does not carry PGroonga's Groonga objects (writes then fail with "object isn't found"),
+// so the fork's CJK index is rebuilt in the clone before anything writes to it.
+async function cloneRunDb(admin: ReturnType<typeof postgres>): Promise<void> {
+  await admin.unsafe('CREATE DATABASE ' + RUN_DB + ' TEMPLATE ' + SEED_DB);
+  const run = postgres(dbUrl(RUN_DB), { max: 1, prepare: false, onnotice: () => {} });
+  try {
+    if ((await run.unsafe("SELECT to_regclass('public.idx_content_chunks_pgroonga') IS NOT NULL AS present"))[0]?.present) {
+      await run.unsafe('REINDEX INDEX idx_content_chunks_pgroonga');
+    }
+  } finally { await run.end(); }
+}
 const WORDS = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega'.split(' ');
 const body = (i: number, v = 0) => Array.from({ length: Math.round((30 + (i % 40)) * KB * 1.5) }, (_, k) => (k % 12 === 11 ? '\n\n' : '') + WORDS[(i * 7 + k * 13 + v) % WORDS.length]).join(' ');
 const slugOf = (i: number) => 'notes/d' + String(i % 50).padStart(2, '0') + '/p' + String(i).padStart(6, '0');
@@ -153,7 +164,7 @@ async function run(): Promise<void> {
   const seeded = JSON.parse(await Bun.file(join(dir, 'seed.json')).text()) as { head: string };
   const admin = postgres(adminUrl, { max: 1, prepare: false, onnotice: () => {} });
   await admin.unsafe('DROP DATABASE IF EXISTS ' + RUN_DB + ' WITH (FORCE)');
-  await admin.unsafe('CREATE DATABASE ' + RUN_DB + ' TEMPLATE ' + SEED_DB);
+  await cloneRunDb(admin);
   await admin.end();
   git('reset', '-q', '--hard', seeded.head); git('clean', '-qfd');
   const out = flag('out', join(dir, 'samples-' + mode + '.ndjson'))!;
@@ -242,7 +253,7 @@ async function cliRun(): Promise<void> {
   if (!seedEmbed) {
     const admin = postgres(adminUrl, { max: 1, prepare: false, onnotice: () => {} });
     await admin.unsafe('DROP DATABASE IF EXISTS ' + RUN_DB + ' WITH (FORCE)');
-    await admin.unsafe('CREATE DATABASE ' + RUN_DB + ' TEMPLATE ' + SEED_DB);
+    await cloneRunDb(admin);
     await admin.end();
     git('reset', '-q', '--hard', seeded.head); git('clean', '-qfd');
     // --durable: git durability on with a tracking remote; every Git effect commits and pushes.
