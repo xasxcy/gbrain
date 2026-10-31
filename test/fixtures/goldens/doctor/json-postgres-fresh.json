@@ -1001,7 +1001,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "RLS enabled on 161/161 public tables",
+          "message": "RLS enabled on 162/162 public tables",
           "name": "rls",
           "status": "ok"
         },
@@ -1022,14 +1022,14 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1394 column(s) verified against live schema",
+          "message": "1408 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "All 161 table(s) the applied migrations create exist.",
+          "message": "All 162 table(s) the applied migrations create exist.",
           "name": "schema_missing_tables",
           "status": "ok"
         },
@@ -3528,6 +3528,13 @@
           "elapsed_ms": "<volatile>",
           "message": "Embeddings disabled — no active embedding width to reconcile.",
           "name": "embedding_width_consistency",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "elapsed_ms": "<volatile>",
+          "message": "gateway not configured — skipping embed_failures check.",
+          "name": "embed_failures",
           "status": "ok"
         },
         {

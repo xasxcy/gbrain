@@ -43,6 +43,7 @@ import type { IdleBlocker, Migration } from './migrate.ts';
 import { FTS_INPUT_FUNCTION_SQL, getFtsLanguage, pageSearchVectorTriggerFnSql } from './fts-language.ts';
 import { isRetryableConnError, isStatementTimeoutError } from './retry-matcher.ts';
 import { MINION_QUEUE_PROTOCOL_FUNCTION_SQL } from './schema-migrations/v205-minion-spend-authorization.ts';
+import { protectTables } from './schema-migrations/v275-rls-backfill-unguarded-tables.ts';
 
 export interface ForkMigrationDeps {
   /** The live MIGRATIONS registry. A getter, not the array: it is still being
@@ -871,8 +872,24 @@ export function buildForkMigrations(deps: ForkMigrationDeps): Migration[] {
         `SELECT 1 FROM pg_constraint WHERE conname = 'op_checkpoints_completed_keys_array' AND conrelid = 'op_checkpoints'::regclass`,
       )).length === 1,
     },
+    {
+      version: 16,
+      name: 'rls_fork_tables',
+      // Upstream v275 enables RLS on every table a fresh upstream install creates (frozen list) and requires each
+      // later table to enable it itself (test/e2e/rls-every-table-postgres.test.ts). The fork's embed_failures (fork#4)
+      // is in neither, so a brain without v35's superuser auto-RLS trigger kept it readable with the anon key. Same
+      // posture as v275: ENABLE only where still off, only under a role that bypasses RLS and owns the table, otherwise
+      // named on stderr for doctor's rls check. PGLite: no-op.
+      idempotent: true,
+      transaction: false,
+      sql: '',
+      handler: async (engine) => { await protectTables(engine, FORK_TABLES, 'fork#16'); },
+    },
   ];
 }
+
+/** The tables only the fork creates, as of fork#16; a later fork table enables RLS in the migration that creates it. */
+const FORK_TABLES = ['embed_failures'] as const;
 
 /** Highest fork migration number (the fork counter's target), derived from the list itself. */
 export const FORK_LATEST_VERSION: number = Math.max(

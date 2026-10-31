@@ -506,18 +506,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 198780,
-                    "net_per_day_7d": 58870,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 198780,
-                    "reclaimable_bytes": 139910,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 198780,
+                    "used": 199300,
                     "window_days": 1
                   },
                   {
@@ -543,18 +543,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 198780,
-                    "net_per_day_7d": 58870,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 198780,
-                    "reclaimable_bytes": 139910,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 198780,
+                    "used": 199300,
                     "window_days": 1
                   }
                 ],
@@ -1112,7 +1112,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 161/161 public tables",
+            "message": "RLS enabled on 162/162 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -1133,14 +1133,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1394 column(s) verified against live schema",
+            "message": "1408 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 161 table(s) the applied migrations create exist.",
+            "message": "All 162 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -4260,6 +4260,13 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
+            "message": "gateway not configured — skipping embed_failures check.",
+            "name": "embed_failures",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
             "message": "gateway not configured — facts.embedding width check skipped.",
             "name": "facts_embedding_width_consistency",
             "status": "ok"
@@ -5288,18 +5295,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 68719476736,
-                    "max_day_7d": 198780,
-                    "net_per_day_7d": 58870,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 198780,
-                    "reclaimable_bytes": 139910,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 137438953472,
                     "resource": "terminal_bytes",
                     "scope": "brain",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 198780,
+                    "used": 199300,
                     "window_days": 1
                   },
                   {
@@ -5325,18 +5332,18 @@
                     "days_to_exhaustion": null,
                     "exhaustion_date": null,
                     "limit": 17179869184,
-                    "max_day_7d": 198780,
-                    "net_per_day_7d": 58870,
+                    "max_day_7d": 199300,
+                    "net_per_day_7d": 58974,
                     "pct": 0,
-                    "per_day_7d": 198780,
-                    "reclaimable_bytes": 139910,
+                    "per_day_7d": 199300,
+                    "reclaimable_bytes": 140326,
                     "recommended_limit": 34359738368,
                     "resource": "terminal_bytes",
                     "scope": "principal:local_cli:<uuid>",
                     "spike_day": null,
                     "status": "ok",
                     "under_reserved_receipts": 0,
-                    "used": 198780,
+                    "used": 199300,
                     "window_days": 1
                   }
                 ],
@@ -5894,7 +5901,7 @@
           {
             "category": "ops",
             "elapsed_ms": "<volatile>",
-            "message": "RLS enabled on 161/161 public tables",
+            "message": "RLS enabled on 162/162 public tables",
             "name": "rls",
             "status": "ok"
           },
@@ -5915,14 +5922,14 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1394 column(s) verified against live schema",
+            "message": "1408 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "All 161 table(s) the applied migrations create exist.",
+            "message": "All 162 table(s) the applied migrations create exist.",
             "name": "schema_missing_tables",
             "status": "ok"
           },
@@ -9037,6 +9044,13 @@
             "elapsed_ms": "<volatile>",
             "message": "Embeddings disabled — no active embedding width to reconcile.",
             "name": "embedding_width_consistency",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "message": "gateway not configured — skipping embed_failures check.",
+            "name": "embed_failures",
             "status": "ok"
           },
           {

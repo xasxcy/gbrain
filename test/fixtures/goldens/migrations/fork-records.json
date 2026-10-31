@@ -1,23 +1,32 @@
 {
   "golden": {
-    "count": 15,
+    "count": 16,
     "gaps": [],
     "helpers": {
+      "EXEMPT_RE": "e8b623114f4f77fc3abcfc479abec1442dbf41bc607e046d124b44572d59953c",
+      "FORK_TABLES": "548a0e32891c1d923a32e45a08e441ecda922858d8d4a90ec60b918aa67b785c",
       "FTS_INPUT_FUNCTION_SQL": "d2f44fc1ef338ff7563c07659d938b743fedb20230948792c71068c022ec54c3",
       "MINION_QUEUE_PROTOCOL_FUNCTION_SQL": "c0381052bf13a121f86abd57f1375194ef46f2d302fb6c70ee122face58d2bcb",
       "PAGE_LINKS_SECURITY_INVOKER_SQL": "2f5e70a43c32ed9b892cc2d7a69de7d28a98f8cba2c0a3bc1c703fc4882c079d",
       "configuredEmbeddingDimensions": "baed06ea90bff06f6564c2188c107ed6b56585e4fb64ffc39fec7b35a8d6e6ac",
+      "enableRlsSql": "b7901b3d5231fcfacd3260ce0f59d4701d8c0bee902808ff48b1d8affbd444b6",
       "getFtsLanguage": "0d790b4c4af1f67a2a1bbd59470beb13f434917b381931baf8404a41c5d903db",
+      "isLockTimeoutError": "52a3720e1ffb74ce381cc3269f78130c38a89c807e308283ec3d557bae2b89b1",
       "isRetryableConnError": "37340edbeb766f6bd8803a34eb2fc7db7f2789ca1b84d9bff3a4f6b780a4f1bd",
       "isStatementTimeoutError": "73f34c5c41a586f55ba47e9a503fe2377937276effbe0141cccea731d5635ab3",
+      "migrationStatementTimeoutMs": "2883be5073d2cd96cc17136e2f7d3223c6bdafebe3ef3c7a6836be320867251d",
       "noticeIdleBlockers": "ea8c2a5d5b14ce1df0fecd2d9f7687f751c6aed8ac717458171584cdf87cf104",
       "noticePageLinksSecurityInvoker": "e5b27381b64bd4d890fbd37e6abbf7ad326b3fa916a3e071face4878eb542c24",
       "pageSearchVectorFunctionSql": "368adf658d0e5bdbe55dafb168daeaa8b6feb4a1b2de506264ad79ca3fd3babf",
       "pageSearchVectorTriggerFnSql": "c78074a731ae571c508ca0a84c6bb19ac34a933a7f4ab2068b47124aabb87435",
+      "protectTables": "ca31d41dd1fbc1d0cc4a41855741b55f4ec3d428dc264fb2aaf5cd1592082a14",
+      "relationsWithoutRls": "1350afca7865e0a915bfd4c6c2614361705090fca4905f25ac3b38312065c99c",
       "requireMaskedMigration": "2d375c916feed25bfff1bf757bd9c180c88b1598f852f62afb620464ee610ec3",
-      "runStatementsAtomically": "b52a134107e1725ee0439c33c8a6ccaaa11ba4fbe5b485cca142211185806fc0"
+      "resolveSchemaLockTimeoutMs": "944eadd479e8de6c6da7dfb5208eb3b140e84b318db97a644d08ae0054d69138",
+      "runStatementsAtomically": "b52a134107e1725ee0439c33c8a6ccaaa11ba4fbe5b485cca142211185806fc0",
+      "schemaLockBlockedError": "c3e1346bc85d4e7592eaa64e262487c87011e4f4fae4c2bcca89b7d818c9a345"
     },
-    "latest": 15,
+    "latest": 16,
     "records": [
       {
         "handler": "absent",
@@ -333,6 +342,33 @@
           "sha256": "999b53beb6eebc44623af8f68b069e5db9972b70674cb72e8ce3a5ced2254506"
         },
         "version": 15
+      },
+      {
+        "handler": {
+          "form": "arrow",
+          "helpers": [
+            "EXEMPT_RE",
+            "FORK_TABLES",
+            "enableRlsSql",
+            "isLockTimeoutError",
+            "migrationStatementTimeoutMs",
+            "protectTables",
+            "relationsWithoutRls",
+            "resolveSchemaLockTimeoutMs",
+            "schemaLockBlockedError"
+          ],
+          "sha256": "72c00bc0849092c2150ff869ee54ea12a5f896ef4d16ec39270260aa441af8bc"
+        },
+        "idempotent": true,
+        "name": "rls_fork_tables",
+        "sql": {
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "sqlFor": "absent",
+        "transaction": false,
+        "verify": "absent",
+        "version": 16
       }
     ],
     "versions": [
@@ -350,7 +386,8 @@
       12,
       13,
       14,
-      15
+      15,
+      16
     ]
   },
   "normalizer": "fork-migrations-record-v1"

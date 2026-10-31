@@ -29,6 +29,7 @@ import { collect, makeHome, spawnDriver } from '../helpers/apply-migrations-lock
 import { writeSchemaDriver } from '../helpers/apply-migrations-schema-driver.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
+import { FORK_COUNTER_KEY } from '../../src/core/fork-migrations.ts';
 import { v275 } from '../../src/core/schema-migrations/v275-rls-backfill-unguarded-tables.ts';
 import { recreateStep } from '../../src/core/schema-missing-tables.ts';
 import { resolveRepairScope, runRepair } from '../../src/core/repair/core.ts';
@@ -156,6 +157,8 @@ describeE2E('RLS on every public table (Postgres, no auto-RLS event trigger)', (
           EXECUTE format('ALTER TABLE %s DISABLE ROW LEVEL SECURITY', t.rel);
         END LOOP; END $$`);
       await conn.unsafe(`UPDATE config SET value = $1 WHERE key = 'version'`, [String(v275.version - 1)]);
+      // FORK: the fork's own tables get RLS from fork#16, so its counter goes back to before that migration too.
+      await conn.unsafe(`UPDATE config SET value = '15' WHERE key = $1`, [FORK_COUNTER_KEY]);
       expect((await tablesWithoutRls(conn)).length).toBeGreaterThan(100);
 
       const home = makeHome({ engine: 'postgres', database_url: url });
