@@ -431,3 +431,23 @@ line and in the first-missing stderr line.
 Fix direction (unverified): call `markNothingRebuilt` whenever a non-deferred candidate was not rebuilt, and count
 only those candidates as failures. Needs a mixed-candidate test next to the single-deferral one in
 `test/embed-stale-images-budget-reuse.test.ts`.
+
+---
+
+## FB-011 · Image pages carry two slug styles, so a re-import can collide with its own page
+
+- **Recorded**: 2026-11-01 (post-landing doctor of the v0.60.517.0 sync)
+- **Status**: observed in production, root cause NOT established. Predates the sync: the first collision was recorded
+  on 2026-10-30, under v0.60.331.0.
+- **Trigger**: another `Another live page of source … already records "<path>" as its origin` sync failure, or work on
+  `slug_path_mismatch`.
+
+In one source, 1,187 of 3,761 live image pages have a slug that keeps the raw path spelling: spaces, `1. dir`, `·`.
+The rest use the normalized spelling: `1.-dir`, with `·` dropped. Two screenshots in the same folder, imported 3 s apart
+in one sync, got one style each. A later re-import of the normalized one derived the raw-style slug for the same file,
+found the origin path already owned by the existing page, and failed three times until it was auto-skipped. That page
+was already imported and embedded, so the ledger entry was stale. It was acknowledged with `sync --skip-failed`, which
+removes the symptom, not the cause. doctor's `slug_path_mismatch` (146 pages) is probably the same split.
+
+Next step: find which image import path produces the raw-style slug (sync import vs. asset/projection paths), and
+whether a re-import should reuse the page that already owns the origin path instead of deriving a new slug.
