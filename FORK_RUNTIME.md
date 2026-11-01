@@ -136,3 +136,5 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
 - **goldens 走 `fork-theirs` 合并驱动，cherry-pick 也一样。** 重放含 golden 改动的提交时，git 会整份采用被摘提交的版本，而不是做三方合并；改写分支历史时，要么跳过只改 golden 的提交，要么事后核对最终树。
 - **fork 表要自己开 RLS。** 上游 v275 只给上游表补 RLS，并要求之后新建的表自己开；fork 的 `embed_failures` 由 fork#16 补。以后 fork 再加表，要在建表的那条迁移里开 RLS（`test/e2e/rls-every-table-postgres.test.ts` 会查）。
 - **fork 的 `embed_failures` 账本会接管 serve 的延迟 embed 重试。** provider 失败后，该 chunk 进入账本退避（15 分钟起、指数增长）；上游 serve 端的 drain 20 ms 后重试时找不到可做的 chunk，就报 `drained`，页面等退避结束后由下一轮补上。
+- **生产 checkout 里跑 `bun install` 就会迁移生产库。** `postinstall`（`scripts/postinstall.ts`）读 `.env`，自动跑结构迁移和 fork 迁移，不会再问。所以要在暂停 cron、做完 `pg_dump` 之后再装依赖，并保留它的完整输出作为迁移记录（v0.60.517.0 落地时，264→279 加 fork#16 在一次 install 里跑完，用时 38 秒）。要单独补迁移，用 `gbrain init --migrate-only`；不要用 `apply-migrations --yes`，它还会扫主机文件并安装 autopilot。
+- **Codex 评审要绕开 magpie。** `~/.codex/config.toml` 把默认 OpenAI 地址指向本地的 magpie（`127.0.0.1:3425`），magpie 是可选应用，开机不会自启。headless 评审加 `-c openai_base_url="https://chatgpt.com/backend-api/codex"`。
