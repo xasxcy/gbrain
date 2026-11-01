@@ -412,3 +412,22 @@ CI r3 added two of the same kind in the `persistence-validation` Postgres arms (
 the sync branch and on `2c049521e`: `test/large-pages/streamed-sync-origin-b14.test.ts` (the setup sync did not report
 `filesImported: 2`) and `test/large-pages/segmented-delete-restore-file.slow.test.ts` (the 90 MiB delete counted
 `bytesCopied` at exactly 4x the file, a run of 117 s).
+
+---
+
+## FB-010 · `embed --stale --images` stays green when a deferral hides a real non-rebuild
+
+- **Recorded**: 2026-11-01 (Codex review of the v0.60.517.0 sync, finding 2)
+- **Status**: static finding, not reproduced; explicit `--images` CLI only. Cron's `embed --stale` folds the sweep
+  through `runStaleImageSweepFirst` and never reaches this call site.
+- **Trigger**: a mixed run is seen in practice, or the `--images` exit code starts gating automation.
+
+`runEmbedStaleImagesCli` (`src/core/embed-stale-images.ts`) skips `markNothingRebuilt` for the whole run when any page
+is `ocr_deferred` or the time budget stopped it. That skip is right for a run that is only deferred: upstream would
+count the deferred pages as failures. It is wrong for a mixed run. Example: one OCR-deferred page plus one missing
+source file. The run reports 0 rebuilt and 0 failures and exits green. The missing file still shows in the summary
+line and in the first-missing stderr line.
+
+Fix direction (unverified): call `markNothingRebuilt` whenever a non-deferred candidate was not rebuilt, and count
+only those candidates as failures. Needs a mixed-candidate test next to the single-deferral one in
+`test/embed-stale-images-budget-reuse.test.ts`.
