@@ -4284,7 +4284,7 @@
         {
           "category": "brain",
           "elapsed_ms": "<volatile>",
-          "message": "55 retrieval-affecting file(s) changed since HEAD: src/core/chunkers/code-elixir.ts, src/core/chunkers/code-module-chunks.ts, src/core/chunkers/code.ts, …. Re-run `gbrain eval run-all` after committing these changes.",
+          "message": "No retrieval-affecting files changed in working tree.",
           "name": "eval_drift",
           "status": "ok"
         },
