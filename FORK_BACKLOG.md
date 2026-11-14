@@ -80,6 +80,20 @@ Existing coverage is insufficient to catch a regression here:
 `test/file-upload-engine-context.test.ts` only exercises the single `default` source.
 Any fix must add a genuinely two-source case.
 
+### Related suspicions from the v0.60.715.0 sync review (2026-11-14, static, not reproduced)
+
+Upstream moved the file operations to `src/core/ops/files.ts`; the sync rebuilt them on the fork's
+`(source_id, storage_path)` key. Two cases still assume one source per storage object. Both need object storage
+configured, so trigger 2 above covers them too.
+
+- **A.** `file_upload` / `file_register` check for an existing row and then write the object, without a lock. Two
+  sources that resolve to the same storage path can race: both pass the check and the later object write wins
+  (`ops/files.ts`, the existence check and write in `file_upload`, and the same pair in `file_register`).
+- **B.** A page purge deletes every `files` row of the page and then deletes each returned `storage_path` object
+  (`src/core/persistence/page-purge.ts`, the `DELETE FROM files … RETURNING storage_path` and the post-commit
+  `storage.delete(path)` loop). If another source still has a row on the same path, its row survives and its object is
+  gone. The fix is to delete only objects that no remaining row references.
+
 ---
 
 ## FB-002 · The `embed_failures` retry ledger is unreachable for transient provider failures
@@ -413,6 +427,14 @@ the sync branch and on `2c049521e`: `test/large-pages/streamed-sync-origin-b14.t
 `filesImported: 2`) and `test/large-pages/segmented-delete-restore-file.slow.test.ts` (the 90 MiB delete counted
 `bytesCopied` at exactly 4x the file, a run of 117 s).
 
+Local runs during the v0.60.715.0 sync (2026-11-14), each failing the same way on the pre-merge fork (`829ee3f7cb`),
+so not caused by the sync: `test/cli-contract.test.ts` (setup, doctor and import `--json` success shapes; compare
+FB-008), `test/setup.test.ts` (the same two tests: a fresh setup applying its migrations, and the hermes brain-first block; a
+pure-upstream v0.60.715.0 checkout failed far more of this file on the same machine, so the environment is the first
+suspect; not established), `segmented-bom` (export BOM) and
+`segmented-delete-restore-file.slow` (two tests). The FORK guard in `managed-writer-guard-null-source-5983` above still
+fails the same way.
+
 ---
 
 ## FB-010 · `embed --stale --images` stays green when a deferral hides a real non-rebuild
@@ -457,7 +479,8 @@ whether a re-import should reuse the page that already owns the origin path inst
 ## FB-012 · Segmented pages bypassed the stale slices, so a large page re-embedded forever with nothing installed
 
 - **Recorded**: 2026-11-14
-- **Status**: **fixed** on branch `fix/segmented-stale-batch` (stale paths only). The ledger gap below is still open.
+- **Status**: **fixed** (stale paths only), landed in production on 2026-11-14 as `6bc7ca221a`; the next cron runs
+  installed vectors on the stuck page. The ledger gap and the summary underreport below are still open.
 - **Trigger** (for the open part): `Embedded 0 chunks … eligible_now=N` repeats while `embed_failures` stays empty and
   the stuck page is segmented (`pages.body_storage = 'segmented'`).
 
@@ -495,3 +518,23 @@ passes on the fix (8).
 A segmented batch that fails is recorded only in the run's in-memory result, not in `embed_failures`, so a batch that
 fails every time is retried every run without backoff or quarantine. Wire the segmented path into the ledger if that
 trigger fires.
+
+The run summary still says `Embedded 0 chunks` when the time budget stops a segmented page part-way, although the
+batches finished before the stop are installed (seen in production right after landing: the page's embedded count
+rose run by run while each run printed 0). The batches installed before the abort are not added to the run result.
+So until that is fixed, judge progress by `total_null` going down, not by the `Embedded N` count.
+
+---
+
+## FB-013 · A failing fork migration on an at-head brain skips upstream's hardening and backfill
+
+- **Recorded**: 2026-11-14 (review of the v0.60.715.0 sync, static, not reproduced)
+- **Status**: latent. No fork migration fails today; every landing so far applied them cleanly.
+- **Trigger**: a fork migration ever fails on `init --migrate-only`, or work on the at-head branch of `runMigrations`.
+
+In `src/core/migrate.ts`, when upstream has no pending migration the runner calls `forkPass(false)`, then
+`harden(false)` and `backfill()`. If `forkPass` throws, the other two never run for that call. They are upstream's
+`search_path` hardening of gbrain functions and the revision backfill. A rerun after fixing the fork migration runs
+them again, so the effect is a delay, not lost work. Whether that delay can leave a brain in a state doctor misreads is
+not established. Fix direction (unverified): run `harden` and `backfill` in a `finally`, or before the fork pass when
+their order does not matter.

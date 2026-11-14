@@ -131,16 +131,19 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
 - **git 看不出来的冲突靠 typecheck 发现**：两边给同一个类型加了同名但类型不同的字段（v0.60.323.0 演练里的 `embed-backfill` `reason`）。驱动合并出来的上限如果放不下合并后的代码，ratchet 会报出来；这时要人带着理由调整上限，不能直接放宽。
 - 记录：v0.60.323.0（881 个上游提交）只开 git 时有 22 个冲突文件；开驱动后剩 10 个文件、11 块；用演练的 rerere 预填后是 0 块。细节在 vault 的 `tasks/2026-10-20_fork-merge-speedup/PLAN-V1.md`。
 - 记录：v0.60.517.0（2564 个上游提交）开驱动后 28 个文件、44 块，rerere 没有命中。
+- 记录：v0.60.715.0（3900 个上游提交）开驱动后 28 个文件、42 块，rerere 没有命中。按区域分三组交给并行的子代理解（引擎/迁移/导入、持久化/sync/doctor、文档/测试登记表），文件互不重叠；两个 ratchet TSV 最后按合并后的实测值人工定。
 - **typecheck 也看不出来的：自动合并进 fork 改写过的函数里的 `await using`。** 上游的页级 embedding 租约用 `await using lease` 绑定，作用域一结束就释放。它被 git 无冲突地合进了 `embedStaleForSource` 的 heal `try` 块，而 fork 的分片安装在这个块之后，于是租约在安装前就已释放。凡是上游加了 `await using` 的函数，若 fork 改过其结构，都要人工确认作用域是否覆盖到写入。
 - **上游最低 Bun 版本会变。** v0.60.517.0 起 `package.json` 要求 `bun >=1.4.4`，CLI 低于该版本直接拒跑（cron 也会拒跑）。合并后上线前先升级本机 Bun；本地验证可以先旁装一份，不动 cron 在用的全局 bun：`npm install --no-save bun@<版本>`，再把 `node_modules/bun/bin/bun.exe` 软链进一个放在 PATH 前面的目录。
 - **fork 仓库的 GitHub Actions 平时全部禁用**（防止上游的定时工作流空耗额度）。同步 CI 的做法：推 `ci/sync-<版本>-rN` 分支（fork-only 提交把 ubicloud runner 换成 `ubuntu-24.04[-arm]`、把 `pgvector/pgvector:pg16` 换成 fork 的 PGroonga 镜像），临时 `gh workflow enable` Test 与 E2E Tests，`gh workflow run … --ref <分支>` 触发，再立刻 `gh workflow disable`；已排队的 run 不受影响。
-- **本地刷新的 golden 会带进本机信息，而 fork 仓库是公开的。** 上游的 doctor `cron_gbrain_home` 检查会读 `crontab -l` 和它调用的脚本；golden 测试把 PATH 固定成 `/usr/bin:/bin`，挡不住。`after-merge.sh` 现在设置 `GBRAIN_TEST_DOCTOR_NO_CRONTAB=1`（fork 在 `readCrontab()` 里留的口子；名字必须以 `GBRAIN_TEST_` 开头，否则测试 preload 会把它清掉）。提交前用 `git grep -e "$HOME" -- test/fixtures` 查一遍。另外，after-merge 必须在合并提交**之后**再跑一次：在未提交的合并上刷新，doctor 的 `eval_drift` 会记下“N 个文件已改动”。
+- **本地刷新的 golden 会带进本机信息，而 fork 仓库是公开的。** 上游的 doctor `cron_gbrain_home` 检查会读 `crontab -l` 和它调用的脚本；golden 测试把 PATH 固定成 `/usr/bin:/bin`，挡不住。`after-merge.sh` 现在设置 `GBRAIN_TEST_DOCTOR_NO_CRONTAB=1`（名字必须以 `GBRAIN_TEST_` 开头，否则测试 preload 会把它清掉）。它管两处 fork 口子：`cron-gbrain-home.ts` 的 `readCrontab(entryDeadlineAt)`（上游已删掉这个函数、改在 `local-audits.ts` 直接调 `localProbe`，fork 让 `local-audits.ts` 改调它），以及 `upgrade-restart.ts` 的 `upgradeRestartReadiness()`：上游 doctor 的 `self_upgrade_health` 会扫本机进程表，把其它 gbrain 进程的 pid、安装路径和版本写进 golden，开关打开时按 CI 的情况当作没有其它进程。提交前用 `git grep -e "$HOME" -- test/fixtures` 查一遍。另外，after-merge 必须在合并提交**之后**再跑一次：在未提交的合并上刷新，doctor 的 `eval_drift` 会记下“N 个文件已改动”。
+- **after-merge 的更新模式会写脏 `test/fixtures/goldens/evidence-delivery/off-path.json`。** 这份是冻结的“功能上线前”样本；更新模式下的那次运行会多录两条 `embed_unavailable` 降级提示，之后普通运行就失败。每次跑完 after-merge 都用 `git show <上游 tag>:<路径>` 恢复它。
+- **本机 Postgres 测试库**：fork 镜像 `ghcr.io/xasxcy/gbrain-cjk-postgres` 只有 amd64，Apple Silicon 上的 colima 要加 `--platform linux/amd64` 才能跑（模拟运行，慢）。慢到一定程度时 doctor 会多打一行 `still reading doctor checks (10 s so far)`，`doctor-hot-checks` 的 Postgres golden 会因此在本机失败；以 CI 的原生 runner 为准。
 - **goldens 走 `fork-theirs` 合并驱动，cherry-pick 也一样。** 重放含 golden 改动的提交时，git 会整份采用被摘提交的版本，而不是做三方合并；改写分支历史时，要么跳过只改 golden 的提交，要么事后核对最终树。
 - **fork 表要自己开 RLS。** 上游 v275 只给上游表补 RLS，并要求之后新建的表自己开；fork 的 `embed_failures` 由 fork#16 补。以后 fork 再加表，要在建表的那条迁移里开 RLS（`test/e2e/rls-every-table-postgres.test.ts` 会查）。
 - **fork 的 `embed_failures` 账本会接管 serve 的延迟 embed 重试。** provider 失败后，该 chunk 进入账本退避（15 分钟起、指数增长）；上游 serve 端的 drain 20 ms 后重试时找不到可做的 chunk，就报 `drained`，页面等退避结束后由下一轮补上。
 - **生产 checkout 里跑 `bun install` 就会迁移生产库。** `postinstall`（`scripts/postinstall.ts`）读 `.env`，会直接跑结构迁移和 fork 迁移，不做确认。v0.60.517.0 落地时就是这样，264→279 加 fork#16 在一次 install 里跑完，用时 38 秒，跳过了迁移前的连接检查。生产上一律用 `bun install --ignore-scripts`，迁移交给下面清单里单独的一步。不要用 `apply-migrations --yes`，它还会扫主机文件、安装 autopilot。
 - **上线清单**（v0.60.331.0 和 v0.60.517.0 两次落地总结出来的；过程记录在 vault 的 `tasks/2026-10-21_gbrain-sync-0.60.331/` 和 `tasks/2026-10-31_gbrain-sync-0.60.517/`）：
-  1. 合并分支先过 Codex 评审（见下一条），并在当天导出的生产库副本上演练迁移。
+  1. 合并分支先过对抗式评审（自 2026-11-14 起用 Claude 子代理，不再用 Codex），并在当天导出的生产库副本上演练迁移。NAS 每天约 02:00 有夜间备份（`backups/gbrain_qwen2000_nightly_<日期>_*.dump`），可直接当作当天副本。
   2. `touch ~/Library/Logs/gbrain-sync.paused.manual` 暂停 cron，等正在跑的那一轮退出（`pgrep -f gbrain-cron-sync.sh` 查不到为止）。
   3. 备份：在 NAS 上执行 `docker exec gbrain-pg pg_dump -U postgres -Fc gbrain_qwen2000`，写到 `/volume2/docker/gbrain-pg/backups/gbrain_qwen2000_pre-<版本>_<时间>.dump`，然后用 `pg_restore -l` 核对。
   4. 上游提高了 Bun 下限的话，原子替换 `~/.bun/bin/bun`，旧版保留为 `bun-<版本>.bak`。
