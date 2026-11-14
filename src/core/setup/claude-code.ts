@@ -37,7 +37,10 @@ import {
   type ClaudeHookEvent,
 } from '../bootstrap/host-specs.ts';
 import { stdioServeArgv } from '../mcp-registration.ts';
+import { withStdioMember } from '../stdio-member-flag.ts';
 import { isTurnRuleEntry } from './turn-hook.ts';
+import { isSkillResolverEntry } from './skill-resolver-lane.ts';
+import { ensureHookLauncher, hookLauncherPath } from './hook-launcher.ts';
 import type { McpSurface } from '../../mcp/surface.ts';
 
 export type WiringScope = 'user' | 'project';
@@ -96,6 +99,8 @@ export interface ClaudeSetupPlan {
   /** `serve --advertise`; null lists the whole surface. */
   advertise: McpSurface | null;
   events: ClaudeHookEvent[];
+  /** GST-363: `serve --stdio-member`: this entry's sessions read as that member. Only a named --stdio-member or the entry setup already wrote sets it. */
+  stdioMember?: string;
 }
 
 export interface SetupStep { step: 'brain' | 'receipt' | 'mcp' | 'hooks'; action: 'write' | 'keep' | 'skip' | 'remove' | 'preserve'; detail: string }
@@ -107,7 +112,8 @@ export interface ClaudeInspection {
   prior: ClaudeSetupReceipt | null;
   /** A hosted `gbrain connect --install` receipt sits at this name. */
   hostedReceipt: { mcp_url?: string } | null;
-  mcp: { state: 'absent' | 'current' | 'owned' | 'remote' | 'unowned'; url?: string };
+  /** stdioMember: the --stdio-member of an entry setup owns (current or owned), which a rewrite carries forward. */
+  mcp: { state: 'absent' | 'current' | 'owned' | 'remote' | 'unowned'; url?: string; stdioMember?: string };
   /** Events wired by another gbrain lane in this settings file. */
   otherLaneEvents: string[];
   /** Owned events whose entry the user edited: preserved, never rewritten. */
@@ -178,13 +184,14 @@ export function desiredMcpEntry(plan: ClaudeSetupPlan): Record<string, unknown> 
   const env: Record<string, string> = {};
   if (plan.gbrainHomeEnv) env.GBRAIN_HOME = plan.gbrainHomeEnv;
   if (plan.sourceId) env.GBRAIN_SOURCE = plan.sourceId;
-  return { type: 'stdio', command: plan.launcher, args: stdioServeArgv(plan.launcher, plan.surface, plan.advertise).slice(1), env };
+  // The harness starts stdio servers in the session's directory, so serve starts through the launcher too (#8426).
+  return { type: 'stdio', command: hookLauncherPath(plan.brainHome), args: stdioServeArgv(plan.launcher, plan.surface, plan.advertise, plan.stdioMember), env };
 }
 
 export function desiredHookHashes(plan: ClaudeSetupPlan): HookHashes {
   const out: HookHashes = {};
   for (const event of plan.events) {
-    out[event] = hookEntryHash({ type: 'command', command: buildClaudeHookCommand(plan.launcher, event, hookEnv(plan)), timeout: CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS[event] })!;
+    out[event] = hookEntryHash({ type: 'command', command: buildClaudeHookCommand(plan.launcher, event, hookEnv(plan), hookLauncherPath(plan.brainHome)), timeout: CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS[event] })!;
   }
   return out;
 }
@@ -208,7 +215,7 @@ function hookCensus(settingsPath: string): HookCensus {
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
         const marker = (entry as Record<string, unknown> | null)?.[GBRAIN_HOOK_MARKER_KEY];
-        if (isTurnRuleEntry(entry)) continue;
+        if (isTurnRuleEntry(entry) || isSkillResolverEntry(entry)) continue;
         if ((typeof marker === 'string' && marker !== GBRAIN_SETUP_MARKER_VALUE) || classifyHarnessHook(entry, event, 'any')) {
           if ((CLAUDE_HOOK_EVENTS as readonly string[]).includes(event)) otherLane.add(event);
           continue;
@@ -229,9 +236,9 @@ export function inspectClaudeSetup(plan: ClaudeSetupPlan): ClaudeInspection {
   const entry = servers?.[plan.name];
   const desired = entryHash(desiredMcpEntry(plan));
   const mcp: ClaudeInspection['mcp'] = entry === undefined ? { state: 'absent' }
-    : entryHash(entry) === desired ? { state: 'current' }
+    : entryHash(entry) === desired ? withStdioMember({ state: 'current' }, entry)
       : typeof (entry as Record<string, unknown>)?.url === 'string' ? { state: 'remote', url: (entry as Record<string, string>).url }
-        : prior && [prior.entry_hash, prior.pending_entry_hash].includes(entryHash(entry)) ? { state: 'owned' } : { state: 'unowned' };
+        : prior && [prior.entry_hash, prior.pending_entry_hash].includes(entryHash(entry)) ? withStdioMember({ state: 'owned' }, entry) : { state: 'unowned' };
 
   const census = hookCensus(paths.settingsPath);
   const want = desiredHookHashes(plan);
@@ -269,12 +276,17 @@ export interface ApplyResult { steps: SetupStep[]; receipt: ClaudeSetupReceipt; 
 export async function applyClaudeSetup(
   plan: ClaudeSetupPlan,
   consent: SetupConsent,
-  opts: { pluginOwner: string | null; brainCreated: boolean; beforeMcp?: () => Promise<void>; abortAfter?: string },
+  opts: { pluginOwner: string | null; brainCreated: boolean; beforeMcp?: () => Promise<void>; abortAfter?: string; refreshOf?: ClaudeSetupReceipt },
 ): Promise<ApplyResult> {
   const paths = claudeSetupPaths(plan);
   const lock = await acquireBootstrapLock(dirname(paths.configPath));
   try {
+    // The MCP entry and every hook command start gbrain through the launcher, so it goes down before anything names it (#8424, #8426).
+    ensureHookLauncher(hookLauncherPath(plan.brainHome));
     const found = inspectClaudeSetup(plan);
+    // post-upgrade's refresh: it rewrites only the install it planned from, and the MCP entry only while it is still setup's, both read again under the lock (#8426).
+    if (opts.refreshOf && JSON.stringify(found.prior) !== JSON.stringify(opts.refreshOf)) throw new Error(`the '${plan.name}' setup receipt changed before setup's entries were rewritten`);
+    if (opts.refreshOf && opts.pluginOwner === null && found.mcp.state !== 'current' && found.mcp.state !== 'owned') throw new Error(`the '${plan.name}' MCP entry changed before setup's entries were rewritten`);
     const now = new Date().toISOString();
     const desired = desiredMcpEntry(plan);
     const desiredHash = entryHash(desired);
@@ -333,7 +345,7 @@ export async function applyClaudeSetup(
     } else {
       const ownedHashes = new Set([...values(prior?.hooks.owned), ...values(prior?.hooks.pending), ...values(receipt.hooks.pending)]);
       writeClaudeHooksAt(paths.settingsPath, {
-        gbrainBin: plan.launcher, env: hookEnv(plan), events: writeEvents, marker: GBRAIN_SETUP_MARKER_VALUE,
+        gbrainBin: plan.launcher, hookLauncher: hookLauncherPath(plan.brainHome), env: hookEnv(plan), events: writeEvents, marker: GBRAIN_SETUP_MARKER_VALUE,
         ownedEntryHashes: ownedHashes, freshMode: 0o600,
       });
       steps.push({ step: 'hooks', action: 'write', detail: writeEvents.length ? `${writeEvents.join(', ')} in ${paths.settingsPath}` : `removed setup's hooks from ${paths.settingsPath}` });

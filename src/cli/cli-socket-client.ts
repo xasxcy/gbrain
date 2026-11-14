@@ -214,7 +214,7 @@ export async function renderOp(command: string, op: OperationMeta, params: Recor
   const rendered = await buffered(() => {
     if (frame.meta) captureRetrievalMeta('retrieval', frame.meta);
     for (const notice of frame.notices) captureOpNotice(notice);
-    const { result, stderr } = applyCliOpNotices(frame.result, params.json === true);
+    const { result, stderr } = applyCliOpNotices(frame.result, params.json === true, { op: op.name, retrieval: frame.meta });
     return { result, noticeText: stderr, output: formatResult(op.name, result, params) };
   });
   if ('error' in rendered) {
@@ -241,7 +241,7 @@ export async function renderOp(command: string, op: OperationMeta, params: Recor
  * caller runs the normal cold path.
  */
 export async function maybeServeFromCliSocket(command: string, args: string[]): Promise<boolean> {
-  if (!CLI_SOCKET_COMMANDS.includes(command) || process.env.GBRAIN_CLI_SOCKET === '0') return false;
+  if (!CLI_SOCKET_COMMANDS.includes(command) || process.env.GBRAIN_CLI_SOCKET === '0' || process.env.GBRAIN_ENFORCED_MEMBER !== undefined) return false;
   const config = loadConfig();
   if (!config || config.engine !== 'postgres' || !config.database_url || isThinClient(config)) { debug('not a local postgres brain'); return false; }
   const cliOpts = getCliOptions();

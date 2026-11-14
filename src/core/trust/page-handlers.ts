@@ -15,6 +15,11 @@
  *   replaced a higher-tier page): accept = the owner endorses the edited page
  *   (confirm it); reject = dismiss, the page stays lowered; revert
  *   (`revertLoweredPage`) = restore the prior owner version's content and tier.
+ *   GST-2518: when the agent write was held from widening privacy labels, accept
+ *   also writes the labels it asked for (in the same owner page write), and undo
+ *   (`writePageLabels`) puts the kept labels and the edited tier back. GST-2521: on a page whose own tier was an
+ *   agent's before the held write, accept writes only the requested labels and keeps the tier, so saying yes to a
+ *   label change never vouches for the body.
  * - #6550 marker repair (`repairPageMarker`, local CLI only): rewrite a page's
  *   `trust_tier: unknown` marker to its stored tier (removed at owner tiers);
  *   the row keeps its tier. trust/marker-repair.ts decides which pages.
@@ -30,7 +35,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
-import { queueTierProjection, recordAgentPageLowering } from './page-write.ts';
+import { heldPrivacyLabels, queueTierProjection, recordAgentPageLowering, withLabels, type HeldPrivacyLabels } from './page-write.ts';
 import { plannedDigest, readPageDrift } from './provenance-drift.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { OperationContext } from '../ops/contract.ts';
@@ -42,6 +47,7 @@ import type { PageType } from '../types.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { assertInlineBody } from '../page-body/page-shape.ts';
 import type { PageVersion } from '../page-state/version-types.ts';
+import type { WriteThroughResult } from '../write-through.ts';
 import { maintenanceAttribution, principalAttribution, withWriteAttribution } from '../persistence/attribution.ts';
 import { withCoordinatedWrite, withTrustKeep, withTrustPromotion } from '../persistence/context.ts';
 import type { OwnerConfirmation } from './confirm.ts';
@@ -51,7 +57,7 @@ import {
   decisionResult, registerTrustProposalHandler, transitionTrustProposal, type TrustProposalAction,
   type TrustDecisionContext, type TrustDecisionResult, type TrustProposalRow,
 } from './proposals.ts';
-import { OWNER_TIER_FLOOR, compareTrust, effectiveWriteTrust, minTrust, storedTrustTier, type TrustTier, type WriteTrust } from './tier.ts';
+import { OWNER_TIER_FLOOR, compareTrust, effectiveWriteTrust, isTrustTier, minTrust, storedTrustTier, type TrustTier, type WriteTrust } from './tier.ts';
 import { propagateTierLowering } from './propagation.ts';
 import { beliefStreamSlugs, lockedBeliefBatch } from '../belief/writers.ts';
 import { markBeliefCommits } from '../belief/append.ts';
@@ -89,9 +95,9 @@ function changedSincePreview(ref: string, what: string): Error {
     'Run the command again: it shows the page as it is now and asks for a new confirmation.');
 }
 
-/** The page with the CEO-21 marker removed (or set to `marker`), as canonical markdown. */
-function markdownWithoutMarker(snapshot: PageSnapshot, marker: TrustTier | null = null): string {
-  const { trust_tier: _marker, ...rest } = (snapshot.page.frontmatter ?? {}) as Record<string, unknown>;
+/** The page with the CEO-21 marker removed (or set to `marker`) and `labels` applied (GST-2518), as canonical markdown. */
+function markdownWithoutMarker(snapshot: PageSnapshot, marker: TrustTier | null = null, labels?: Record<string, unknown>): string {
+  const { trust_tier: _marker, ...rest } = withLabels((snapshot.page.frontmatter ?? {}) as Record<string, unknown>, labels ?? {});
   const frontmatter = marker ? { ...rest, trust_tier: marker } : rest;
   return serializeMarkdown(frontmatter, snapshot.page.compiled_truth ?? '', snapshot.page.timeline ?? '', {
     type: (snapshot.page.type as PageType) ?? 'note', title: snapshot.page.title ?? '', tags: snapshot.tags,
@@ -178,14 +184,16 @@ export interface PageActionInput {
   confirmation: OwnerConfirmation;
   by?: Principal | null;
   config?: GBrainConfig;
-  /** A lower_page proposal this action decides, closed in the same transaction. */
-  proposal?: { id: number; to: 'accepted' | 'rejected'; after: Record<string, unknown> };
+  /** A lower_page proposal this action decides, closed in the same transaction (from pending unless `from` says accepted, for an undo). */
+  proposal?: { id: number; from?: 'pending' | 'accepted'; to: 'accepted' | 'rejected' | 'undone'; after: Record<string, unknown> };
+  /** GST-2518: privacy labels the action writes with the page (null removes a key). */
+  labels?: Record<string, unknown>;
   /** The remote context of a memory_confirm caller (managed admission authority); local CLI otherwise. */
   ctx?: OperationContext;
 }
 
 export interface PageActionResult {
-  status: 'confirmed' | 'reverted' | 'repaired' | 'restored' | 'unchanged';
+  status: 'confirmed' | 'reverted' | 'repaired' | 'restored' | 'labelled' | 'unchanged';
   ref: string;
   tier: TrustTier;
   prior_tier: TrustTier;
@@ -194,8 +202,11 @@ export interface PageActionResult {
 }
 
 type OwnerPageIntent = {
-  mode: 'confirm' | 'revert' | 'repair_marker' | 'restore_provenance';
+  mode: 'confirm' | 'revert' | 'repair_marker' | 'restore_provenance' | 'write_labels';
   expected_revision: string;
+  /** GST-2518: confirm and write_labels write these privacy labels (null removes a key); write_labels keeps the page at most at `tier`. */
+  labels?: Record<string, unknown>;
+  tier?: TrustTier;
   version_id?: number;
   /** restore_provenance: the digest of the change the preview showed, and whether unattributed damage was included. */
   planned?: string;
@@ -207,7 +218,11 @@ type OwnerPageIntent = {
 /** Closes a decided proposal inside the publication transaction, or refuses (it was decided meanwhile). */
 async function closeProposal(tx: BrainEngine, proposal: PageActionInput['proposal'], by: Principal | null | undefined): Promise<void> {
   if (!proposal) return;
-  if (!(await transitionTrustProposal(tx, proposal.id, 'pending', proposal.to, { after: proposal.after, decidedBy: by ?? null }))) {
+  // GST-2518: an accepted held-label proposal records the revision its accept wrote, so an undo applies only to that page.
+  const [accepted] = proposal.to === 'accepted' && heldPrivacyLabels(proposal.after) ? await tx.executeRaw<{ revision: string }>(`SELECT p.knowledge_revision::text AS revision
+    FROM trust_proposals t JOIN pages p ON p.id = t.target_id WHERE t.id = $1 AND t.target_table = 'pages'`, [proposal.id]) : [];
+  const after = accepted ? { ...proposal.after, accepted_revision: accepted.revision } : proposal.after;
+  if (!(await transitionTrustProposal(tx, proposal.id, proposal.from ?? 'pending', proposal.to, { after, decidedBy: by ?? null }))) {
     throw opError('preview_changed', `Trust proposal tp${proposal.id} was decided by someone else meanwhile; nothing was changed.`,
       'Run gbrain trust review to see its current state.');
   }
@@ -219,6 +234,11 @@ export async function confirmPage(engine: BrainEngine, input: PageActionInput): 
   const state = await readPageTrustState(engine, input.sourceId, input.slug);
   if (!state) throw opError('page_not_found', `No live page ${ref}.`, 'Check the ref; gbrain trust review lists pages waiting for you.');
   if (state.revision !== input.expectedRevision) throw changedSincePreview(ref, 'its confirmation');
+  if (input.labels) {
+    await publishOwnerPage(engine, input, { mode: 'confirm', expected_revision: input.expectedRevision, via: input.confirmation.via, proposal: input.proposal, labels: input.labels },
+      markdownWithoutMarker(state.snapshot, null, input.labels), 'user_confirmed');
+    return { status: 'confirmed', ref, tier: 'user_confirmed', prior_tier: state.tier, marker_removed: state.hasMarker };
+  }
   if (state.tier === 'user_confirmed' && !state.hasMarker) {
     await engine.transaction(tx => closeProposal(tx, input.proposal, input.by));
     return { status: 'unchanged', ref, tier: state.tier, prior_tier: state.tier };
@@ -241,7 +261,26 @@ export async function confirmPage(engine: BrainEngine, input: PageActionInput): 
 /** #6550: the marker a repaired page carries: its stored tier, none at owner tiers (CEO-21 stamps none there). */
 export const repairedMarker = (tier: TrustTier): TrustTier | null => compareTrust(tier, OWNER_TIER_FLOOR) >= 0 ? null : tier;
 
-const ACTION_NAMES: Record<OwnerPageIntent['mode'], string> = { confirm: 'its confirmation', revert: 'the revert', repair_marker: 'the marker repair', restore_provenance: 'the provenance restore' };
+const ACTION_NAMES: Record<OwnerPageIntent['mode'], string> = { confirm: 'its confirmation', revert: 'the revert', repair_marker: 'the marker repair', restore_provenance: 'the provenance restore',
+  write_labels: 'the label change' };
+/** GST-2518: the keys an owner page intent may write as labels. */
+const LABEL_KEYS = ['visibility', 'access', 'confidentiality', 'readable_by'];
+
+/**
+ * GST-2518: writes `input.labels` on the page at the revision the owner saw, with the page at most at `tier` and its
+ * marker: an undo of an accepted held-label proposal (the kept labels, the edited tier) and, GST-2521, the accept of a
+ * held-label proposal on an agent page (the requested labels, the page's own tier). Never raises the tier.
+ */
+export async function writePageLabels(engine: BrainEngine, input: PageActionInput & { tier: TrustTier }): Promise<PageActionResult> {
+  const ref = pageRef(input.sourceId, input.slug);
+  const state = await readPageTrustState(engine, input.sourceId, input.slug);
+  if (!state) throw opError('page_not_found', `No live page ${ref}.`, 'Check the ref; gbrain trust review lists pages waiting for you.');
+  if (state.revision !== input.expectedRevision) throw changedSincePreview(ref, ACTION_NAMES.write_labels);
+  const tier = minTrust(input.tier, state.tier);
+  await publishOwnerPage(engine, input, { mode: 'write_labels', expected_revision: input.expectedRevision, via: input.confirmation.via, proposal: input.proposal,
+    labels: input.labels, tier }, markdownWithoutMarker(state.snapshot, repairedMarker(tier), input.labels), tier);
+  return { status: 'restored', ref, tier, prior_tier: state.tier };
+}
 /** Owner page modes only the trusted local CLI may run. */
 const LOCAL_ONLY_MODES: ReadonlyArray<OwnerPageIntent['mode']> = ['repair_marker', 'restore_provenance'];
 
@@ -320,26 +359,64 @@ async function publishOwnerPage(engine: BrainEngine, input: PageActionInput, int
       'Fix the checkout (gbrain sources status), then preview the repair again.');
   }
   const writeThrough = file?.ok && file.target ? await import('../write-through.ts') : null;
-  await engine.transaction(tx => withWriteAttribution(tx, { ...attribution, trust }, () => withTrustPromotion(tx, tier, () =>
-    withTrustKeep(tx, FENCE_TABLES, async () => {
-      if ((await tx.readPageSnapshot(input.slug, { sourceId: input.sourceId }))?.revision !== input.expectedRevision) {
-        throw changedSincePreview(pageRef(input.sourceId, input.slug), ACTION_NAMES[intent.mode]);
-      }
-      // forceRechunk: the trust_tier marker is hash-ephemeral, so removing it alone would read as unchanged content.
-      const prior = intent.mode === 'restore_provenance' ? await readPageTrustState(tx, input.sourceId, input.slug) : null;
-      await importFromContent(tx, input.slug, markdown, { sourceId: input.sourceId, noEmbed: true, preserveGateMarkers: intent.mode !== 'revert', forceRechunk: true, allowEmptyOverwrite: intent.mode === 'revert' });
-      if (prior) await recordAgentPageLowering(tx, { operation: TRUST_OWNER_PAGE_OPERATION, source_id: input.sourceId, slug: input.slug }, { tier: prior.tier, revision: prior.revision }, PROVENANCE_PROPOSER);
-      if (writeThrough && file?.ok && file.target) {
-        const written = await writeThrough.writePageThrough(tx, input.slug, { sourceId: input.sourceId, expectedFileBytes: file.target.expectedFileBytes });
-        if (written.skipped === 'file_changed') throw changedSincePreview(pageRef(input.sourceId, input.slug), ACTION_NAMES[intent.mode]);
-        if (!written.written) {
-          throw opError('unavailable', `The page file of ${pageRef(input.sourceId, input.slug)} could not be written (${written.skipped ?? written.error}); nothing was changed.`,
-            'Fix the checkout (gbrain sources status), then preview the repair again.');
+  // #7960: the file is written (and on a hardened checkout committed) inside the transaction, Git first; when the
+  // database commit then fails, the file and its commit are put back so a failed apply leaves both sides unchanged.
+  let rendered = null as WriteThroughResult | null;
+  try {
+    await engine.transaction(tx => withWriteAttribution(tx, { ...attribution, trust }, () => withTrustPromotion(tx, tier, () =>
+      withTrustKeep(tx, FENCE_TABLES, async () => {
+        if ((await tx.readPageSnapshot(input.slug, { sourceId: input.sourceId }))?.revision !== input.expectedRevision) {
+          throw changedSincePreview(pageRef(input.sourceId, input.slug), ACTION_NAMES[intent.mode]);
         }
-      }
-      await closeProposal(tx, intent.proposal, input.by);
-    }))));
+        // forceRechunk: the trust_tier marker is hash-ephemeral, so removing it alone would read as unchanged content.
+        const prior = intent.mode === 'restore_provenance' ? await readPageTrustState(tx, input.sourceId, input.slug) : null;
+        await importFromContent(tx, input.slug, markdown, { sourceId: input.sourceId, noEmbed: true, preserveGateMarkers: intent.mode !== 'revert', forceRechunk: true, allowEmptyOverwrite: intent.mode === 'revert' });
+        if (prior) await recordAgentPageLowering(tx, { operation: TRUST_OWNER_PAGE_OPERATION, source_id: input.sourceId, slug: input.slug }, { tier: prior.tier, revision: prior.revision }, PROVENANCE_PROPOSER);
+        if (writeThrough && file?.ok && file.target) {
+          const written = await writeThrough.writePageThrough(tx, input.slug, { sourceId: input.sourceId, expectedFileBytes: file.target.expectedFileBytes });
+          if (written.skipped === 'file_changed') throw changedSincePreview(pageRef(input.sourceId, input.slug), ACTION_NAMES[intent.mode]);
+          if (!written.written) {
+            throw opError('unavailable', `The page file of ${pageRef(input.sourceId, input.slug)} could not be written (${written.skipped ?? written.error}); nothing was changed.`,
+              'Fix the checkout (gbrain sources status), then preview the repair again.');
+          }
+          rendered = written;
+        }
+        await closeProposal(tx, intent.proposal, input.by);
+      }))));
+  } catch (error) {
+    if (rendered?.path && file?.ok && file.target) await restoreOwnerRepairFile(engine, input, file.target, rendered);
+    throw error;
+  }
 }
+
+/**
+ * #7960: puts back the bytes an owner repair's file held before `rendered` replaced them (removes a file it created), only
+ * while the file still holds what the repair wrote and the page row still has the revision the repair started from (a
+ * transaction whose COMMIT landed but whose acknowledgment was lost keeps its file), and commits that restore when the
+ * repair's write was committed. Best-effort: the caller rethrows the database failure either way.
+ */
+async function restoreOwnerRepairFile(engine: BrainEngine, input: PageActionInput, target: OwnerRepairTarget, rendered: WriteThroughResult): Promise<void> {
+  const { existsSync, readFileSync, rmSync } = await import('node:fs');
+  const { atomicWriteFileSync } = await import('../atomic-write.ts');
+  const { commitWriteThroughFile } = await import('../brain-repo-durability.ts');
+  const { withSourceFilesystemLock } = await import('../minions/source-filesystem.ts');
+  const { slug } = input;
+  const path = rendered.path!;
+  try {
+    await withSourceFilesystemLock(engine, target.writeRoot, async () => {
+      if ((existsSync(path) ? readFileSync(path, 'utf-8') : null) !== rendered.content) return;
+      if ((await engine.readPageSnapshot(slug, { sourceId: input.sourceId }))?.revision !== input.expectedRevision) return;
+      if (target.expectedFileBytes === null) rmSync(path, { force: true });
+      else atomicWriteFileSync(path, target.expectedFileBytes);
+      if (rendered.committed) commitWriteThroughFile(target.writeRoot, path, slug, 'restore write-through');
+    });
+  } catch (error) {
+    console.error(`[trust] ${slug}: the page file could not be restored after the database write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** The checkout file an owner repair renders: the bytes it must still find, and the write root its commit goes through. */
+type OwnerRepairTarget = { expectedFileBytes: string | null; writeRoot: string };
 
 /** Write-through outcomes that leave a repair database-only on purpose: no checkout, write-through off, an ignored or db_only target. */
 const DATABASE_ONLY_TARGETS = ['no_repo_configured', 'disabled_by_config', 'not_canonical'];
@@ -348,19 +425,20 @@ const DATABASE_ONLY_TARGETS = ['no_repo_configured', 'disabled_by_config', 'not_
  * The checkout file an owner repair mode on an unmanaged brain renders the page to: `target: null` when the page has
  * none on purpose (DATABASE_ONLY_TARGETS), the bytes the write must still find, or why the page cannot be repaired:
  * `file_database_drift` when the file holds an edit the database lacks (a hand edit sync has not imported), else the
- * unresolvable target (a missing checkout, a path outside the source root) or `url_clone` (a clone gbrain pulls, whose
+ * unresolvable target (a missing checkout, a path outside the source root), `mirror_read_only` or `url_clone` (a mirror or a clone gbrain pulls, whose
  * next pull would undo a database-only repair). Read-only.
  */
 export async function ownerRepairFile(engine: BrainEngine, sourceId: string, slug: string):
-  Promise<{ ok: true; target: { expectedFileBytes: string | null } | null } | { ok: false; reason: string }> {
+  Promise<{ ok: true; target: OwnerRepairTarget | null } | { ok: false; reason: string }> {
   const { derivedFileTarget } = await import('../cycle/derived-write-through.ts');
   const resolved = await derivedFileTarget(engine, slug, sourceId);
   if (!resolved.ok) return DATABASE_ONLY_TARGETS.includes(resolved.skipped) ? { ok: true, target: null } : { ok: false, reason: resolved.skipped };
-  const { urlCloneReadOnly } = await import('../url-clone.ts');
-  if (await urlCloneReadOnly(engine, sourceId)) return { ok: false, reason: 'url_clone' };
+  const { readOnlyCheckout } = await import('../persistence/mirror-read-only.ts');
+  const readOnly = await readOnlyCheckout(engine, sourceId);
+  if (readOnly) return { ok: false, reason: readOnly };
   const { replaceableFile } = await import('../facts/file-body-guard.ts');
   const file = await replaceableFile(engine, sourceId, slug, resolved.target.filePath);
-  return file.ok ? { ok: true, target: { expectedFileBytes: file.expectedFileBytes } } : { ok: false, reason: 'file_database_drift' };
+  return file.ok ? { ok: true, target: { expectedFileBytes: file.expectedFileBytes, writeRoot: resolved.target.writeRoot } } : { ok: false, reason: 'file_database_drift' };
 }
 
 /** Admits the journaled owner page mutation and waits for its publication (the decide_proposal precedent). */
@@ -397,7 +475,9 @@ async function submitOwnerPage(engine: BrainEngine, input: PageActionInput, inte
  */
 export async function prepareTrustOwnerPageMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const intent = row.intent as unknown as OwnerPageIntent | null;
-  if (row.operation !== TRUST_OWNER_PAGE_OPERATION || !intent || !Object.hasOwn(ACTION_NAMES, intent.mode) || typeof intent.expected_revision !== 'string'
+  const labelsValid = intent?.labels === undefined || (typeof intent.labels === 'object' && intent.labels !== null && Object.keys(intent.labels).every(key => LABEL_KEYS.includes(key)));
+  if (row.operation !== TRUST_OWNER_PAGE_OPERATION || !intent || !Object.hasOwn(ACTION_NAMES, intent.mode) || typeof intent.expected_revision !== 'string' || !labelsValid
+    || (intent.mode === 'write_labels' && (!intent.labels || !isTrustTier(intent.tier)))
     || (row.authority.remote && (LOCAL_ONLY_MODES.includes(intent.mode) || !(row.authority.scopes ?? []).includes(MEMORY_CONFIRM_SCOPE)))) {
     throw opError('confirmation_required', 'This owner page action is not confirmed by the owner; nothing was changed.',
       'Run the gbrain trust command on the brain host in an interactive terminal.');
@@ -418,7 +498,10 @@ export async function prepareTrustOwnerPageMutation(engine: BrainEngine, row: Wr
     tier = state.tier;
     content = markdownWithoutMarker(state.snapshot, repairedMarker(tier));
   } else if (intent.mode === 'restore_provenance') ({ content, tier } = await plannedProvenanceRestore(engine, state, intent));
-  else content = markdownWithoutMarker(state.snapshot);
+  else if (intent.mode === 'write_labels') {
+    tier = minTrust(intent.tier!, state.tier);
+    content = markdownWithoutMarker(state.snapshot, repairedMarker(tier), intent.labels);
+  } else content = markdownWithoutMarker(state.snapshot, null, intent.labels);
   // The request keeps its own operation, so page-prepare stamps no CEO-21 marker and files no lower_page item for it.
   const { preparePageMutation } = await import('../persistence/page-prepare.ts');
   const page = await preparePageMutation(engine, row, config, { content, expectedRevision: intent.expected_revision, ...(tags ? { tags } : {}) });
@@ -445,6 +528,13 @@ export interface LowerPageState {
   /** The latest agent edit (after_state). */
   edited_revision: string | null;
   edited_tier: TrustTier;
+  /** GST-2518: the privacy labels the edit asked to widen and the page kept, or null. */
+  labels: HeldPrivacyLabels | null;
+  /**
+   * GST-2521: the held labels are on a page whose own tier before the edit (before_state.page_tier) was an agent's (known
+   * and below operator_curated), so accept writes only the labels and keeps the tier. Unknown and older proposals confirm.
+   */
+  labels_only: boolean;
 }
 
 export function lowerPageState(proposal: TrustProposalRow): LowerPageState {
@@ -454,7 +544,8 @@ export function lowerPageState(proposal: TrustProposalRow): LowerPageState {
     slug: String(b.slug ?? ''), prior_tier: storedTrustTier(b.prior_tier),
     prior_revision: typeof b.prior_revision === 'string' ? b.prior_revision : null,
     version_id: b.version_id === null || b.version_id === undefined ? null : Number(b.version_id),
-    edited_revision: typeof a.revision === 'string' ? a.revision : null, edited_tier: storedTrustTier(a.tier),
+    edited_revision: typeof a.revision === 'string' ? a.revision : null, edited_tier: storedTrustTier(a.tier), labels: heldPrivacyLabels(a),
+    labels_only: heldPrivacyLabels(a) !== null && isTrustTier(b.page_tier) && b.page_tier !== 'unknown' && compareTrust(b.page_tier, OWNER_TIER_FLOOR) < 0,
   };
 }
 
@@ -487,12 +578,35 @@ registerTrustProposalHandler('lower_page', {
     const state = lowerPageState(proposal);
     const page = await staleUnlessAt(engine, proposal, state);
     if (!('pageId' in page)) return page;
+    const labels = heldPrivacyLabels(proposal.after_state);
+    if (labels && state.labels_only) {
+      const written = await writePageLabels(engine, {
+        sourceId: proposal.source_id, slug: state.slug, expectedRevision: page.revision, confirmation: ctx.confirmation, by: ctx.decidedBy, config: ctx.config,
+        labels: labels.requested, tier: page.tier, proposal: { id: proposal.id, to: 'accepted', after: { ...proposal.after_state, resolution: 'labels_applied' } },
+      });
+      return decisionResult(proposal, 'accept', 'accepted', { detail: { ...written, status: 'labelled' } });
+    }
     const result = await confirmPage(engine, {
       sourceId: proposal.source_id, slug: state.slug, expectedRevision: page.revision, confirmation: ctx.confirmation,
-      by: ctx.decidedBy, config: ctx.config,
+      by: ctx.decidedBy, config: ctx.config, ...(labels ? { labels: labels.requested } : {}),
       proposal: { id: proposal.id, to: 'accepted', after: { ...proposal.after_state, resolution: 'confirmed' } },
     });
     return decisionResult(proposal, 'accept', 'accepted', { detail: { ...result } });
+  },
+  // GST-2518: only a proposal that held privacy labels undoes: its kept labels and edited tier come back, while the page is still the one its accept wrote.
+  async undo(engine, proposal, ctx) {
+    const labels = heldPrivacyLabels(proposal.after_state);
+    if (!labels) return decisionResult(proposal, 'undo', 'refused', { reason: 'undo_unsupported' });
+    const state = lowerPageState(proposal);
+    const page = state.slug ? await readPageTrustState(engine, proposal.source_id, state.slug) : null;
+    if (!page || page.pageId !== proposal.target_id) return decisionResult(proposal, 'undo', 'stale', { reason: 'page_missing' });
+    if (page.revision !== proposal.after_state.accepted_revision) return decisionResult(proposal, 'undo', 'stale', { reason: 'page_changed_since' });
+    const result = await writePageLabels(engine, {
+      sourceId: proposal.source_id, slug: state.slug, expectedRevision: page.revision, confirmation: ctx.confirmation, by: ctx.decidedBy, config: ctx.config,
+      labels: labels.kept, tier: state.edited_tier,
+      proposal: { id: proposal.id, from: 'accepted', to: 'undone', after: { ...proposal.after_state, resolution: 'undone' } },
+    });
+    return decisionResult(proposal, 'undo', 'undone', { detail: { ...result } });
   },
   async reject(engine, proposal, ctx) {
     return await transitionTrustProposal(engine, proposal.id, 'pending', 'rejected', { after: { ...proposal.after_state, resolution: 'dismissed' }, decidedBy: ctx.decidedBy })

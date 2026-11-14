@@ -1,7 +1,7 @@
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { capacityDiagnostics } from '../../../core/persistence/diagnostics.ts';
-import { oneYearCapacity, readJournalLimits } from '../../../core/persistence/limits.ts';
+import { HOUSEKEEPING_FLOOR_DAYS, oneYearCapacity, readCompactableReceiptBytes, readJournalLimits, readReceiptTargetBytes, RECEIPT_RETENTION_KEY, RECEIPT_TARGET_KEY } from '../../../core/persistence/limits.ts';
 import type { CapacityForecast } from '../../../core/persistence/capacity-forecast.ts';
 import { doctorCapacityForecast, forecastOrNull } from '../capacity-memo.ts';
 import { capacityVerify } from '../../../core/persistence/capacity-view.ts';
@@ -9,6 +9,8 @@ import { BACKGROUND_PRODUCERS, readBackgroundPauseShare } from '../../../core/pe
 
 const VERIFY = 'gbrain doctor --only persistence_capacity --json';
 const DOCS = 'docs/guides/concurrent-writes.md#quota-near-exhaustion';
+const OUTSTANDING_WARN = 0.9;
+const OUTSTANDING_STALL_S = 600;
 
 /**
  * #5470/#6696 (A3): a cumulative managed-write cap (permanent request IDs,
@@ -19,6 +21,11 @@ const DOCS = 'docs/guides/concurrent-writes.md#quota-near-exhaustion';
  * their compacted (net) size. Each key gets the one value that covers a year.
  * A scope past the background pause line (A5) names the producers it pauses.
  * The fix verifies through doctor and the read-scope `get_brain_health` band (#6696 B2).
+ * #8368: an outstanding-request cap at 90% or more whose oldest outstanding request is over ten minutes old is a warning
+ * too, naming the sources holding its slots (requests that stopped settling, or wait behind a slow publication, hold them,
+ * so raising the cap is not the fix); its
+ * fix is the read-only writer status of the holder with the most stalled requests. A healthy sync drain runs near the line
+ * with young requests and stays ok.
  */
 export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Check> {
   try {
@@ -28,7 +35,26 @@ export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Che
     const limits = await readJournalLimits(engine);
     const forecast: CapacityForecast | null = await doctorCapacityForecast(engine, { limits }).catch(forecastOrNull);
     const pause = await readBackgroundPauseShare(engine);
+    const target = await readReceiptTargetBytes(engine);
+    const [retention] = await engine.executeRaw<{ value: string }>('SELECT value FROM config WHERE key=$1', [RECEIPT_RETENTION_KEY]);
+    const stored = Number(counters.find(row => row.key === 'brain')?.terminal_bytes ?? 0);
+    const compactable = target > 0 && stored > target ? await readCompactableReceiptBytes(engine) : null;
+    const housekeeping = { target_bytes: target, used_bytes: stored, compactable_bytes: compactable, over_target: compactable !== null && compactable > target,
+      explicit_retention_days: retention ? Number(retention.value) : null };
     const cumulative = capacityDiagnostics(counters, limits).filter(row => row.resource === 'lifetime_ids' || row.resource === 'terminal_bytes');
+    const outstanding = [];
+    for (const row of capacityDiagnostics(counters, limits)) {
+      if (row.resource !== 'outstanding_count' || row.limit <= 0 || row.used < Math.ceil(row.limit * OUTSTANDING_WARN)) continue;
+      const principal = /^principal:([^:]+):(.+)$/.exec(row.scope);
+      const stalled = `count(*) FILTER (WHERE created_at <= now()-interval '${OUTSTANDING_STALL_S} seconds')`;
+      const holders = await engine.executeRaw<{ source_id: string; n: number | string; stalled: number | string }>(`SELECT source_id,count(*) AS n,${stalled} AS stalled
+        FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering')${principal ? ' AND principal_kind=$1 AND principal_id=$2' : ''}
+        GROUP BY source_id ORDER BY ${stalled} DESC,count(*) DESC,source_id LIMIT 3`,
+        principal ? [principal[1], principal[2]] : []);
+      if (!holders.length || Number(holders[0].stalled) === 0) continue;
+      outstanding.push({ scope: row.scope, resource: row.resource, used: row.used, limit: row.limit, config_key: row.config_key,
+        holders: holders.map(holder => ({ source_id: holder.source_id, outstanding: Number(holder.n) })) });
+    }
     const resources = [];
     const needed = new Map<string, number>();
     let worst: 'ok' | 'warn' | 'fail' = 'ok';
@@ -51,11 +77,31 @@ export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Che
     }
     const anyPaused = resources.some(r => r.background_paused);
     const commands = [...needed].map(([key, value]) => `gbrain config set ${key} ${value}`);
-    const details = { exact: true, inspected: counters.length, truncated: false, resources, commands, verify: VERIFY, docs: DOCS,
+    const details = { exact: true, inspected: counters.length, truncated: false, resources, outstanding, commands, housekeeping, verify: VERIFY, docs: DOCS,
       background_pause_pct: Math.round(pause * 100), paused_producers: anyPaused ? [...BACKGROUND_PRODUCERS] : [],
       forecast: forecast ? { thresholds: forecast.thresholds, window_days: forecast.window_days, retention_days: forecast.retention_days,
         table_bytes: forecast.table_bytes, rows: forecast.rows } : { health: 'unknown' } };
     const thresholds = forecast?.thresholds;
+    const holder = outstanding.flatMap(row => row.holders)[0];
+    const held = outstanding.length ? `${outstanding.length} outstanding-request cap(s) at or near the limit: ${outstanding.map(row => `${row.scope} ${row.used}/${row.limit}`
+      + (row.holders.length ? ` held by ${row.holders.map(h => `source ${h.source_id} (${h.outstanding})`).join(', ')}` : '')).join('; ')}. `
+      + 'Admission refuses past the cap; requests unsettled for over ten minutes hold it (stuck, or behind a slow publication), so inspect the holder before raising anything. ' : '';
+    if (!resources.length && outstanding.length) return { name: 'persistence_capacity', status: 'warn', details,
+      fix: { argv: holder ? ['gbrain', 'sources', 'writer', 'status', '--source', holder.source_id, '--json'] : ['gbrain', 'sources', 'writer', 'status', '--json'],
+        consent: [], actor: 'host_admin', requires_exclusive: false, verify: capacityVerify(), docs: DOCS,
+        why: `Read-only: names the requests${holder ? ` source ${holder.source_id}` : ''} holds and why they have not settled (a refused write ends terminally and frees its slot).` },
+      message: `${held}Run on the brain host: ${holder ? `gbrain sources writer status --source ${holder.source_id} --json` : 'gbrain sources writer status --json'}, then verify with ${VERIFY}.` };
+    // GBRA-108: receipt storage over the housekeeping target is the host operator's to look at; it never refuses or pauses a write.
+    if (!resources.length && housekeeping.over_target) return { name: 'persistence_capacity', status: 'warn', details,
+      fix: { argv: ['gbrain', 'repair', 'receipt-compaction', '--json'], consent: [], actor: 'host_admin', requires_exclusive: false, verify: capacityVerify(), docs: DOCS,
+        why: 'Previews the receipts an explicit compaction would take and the bytes it would free; it compacts nothing.' },
+      message: `Receipts not yet compacted reserve ${compactable} bytes (receipt storage holds ${stored} in all), above the housekeeping target of ${target} (${RECEIPT_TARGET_KEY}). Writes are not affected: receipt storage never refuses or pauses a write unless the operator sets a cap. `
+        + (housekeeping.explicit_retention_days !== null
+          ? `Housekeeping leaves receipts to the retention you set (${RECEIPT_RETENTION_KEY} = ${housekeeping.explicit_retention_days} days). `
+          : `Housekeeping compacts settled receipts, and refusals gbrain's own producers write again, older than ${HOUSEKEEPING_FLOOR_DAYS} days while storage is above the target; what stays is newer receipts, refusals whose intent a replay or retry reads, job receipts, receipts an open sync or recovery holds, and compacted receipts that keep request ids idempotent. `)
+        + `On the brain host, gbrain repair receipt-compaction --json previews what an explicit compaction would free and compacts nothing; a larger target, or 0, quiets this warning.` };
+    if (!resources.length && !cumulative.length) return { name: 'persistence_capacity', status: 'ok', details,
+      message: `No cumulative write cap is set (the default), so receipt storage never refuses or pauses a write; it holds ${stored} reserved bytes${target > 0 ? `, and receipts not yet compacted are under the housekeeping target of ${target}` : ''}.` };
     if (!resources.length) return { name: 'persistence_capacity', status: 'ok', details,
       message: thresholds ? `Managed write capacity is below ${thresholds.warn_pct}% of every cumulative limit and none runs out within ${thresholds.warn_days} days at its 7-day rate.`
         : 'Managed write capacity is below 80% of every cumulative limit.' };
@@ -64,7 +110,7 @@ export async function checkPersistenceCapacity(engine: BrainEngine): Promise<Che
       fix: { argv: ['gbrain', 'config', 'set', first![0], String(first![1])], consent: [], actor: 'host_admin', requires_exclusive: false,
         verify: capacityVerify(), docs: DOCS,
         why: `Raises ${first![0]} to a value that covers about one more year at the 7-day rate; reversible with gbrain config unset.${commands.length > 1 ? ` Also run: ${commands.slice(1).join('; ')}.` : ''}` },
-      message: `${resources.length} managed write limit(s) near exhaustion: ${resources.map(r => `${r.scope} ${r.resource} ${r.used}/${r.limit}`
+      message: `${held}${resources.length} managed write limit(s) near exhaustion: ${resources.map(r => `${r.scope} ${r.resource} ${r.used}/${r.limit}`
         + ('days_to_exhaustion' in r && r.days_to_exhaustion !== null ? ` (about ${r.days_to_exhaustion} day(s) left at the 7-day rate, ${r.basis})` : '')).join('; ')}. `
         + `Admission refuses at the limit. Run on the brain host: ${commands.join('; ')} (each covers about one more year at the current admission rate), `
         + `then verify with ${VERIFY}. Permanent request IDs are never evicted.`

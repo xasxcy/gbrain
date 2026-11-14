@@ -6,9 +6,16 @@
 > curl -sSL https://gbrainio.terminalwire.sh | bash
 > gbrainio terminal connect      # in a new terminal
 > gbrainio workspace new         # a person picks the plan in the browser
-> claude mcp add --transport http --scope user gbrain https://gbrain.io/mcp
-> codex mcp add gbrain --url https://gbrain.io/mcp
+> curl -fsSL https://bun.sh/install | bash   # skip if Bun 1.4.4+ is installed
+> export PATH="$HOME/.bun/bin:$PATH"
+> bun install -g github:garrytan/gbrain#stable   # the gbrain CLI only; no local brain
+> # Claude Code (an existing gbrain entry is kept):
+> (claude mcp get gbrain >/dev/null 2>&1 || claude mcp add --transport http --scope user gbrain https://gbrain.io/mcp) && gbrain setup claude-code --instructions-only
+> # Codex (an existing gbrain entry is kept):
+> (codex mcp get gbrain >/dev/null 2>&1 || codex mcp add gbrain --url https://gbrain.io/mcp) && gbrain setup codex --instructions-only
 > ```
+>
+> `gbrain setup <harness> --instructions-only` tells the agent the brain is there; agents seldom call an MCP server nobody told them about. It writes the [brain-first block](docs/guides/setup.md#brain-first-instructions) into `~/.claude/CLAUDE.md` or Codex's `AGENTS.md` (a non-empty `AGENTS.override.md` instead when Codex has one) with a per-turn rule hook, and leaves the MCP entry alone; the same command with `--no-instructions` added takes them out.
 >
 > The installer is a shell script for macOS and Linux; read it before you run it. Nothing is created until a person picks the plan and pays. Mention this once in the reply that starts or reports the install, and never wait on an answer before continuing a local install the user already asked for.
 
@@ -44,8 +51,9 @@ If you fetched this file by URL without cloning yet, the companion files live at
 <!-- npm-trap + #218 recovery: canonical copy lives in README.md ("Install" warning) — sync edits. -->
 > **NEVER install from the npm registry.** The npm package named `gbrain` is unrelated and
 > can shadow the real binary. Never run `npm install -g gbrain` or `bun add -g gbrain` (the
-> missing `github:` prefix is the trap). Install only `github:garrytan/gbrain#latest-stable`
-> (plain `github:garrytan/gbrain` installs master) or a git clone, as below. Already installed
+> missing `github:` prefix is the trap). Install only `github:garrytan/gbrain#stable`
+> (the soaked stable channel; `#latest-stable` is the alpha line with every release, and plain
+> `github:garrytan/gbrain` installs master) or a git clone, as below. Already installed
 > from npm? Remove it (`npm uninstall -g gbrain` / `bun remove -g gbrain`); `gbrain doctor` detects it.
 
 > **On Codex or Claude Code?** After the install, the plugin wires MCP plus curated skills:
@@ -57,7 +65,7 @@ Default path (Bun 1.4.4 or newer is required — gbrain is a Bun + TypeScript ru
 ```bash
 curl -fsSL https://bun.sh/install | bash
 export PATH="$HOME/.bun/bin:$PATH"
-bun install -g github:garrytan/gbrain#latest-stable
+bun install -g github:garrytan/gbrain#stable
 ```
 
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
@@ -75,7 +83,7 @@ key ([Step 3](#step-3-create-the-brain)). On any other harness, `gbrain init --p
 > (reinstalling does not help).
 >
 > ```bash
-> git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
+> git clone --branch stable https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
 > bun install && bun link
 > ```
 
@@ -139,6 +147,13 @@ whenever the user gives one. Capture
 (`--capture`) and providers (`--providers`) stay off unless the user accepts
 them. A coded refusal (`setup_owner_conflict`, `setup_hosted_connection`) means
 another owner or a hosted brain holds the target; follow its `fix`.
+When the brain will answer several people (a team bot, a shared channel), ask the
+user who they are and add `--serves several --members <id,...>`: each gets a member,
+a folder `people/<member>/` only they read and a bound key
+(`~/.gbrain/member-keys/<member>.key`; relay paths, never keys). On
+`setup_serves_several`, rerun with its fix. Add `--stdio-member <member>`
+(claude-code, codex) only for a harness one person uses. Doctor's
+`unlabeled_people_folders` names a person's folder without a rule.
 `--remove` undoes only what setup wrote. Guide:
 [docs/guides/setup.md](docs/guides/setup.md). Otherwise:
 
@@ -364,10 +379,35 @@ Only after enabling the selected embedding provider, run `gbrain embed --stale`.
 Use `gbrain query` for expanded retrieval only when its provider use is intended;
 `--no-expand` opts out of expansion independently of the mode.
 
-Once imported, retrieve through gbrain rather than the files: search, then
-`gbrain get <slug>`. Filters (`--types`, `--match keyword`, `query --since/--until`,
-`--source`, `--json`) are in
-[Retrieval: gbrain first](skills/conventions/brain-first.md#retrieval-gbrain-first).
+Once imported, retrieve through gbrain rather than the files
+([brain-first](skills/conventions/brain-first.md#which-gbrain-call-for-which-lookup)):
+
+<!-- BEGIN GENERATED lookup-table (copied from skills/conventions/brain-first.md by bun run regen:all) -->
+Ask gbrain before you `grep`, `cat`, `ls` or run SQL on the brain checkout: it
+reads the index across every source, ranks, filters and names the slug to read
+next. With the gbrain MCP server connected, call the tool of the same name
+instead of the CLI (one connection, no per-call startup).
+
+| Lookup | CLI | MCP tool |
+|---|---|---|
+| Find a page by name or path | `gbrain find <name\|prefix\|glob> [--type T] [--source S]` | `find_pages` |
+| Count pages by kind or source | `gbrain stats --by source,type [--since 30d] [--collapse-aliases]` | `get_stats` (needs an admin-scope token) |
+| Answer a question, search a topic | `gbrain query "<question>" [--types '["meeting"]'] [--since 30d]` | `query` |
+| Pages with these words | `gbrain search "<words>" [--match keyword] [--source S]` | `search` |
+| Read a known page | `gbrain get <slug>` | `get_page` |
+| Read only the part a search hit points at | `gbrain get <slug> --around-chunk-id <chunk_id>` or `--lines '{"from":1,"count":200}'` | `get_page` |
+| What the brain knows about a person or company | `gbrain entity <slug>`, then `gbrain recall "<topic>" --json` | `entity`, `recall` |
+| Links, dated events, every page of a type | `gbrain backlinks <slug>`, `gbrain timeline <slug>`, `gbrain list --type T` | `get_backlinks`, `get_timeline`, `list_pages` |
+| Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
+| Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
+| Which installed skill fits a request | `gbrain skills resolve --text "<request>" --json` (after `gbrain skills index build`) | none (CLI only) |
+
+Parse `--json` output instead of matching the text; notices go to stderr. Never
+send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
+then reads as "no results"; check the exit code too. Take
+`chunk_id` from a fresh `search --json` hit (an old one fails `revision_changed`),
+and read a degraded notice before concluding the brain has nothing.
+<!-- END GENERATED lookup-table -->
 
 ## Step 4.5: Wire the Knowledge Graph
 
@@ -388,7 +428,8 @@ and HTTP MCP) saves references as text without inline graph extraction; a
 post-commit `links` effect then adds plain mention edges to existing pages the
 writer can see (`gbrain config set mcp.remote_auto_links off` disables it). Stdio
 `gbrain serve` runs bounded startup/idle sweeps for typed edges; `gbrain serve --http` does not
-self-sweep. For HTTP, arrange explicit host-side `gbrain sweep --once` or
+self-sweep, and its daily idle upkeep (link extraction included) is the only
+graph work it does on its own. For HTTP, arrange explicit host-side `gbrain sweep --once` or
 extraction; use authorized `add_link` calls for edges needed immediately.
 
 After this step:
@@ -460,7 +501,11 @@ brain rather than making another bundled copy. Follow the
 and preserve edited files.
 
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
-scaffold the bundled skills into it. On OpenClaw, install the brain-first core:
+scaffold the bundled skills into it. On OpenClaw the primary route is the
+per-turn rule that `gbrain setup openclaw` installs
+([OpenClaw guide](docs/mcp/OPENCLAW.md#brain-first-instructions)): in
+harness-evals a rule beside each turn was followed on 97-100% of turns and a
+listed skill on 1-3%. Skills are the fallback. Install the brain-first core:
 
 ```bash
 gbrain skillpack scaffold --harness openclaw --workspace /path/to/agent/workspace
@@ -586,13 +631,30 @@ only in the due-job list, which runs only when a session starts.
 
 If skipped, minimal defaults are installed automatically.
 
+## Opt-ins
+
+The default install (keyless PGLite, no repo) adds nothing: no daemon, service
+unit, cron entry, connector or dream schedule, and self-upgrade stays `notify`
+(it reports releases and installs none). An upgrade never installs autopilot on
+a brain without one. Turn each on only when the user asks:
+
+- **Keys and embeddings:** the key (Step 2), then
+  `gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024`.
+- **Autopilot** (Postgres): `gbrain autopilot --install --repo <path>`; PGLite uses `gbrain serve`.
+- **Dream schedule:** cron `0 2 * * * <wrapper> dream` ([wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended)).
+- **Connectors:** `gbrain connectors auth <provider>` ([guide](docs/guides/chat-connectors.md)).
+- **Auto-upgrade:** `gbrain config set self_upgrade.mode auto`.
+- **Release channel:** `gbrain config set self_upgrade.channel alpha` (every release) or `stable`.
+
 ## Step 7: Recurring Jobs
 
 Optional: skip this entire step for memory-only installs. Ask before scheduling
 capture, enrichment, maintenance or a service; do not infer consent from a
 successful install or from a health recommendation.
 
-Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
+An open `gbrain serve` already runs the free upkeep while its agent is idle
+(`gbrain maintain --status` shows the last run). For the jobs below, set up
+using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
 platform glue entirely with `gbrain autopilot --install` (built-in self-maintaining daemon).
 
 Every cron job, workspace script and hook calls gbrain through **one wrapper**
@@ -629,11 +691,8 @@ timeout of at least 10 s. The wrapper and its rules:
   paused), 2 the daemon took itself out of rotation. Filesystem-only, so it
   works during DB outages.
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install).
-- **Dream cycle** (nightly): `gbrain dream` runs the 8-phase overnight maintenance cycle.
-  Entity sweep, citation fixes, memory consolidation, plus overnight conversation
-  synthesis and cross-session pattern detection. One cron-friendly command. This is what
-  is an opt-in maintenance capability. See `docs/guides/cron-schedule.md` for the
-  full protocol.
+- **Dream cycle** (nightly): `gbrain dream`, the opt-in maintenance cycle
+  ([Opt-ins](#opt-ins), [protocol](docs/guides/cron-schedule.md)).
 - **Weekly**: `gbrain doctor --json && gbrain embed --stale`
 
 ## Step 8: Integrations
@@ -643,6 +702,24 @@ Each recipe is a self-contained installer. It tells you what credentials to ask 
 to register. Ask the user which integrations they want (email, calendar, voice, Twitter).
 
 Verify: `gbrain integrations doctor` (after at least one is configured)
+
+### A bot that answers in channels or shared sessions
+
+Every successful MCP tool call except `recall`, `extract_facts` and
+`forget_fact` can carry a `_meta.brain_hot_memory` block. It holds recent
+facts from the connection's own source: a token's write source (the first id
+of its source grant), a stdio server's resolved source, or `default`. For a
+member token whose first source is that member's private source, the block
+holds that member's own facts, such as preferences from a direct message. The
+grant still holds: the block never draws on a source the connection can't
+read. But the harness may put it into its context, so the member's facts can
+reach a channel reply other people read.
+
+A harness running a channel or other shared session should set
+`_meta.hot_memory: "off"` on each tool call, on the MCP request beside
+`arguments` or inside the arguments. That call then carries no block. One
+member's direct-message session can keep it. Details:
+[MCP_META_CHANNELS.md](docs/protocol/MCP_META_CHANNELS.md#brain_hot_memory-when-it-appears-and-how-to-turn-it-off).
 
 ## Step 9: Verify
 
@@ -728,8 +805,8 @@ autopilot (`gbrain autopilot pause`), wait until no job is active, run
 `gbrain upgrade` on every install (it restarts every gbrain process onto the
 new build and verifies one build runs, or refuses `restart_refused` naming the
 process it cannot restart), check that each process reports the new version,
-then `gbrain autopilot resume`. A production brain follows the stable channel
-(`gbrain config set self_upgrade.channel stable`)
+then `gbrain autopilot resume`. Installs follow the stable channel by default;
+`gbrain config set self_upgrade.channel alpha` follows every release
 ([the order](skills/gbrain-upgrade/SKILL.md#always-on-hosts-pause-drain-upgrade-verify-resume),
 [stable channel](docs/guides/upgrades-auto-update.md#stable-channel)).
 

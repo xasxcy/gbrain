@@ -24,6 +24,7 @@ import type { SearchResult } from '../types.ts';
 import { runGather, renderPagesBlockDetailed, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
 import { readThinkPagesBudget } from './pages-budget.ts';
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
+import { fenceTranscriptText, neutralizeToolCalls, quoteLabel } from '../search/transcript-quote.ts';
 import { renderTakesBlock } from './sanitize.ts';
 import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
@@ -34,9 +35,9 @@ import { withDefaultChatPhase } from '../ai/chat-usage.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
-import { resolveThinkWindow } from './temporal-window.ts';
+import { resolveThinkWindow, trajectoryPointsInWindow } from './temporal-window.ts';
 import { resolveThinkTemporalContext } from './temporal-context.ts';
-import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { resolveExcludePrivatePages, worldOnlyFacts } from '../search/private-visibility.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, EVIDENCE_BLOCK_CHAR_CAP, THINK_RETURN_UNIT_CONFIG_KEY, type DeliveryMeta } from '../search/evidence-delivery.ts';
 import { evidenceTitlesEnabled } from '../search/evidence-date.ts';
 import { startThinkDecide, thinkAbstainResult, type ThinkAbstention } from './decide.ts';
@@ -457,10 +458,13 @@ export interface ExtractiveFallback {
  * title + the excerpt window with the strongest query-term coverage, cited
  * `[slug]`. NEVER fabricates: every line quotes ONE gathered page and an
  * empty gather returns null (ENG-19 — no pages, no answer, ever).
+ * GST-687: with `untrusted` (a remote caller), a chat page's excerpt is chosen with its tool-call blocks summarized, and it
+ * and a page below the owner's tier are fenced as quoted source material, as think's prompt does (#8042); local is unchanged.
  */
 export function composeExtractiveFallback(
   pages: SearchResult[],
   question: string,
+  untrusted = false,
 ): ExtractiveFallback | null {
   if (pages.length === 0) return null;
   const top = pages.slice(0, EXTRACTIVE_TOP_PAGES);
@@ -472,12 +476,15 @@ export function composeExtractiveFallback(
     const slug = String(page.slug ?? '');
     const title = String(page.title ?? '') || slug;
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
-    const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const raw = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
+    const quote = untrusted ? quoteLabel({ ...p, chunk_text: raw }, true) : null;
+    const content = quote !== null && quoteLabel({ ...p, chunk_text: raw }) !== null ? neutralizeToolCalls(raw) : raw;
     const excerpt = selectRelevantExcerpt(
       content, question, EXTRACTIVE_EXCERPT_LEN, `${title} ${slugIdentity}`,
     ).trim();
     citations.push({ page_slug: slug, row_num: null, citation_index: idx + 1, source_id: p.source_id ?? 'default' });
-    return excerpt ? `- ${title} [${slug}]: ${excerpt}` : `- ${title} [${slug}]`;
+    if (!excerpt) return `- ${title} [${slug}]`;
+    return quote === null ? `- ${title} [${slug}]: ${excerpt}` : `- ${title} [${slug}]:\n${fenceTranscriptText(excerpt, quote)}`;
   });
   return {
     answer:
@@ -733,7 +740,7 @@ export async function runThink(
       const trajIntent = thinkDecide ? await thinkDecide.trajectoryIntent(classifyIntent(opts.question)) : classifyIntent(opts.question);
       if (trajIntent === 'temporal' || trajIntent === 'knowledge_update') {
         const { extractCandidateEntities } = await import('./entity-extract.ts');
-        const retrievedSlugs = gather.pages.map(p => p.slug);
+        const retrievedSlugs = [...gather.pages.map(p => p.slug), ...gather.outsideWindowSlugs];
         const candidates = extractCandidateEntities(opts.question, retrievedSlugs);
         if (candidates.length > 0) {
           const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
@@ -764,7 +771,7 @@ export async function runThink(
                     entitySlug: resolved.slug,
                     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
                     ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
-                    ...(opts.remote !== undefined ? { remote: opts.remote } : {}),
+                    ...(opts.remote !== undefined ? { remote: worldOnlyFacts(opts.remote) } : {}),
                     excludePrivate,
                     kind: 'all',
                     limit: 100,
@@ -775,13 +782,9 @@ export async function runThink(
                   if (err instanceof OperationTimeoutError) return [];
                   throw err;
                 });
-                const boundedPoints = window ? points.filter(point => {
-                  const ms = point.valid_from.getTime();
-                  const outside = (window.startMs !== null && ms < window.startMs)
-                    || (window.endMs !== null && ms > window.endMs);
-                  if (outside) trajectoryExcludedCount++;
-                  return !outside;
-                }) : points;
+                const windowed = window ? trajectoryPointsInWindow(points, window) : { kept: points, excluded: 0 };
+                trajectoryExcludedCount += windowed.excluded;
+                const boundedPoints = windowed.kept;
                 if (boundedPoints.length === 0) return null;
                 trajectoryFactIds.push(...boundedPoints.map(point => point.fact_id));
                 const fmt = formatTrajectoryBlock(boundedPoints, resolved.slug, {
@@ -881,7 +884,7 @@ export async function runThink(
       // [WP2/E2] non-empty gather still has value — attach the extractive
       // digest so callers (the synthesize verb) can surface it instead of
       // the stub answer. Null on empty gather (never fabricate).
-      const stubExtractive = composeExtractiveFallback(gather.pages, opts.question);
+      const stubExtractive = composeExtractiveFallback(gather.pages, opts.question, opts.remote !== false);
       // Degrade gracefully: return the gather without synthesis. Better than throwing.
       return {
         question: opts.question,
@@ -1019,7 +1022,7 @@ export async function runThink(
   // [WP2/E2] compose failed + non-empty gather → attach extractive material
   // (callers decide whether to surface it; null on empty gather — ENG-19).
   const extractive = synthesisStatus !== 'ok'
-    ? composeExtractiveFallback(gather.pages, opts.question)
+    ? composeExtractiveFallback(gather.pages, opts.question, opts.remote !== false)
     : null;
 
   return {

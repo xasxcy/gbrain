@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { existsSync, lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { BrainEngine } from '../engine.ts';
 import type { SyncOpts } from '../../commands/sync.ts';
@@ -19,7 +19,7 @@ import { resolveSlugRootMode } from '../sync-anchor.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { unboundBindCommand } from './unbound-source.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { trustedCliRequired } from '../ops/op-fix.ts';
 import { ownerUnavailableReason } from './owner-refusal.ts';
@@ -35,6 +35,7 @@ import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { holdBasisMoved, holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
 import { readBlobContents, readTreeBlobs, SYNC_READ_BOUND } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { HARDENED_GIT_ARGS, NO_LAZY_FETCH_ENV } from '../hardened-git.ts';
 import { readOriginEvidence } from './sync-origin-evidence.ts';
 import { sourceDbOnlyVerdict } from './source-storage.ts';
 import { dbOnlyVerdict, storageConfigFromYaml, unresolvedDbOnlyIn } from '../storage-config.ts';
@@ -59,6 +60,8 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   drift?: SyncDriftSide;
   /** #6712: for `both`, the blob the last recorded import left on disk; #7338: for `unknown`, the file at the baseline commit. The freeze imports when the page still holds what that blob imports. */
   driftBaseline?: string;
+  /** #7199: for an older side-`unknown` hold, the file's earlier committed blobs; the freeze imports when the page still holds what one imports. */
+  driftHistory?: string[];
   /** #6727: live pages with no recorded origin whose slugs fold to this file's slug, several or one the importer cannot write; the freeze holds it `legacy_slug_conflict`. */
   legacySlugs?: string[];
   /** #6729 x #6727: the one legacy page carries an explicit frontmatter id that differs from the file's, so it is another document; held `legacy_slug_conflict` (`explicit_id_conflict`). */
@@ -109,14 +112,32 @@ export async function syncExcludePatterns(engine: Pick<BrainEngine, 'getConfig'>
   return [...extra, ...(await engine.getConfig('sync.exclude') ?? '').split(/[\n,]/).map(v => v.trim()).filter(Boolean)]
     .map(v => v.endsWith('/') ? `${v}**` : v);
 }
+/** GST-2331: one managed-sync Git read, under `HARDENED_GIT_ARGS` and `NO_LAZY_FETCH_ENV`: no repository program runs, and a partial clone fetches nothing (a missing object fails the read). */
 export function syncGit(root: string, args: string[]): string {
-  return execFileSync('git', ['-c', 'core.quotepath=false', '-C', root, ...args],
-    { env: gitChildEnv(), encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
+  return execFileSync('git', ['-c', 'core.quotepath=false', ...HARDENED_GIT_ARGS, '-C', root, ...args],
+    { env: gitChildEnv(NO_LAZY_FETCH_ENV), encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+/** GST-2331: whether the repository at `gitRoot` is a partial clone (`extensions.partialClone`, or a remote marked `promisor`), whose missing objects sync never fetches. */
+export function syncPartialClone(gitRoot: string): boolean {
+  try { return syncGit(gitRoot, ['config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$']).split('\n').some(line => /^extensions\.partialclone \S|^remote\..*\.promisor (true|yes|on|1)$/i.test(line)); } catch { return false; }
+}
+/**
+ * GST-2331: the stop for a partial clone that lacks a tree of `commit` (sync fetches nothing, so it cannot list the commit's
+ * files), or null when the repository is no partial clone or holds every tree of the commit.
+ */
+export function partialCloneTreeRefusal(gitRoot: string, sourceId: string, commit: string): OperationError | null {
+  if (!syncPartialClone(gitRoot)) return null;
+  try { syncGit(gitRoot, ['ls-tree', '-r', '-d', '-z', commit]); return null; } catch { /* a tree is missing */ }
+  return opError('git_object_missing', `A Git tree of commit ${commit} that source ${sourceId} syncs is missing from the repository.`,
+    `The repository of source ${sourceId} is a partial clone (git clone --filter) that never fetched every tree of commit ${commit}, and sync fetches nothing from a remote, so it cannot list the commit's files; nothing was synced and no page was deleted. `
+      + `Fetch the trees in the checkout (git -C ${gitRoot} ls-tree -r -d ${commit} fetches them from the partial clone's remote) or use a clone without --filter, then run gbrain sync --source ${sourceId} --no-pull.`,
+    { detail: commit, fix: { argv: ['git', '-C', gitRoot, 'ls-tree', '-r', '-d', commit], consent: [], actor: 'user', requires_exclusive: false,
+      why: 'Fetches the commit\'s missing trees from the partial clone\'s remote, so the next sync can list its files.', verify: { argv: ['gbrain', 'sources', 'status', sourceId, '--json'] } } });
 }
 /** `syncGit` without blocking the event loop while Git runs (a level read: a synchronous spawn held timers for 200+ ms on a loaded host). */
 const execFileAsync = promisify(execFile);
 export async function syncGitAsync(root: string, args: string[]): Promise<string> {
-  return (await execFileAsync('git', ['-c', 'core.quotepath=false', '-C', root, ...args], { env: gitChildEnv(), encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 ** 2 })).stdout;
+  return (await execFileAsync('git', ['-c', 'core.quotepath=false', ...HARDENED_GIT_ARGS, '-C', root, ...args], { env: gitChildEnv(NO_LAZY_FETCH_ENV), encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 ** 2 })).stdout;
 }
 /**
  * A sync file or root failed a confinement or identity check. These helpers
@@ -182,6 +203,32 @@ export function assertConfiguredSyncRoot(root: string, configuredRoot: string | 
 export function syncGitPath(context: Pick<SyncDiscovery, 'root' | 'gitRoot'>, path: string): string {
   return relative(realpathSync.native(context.gitRoot), resolve(realpathSync.native(context.root), path)).split(sep).join('/');
 }
+type SyncTreeItem = { mode: string; kind: string; object: string; name: string };
+const treeName = (name: string): string => process.platform === 'win32' ? name.toLowerCase() : name;
+/**
+ * GBRA-135: one Git tree's entries by name (case-folded on Windows), memoized by object id. A tree object never changes,
+ * so the freeze, the claim and the publish of every committed delete under one directory share one `git ls-tree`
+ * instead of spawning it three times per delete and level (10,000 deletes: about 30,000 spawns). Only a full object id
+ * is memoized (a ref name moves); the cache keeps the most recently used `SYNC_TREE_LISTING_CAP` trees.
+ */
+const SYNC_TREE_LISTING_CAP = 64;
+const syncTreeListings = new Map<string, Map<string, SyncTreeItem[]>>();
+function syncTreeListing(gitRoot: string, tree: string): Map<string, SyncTreeItem[]> {
+  const key = `${gitRoot}\0${tree}`;
+  const cached = syncTreeListings.get(key);
+  if (cached) { syncTreeListings.delete(key); syncTreeListings.set(key, cached); return cached; }
+  const listing = new Map<string, SyncTreeItem[]>();
+  for (const row of syncGit(gitRoot, ['ls-tree', '-z', tree]).split('\0').filter(Boolean)) {
+    const tab = row.indexOf('\t'), [mode, kind, object] = row.slice(0, tab).split(' ');
+    const item = { mode: mode!, kind: kind!, object: object!, name: row.slice(tab + 1) };
+    const name = treeName(item.name);
+    listing.set(name, [...(listing.get(name) ?? []), item]);
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree)) return listing;
+  syncTreeListings.set(key, listing);
+  if (syncTreeListings.size > SYNC_TREE_LISTING_CAP) syncTreeListings.delete(syncTreeListings.keys().next().value!);
+  return listing;
+}
 export function assertSyncEntryOrigin(context: Pick<SyncDiscovery, 'root' | 'gitRoot' | 'target' | 'slugMode'>,
   entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'action'> & { working?: boolean }): void {
   const gitPath = syncGitPath(context, entry.path);
@@ -200,10 +247,7 @@ export function assertSyncEntryOrigin(context: Pick<SyncDiscovery, 'root' | 'git
   let tree = context.target;
   const parts = syncOriginPath(gitPath).split('/');
   for (const [index, part] of parts.entries()) {
-    const matches = syncGit(context.gitRoot, ['ls-tree', '-z', tree]).split('\0').filter(Boolean).map(row => {
-      const tab = row.indexOf('\t'), [mode, kind, object] = row.slice(0, tab).split(' ');
-      return { mode, kind, object, name: row.slice(tab + 1) };
-    }).filter(item => item.name === part || process.platform === 'win32' && item.name.toLowerCase() === part.toLowerCase());
+    const matches = syncTreeListing(context.gitRoot, tree).get(treeName(part)) ?? [];
     if (!matches.length) return;
     // GBRA-133 S-22: a directory where the deleted file was (notes/a.md became notes/a.md/x.md) means the file origin is gone.
     if (index === parts.length - 1 && matches.every(item => item.kind === 'tree')) return;
@@ -226,6 +270,17 @@ export function readManagedSyncRows(engine: BrainEngine, sourceId: string): Prom
   return Promise.all([engine.executeRaw<ManagedSourceRow>('SELECT incarnation,archived,local_path,last_commit,config FROM sources WHERE id=$1', [sourceId]).then(rows => rows[0]),
     getWorktreeBinding(engine, sourceId)]);
 }
+/** #7973: the checkout's Git top level; a registered root with no Git checkout at or above it is a plain directory, which `gbrain sync` imports without Git. */
+function managedGitTopLevel(root: string, sourceId: string): string {
+  try { return realpathSync(syncGit(root, ['rev-parse', '--show-toplevel']).trim()); }
+  catch (error) {
+    for (let dir = root; ; dir = dirname(dir)) { if (existsSync(join(dir, '.git'))) throw error; if (dir === dirname(dir)) break; }
+    throw opError('sync_not_applicable', `The managed Git sync path does not apply to source ${sourceId}: ${root} is a plain directory, not a Git checkout.`,
+      `Run gbrain sync --source ${sourceId} without --repo or --src-subpath; it imports the directory's files without Git (a file removed from it keeps its page). Nothing was synced.`,
+      { reason: 'plain_directory', fix: { argv: ['gbrain', 'sync', '--source', sourceId], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Sync imports a plain-directory source the way gbrain import does on a repo-less brain.' } });
+  }
+}
 /**
  * Validate the current owner and source without enumerating a new manifest. `rows`: `readManagedSyncRows` started by a
  * caller that has asserted the managed mode itself (and handles the promise's rejection).
@@ -244,12 +299,12 @@ export async function resolveManagedSyncContext(engine: BrainEngine, opts: SyncO
   const source = read && opts.canonicalOverride === 'git' ? { ...read, config: { ...read.config, canonical: 'git' } } : read;
   if (source?.config?.canonical === 'git' && managedForbiddenFlag(opts, true)) throw managedSyncFlagRefusal('--working-tree', sourceId, ['--source', sourceId, '--no-pull', '--working-tree']);
   if (!source || source.archived || !binding || binding.source_incarnation !== source.incarnation ||
-      binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path) {
+      binding.owner_host_id !== hostIdFor(engine) || binding.state !== 'active' || !binding.local_path) {
     // #6449: a rooted source with no owner at all is the database-only one activation listed; the exit is a deliberate claim.
     const unbound = source && !source.archived && !binding && source.local_path && source.config?.kind == null;
     // #7239: a missing, archived or re-registered source, or a checkout another host id owns, refuses the same way on every
     // retry from this host, so a sync job ends at once; a transfer or clone in progress can finish, so it stays retryable.
-    const reason = source && !source.archived ? ownerUnavailableReason(binding, source.incarnation, localHostId()) : null;
+    const reason = source && !source.archived ? ownerUnavailableReason(binding, source.incarnation, hostIdFor(engine)) : null;
     const deterministic = !source || source.archived || (reason !== null && reason !== 'transfer_in_progress' && reason !== 'clone_in_progress');
     throw opError('owner_unavailable', 'Sync must run on the active registered worktree owner.',
       unbound
@@ -267,7 +322,7 @@ export async function resolveManagedSyncContext(engine: BrainEngine, opts: SyncO
     { fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
       why: 'Shows the root the owner registered, to compare with the directory on disk.' } });
   assertConfiguredSyncRoot(root, source.local_path);
-  const gitRoot = realpathSync(syncGit(root, ['rev-parse', '--show-toplevel']).trim());
+  const gitRoot = managedGitTopLevel(root, sourceId);
   const requested = realpathSync(opts.srcSubpath ? resolve(opts.repoPath ?? gitRoot, opts.srcSubpath) : opts.repoPath ?? root);
   if (realpathSync.native(requested) !== realpathSync.native(root) || !isWriteTargetContained(realpathSync.native(root), realpathSync.native(gitRoot))) throw opError('source_changed', 'Sync path does not match this source binding.',
     `The repository path or source subpath given for ${sourceId} does not resolve to its registered root. Run gbrain sync --no-pull --source ${sourceId} without --repo or --src-subpath so it uses the registered root.`,
@@ -471,7 +526,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     for (const path of delta.manifest.deleted) put(path, 'delete');
     for (const rename of delta.manifest.renamed) putRename(rename);
   } else {
-    const listed = syncGit(gitRoot, ['ls-tree', '-r', '--name-only', '-z', target]).split('\0')
+    const listed = ((): string => { try { return syncGit(gitRoot, ['ls-tree', '-r', '--name-only', '-z', target]); } catch (error) { throw partialCloneTreeRefusal(gitRoot, sourceId, target) ?? error; } })().split('\0')
       .filter(path => path && (!scope || path.startsWith(`${scope}/`)));
     const paths = listed.filter(path => !refuse(path));
     assertDistinctSyncOrigins(paths);

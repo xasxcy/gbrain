@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
+import { ENGINE_ROOT } from '../engine-root.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
@@ -17,6 +18,7 @@ import { claimOwner, EXPIRED_PREPARING_CHARGE_SQL } from './claim-phase.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { pageBatchChildRequestIds } from './page-batch-id.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
+import { asciiLowerSql, edgeTrimSql } from '../edge-whitespace.ts';
 import { nativeFilesystemPath } from './root-registry.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 
@@ -40,7 +42,9 @@ function physicalFilePath(root: string, file: string): string {
 export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest & Partial<Pick<WriteRequest, 'operation' | 'intent' | 'authority' | 'principal_kind' | 'principal_id'>>, snapshot: PageSnapshot | null,
   outcome: Record<string, unknown>, prepared?: PreparedMutation,
   /** A grouped publication completes its members after queueing all of them, then calls `reconcileFinishedBatch` itself. */
-  opts: { deferBatchReconcile?: boolean; /** G2 (git-door.ts): the file is already committed; its Git effect only pushes. */ pushOnly?: boolean } = {}): Promise<void> {
+  opts: { deferBatchReconcile?: boolean; /** G2 (git-door.ts): the file is already committed; its Git effect only pushes. */ pushOnly?: boolean;
+    /** GBRA-190 G4 (D2): every page a multi-page publication wrote, sorted by slug; its Git and embedding effects walk them (effect-targets.ts). */
+    pageTargets?: readonly { slug: string; page_id: number; revision: string }[] } = {}): Promise<void> {
   if (prepared?.noop || prepared?.target === 'skill_bundle') return;
   await declarePersistenceProtocol(tx);
   const revision = snapshot?.revision;
@@ -48,7 +52,11 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   // #6007: the effects are inserted together, in queue order, by one statement at the end.
   const queued: { kind: EffectKind; data: Record<string, unknown>; gated?: boolean }[] = [];
   const queue = (kind: EffectKind, extra: Record<string, unknown> = {}) => { queued.push({ kind, data: { ...data, ...extra } }); };
-  if (prepared?.file && row.worktree_id) {
+  const companionFiles = (prepared?.companions ?? []).some(companion => companion.file);
+  if (opts.pageTargets && (prepared?.file || companionFiles) && row.worktree_id) {
+    queue('git', { version: 2, targets: opts.pageTargets, ...(opts.pushOnly ? { push_only: true } : {}) });
+    if (!opts.pushOnly && outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
+  } else if (prepared?.file && row.worktree_id) {
     const [binding] = await tx.executeRaw<{ local_path: string }>(`SELECT h.local_path FROM persistence_host_bindings h
       JOIN persistence_worktrees w ON w.id=h.worktree_id AND w.owner_host_id=h.host_id WHERE w.id=$1::uuid`, [row.worktree_id]);
     if (!binding?.local_path) throw opError('owner_unavailable', 'Cannot record the canonical Git target without its owner binding.',
@@ -62,11 +70,11 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     const target = nativeFileTarget(binding.local_path, physicalFilePath(binding.local_path, prepared.file.path), 'source_changed');
     queue('git', { relative_path: relative(binding.local_path, target).split(sep).join('/'),
       expected_hash: prepared.file.content === null ? null : fileContentHash(prepared.file.content),
-      ...(opts.pushOnly ? { push_only: true } : commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailer ? { commit_trailer: commit.trailer } : {}) } : {}) });
+      ...(opts.pushOnly ? { push_only: true } : commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailers?.length ? { commit_trailers: commit.trailers } : {}) } : {}) });
     if (!opts.pushOnly && outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
   }
   if (snapshot && !snapshot.page.deleted_at) {
-    if (!prepared?.deferEmbedding && !prepared?.embeddingCurrent) queue('embedding');
+    if (!prepared?.deferEmbedding && !prepared?.embeddingCurrent) queue('embedding', opts.pageTargets ? { version: 2, targets: opts.pageTargets } : {});
     outcome.embedding_state = await embeddingDisabled(tx) ? 'disabled' : prepared?.deferEmbedding ? 'deferred' : prepared?.embeddingCurrent ? 'current' : 'queued';
     if ((outcome.facts_backstop as { queued?: boolean } | undefined)?.queued) {
       if (!(await isFactsExtractionEnabled(tx))) outcome.facts_backstop = { skipped: 'extraction_disabled' };
@@ -76,11 +84,11 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     if (queuesMentionLinks(row, prepared)) queued.push({ kind: 'links', data: { ...data, ...(prepared?.mentionRange ? { range: prepared.mentionRange } : {}) }, gated: true });
     // #5876: the Life Chronicle decision is a ledger row, not an effect; the `chronicle` cycle phase executes it.
     await recordChronicleDecision(tx, row, snapshot, outcome);
-  }
+  } else if (opts.pageTargets?.length && !prepared?.deferEmbedding) queue('embedding', { version: 2, targets: opts.pageTargets });
   const inserted = queued.length ? await tx.executeRaw<{ kind: string }>(`INSERT INTO persistence_effects (request_id,kind,revision,data,source_id,source_incarnation,worktree_id)
     SELECT $1::uuid,t.e->>'kind',$2::uuid,t.e->'data',$3,$4::uuid,$5::uuid FROM jsonb_array_elements($6::text::jsonb) WITH ORDINALITY AS t(e,n)
     WHERE NOT (COALESCE((t.e->>'gated')::boolean,false) AND EXISTS (SELECT 1 FROM config
-      WHERE key IN ('auto_link',$7) AND lower(btrim(value,E' \\t\\r\\n')) IN ('false','0','no','off')))
+      WHERE key IN ('auto_link',$7) AND ${asciiLowerSql(edgeTrimSql('value'))} IN ('false','0','no','off')))
     ORDER BY t.n ON CONFLICT(request_id,kind) DO NOTHING RETURNING kind`,
   [row.id, revision ?? null, row.source_id, row.source_incarnation, row.worktree_id, JSON.stringify(queued), REMOTE_AUTO_LINKS_KEY]) : [];
   if (queued.some(effect => effect.kind === 'links')) {
@@ -293,9 +301,22 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
   return rows.sort((a, b) => Number(a.id) - Number(b.id));
 }
 
+/** When this process started; on PGLite no claim written earlier can belong to a live owner. */
+export const PROCESS_STARTED_AT = new Date(performance.timeOrigin);
 /**
- * PGLite only: the datastore admits one process, and this one opened it at
- * `processStartedAt`, so a claim last written before then was held by an owner
+ * #9227: the instant before which every running claim on this brain is abandoned, or null when this process cannot
+ * prove it. Only a PGLite engine that holds its datastore lock proves it: no other process can have renewed a claim
+ * since this one started, so the owner of an older claim has exited. A process without the lock, and every Postgres
+ * brain, gets null and releases nothing here.
+ */
+export function abandonedClaimCutoff(engine: BrainEngine): Date | null {
+  if (engine.kind !== 'pglite') return null;
+  const root = (engine as { [ENGINE_ROOT]?: { holdsDatastoreLock?: () => boolean } })[ENGINE_ROOT];
+  return root?.holdsDatastoreLock?.() === true ? PROCESS_STARTED_AT : null;
+}
+/**
+ * PGLite only, and only while this engine holds the datastore lock (`abandonedClaimCutoff`): the datastore admits one
+ * process, and this one opened it at `processStartedAt`, so a claim last written before then was held by an owner
  * that has exited (a crash or SIGKILL). Release those claims now instead of
  * waiting out their leases (effects 2 minutes, requests 30 s); a withdrawal
  * mirror left running would otherwise also hold back writes to its pages.
@@ -308,7 +329,7 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
  * kill loop reaches `persistence.max_preparation_attempts`.
  */
 export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date, chargePreparing = false): Promise<number> {
-  if (engine.kind !== 'pglite') return 0;
+  if (!abandonedClaimCutoff(engine)) return 0;
   const effects = await engine.executeRaw(`UPDATE persistence_effects SET state='queued',execution_token=NULL,claim_expires_at=NULL,claim_owner=NULL,
     next_attempt_at=LEAST(next_attempt_at,now()) WHERE state='running' AND recovery IS NULL AND updated_at<$1::timestamptz
     AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
@@ -411,6 +432,29 @@ export async function parkEffect(engine: SqlEngine, effect: PersistenceEffect, d
 export async function failEffect(engine: SqlEngine, effect: PersistenceEffect, reason: string): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET state='failed',execution_token=NULL,claim_expires_at=NULL,claim_owner=NULL,error_code=$3,updated_at=now()
     WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [effect.id, effect.execution_token, reason]);
+}
+
+/**
+ * #9227: what a classic write's receipt says about Git, read from its Git effect each time the receipt is read. Its
+ * publication stored `git_state: queued` (`queuePublicationEffects`) and nothing rewrites it, so the effect row is the
+ * live answer: `committed` with the commit's oid (an effect that recorded none, from an older build or a file Git
+ * already held, reads `committed` without one), `superseded`, `skipped` or `failed` with the reason, `retrying`
+ * with the last attempt's error, `running`, `recovering`, and `queued` only while the effect is queued. Null when the
+ * request has no Git effect row.
+ */
+export async function gitReceiptState(engine: SqlEngine, requestId: string): Promise<{ git_state: string; git_commit?: string; git_reason?: string } | null> {
+  const [row] = await engine.executeRaw<{ state: string; error_code: string | null; recovering: boolean; outcome: Record<string, unknown> | null }>(
+    `SELECT state,error_code,outcome,recovery IS NOT NULL AS recovering FROM persistence_effects WHERE request_id=$1::uuid AND kind='git' ORDER BY id DESC LIMIT 1`, [requestId]);
+  if (!row) return null;
+  const reason = (value: unknown) => typeof value === 'string' && /^[a-z_]{1,80}$/.test(value) ? { git_reason: value } : {};
+  if (row.recovering) return { git_state: 'recovering' };
+  if (row.state === 'failed') return { git_state: 'failed', ...reason(row.error_code) };
+  if (row.state === 'queued') return row.error_code ? { git_state: 'retrying', ...reason(row.error_code) } : { git_state: 'queued' };
+  if (row.state !== 'committed') return { git_state: row.state };
+  const git = row.outcome?.git;
+  if (git === 'superseded' || git === 'skipped') return { git_state: git, ...reason(row.outcome?.reason) };
+  const commit = row.outcome?.commit;
+  return { git_state: 'committed', ...(typeof commit === 'string' && /^[0-9a-f]{40,64}$/.test(commit) ? { git_commit: commit } : {}) };
 }
 
 /** Only public kind/state/reason, aggregated so withdrawal page counts cannot leak. */

@@ -6,7 +6,10 @@
  * - `statement_cancel`: the database ended one of the write's own statements with SQLSTATE 57014 (a statement timeout
  *   or cancel) while it stayed up, at preparation or inside the publication transaction;
  * - `publication_ceiling`: the publication ran past `persistence.publication_ceiling_ms` and its grace, and the owner
- *   cancelled it (publication-deadline.ts `boundPublication`), whatever error the cancelled publish then rejects with.
+ *   cancelled it (publication-deadline.ts `boundPublication`), whatever error the cancelled publish then rejects with;
+ * - `stale_plan` (GST-2314): a statement inside the write's transaction ran on a plan cached before a migration changed
+ *   its table (0A000 "cached plan must not change result type"); the transaction rolled back and the next claim
+ *   prepares it again.
  *
  * Each one is counted in `transient_interruptions` (v261), never in `preparation_attempts` (the content-class budget
  * that preparations cut off at their deadline keep), and schedules the request's next claim at `next_attempt_at` with
@@ -21,6 +24,8 @@
  * counted and no backoff applies: the switch restores the uncounted release, as it does for the deadlines.
  */
 import { OperationError } from '../ops/contract.ts';
+import { isStalePlanError } from '../retry-matcher.ts';
+import { classifyPgAccessError } from '../pg-access-classify.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { publicationDeadlinePassed } from './publication-deadline.ts';
@@ -37,7 +42,7 @@ export function transientBackoffMs(interruptions: number): number {
 /** Whether a queued row's backoff has elapsed; every claim statement requires it. */
 export const BACKOFF_ELAPSED = (alias: string) => `(${alias}.next_attempt_at IS NULL OR ${alias}.next_attempt_at<=now())`;
 
-export type TransientCause = 'statement_cancel' | 'publication_ceiling';
+export type TransientCause = 'statement_cancel' | 'publication_ceiling' | 'stale_plan';
 export interface TransientInterruption { cause: TransientCause; sqlstate: string | null }
 
 /**
@@ -49,9 +54,21 @@ export function transientInterruption(error: unknown): TransientInterruption | n
   const code = (error as { code?: unknown } | null)?.code;
   const sqlstate = typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null;
   if (publicationDeadlinePassed() && !(error instanceof OperationError)) return { cause: 'publication_ceiling', sqlstate };
+  if (isStalePlanError(error)) return { cause: 'stale_plan', sqlstate: '0A000' };
   return code === '57014' ? { cause: 'statement_cancel', sqlstate: '57014' } : null;
 }
 
+export function transientDatabaseFailure(error: unknown): boolean {
+  return ['40001','40P01','55P03','57014','53300','57P01','57P02','57P03','08000','08003','08006','08001','08004',
+    'ECONNRESET','ECONNREFUSED','ETIMEDOUT','CONNECTION_CLOSED','CONNECTION_ENDED'].includes(String((error as {code?:string})?.code)) || connectionCapFailure(error) || isStalePlanError(error);
+}
+/**
+ * GBRA-133: a pooler's client cap (Supavisor `EMAXCONNSESSION`, "too many clients already") is the same contention as
+ * SQLSTATE 53300 whatever code the pooler sends with it, so a write that meets it is released, never failed terminally.
+ */
+export function connectionCapFailure(error: unknown): boolean {
+  return classifyPgAccessError(error).reason === 'pool_exhausted';
+}
 /** The `*_interruption_charged` fault-point detail: the charge and the error it was charged for. */
 export function chargedInterruptionDetail(interruption: TransientInterruption | null, error: unknown) {
   const e = error as { name?: unknown; code?: unknown; message?: unknown } | null;

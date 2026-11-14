@@ -38,6 +38,18 @@
         "name": "skill_preconditions"
       },
       {
+        "category": "skill",
+        "name": "skill_health"
+      },
+      {
+        "category": "skill",
+        "name": "skillpack_update_incomplete"
+      },
+      {
+        "category": "skill",
+        "name": "skillpack_backups"
+      },
+      {
         "category": "ops",
         "name": "plugin_lane_collision"
       },
@@ -226,6 +238,10 @@
         "name": "harness_wiring"
       },
       {
+        "category": "ops",
+        "name": "skill_resolver"
+      },
+      {
         "category": "meta",
         "name": "agent_contract"
       },
@@ -354,12 +370,92 @@
         "name": "derived_visibility"
       },
       {
+        "category": "brain",
+        "name": "access_readers_malformed"
+      },
+      {
+        "category": "brain",
+        "name": "access_unknown_readers"
+      },
+      {
+        "category": "brain",
+        "name": "access_recent_narrowings"
+      },
+      {
+        "category": "brain",
+        "name": "access_page_readers_backfill"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_pending"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_widening_held"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_invalid"
+      },
+      {
+        "category": "brain",
+        "name": "access_policy_store_mismatch"
+      },
+      {
+        "category": "brain",
+        "name": "unlabeled_people_folders"
+      },
+      {
+        "category": "brain",
+        "name": "unscoped_shared_reads"
+      },
+      {
+        "category": "brain",
+        "name": "shared_stdio_binding"
+      },
+      {
+        "category": "brain",
+        "name": "access_may_act_for_wildcard"
+      },
+      {
+        "category": "brain",
+        "name": "access_owner_reads_restricted"
+      },
+      {
+        "category": "brain",
+        "name": "access_raw_only_rules"
+      },
+      {
+        "category": "brain",
+        "name": "access_audience_members"
+      },
+      {
+        "category": "brain",
+        "name": "access_members_read_lineage"
+      },
+      {
+        "category": "brain",
+        "name": "access_labelled_only_members"
+      },
+      {
+        "category": "brain",
+        "name": "attest_read_shared_scope"
+      },
+      {
         "category": "ops",
         "name": "rls"
       },
       {
         "category": "ops",
+        "name": "postgres_tls"
+      },
+      {
+        "category": "ops",
         "name": "function_search_path"
+      },
+      {
+        "category": "ops",
+        "name": "database_encoding"
       },
       {
         "category": "meta",
@@ -372,6 +468,10 @@
       {
         "category": "meta",
         "name": "schema_missing_tables"
+      },
+      {
+        "category": "meta",
+        "name": "schema_function_bodies"
       },
       {
         "category": "ops",
@@ -451,7 +551,15 @@
       },
       {
         "category": "brain",
+        "name": "segmented_tiling"
+      },
+      {
+        "category": "brain",
         "name": "timeline_history"
+      },
+      {
+        "category": "brain",
+        "name": "privacy_label_ignored"
       },
       {
         "category": "brain",
@@ -498,6 +606,10 @@
         "name": "frontmatter_hook"
       },
       {
+        "category": "ops",
+        "name": "url_source_origin"
+      },
+      {
         "category": "brain",
         "name": "orphan_persistence_bindings"
       },
@@ -512,6 +624,14 @@
       {
         "category": "brain",
         "name": "unbound_source"
+      },
+      {
+        "category": "ops",
+        "name": "dream_write_deferred"
+      },
+      {
+        "category": "ops",
+        "name": "embedding_restamp_stalled"
       },
       {
         "category": "ops",
@@ -555,6 +675,10 @@
       },
       {
         "category": "brain",
+        "name": "atom_fence_rows"
+      },
+      {
+        "category": "brain",
         "name": "generation_retirements"
       },
       {
@@ -571,6 +695,10 @@
       },
       {
         "category": "brain",
+        "name": "unwithdrawn_facts"
+      },
+      {
+        "category": "brain",
         "name": "conversation_label_facts"
       },
       {
@@ -580,6 +708,10 @@
       {
         "category": "brain",
         "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "agent_session_facts"
       },
       {
         "category": "brain",
@@ -723,6 +855,10 @@
       },
       {
         "category": "ops",
+        "name": "unattended_maintenance"
+      },
+      {
+        "category": "ops",
         "name": "embed_backfill_stalled"
       },
       {
@@ -752,6 +888,10 @@
       {
         "category": "ops",
         "name": "grant_new_ops_available"
+      },
+      {
+        "category": "ops",
+        "name": "unscoped_multi_user_token"
       },
       {
         "category": "ops",
@@ -842,8 +982,16 @@
         "name": "quarantined_changes"
       },
       {
+        "category": "brain",
+        "name": "foreign_writers"
+      },
+      {
         "category": "ops",
         "name": "decide_health"
+      },
+      {
+        "category": "brain",
+        "name": "memory_proposals_pending"
       },
       {
         "category": "brain",
@@ -863,11 +1011,19 @@
       },
       {
         "category": "brain",
+        "name": "chronicle_duplicate_events"
+      },
+      {
+        "category": "brain",
         "name": "auto_chronicle_default_on"
       },
       {
         "category": "brain",
         "name": "facts_drain"
+      },
+      {
+        "category": "ops",
+        "name": "wakeshift"
       },
       {
         "category": "brain",
@@ -928,6 +1084,10 @@
       {
         "category": "ops",
         "name": "host_identity_mismatch"
+      },
+      {
+        "category": "ops",
+        "name": "session_lane_budget"
       },
       {
         "category": "ops",
@@ -994,6 +1154,10 @@
         "name": "sync_overwritten_db_edits"
       },
       {
+        "category": "brain",
+        "name": "sync_rows_behind_checkpoint"
+      },
+      {
         "category": "meta",
         "name": "sync_config_keys"
       },
@@ -1015,7 +1179,27 @@
       },
       {
         "category": "brain",
+        "name": "strict_facts_outside_git"
+      },
+      {
+        "category": "brain",
+        "name": "local_edit_adoptions"
+      },
+      {
+        "category": "brain",
         "name": "outside_content_fences"
+      },
+      {
+        "category": "ops",
+        "name": "owner_host_stale"
+      },
+      {
+        "category": "brain",
+        "name": "embedding_plane_disagreement"
+      },
+      {
+        "category": "ops",
+        "name": "mcp_request_log_retention"
       },
       {
         "category": "brain",
@@ -1024,6 +1208,10 @@
       {
         "category": "ops",
         "name": "search_mode"
+      },
+      {
+        "category": "brain",
+        "name": "synopsis_tier_coverage"
       },
       {
         "category": "brain",

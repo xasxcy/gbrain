@@ -183,6 +183,54 @@ analyzes the tables. If a refresh is skipped (a lock, or a role that does not
 own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation)` and
 `ANALYZE pages` as the table owner.
 
+### TLS for Postgres connections
+
+Every Postgres connection gbrain opens to a host that is **not on this
+machine** requires TLS unless the database URL says otherwise. On this
+machine means `localhost`, `127.0.0.0/8`, `::1` or a Unix socket path;
+everything else needs TLS, including private addresses (`10.x`,
+`192.168.x`) and Docker service names such as `postgres-1`, because gbrain
+cannot tell a trusted network from an untrusted one by its name.
+(`src/core/pg-tls.ts` is the one resolver every connection pool uses.)
+
+| URL says | What gbrain does |
+|---|---|
+| no `sslmode`, host on this machine | plaintext, as before |
+| no `sslmode`, any other host | `sslmode=require` |
+| `?sslmode=require` | encrypts the connection; does **not** verify the server certificate |
+| `?sslmode=verify-full` | encrypts and verifies the certificate and host name against the CA store |
+| `?sslmode=disable` | plaintext; the one opt-out, for a network you trust |
+
+An sslmode (or `ssl=`, or `sslrootcert=system`) in the URL is always
+honored and never weakened, and so is the driver's own `PGSSL` variable.
+
+`require` stops anyone on the network from reading the traffic, but it would
+not notice an attacker who sits in the middle and presents their own
+certificate. For that, use `verify-full`. It checks the server certificate
+against Node's CA store, so a provider with its own CA needs that CA added:
+Supabase publishes it under **Project Settings → Database → SSL
+Configuration → Download certificate**. Put the file on the brain host and set
+`NODE_EXTRA_CA_CERTS=/path/to/prod-ca-2021.crt` in the environment gbrain
+runs in (for the installed service, `~/.gbrain/env`), then use
+`?sslmode=verify-full`. A `sslrootcert=<file>` parameter is not read by the
+driver; use `NODE_EXTRA_CA_CERTS` instead.
+
+A server that does not accept TLS fails the connection with
+[`postgres_tls_required`](guides/error-codes.md#postgres_tls_required),
+which names both choices: turn TLS on at the server, or add
+`sslmode=disable` to the URL. Nothing falls back to plaintext on its own.
+`gbrain doctor --only postgres_tls` reports whether this machine's own
+connection to a non-local server uses TLS. It judges that from the client side:
+`sslmode=require`, `verify-ca` and `verify-full` make the driver refuse a
+server without TLS. It warns on `sslmode=disable`, and on `sslmode=prefer` when
+the server does not offer TLS or reports the session unencrypted (prefer falls
+back to plaintext without saying so, so doctor never certifies a prefer
+connection as encrypted). Behind a
+pooler, the server's `pg_stat_ssl` row describes the pooler's own hop to the
+database, which can't be checked from your machine, so doctor shows it as detail
+and never warns about it. PGLite opens no network connection, so none of this
+applies to it.
+
 ### Vector index sizing
 
 The chunk HNSW index stores each vector beside its graph links, so at 1,024
@@ -398,24 +446,102 @@ tables) under that role's RLS. Every gbrain function that pins a search_path end
 cannot hide it from a guard; before, any session, the owner included, could store purged
 content that way. A write role with no policy on a ledger still reads it empty, so its
 purged or withdrawn writes still go through: give a scoped write role a `SELECT` policy on
-the ledgers of the sources it writes (gbrain#7659 tracks the fix). Where the migrating role
-does not own a function, v277 names it on stderr and leaves it; `gbrain doctor`
-(`function_search_path`) prints the `ALTER FUNCTION` to run as its owner
-(`test/e2e/function-search-path-postgres.test.ts`).
+the ledgers of the sources it writes (gbrain#7659 tracks the fix). Each definition outside
+`src/core/schema-migrations/` pins `pg_catalog, public, pg_temp` itself (`bun run check:search-path`
+fails one that does not, or a pinned function missing from `PINNED_FUNCTION_NAMES`), so a schema
+replay keeps it; historical migration bodies still pin the old path, so every migration run ends by
+putting `pg_temp` back (`hardenFunctionSearchPaths` in `src/core/function-search-path.ts`), and the
+schema blob's generated hardening region must stay its last statement. Where the migrating role
+does not own a function, the run that applies migrations names it on stderr and leaves it;
+`gbrain doctor` (`function_search_path`) prints the schema-qualified `ALTER FUNCTION` to run as its
+owner, or `gbrain apply-migrations --yes` below v277 ([function search path](guides/troubleshooting.md#function-search-path);
+`test/e2e/function-search-path-postgres.test.ts`).
 
+<a id="writer-protocol-fences"></a>
 **Writer-protocol fences.** The managed-writer guard, the persistence protocol floor, protocol
 activation and the Git-canonical source counter also run as the writing role and read their state
 under its RLS. Since migration v278 (#7636) they fail closed: a role that cannot see the
-`persistence_brain` row is refused with `writer_coordinator_required` (relationship
-`unreadable_state`) on every guarded write, managed brain or not, instead of being treated as
-unmanaged. On a managed brain the same refusal covers a hidden `git_canonical_brain` row or
-Git-canonical source row (for a writer without the git protocol) and a hidden page row behind a tag,
+`persistence_brain` row is refused on every guarded write, managed brain or not, instead of being
+treated as unmanaged. The message is `writer_coordinator_required: writer state is unreadable to
+this database role`: the managed-writer guard raises it as P0001, the request, effect and
+activation guards of the persistence protocol as SQLSTATE 42501. During a coordinated write's
+publication either one is stored on the receipt as `writer_coordinator_required` (relationship
+`unreadable_state`, the role remedy, and the owner-only `error_detail.state` naming the table; since
+#7777 for the protocol guards, #7780 for the state and remedy). A protocol guard's
+refusal outside publication (write admission, protocol activation) reaches the command as that
+database error, which gbrain's generic database output labels `permission_denied` with grant
+advice: the code at the start of the message names the refusal. On a managed brain the same refusal covers, for a writer without the git protocol, a
+hidden `git_canonical_brain` row and, while the brain has any Git-canonical source, a hidden
+target or old source row whether or not that source is Git-canonical; and a hidden page row behind a tag,
 timeline entry or take. Protocol activation (row-level security on `sources`, `persistence_requests`,
 `persistence_effects`, `persistence_worktrees` or `persistence_source_bindings`) and a change to
 which sources are Git-canonical (row-level security on `sources`) refuse any role it applies to,
 whatever its policies; only the table owner (without `FORCE ROW LEVEL SECURITY`) or a role that
 bypasses RLS passes them ([write refusals](guides/write-refusals.md#writer-coordinator-required);
 `test/writer-fence-fail-closed-7636.test.ts`).
+
+<a id="derived-state-maintainers"></a>**Derived-state maintainers.** Eight triggers keep derived state as the writing role:
+deleting a page removes its `page_retrievals` rows, soft-deleting or moving it clears its
+`extract_atoms_page_state` rows, a tag write moves its page's revision, a `page_versions` row copies the page's
+trust tier and writer, a page update re-indexes its `timeline_entries` text, a page write queues or drops its
+`page_projection_jobs` row (reading `sources`), and a trust-relevant change bumps `trust_policy_state`. Since
+migration v281 (#7637) each refuses with `writer_coordinator_required` (relationship `unreadable_state`, the error
+names the table) when row-level security applies to the role on a table it needs and no permissive policy for the role
+covers a command it runs there. Before, such a role kept stale derived state (a deleted page's retrieval rows stayed)
+or failed with a raw RLS error. The owner (without `FORCE ROW LEVEL SECURITY`) and a role that bypasses RLS are not
+affected. A scoped write role that does not own these tables needs these policies; the maintainer tables hold ids,
+timestamps and counters but no page text, so the writer sees every row, and a policy that filters them would leave the
+rows it hides stale:
+
+<!-- gbrain:maintainer-rls-recipe:begin (applied verbatim by test/derived-state-maintainers-7637.test.ts) -->
+```sql
+-- The writer's own pages and sources, with the pages_scope_filter predicate.
+-- Tag writes update the page revision; version rows and the projection queue
+-- read the page and its source.
+CREATE POLICY pages_writer_scope ON pages FOR ALL TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')))
+  WITH CHECK (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY sources_writer_scope ON sources FOR SELECT TO <writer-role>
+  USING (current_setting('app.scopes', true) = '*'
+         OR id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- The timeline text a page update indexes: the entries of pages the writer sees.
+CREATE POLICY timeline_entries_writer_scope ON timeline_entries FOR SELECT TO <writer-role>
+  USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+-- Derived state with no page text: every row, so a deleted page's rows go too.
+CREATE POLICY page_retrievals_writer ON page_retrievals FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY extract_atoms_page_state_writer ON extract_atoms_page_state FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY page_projection_jobs_writer ON page_projection_jobs FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+CREATE POLICY trust_policy_state_writer ON trust_policy_state FOR ALL TO <writer-role>
+  USING (true) WITH CHECK (true);
+```
+<!-- gbrain:maintainer-rls-recipe:end -->
+
+<a id="folder-access-tables"></a>**Folder access tables.** A page write stamps the folder rules covering its slug
+from `access_policy_state` and `access_rules`, and remote reads hide the prefixes listed in
+`access_pending_coverage`, all as the database role doing the write or read. A role that row-level security keeps
+from reading those tables never reads them as "no rule": the stamp refuses the write with
+`writer_coordinator_required` (relationship `unreadable_state`, naming the table), and reads treat every page as
+under a pending prefix, so nothing is shown. The owner (without `FORCE ROW LEVEL SECURITY`) and a role that
+bypasses RLS are not affected, and `gbrain access` rule commands refuse such a role with `permission_denied`. A scoped
+role that writes or serves pages needs these policies; they let it read the rules and lock a source's policy row while
+stamping, but not change either. Row-level security does not cover TRUNCATE or triggers, so the recipe also revokes
+those. A policy that filters these rows hides rules from the role and so reveals the pages under them: keep `USING (true)`. The folder-rule lineage test also reads `slug_rename_history` (every slug a renamed page has had), which renames write; a role that cannot read it reads every page as covered, so a scoped role needs a `USING (true)` policy there like the other tables it writes. The recipe for the three access tables:
+
+<!-- gbrain:access-rls-recipe:begin (applied verbatim by test/access-folder-scoped-role.test.ts) -->
+```sql
+CREATE POLICY access_policy_state_reader ON access_policy_state FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY access_policy_state_stamp_lock ON access_policy_state FOR UPDATE TO <writer-role>
+  USING (true) WITH CHECK (false);
+CREATE POLICY access_rules_reader ON access_rules FOR SELECT TO <writer-role> USING (true);
+CREATE POLICY access_pending_coverage_reader ON access_pending_coverage FOR SELECT TO <writer-role> USING (true);
+REVOKE TRUNCATE, TRIGGER, REFERENCES ON access_policy_state, access_rules, access_pending_coverage FROM <writer-role>;
+```
+<!-- gbrain:access-rls-recipe:end -->
 
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
@@ -659,6 +785,82 @@ the same reason and fix on its `connection` check.
    `<data-dir>.gbrain-owner.json`, and starts the 10-minute WAL-repair
    quarantine (`<data-dir>.lock-reap.json`). The next ordinary open succeeds.
 
+## Opening an engine from settings (experimental)
+
+`openEngine(settings)` (`src/core/engine-open.ts`, exported as `gbrain/engine-open`) creates and connects an engine
+from one value, for a host that embeds several brains in one process or keeps its settings somewhere other than
+`~/.gbrain`. It is off by default and refuses unless `settings.embedded_core === true` (`embedded_core_required`).
+The CLI, `gbrain serve` and mounts never call it and behave exactly as before.
+
+```ts
+import { openEngine } from 'gbrain/engine-open';
+
+const engine = await openEngine({
+  embedded_core: true,
+  engine: 'postgres',
+  database: { url, directUrl },        // PGLite: { path }, or none for an in-memory brain
+  pool: { max: 4 },                    // this engine's own pool (default 4), never the db.ts singleton
+  host: { id: hostId },                // required UUID: the persistence host identity
+  writer: { id, credential, lane: 'stdio' },
+  embedding: { model: 'voyage:voyage-4', dimensions: 1024 },
+  ai: { providers: { voyage: { apiKey } }, models: { chat } },
+});
+await engine.initSchema();             // the host migrates; a connect never does
+await engine.disconnect();
+```
+
+What the settings decide, with nothing read from a config file, an environment variable, the home directory or the
+working directory:
+
+- **Connection.** The direct (DDL/session) pool uses only
+  `database.directUrl`, or the route a known pooler URL derives; `GBRAIN_DIRECT_DATABASE_URL` is never consulted.
+  Each URL must be one single-host URL naming its host, user and database (`engine_settings_invalid` otherwise).
+  Both pools pass every connection field to the driver (port 5432 when unnamed; no password when the URL has none),
+  so no `PG*` variable picks the server or credentials. The statement-description cache stays in the process
+  instead of `<home>/cache/pg-types` unless a CLI-path pool to the same database shares the process. PGLite skips the
+  `GBRAIN_PGLITE_SNAPSHOT` fast path.
+- **Host identity.** `hostIdFor(engine)` (`src/core/persistence/identity.ts`) answers `host.id` for the engine and
+  everything sharing its `engineKey`; every host-id read in `src/core` goes through it (two CLI-only sites
+  excepted), and for any other engine it is `localHostId()`. No `host.json` is read or minted; no id refuses
+  `engine_host_missing`. The consumer heartbeat records `embedded:<host-id>`, read as identity given at open.
+- **Writer.** An unauthenticated write uses `settings.writer` for its lane (a remote call needs a `stdio` writer, a
+  local one `cli`), registered in `persistence_local_writers` on first use with the default read/write ceiling. An
+  existing registration keeps its own ceiling, another credential or lane under the id refuses `permission_denied`,
+  and a revoked one is never replaced. Engines that make their first write at the same moment register the writer once;
+  a credential already registered under another id refuses `permission_denied`. No `<brain>.<lane>.json` file is read or minted; with no writer for the lane
+  the write refuses `writer_registration_required`.
+- **Embedding identity.** `initSchema()` seeds a fresh brain from `settings.embedding` (else the built-in default),
+  never from the process gateway, and refuses `engine_embedding_mismatch` on a database that records another model
+  or width.
+- **AI gateway.** Embed, chat, expansion and rerank calls use only `settings.ai` (`providers`: id to
+  `{ apiKey, baseUrl }`; `models`: chat, expansion, reranker) and `settings.embedding`, never a `process.env`
+  key, the config file or the process gateway. An unnamed provider refuses `engine_scope_missing` and nothing is
+  sent. Operations, persistence consumers, minion jobs, `POST /mcp`, `hybridSearch` and the import paths enter
+  their engine's scope; wrap any other direct call in `withEngineScope(engine, fn)`. With an embedded engine open,
+  a call in no scope refuses `engine_scope_required`; `withLocalScope(fn)` (the CLI, serve and jobs enter it) uses
+  the process gateway. Batch shrink, no-key and structured-output memory, usage rows and the alias policy are per
+  engine. Query embeddings are cached per engine until close, unless `cache_namespace` (a host's name for
+  one tenant database) keeps them warm; a new key starts cold.
+- **Read back.** `embeddedSettings(engine)` returns a frozen copy with no secrets.
+- **Close.** `disconnect()` closes the engine for good and drops its settings, even while a reconnect is in flight
+  (any pool that reconnect builds is ended). A later `connect()` or `reconnect()` refuses `engine_closed`; call
+  `openEngine` again instead.
+- **Files.** File ops use `settings.storage` (local, or s3 with an endpoint) and its key `prefix`.
+
+Still process-wide: CLI file storage, transcription, the AI call log and timeouts, `GBRAIN_*` tuning variables (pool lifetime,
+connect and session timeouts, `GBRAIN_PREPARE`, `GBRAIN_DIRECT_POOL_SIZE`, `GBRAIN_DISABLE_DIRECT_POOL`,
+`GBRAIN_RLS_SCOPE_BINDING`, the PGLite close watchdog), `PG*` TLS and tuning
+variables, the connection-events audit log, and operation-level
+config reads (content-sanity screening, schema-pack resolution, the embedding switch on publication). None of them
+picks an engine's database, host identity, writer, embedding identity or AI keys. A source with a git checkout keeps its native coordination lock under the
+process's persistence home.
+
+### Upgrading an embedded host
+
+- Unscoped AI calls refuse `engine_scope_required` even after `configureGateway`; wrap them as above.
+- `openEngine` refuses an unknown settings key, top-level or nested (`engine_settings_invalid` names it).
+- `examples/embedded-two-brains.ts` is a two-brain host on package exports only: `bun examples/embedded-two-brains.ts`.
+
 ## Canonical schema sources
 
 Schema DDL text has one hand-edited copy. `bun run build:schema`
@@ -811,7 +1013,7 @@ names — reasons may be added, never renamed or removed). All 16:
 | `no_url` | nothing configured at all — `gbrain init --prefer-postgres` (or `gbrain init` for PGLite) |
 | `env_shadowed` | a cwd-.env `DATABASE_URL` exists but the cwd-.env guard excludes it — export `GBRAIN_DATABASE_URL` |
 | `auth_failed` | password/role rejected (28P01) — reset credentials, then `gbrain init --url <conn>` |
-| `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS |
+| `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS; a 42501 whose message starts with a writer code (`writer_coordinator_required:`, `writer_upgrade_required:`, `writer_not_quiesced:`, `unsupported_mutation_protocol:`) is a persistence protocol guard's refusal ([write refusals](guides/write-refusals.md#protocol-guard)) |
 | `tenant_not_found` | Supavisor rejected the tenant — pooler usernames are `postgres.<project-ref>`; also raised by paused projects |
 | `ssl_required` | the server demands SSL — `?sslmode=require` rewrite (rewrite tier) |
 | `pool_exhausted` | 53300 / session-slot exhaustion — [pool sizing](#pool-sizing) guidance: `export GBRAIN_POOL_SIZE=6` per long-running process, fewer processes |
@@ -824,6 +1026,7 @@ names — reasons may be added, never renamed or removed). All 16:
 | `schema_missing` | 42P01/42703 — pending migrations (`gbrain apply-migrations --yes`; excluded from the db-repair marker on the MCP mid-operation path, where it usually means code skew) |
 | `pgvector_missing` | the vector extension is absent — auto tier creates it |
 | `storage_corrupt` | XX001/XX002, or an XX000 such as `unexpected chunk number … for toast value` or `tuple concurrently deleted` — stored data is damaged; db-repair stops at manual and names the first step, `gbrain repair orphan-children` (preview, includes the torn-TOAST probe; [orphan children](guides/repair.md#orphan-children)) |
+| `tls_required_default` | `postgres_tls_required`: gbrain's TLS default met a non-local server without TLS — db-repair stops at manual; turn TLS on at the server or add `sslmode=disable` ([TLS](#tls-for-postgres-connections)) |
 | `unknown` | unclassified — redacted error + `gbrain doctor` |
 
 The classifier lives in `src/core/pg-access-classify.ts`; remediation copy has
@@ -904,6 +1107,18 @@ may open the full 3-connection direct pool.
 When the sum does not fit, run fewer long-running processes (for example one
 shared `gbrain serve --http` instead of one stdio `serve` per agent session),
 or raise the pooler's limit. Do not lower a long-running process below 6.
+
+`gbrain doctor` check `session_lane_budget` (read-only) counts this role's
+connections in `pg_stat_activity` across every process, by process kind
+(`serve`, `sync`, `jobs`, … from the `gbrain <kind>:<pid>:<nonce>`
+connection name) and host, and warns at 80% of the limit with the kinds
+holding the most. Postgres cannot read a pooler's per-role limit, so behind a
+Supabase pooler set `GBRAIN_SESSION_LANE_LIMIT` to the project's `pool_size`;
+without it the check reports the counts only. Without a pooler the limit is
+`max_connections` less the reserved slots. Behind a pooler the count is an
+upper bound: connections that bypass it (a direct `db.<ref>` host) count too,
+and a transaction pooler's server connections carry its own name, so they are
+counted apart, not attributed to a process.
 
 With a direct route configured, the persistence consumer's own tick
 statements (idle probe, switch read, recovery and expired-claim scans,
@@ -1283,24 +1498,8 @@ and assert `jsonb_typeof` — the assertion PGLite cannot make.
 ## Adding a new engine
 
 1. Create `src/core/<name>-engine.ts` implementing `BrainEngine`
-2. Add to engine factory in `src/core/engine-factory.ts`:
-   ```typescript
-   export async function createEngine(config: EngineConfig): Promise<BrainEngine> {
-     switch (config.engine || 'postgres') {
-       case 'pglite': {
-         const { PGLiteEngine } = await import('./pglite-engine.ts');
-         return new PGLiteEngine();
-       }
-       case 'myengine': {
-         const { MyEngine } = await import('./my-engine.ts');
-         return new MyEngine();
-       }
-       // ...
-     }
-   }
-   ```
-   The factory uses dynamic imports so an engine's dependencies (e.g. the
-   PGLite WASM blob) are only loaded when that engine is selected.
+2. Add a case to `constructEngine` in `src/core/engine-construct.ts`, which `createEngine` and `openEngine`
+   both build through. Its dynamic imports load an engine's dependencies (the PGLite WASM blob) only when selected.
 3. If the engine speaks the Postgres dialect, add a dialect adapter that
    implements `SqlExecutor` (`src/core/engine-sql/executor.ts`) beside
    `dialect-pglite.ts` and `dialect-postgres.ts`, expose it through a private
@@ -1345,10 +1544,6 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 
 ## Future engine ideas
 
-**TursoEngine.** libSQL (SQLite fork) with embedded replicas and HTTP edge access. Would give SQLite's simplicity with cloud sync. Interesting for mobile/edge use cases.
-
-**DuckDBEngine.** Analytical workloads. Bulk exports, embedding analysis, brain-wide statistics. Not for OLTP. Could be a secondary engine for analytics alongside Postgres for operations.
-
-**Custom/Remote.** The interface is clean enough that someone could build an engine backed by any storage: Firestore, DynamoDB, a REST API, even a flat file system. The interface doesn't assume SQL.
-
-Note: there is no SQLite engine. PGLite uses the same SQL as Postgres, so no separate SQLite dialect with FTS5/sqlite-vss translation is needed.
+TursoEngine (libSQL with embedded replicas and edge sync), DuckDBEngine (analytics and bulk exports beside
+Postgres, not OLTP) and custom engines over any store: the interface assumes no SQL. There is no SQLite engine;
+PGLite speaks Postgres SQL, so no FTS5/sqlite-vss dialect is needed.

@@ -4,16 +4,16 @@
  * a checkout, or the `gbrain` binary while this brain is under a non-default GBRAIN_HOME, reads and writes
  * `~/.gbrain` instead: a second, silent brain state (locks, queue, config) beside the real one.
  *
- * Read-only and bounded: `crontab -l` (5 s; no check unless the crontab mentions gbrain or src/cli.ts), plus at most 20 scripts the lines name (64 KiB
+ * Read-only and bounded: `crontab -l` (5 s, or the entry deadline when sooner: local-audits.ts `localProbe`; no check unless the crontab mentions gbrain or src/cli.ts), plus at most 20 scripts the lines name (64 KiB
  * each). A line or script counts as setting the home when it assigns GBRAIN_HOME (on the line, in the crontab's
  * environment lines, or anywhere in the script). Warns, never fails; the user edits the crontab.
  */
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { execFileSync } from '../../../core/spawn.ts';
 import type { Check } from '../../doctor.ts';
 import { doctorVerify } from '../check-fix.ts';
+import { localProbe } from '../local-probe.ts';
 
 const SCRIPTS_MAX = 20;
 const SCRIPT_BYTES_MAX = 64 * 1024;
@@ -98,10 +98,13 @@ export function cronGbrainHomeCheck(crontab: string | null, customHome: string |
       verify: doctorVerify('cron_gbrain_home') } };
 }
 
-/** `crontab -l` on a local machine; null when there is no crontab or it cannot be read in 5 s. */
-export function readCrontab(): string | null {
-  // FORK: fork tooling refreshes the committed doctor goldens on a dev box; this keeps its crontab out of them, as on CI.
+/**
+ * FORK: `crontab -l` through doctor's bounded local probe (local-probe.ts), or null when there is no crontab, it cannot
+ * be read in time, or GBRAIN_TEST_DOCTOR_NO_CRONTAB=1. Fork tooling refreshes the committed doctor goldens on a dev box;
+ * the seam keeps its crontab out of them, as on CI. Upstream calls localProbe directly; the fork's caller
+ * (local-audits.ts) calls this instead.
+ */
+export async function readCrontab(entryDeadlineAt: number | undefined): Promise<string | null> {
   if (process.env.GBRAIN_TEST_DOCTOR_NO_CRONTAB === '1') return null;
-  try { return execFileSync('crontab', ['-l'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 }).toString(); }
-  catch { return null; }
+  return localProbe(entryDeadlineAt, 'crontab', ['-l']);
 }

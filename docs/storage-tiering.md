@@ -54,7 +54,7 @@ storage:
 When storage configuration is present, `gbrain sync` automatically manages `.gitignore` entries on every successful sync:
 
 - Adds missing `db_only` directory patterns to `.gitignore`.
-- A file under a `db_only` directory that git already tracked before the declaration stays tracked and shows as modified once the database updates it; untrack it with `git rm --cached <path>`. A managed sync never soft-deletes a live page under a declared `db_only` directory because its file left Git (untracked, ignored or gone): the database copy is canonical (#7324).
+- A file under a `db_only` directory that git already tracked before the declaration stays tracked and shows as modified once the database updates it; untrack it with `gbrain git commit-push --untrack -m "<msg>" -- <dir>`, which keeps the files on disk ([untrack](guides/shared-checkout-git.md#untrack)). While it stays tracked, a label repair on its page sticks, and a commit to the file never widens the page: a privacy label the row holds and the file does not state is kept (a label the file states applies). A managed sync never soft-deletes a live page under a declared `db_only` directory because its file left Git (untracked, ignored or gone): the database copy is canonical (#7324).
 - Idempotent — re-running adds no duplicate entries.
 - Stable comment header so the managed block is grep-able.
 - Skipped on `--dry-run` (don't mutate disk in preview mode).
@@ -70,8 +70,8 @@ When storage configuration is present, `gbrain sync` automatically manages `.git
 
 Related doctor coverage: `undeclared_db_only_pages` warns about DB pages with no
 backing file that sit outside every declared `db_only` path. The engine's own
-derive-phase output prefixes (`life/events/`, `atoms/`, `extracts/`,
-`dream-cycle-summaries/`) count as implicitly declared for that check, so healthy
+derive-phase output prefixes (`life/events/`, `atoms/`, `concepts/`, `extracts/`,
+`dream-cycle-summaries/`, and the drift phase's `reports/drift-<date>` report) count as implicitly declared for that check, so healthy
 brains stay quiet without adding them to `gbrain.yml`. They are NOT auto-added to
 `.gitignore` — only explicitly declared `db_only` dirs are. Google and GitHub
 connector sources running under managed persistence without a worktree binding

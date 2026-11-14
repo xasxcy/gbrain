@@ -10,7 +10,10 @@
  * caller; reads and writes copy, so a caller mutating its vector cannot change
  * the cache. The gateway clears it with its model cache whenever the config or
  * env that built the provider client changes; the generation counter keeps an
- * embed that started before a clear from storing its vector after it.
+ * embed that started before a clear from storing its vector after it. An
+ * engine's close drops only its own entries, and the gateway skips the store
+ * of an embed whose engine closed while it was in flight, so one engine's
+ * close leaves other engines' embeds in flight alone.
  */
 
 const MAX_ENTRIES = 512;
@@ -42,6 +45,16 @@ export function storeQueryEmbedding(key: string, vector: Float32Array, startedAt
   if (startedAt !== generation) return;
   entries.set(key, { vector: new Float32Array(vector), expiresAt: Date.now() + TTL_MS });
   if (entries.size > MAX_ENTRIES) entries.delete(entries.keys().next().value!);
+}
+
+/** Drop every entry an engine cached under `tag` (its unique cache tag, engine-gateway.ts) when it closes. */
+export function dropQueryEmbeddingsTagged(tag: string): void {
+  for (const key of entries.keys()) if (key.includes(tag)) entries.delete(key);
+}
+
+/** @internal exported for tests: the cache keys, oldest first. */
+export function __queryEmbedCacheKeysForTests(): string[] {
+  return [...entries.keys()];
 }
 
 export function clearQueryEmbedCache(): void {

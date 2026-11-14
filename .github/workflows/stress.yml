@@ -47,7 +47,16 @@ jobs:
     steps:
       # Full history: the gate diffs against the merge base, the race hunt
       # reads which helpers changed on master since the last night.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 6
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 6
         with:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -105,7 +114,14 @@ jobs:
           --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.4.4
@@ -119,7 +135,7 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/**/*.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -156,7 +172,14 @@ jobs:
       issues: read
       actions: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.4.4

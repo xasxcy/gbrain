@@ -16,11 +16,12 @@ import {
   readUpdateCache,
   isCacheFresh,
   pendingUpgradeVersion,
-  readSnooze,
-  isSnoozeActive,
+  snoozeHolds,
+  currentReleaseChannel,
   resolveSelfUpgradeMode,
   justUpgradedPath,
 } from '../core/self-upgrade.ts';
+import { maybeEmitChannelNotice } from '../core/release-channel-notice.ts';
 import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, isThinClient, getDbUrlSource, envShadowDetected, MERGED_CONFIG_BY_ENGINE } from '../core/config.ts';
 import {
   classifyPgAccessError as classifyDbAccessError,
@@ -29,11 +30,12 @@ import {
   shouldEmitDbAccessMarker,
 } from '../core/pg-access-classify.ts';
 import { resolveBrainId as resolveBrainIdForDbMarker } from '../core/brain-resolver.ts';
+import { captureHookSessionCwd } from '../core/session-cwd.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import type { AIGatewayConfig } from '../core/ai/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { OperationError, type OperationMeta } from '../core/ops/contract.ts';
-import { OPERATION_MANIFEST, cliOps } from './op-manifest.ts';
+import { cliOps } from './op-manifest.ts';
 import { openRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { resolveSourceIdEngineFree } from '../core/source-resolver.ts';
 import { installCliRoutingFor } from './fix-routing-provider.ts';
@@ -43,9 +45,12 @@ import { isScopeErrorCode } from '../core/error-catalogue.ts';
 import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { printCuratedHelp } from './help/render.ts';
 import { OWN_EQUALS_PARSERS, READER_ALIASES, findUnknownFlag, splitFlagEquals } from './flag-equals.ts';
+import { buildCliAliases, cliAliases, findUnknownOpFlag, validateCommandFlags } from './flag-validation.ts';
+import { cliSurface } from './skill-surface.ts';
+import { setSkillSurfaceProvider } from '../core/skill-health.ts';
 import { printHelp } from './top-help.ts';
 import { curatedFlagError } from './help/validate.ts';
-import { cliCommandOf, exitCliError, exitOnRepairFailed, unknownFlagError, usageError, writeCliError, writeCliNotice, writeFatalCliError } from './cli-error.ts';
+import { cliCommandOf, exitCliError, exitOnRepairFailed, reportInBandFailure, unknownFlagError, usageError, writeCliError, writeCliNotice, writeFatalCliError } from './cli-error.ts';
 import type { Notice } from '../core/agent-output.ts';
 import { opError, opOwnsSource } from '../core/ops/contract.ts';
 import { PAGE_MAX_BYTES } from '../core/page-size-policy.ts';
@@ -61,6 +66,7 @@ import { routeCommand } from './command-route.ts';
 import type { CliOptions } from '../core/cli-options.ts';
 import { RemoteMcpError, extractResponseMeta } from '../core/remote-mcp-error.ts';
 import { assertSingleSourceScopeFlag, checkHostHonoredParams, hintAmbientNarrowing, type AmbientSourceBinding } from './source-scope.ts';
+import { formatFindPages, formatStatsBy } from './format-page-lookup.ts';
 import { maybePromptForUpgrade } from '../core/thin-client-upgrade-prompt.ts';
 import { CLI_FLAG_REGISTRY } from '../core/cli-flag-registry.generated.ts';
 import { SEARCH_SUBCOMMANDS, cliHelpRequested } from './subcommands.ts';
@@ -79,7 +85,7 @@ import {
 } from './command-table.ts';
 import { formatRememberResult } from './remember-format.ts';
 import { formatEntityResult, markEntityMiss } from './entity-format.ts';
-import { applyCliOpNotices, captureCapacityNotices, captureOpNotice, captureRetrievalNotices, retrievalIncompleteLine } from './op-notices.ts';
+import { applyCliOpNotices, captureCapacityNotices, captureOpNotice, captureRetrievalNotices, retrievalIncompleteLine, withExplainTargetJson, withRoutedDegradedStamp } from './op-notices.ts';
 import { admitAcrossCliCalls } from '../core/notice-ledger.ts';
 import { searchTimingsDocument, searchTimingsLine, timeCliPhase } from './search-timings.ts';
 
@@ -145,8 +151,10 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, true | (() => Promise<(engine: ne
   loops: async () => (await import('../commands/loops.ts')).runLoops as never,
   beliefs: async () => (await import('../commands/beliefs.ts')).runBeliefs as never,
   'edge-proposals': async () => (await import('../commands/edge-proposals.ts')).runEdgeProposals as never,
+  'memory-proposals': async () => (await import('../commands/memory-proposals.ts')).runMemoryProposals as never,
   questions: async () => (await import('../commands/questions.ts')).runQuestions as never, // --help before the engine
   waiting: async () => (await import('../commands/loops.ts')).runWaiting as never,
+  access: async () => (await import('../commands/access.ts')).runAccess as never, // GBRA-218: usage prints before the engine
   // runSources's `--help`/`-h`/undefined-subcommand branch calls printHelp()
   // without ever touching `engine` — safe to dispatch with no brain
   // configured, matching the reader who runs `sources --help` because they
@@ -161,7 +169,7 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, true | (() => Promise<(engine: ne
   // D3: post-connect records whose handler answers --help before the engine; run through the table.
   advisor: true, anomalies: true, feedback: true, backfill: true, 'book-mirror': true, 'edges-backfill': true, embed: true, 'embed-failures': true, features: true,
   founder: true, 'graph-query': true, orphans: true, salience: true, think: true,
-  brainstorm: true, lsd: true, migrate: true, pages: true, pricing: true, 'retrieval-upgrade': true, whoknows: true, core: true, trust: true,
+  brainstorm: true, lsd: true, migrate: true, pages: true, pricing: true, 'retrieval-upgrade': true, whoknows: true, core: true, trust: true, wakeshift: true,
 };
 
 /** Returns true when the command's own help was printed. */
@@ -177,35 +185,6 @@ async function printSelfHelpWithoutEngine(command: string, args: string[]): Prom
   return true;
 }
 
-// v114 (#1941): alias -> operation lookup, kept separate from `cliOps` so
-// aliases don't double-list in printHelp's auto-generated section. Collisions
-// with a primary CLI name, a CLI_ONLY command, or another alias throw at module
-// load — a silent route-shadow is worse than a loud boot failure. CLI_ONLY is
-// derived from the command table (src/cli/command-table.ts), so the check runs
-// over every table record. Exported for the table test's collision case.
-export function buildCliAliases<T extends OperationMeta>(
-  ops: readonly T[],
-  primary: ReadonlyMap<string, OperationMeta>,
-  cliOnly: ReadonlySet<string>,
-): Map<string, T> {
-  const aliases = new Map<string, T>();
-  for (const op of ops) {
-    if (op.cliHints?.hidden) continue;
-    for (const alias of op.cliHints?.aliases ?? []) {
-      if (primary.has(alias) || cliOnly.has(alias) || aliases.has(alias)) {
-        throw new Error(
-          `CLI alias collision: '${alias}' (op '${op.name}') conflicts with an existing ` +
-          `command or alias. Rename the alias in src/core/operations.ts.`,
-        );
-      }
-      aliases.set(alias, op);
-    }
-  }
-  return aliases;
-}
-
-export const cliAliases = buildCliAliases(OPERATION_MANIFEST, cliOps, CLI_ONLY);
-
 /**
  * Emit the self-upgrade marker on the hot path. CACHE-READ-ONLY: a statSync +
  * read, sub-ms. On a stale/missing cache it kicks a DETACHED, single-flighted
@@ -213,7 +192,7 @@ export const cliAliases = buildCliAliases(OPERATION_MANIFEST, cliOps, CLI_ONLY);
  * blocks a command and NEVER throws (the marker must not break any command).
  * Mode resolution is file-plane only (no DB; thin clients have no local DB).
  */
-function maybeEmitUpdateMarker(command: string): void {
+function maybeEmitUpdateMarker(command: string, args: readonly string[]): void {
   try {
     if (process.env.GBRAIN_SKIP_STARTUP_HOOKS) return;
     // Never run during the test suite: tests spawn the CLI hundreds of times,
@@ -244,17 +223,20 @@ function maybeEmitUpdateMarker(command: string): void {
     const cfg = loadConfigFileOnly();
     const mode = resolveSelfUpgradeMode(cfg);
     if (mode === 'off') return;
+    const channel = currentReleaseChannel();
+    if (!channel) return;
+    maybeEmitChannelNotice({ command, args, cfg });
 
     const now = Date.now();
-    const entry = readUpdateCache();
+    const entry = readUpdateCache(channel);
     if (entry && isCacheFresh(entry, now)) {
       // Shared stale/foreign-cache guard (pendingUpgradeVersion): only nag when
-      // the cached latest is strictly newer than the RUNNING binary, and print
-      // the running version — the cache records whatever binary WROTE it.
-      const latest = pendingUpgradeVersion(VERSION, now);
+      // the channel offers this RUNNING binary a release, and print the running
+      // version — the cache records whatever binary WROTE it.
+      const latest = pendingUpgradeVersion(VERSION, now, channel);
       if (latest) {
-        // notify mode honors a per-version snooze; auto mode ignores it.
-        if (mode === 'notify' && isSnoozeActive(readSnooze(), latest, now)) return;
+        // notify mode honors the channel's time-based snooze; auto mode ignores it.
+        if (mode === 'notify' && snoozeHolds(latest, now, channel)) return;
         // One line, once per COVERAGE_NOTICE_WINDOW_MS across calls under
         // GBRAIN_HOME (a newer latest prints at once, #7147). An agent harness
         // (stderr not a TTY, or GBRAIN_FORCE_UPGRADE_MARKER=1 under a PTY) gets
@@ -316,6 +298,8 @@ async function main() {
 
   let command = args[0];
   installCliRoutingFor(() => command, args);
+  // #8426: a serve the hook launcher started reads the session directory from GBRAIN_HOOK_CWD, before any brain or source resolution.
+  if (command === 'serve') captureHookSessionCwd();
 
   if (!command || command === '--help' || command === '-h') {
     printHelp();
@@ -325,6 +309,16 @@ async function main() {
   if (command === '--version' || command === 'version') {
     console.log(`gbrain ${VERSION}`);
     return;
+  }
+
+  // GST-2476 G2: enforced member mode decides first; nothing below runs for a refused command (cli/enforced-member.ts).
+  if (process.env.GBRAIN_ENFORCED_MEMBER !== undefined) {
+    const routedForGate = routeCommand(command === 'ask' ? 'query' : command, args.slice(1));
+    const gateMeta = CLI_ONLY.has(routedForGate.command) ? undefined : cliOps.get(routedForGate.command) ?? cliAliases.get(routedForGate.command);
+    enforcedClass = await (await import('./enforced-member.ts')).enforcedGate({
+      command: routedForGate.command, args: routedForGate.subArgs, opName: gateMeta?.name,
+      helpRequested: cliHelpRequested(command, args.slice(1)), asFlag: cliOpts.as !== undefined, thinClient: isThinClient(loadConfig()),
+    });
   }
 
   if (command === '--tools-json') {
@@ -347,7 +341,7 @@ async function main() {
   // only, fail-open, never blocks. Skips the update path's own commands + sets
   // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every real command.
   if (!helpRequested) {
-    maybeEmitUpdateMarker(command);
+    maybeEmitUpdateMarker(command, args);
 
     // Monthly backup-coverage nag (cache-read-only, bounded by the nag gate;
     // guards + skip set live inside the helper — one place, every call site).
@@ -366,6 +360,7 @@ async function main() {
   command = routed.command;
   let subArgs = routed.subArgs;
   dispatchedCommand = command;
+  if (cliOpts.as !== undefined && !helpRequested) (await import('./as-preview.ts')).refuseAsOutsideOperations(command, subArgs, !CLI_ONLY.has(command) && (cliOps.has(command) || cliAliases.has(command))); // GBRA-218
   {
     const { directPoolProfileForCommand, setDirectPoolProfile } = await import('../core/direct-pool-profile.ts');
     setDirectPoolProfile(directPoolProfileForCommand(command, subArgs));
@@ -396,6 +391,7 @@ async function main() {
       printOpHelp(op, command);
       return;
     }
+    if (enforcedClass) { printCliOnlyHelp(command); return; } // GST-2476 G2: static help only; a handler never runs under the mode
     if (!selfHelpSub && CLI_ONLY.has(command) && !CLI_ONLY_SELF_HELP.has(command)) {
       printCliOnlyHelp(command);
       return;
@@ -518,8 +514,12 @@ async function main() {
     return;
   }
 
-  if (['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)) return; // warm serve socket (opt-in)
+  if (cliOpts.as === undefined && !enforcedClass && ['search', 'query', 'get', 'recall'].includes(command) && await (await import('./cli-socket-client.ts')).maybeServeFromCliSocket(command, subArgs)) return; // warm serve socket (opt-in)
   // CLI-only commands
+  if (CLI_ONLY.has(command) && enforcedClass && !helpRequested && command !== 'errors' && command !== 'protocol') {
+    await (await import('./enforced-member.ts')).runEnforcedCliOnly(command, subArgs, { handleCliOnly, connectEngine });
+    return;
+  }
   if (CLI_ONLY.has(command)) {
     const endRead = (await import('./slow-read.ts')).beginCommandRead(command, subArgs); try { await handleCliOnly(command, subArgs); } finally { endRead(); }
     return;
@@ -527,6 +527,9 @@ async function main() {
 
   await runSharedOperation(command, subArgs, cliOpts);
 }
+
+/** GST-2476 G2: the gate's class for this invocation; undefined when GBRAIN_ENFORCED_MEMBER is unset. */
+let enforcedClass: import('./enforced-member-classes.ts').EnforcedClass | undefined;
 
 /**
  * Shared-operation dispatch (every non-CLI_ONLY command and alias): parse the
@@ -626,7 +629,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
 
   // The live PGLite owner exposes canonical operations over a dedicated
   // local socket. Delegate before opening a competing engine connection.
-  {
+  if (cliOpts.as === undefined && !enforcedClass) { // GBRA-218: a --as preview runs in this process (the owner socket carries no member identity); G2: so does an enforced member
     const { runDelegatedCliOperation } = await import('../commands/persistence-delegate.ts');
     if (await runDelegatedCliOperation(op.name, params, cfgPre, {
       brain: cliOpts.brain, timeoutMs: cliOpts.timeoutMs ?? undefined,
@@ -656,6 +659,10 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
   // because the import.meta.main seam exits explicitly on every one-shot path.
   const READ_OP_TIMEOUT_MS = 180_000;
   const configSnapshot = op.scope === 'read' ? takeStartupConfigSnapshot(engine) ?? openRequestConfigSnapshot(engine) : null;
+  const asPreview = await (await import('./as-preview.ts')).openAsPreview(engine, cliOpts.as, command, op.mutating === false); // GBRA-218 local --as <member>; GST-2490: owner lineage on reads only
+  // GST-2476 G2: an enforced read runs as the member's stdio server would answer it; an enforced write is checked first.
+  const enforced = enforcedClass ? await import('./enforced-member.ts') : null;
+  if (enforced) await enforced.checkEnforcedOpArgs(engine, command, op, params);
 
   try {
     const { withTimeout, OperationTimeoutError } = await import('../core/timeout.ts');
@@ -678,7 +685,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     let ctx: Awaited<ReturnType<typeof makeContext>>;
     try {
       ctx = await withTimeout(
-        timeCliPhase('context', () => (configSnapshot ? configSnapshot.run(() => makeContext(engine, params, op)) : makeContext(engine, params, op))),
+        timeCliPhase('context', () => (configSnapshot ? configSnapshot.run(() => makeContext(engine, params, op)) : makeContext(engine, params, op)).then(c => asPreview.context(c))),
         wallclockMs,
         `gbrain ${command}: context`,
       );
@@ -691,10 +698,24 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     }
 
     let rawResult: unknown;
-    if (op.scope === 'read') {
+    const enforcedReadOf = enforced && enforcedClass === 'read'
+      ? (p: Record<string, unknown>) => enforced.enforcedRead(engine, command, op.name, p, { sourceId: ctx.sourceId, localFederatedSourceIds: ctx.localFederatedSourceIds, config: ctx.config })
+      : null;
+    if (enforced && enforcedClass === 'write') await enforced.checkEnforcedWrite(engine, command, op.name, params, ctx.sourceId);
+    if (enforcedReadOf) {
+      try {
+        rawResult = await withTimeout(enforcedReadOf(params), wallclockMs, `gbrain ${command}`);
+      } catch (e: unknown) {
+        if (e instanceof OperationTimeoutError) {
+          onWallclockTimeout(e);
+          return;
+        }
+        throw e;
+      }
+    } else if (op.scope === 'read') {
       try {
         rawResult = await withTimeout(
-          configSnapshot!.run(() => withRequestIdentityMemo(() => op.handler(ctx, params))).catch(async (e: unknown) => { // large pages: a segmented page streams to stdout
+          configSnapshot!.run(() => withRequestIdentityMemo(() => asPreview.run(() => op.handler(ctx, params)))).catch(async (e: unknown) => { // large pages: a segmented page streams to stdout
             if (op.name !== 'get_page') throw e;
             const { streamSegmentedGet, SEGMENTED_STREAMED } = await import('./page-render.ts');
             if (await streamSegmentedGet(engine, params, e, writeStdoutFinal)) return SEGMENTED_STREAMED;
@@ -711,8 +732,9 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
         throw e;
       }
     } else {
-      rawResult = await withRequestIdentityMemo(() => op.handler(ctx, params));
+      rawResult = await withRequestIdentityMemo(() => asPreview.run(() => op.handler(ctx, params)));
       if (op.mutating) await captureCapacityNotices(engine); // #6696 (A4)
+      if (enforced && enforcedClass === 'write') await enforced.recordEnforcedReceipts(op.name, rawResult, params);
     }
     if (op.name === 'get_page' && rawResult === (await import('./page-render.ts')).SEGMENTED_STREAMED) return;
     captureRetrievalNotices(op.name, rawResult, lastRetrievalMeta, params, ctx.config);
@@ -720,29 +742,19 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     // path's return value so renderers see the same shape they'd see on the
     // routed path. Date → ISO string; bigint → string (postgres.js shape);
     // Buffer → object. Microsecond-cost; eliminates a whole drift bug class.
-    const { result, stderr: noticeText } = applyCliOpNotices(normalizeLocalResult(rawResult), params.json === true);
-    const output = formatResult(op.name, result, params);
+    const { result, stderr: noticeText } = applyCliOpNotices(normalizeLocalResult(rawResult), params.json === true, { op: op.name, retrieval: lastRetrievalMeta });
+    if (enforced && await enforced.namesHiddenPage(engine, command, result)) {
+      process.stderr.write(enforced.WITHHELD_LINE(command));
+      return;
+    }
+    const paged = op.name === 'get_page' && await (await import('./page-render.ts')).finishAsOfRead(async p => normalizeLocalResult(enforcedReadOf ? await enforcedReadOf(p) : await op.handler(ctx, p)) as Record<string, any>, result as Record<string, any>, params, writeStdoutFinal); // GBRA-217
+    const output = paged ? '' : formatResult(op.name, result, params);
     // Awaited delivery (#3423): queued stdout writes past 64KiB lose their
     // tail to a slow pipe reader when the exit grace lapses — see
     // writeStdoutFinal.
     if (output) await writeStdoutFinal(output);
     if (noticeText) process.stderr.write(noticeText);
-    // #4488: an op that reports failure IN-BAND (`{status: 'error'}` — e.g.
-    // put_page over unparseable frontmatter) used to print the envelope and
-    // exit 0, so scripts read a never-written page as success. Echo the error
-    // to stderr and set the failure verdict. No-op statuses ('skipped',
-    // 'unchanged', …) stay exit 0 — a no-op is not a failure.
-    if (
-      typeof result === 'object' && result !== null && !Array.isArray(result) &&
-      (result as { status?: unknown }).status === 'error'
-    ) {
-      const detail = (result as { error?: unknown }).error;
-      console.error(
-        `gbrain ${command}: operation reported status 'error'` +
-        (typeof detail === 'string' && detail ? ` — ${detail}` : '') + '.',
-      );
-      setCliExitVerdict(1);
-    }
+    reportInBandFailure(result, command);
     markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
@@ -754,6 +766,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
     // bounds a hung one.
     // #5232: the reporter owns the write verdict; never overwrite it.
     const { reportPersistenceCliError } = await import('../commands/persistence-delegate.ts');
+    if (enforced && enforcedClass === 'write' && e instanceof OperationError && e.writeRequest) await enforced.recordEnforcedReceipts(op.name, e.writeRequest, params);
     const receipt = !(e instanceof OperationError) || !!e.writeRequest;
     if (!receipt || !await reportPersistenceCliError(e, params.json === true || !!(e as OperationError)?.writeRequest)) {
       setCliExitVerdict(writeCliError(e, command));
@@ -835,13 +848,17 @@ async function runThinClientRouted(
     const envelopeMeta = extractResponseMeta(raw);
     if (envelopeMeta?.retrieval) captureRetrievalMeta('retrieval', envelopeMeta.retrieval);
     checkHostHonoredParams(op, params, raw);
-    const result = unpackToolResult(raw);
+    const { result, stderr: stampText } = withRoutedDegradedStamp(op.name, unpackToolResult(raw), envelopeMeta, params.json === true);
+    if (op.name === 'get_page' && await (await import('./page-render.ts')).finishAsOfRead(async p => unpackToolResult(await callRemoteTool(cfg, 'get_page', p, { timeoutMs, signal: sigintController.signal })) as Record<string, any>, // GBRA-217: an older host's
+      result as Record<string, any>, params, writeStdoutFinal, { client: VERSION, host: identityCache.get(cfg.remote_mcp!.mcp_url)?.identity.version ?? null })) return; // reply fails closed
     hintAmbientNarrowing(op, params, result, ambientScope);
     const skew = (await import('../core/search/evidence-delivery.ts')).deliveryVersionSkewWarning(op.name, params, envelopeMeta?.retrieval as Record<string, unknown> | undefined, result);
     if (skew) process.stderr.write(skew + '\n');
     const output = formatResult(op.name, result, params);
     // Awaited delivery (#3423) — same contract as the local-engine path.
     if (output) await writeStdoutFinal(output);
+    if (stampText) process.stderr.write(stampText);
+    reportInBandFailure(result, op.cliHints?.name ?? op.name);
     markEntityMiss(op.name, result);
     maybePrintConceptNudge(op.name, params);
   } catch (e: unknown) {
@@ -1277,57 +1294,6 @@ export function applyThinClientSourceScope(
 }
 
 // Exported for tests (same import-safety contract as applyThinClientSourceScope).
-// ─────────────────────────────────────────────────────────────────
-// #2185 — strict unknown-flag validation (pre-dispatch, pre-engine).
-// A flag no handler consults must fail loud instead of silently doing the
-// destructive thing (`init --migrate-only --dry-run` applied REAL migrations
-// while the user asked for a rehearsal). Two lanes:
-//   - op commands: legal flags derive from the operation contract
-//     (op.params) + the CLI-local formatter flags, mirroring parseOpArgs's
-//     traversal so values that begin with '--' are never misread.
-//   - CLI_ONLY commands: legal flags come from the generated
-//     CLI_FLAG_REGISTRY (scripts/generate-flag-registry.ts scans each
-//     command's source; freshness + coverage pinned by
-//     test/cli-flag-validation.test.ts).
-// Everything after a literal `--` is passthrough and never validated.
-// ─────────────────────────────────────────────────────────────────
-
-// Exempt by contract, not oversight:
-//  - call: the generic op invoker — arbitrary --param names are its interface.
-//  - config: `config set <key> <value>` values are arbitrary strings.
-//  - jobs submit: job payloads carry handler-defined params (shell lane incl.).
-//  - eval brainbench: owns the 0/1/2 CI exit-code contract (0 pass · 1
-//    regression · 2 error/inconclusive) via its own arg parser. The global
-//    validator's exit(1) on an unknown flag would be read by a CI harness as a
-//    memory REGRESSION rather than a typo; brainbench maps a bad flag to exit 2
-//    (error) with its own usage. Its legal flags still land in the generated
-//    registry (the generator scans eval's modules), so freshness/drift hold.
-function flagValidationExempt(command: string, subArgs: string[]): boolean {
-  return command === 'call' || command === 'config'
-    || (command === 'jobs' && subArgs[0] === 'submit')
-    || (command === 'eval' && subArgs[0] === 'brainbench');
-}
-
-/** Returns the first unknown flag (e.g. '--dry-run') or null when clean. */
-export function validateCommandFlags(command: string, subArgs: string[]): string | null {
-  if (flagValidationExempt(command, subArgs)) return null;
-  if (command === 'retrieval-upgrade' || command === 'migrate' && subArgs[0] === 'embeddings') return migrationCliArgumentError(command, subArgs)?.flag ?? null;
-  // Lane order MUST mirror dispatch order (CLI_ONLY first): commands that are
-  // BOTH an op and a CLI_ONLY member (think, salience, anomalies) dispatch to
-  // handleCliOnly, whose handlers parse flags the op contract doesn't declare
-  // (`salience --kind`, `think --with-calibration`) — validating those
-  // against op.params rejected documented invocations.
-  if (CLI_ONLY.has(command)) {
-    const legal = CLI_FLAG_REGISTRY[command];
-    // Registry drift fails OPEN at runtime (never brick a command); the
-    // drift-guard test fails the build instead.
-    if (!legal) return null;
-    return findUnknownFlag(subArgs, new Set(legal));
-  }
-  const op = cliOps.get(command) ?? cliAliases.get(command);
-  if (op) return findUnknownOpFlag(op, op.name === 'put_page' ? subArgs.filter((a, i) => !/^--file(=|$)/.test(a) && subArgs[i - 1] !== '--file') : subArgs); // put --file: cli/commands/append.ts
-  return null; // unknown command — the dispatcher's own error handles it
-}
 
 /** #7619: the argv a CLI_ONLY handler receives, `--flag=value` split or refused (cli/flag-equals.ts); commands with their own `=`-aware parser keep it. */
 export async function cliOnlyFlagArgs(command: string, subArgs: string[]): Promise<{ args: string[] } | { refusal: OperationError }> {
@@ -1341,59 +1307,10 @@ function equalsExempt(command: string, subArgs: string[]): boolean {
   return command === 'call' || command === 'config' && subArgs[0] === 'set' || command === 'eval' && subArgs[0] === 'brainbench';
 }
 
-export { findUnknownFlag };
+export { findUnknownFlag, buildCliAliases, cliAliases, findUnknownOpFlag, validateCommandFlags };
 
-/** Op lane: mirrors parseOpArgs so flag VALUES starting with '--' are skipped. */
-export function findUnknownOpFlag(op: OperationMeta, args: string[]): string | null {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--') break;
-    const m = /^--([a-z0-9][a-z0-9-]*)(?:=(.*))?$/i.exec(a);
-    if (!m) continue;
-    // Casing typo = unknown flag (see findUnknownFlag).
-    if (/[A-Z]/.test(m[1])) return `--${m[1]}`;
-    const rawKey = m[1];
-    // CLI-local flags consumed OUTSIDE the op contract (never wire params):
-    //   json/explain — formatter flags; help — short-circuits pre-dispatch;
-    //   source — makeContext's 6-tier source resolution (deleted before wire);
-    //   dry-run — makeContext's ctx.dryRun projection.
-    // Pre-fix, rejecting these broke documented invocations
-    // (`gbrain search "x" --source y`, `gbrain put x --dry-run`).
-    if (rawKey === 'json') {
-      // #4602: parseOpArgs consumes a literal true/false as this boolean's
-      // value — mirror the traversal so the token counts as consumed here too.
-      if (m[2] === undefined && isBooleanLiteral(args[i + 1])) i++;
-      continue;
-    }
-    // Bare-only even where an op also declares `explain` (search/query): the `=` form is refused, never parsed as a value.
-    if (rawKey === 'explain' || rawKey === 'help') { if (m[2] === undefined) continue; return `--${rawKey}`; }
-    if (rawKey === 'source' || rawKey === 'dry-run') {
-      // Non-boolean-style CLI-locals consume the next token as their value
-      // in parseOpArgs (source does; dry-run is boolean-read) — mirror the
-      // parser: source consumes a value when not inline-`=`; dry-run
-      // consumes only a literal true/false (#4602).
-      if (rawKey === 'source' && m[2] === undefined) i++;
-      if (rawKey === 'dry-run' && m[2] === undefined && isBooleanLiteral(args[i + 1])) i++;
-      continue;
-    }
-    if (rawKey.startsWith('no-')) {
-      const positive = rawKey.slice(3).replace(/-/g, '_');
-      if (op.params[positive]?.type === 'boolean') continue;
-    }
-    const key = rawKey.replace(/-/g, '_');
-    const paramDef = op.params[key];
-    if (paramDef) {
-      // Non-boolean flags consume the next token as their value unless
-      // provided inline via `=` — exactly like parseOpArgs. Boolean flags
-      // consume only a literal true/false value token (#4602).
-      if (paramDef.type !== 'boolean' && m[2] === undefined) i++;
-      else if (paramDef.type === 'boolean' && m[2] === undefined && isBooleanLiteral(args[i + 1])) i++;
-      continue;
-    }
-    return `--${rawKey}`;
-  }
-  return null;
-}
+setSkillSurfaceProvider(cliSurface);
+
 
 const SELECTED_CONFIG_BY_ENGINE = new WeakMap<BrainEngine, GBrainConfig>();
 
@@ -1585,13 +1502,13 @@ function describeEmptyRetrieval(): string {
     parts.push(`retrieved ${m.retrieved_count} before trimming`);
   }
   // Ranking-only stages (a skipped reranker) never cause a miss — keep the
-  // "clean miss" verdict honest.
+  // "retrieval healthy" verdict honest.
   const stages = Array.isArray(m.degraded)
     ? [...new Set((m.degraded as Array<{ stage?: string }>).filter(affectsRecall).map(d => d?.stage).filter(Boolean))]
     : [];
   parts.push(stages.length > 0
     ? `degraded: ${stages.join(', ')}`
-    : 'clean miss — no retrieval degradation');
+    : 'retrieval healthy; try the display name or --match hybrid before concluding the brain has nothing');
   return ` (${parts.join('; ')})`;
 }
 
@@ -1672,7 +1589,7 @@ export function formatResult(
         if (incompleteNotice) process.stderr.write(incompleteNotice);
         // --explain --json: the same per-row score_details object MCP `explain: true` returns.
         if (getCliOptions().explain) for (const r of results) r.score_details ??= require('../core/search/explain-formatter.ts').buildScoreDetails(r);
-        return JSON.stringify(searchTimingsDocument(answerId ? results.map(r => ({ ...r, answer_id: answerId })) : results, meta), null, 2) + '\n';
+        return JSON.stringify(withExplainTargetJson(params, meta, searchTimingsDocument(answerId ? results.map(r => ({ ...r, answer_id: answerId })) : results, meta)), null, 2) + '\n';
       }
       // T15/FOV-1: an empty result names its cause when the pipeline told us
       // (degradation stages from _meta.retrieval / the local meta capture) —
@@ -1690,16 +1607,16 @@ export function formatResult(
         // (autocut decision, `degraded: reranker_skipped (no_key)`) render.
         return formatResultsExplain(results, meta ?? undefined);
       }
-      return retrievalIncompleteLine(meta) + results.map(r =>
-        `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${require('../core/search/transcript-quote.ts').rowPreview(r, 100)}${r.stale ? ' (stale)' : ''}`,
-      ).join('\n') + '\n';
+      return retrievalIncompleteLine(meta) + results.map(require('./search-row-format.ts').formatSearchRow).join('\n') + '\n';
     }
     case 'get_tags': {
       const tags = result as string[];
       return tags.length > 0 ? tags.join(', ') + '\n' : 'No tags.\n';
     }
+    case 'find_pages': return formatFindPages(result);
     case 'get_stats': {
       const s = result as any;
+      if (Array.isArray(s?.groups)) return formatStatsBy(s);
       const lines = [
         `Pages:     ${s.page_count}`,
         `Chunks:    ${s.chunk_count}`,
@@ -1776,7 +1693,7 @@ export function formatResult(
         const truth = v.compiled_truth ?? v.title ?? '';
         const head = truth.slice(0, VERSION_TRUTH_PREVIEW_CHARS);
         const elided = truth.length > VERSION_TRUTH_PREVIEW_CHARS ? '...' : '';
-        return `#${v.id}  ${v.snapshot_at?.toString().slice(0, 19) || '?'}  ${head}${elided}`;
+        return `#${v.id}  ${v.snapshot_at?.toString().slice(0, 19) || '?'}  ${head}${elided}${typeof v.replaced_because === 'string' ? `\n    changed because: ${v.replaced_because}` : ''}`;
       }).join('\n') + '\n';
     }
     // MEMORY_VERBS v1 [F-E]: human-readable by default; trailing `--json`
@@ -2070,6 +1987,8 @@ async function routeEngineFreeSubcommands(command: string, args: string[]): Prom
     const { tryRunConfigEngineFree } = await import('../commands/config.ts');
     if (await tryRunConfigEngineFree(args)) return true;
   }
+  // GBRA-438: `maintain --schedule`, `--unschedule` and a scheduled run beside a live serve open no engine (PGLite would wait on its lock).
+  if (command === 'maintain' && await (await import('../commands/maintain-schedule.ts')).tryRunMaintainEngineFree(args)) return true;
   // Engine graduation owns its connections (routing rules: commands/migrate-graduation.ts routesToGraduation).
   if (command === 'migrate' && await (await import('../commands/migrate-graduation.ts')).tryRunMigrateGraduation(args)) return true;
   if (command === 'mcp') {

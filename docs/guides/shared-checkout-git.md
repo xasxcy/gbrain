@@ -44,7 +44,9 @@ another writer has half-written.
    instead of skipping silently. The push itself runs under a separate push
    lock, so a slow remote never blocks commits or gbrain's own page writes.
 2. **Commits only the paths you name.** It stages and commits exactly those
-   paths (`git add -A -- <paths>`, `git commit --only -- <paths>`), each
+   paths (`git add -u -- <paths>` for tracked ones, so a deletion under an
+   ignored directory still commits, `git add -A -- <paths>` for new files,
+   then `git commit --only -- <paths>`), each
    marked literal (`:(literal)<path>`), so a name with `*`, `?` or `[` matches
    only itself. The repository's hooks run as they do for a plain
    `git commit`: a pre-commit check that picks files by pattern still sees
@@ -105,7 +107,11 @@ gbrain git commit-push --pull
 # Commit and push the write-through files gbrain could not commit (doctor's dirty_age names them)
 gbrain git commit-push --pending
 
-# Preview: prints the paths, branch and lock it would use; takes no lock, writes nothing
+# Stop tracking files and keep them on disk (see "Untrack" below)
+gbrain git commit-push --untrack -m "stop tracking the archive" -- archive-example
+
+# Preview: runs the real run's path checks (a path outside the source root, a sparse-checkout
+# exclusion and the rest refuse here too), prints the paths, branch and lock it would use; takes no lock, writes nothing
 gbrain git commit-push --dry-run -m "people: add alice-example" -- people/alice-example.md
 ```
 
@@ -114,24 +120,33 @@ current directory (the paths are then relative to `<dir>`, like `git -C`),
 `-m` repeats like `git commit` (each one is a new paragraph, so a second `-m`
 carries a trailer), `--json` prints one JSON result (or the error envelope),
 `--require-clean` makes `--pull` skip when the checkout has any local edit
-(the rule the unattended pull cron uses). The command is local only: it pushes
+(the rule the unattended pull cron uses), `--scan-timeout <seconds>` gives the
+secret scan every push runs a longer budget than its 300 s default. The command is local only: it pushes
 with this machine's git credentials and is never exposed over MCP.
 
-When gbrain is not installed on the machine, the helper falls back to a locked
-path-scoped commit and a plain push. A rejected push then fails loudly (exit 4)
-and tells you to install gbrain and run `gbrain git commit-push --push-only`;
-the fallback never integrates remote commits itself.
+When gbrain is not installed on the machine, or the installed one predates the
+scan on every push (its `git commit-push --help` has no `--scan-timeout`), the
+helper falls back to a locked path-scoped commit and pushes nothing, because only gbrain scans the commits it
+publishes for secrets. It exits 4 (0 when the branch is already on the remote),
+logs the commit as local-only and tells you to install gbrain and run
+`gbrain git commit-push --push-only`. A named path git left out of the commit
+is reported as `commit_paths_skipped`, as `gbrain git commit-push` reports it;
+the helper then exits 1, or 4 when the commit is not on the remote.
 
 In a managed canonical worktree (`gbrain sources writer git-durability`) its
 persistence owner is the only Git publisher. Save pages with `put_page`,
 `edit_page`, `remember` or `capture`. For files written there outside gbrain
 (see [files that are not pages](../architecture/topologies.md#files-that-are-not-pages)),
 `gbrain git commit-push -m "<msg>" -- <paths>` commits only the named paths
-under the checkout's commit lock and reports `committed_local`: it never
-fetches, merges, pushes or moves the checkout, and refuses `--pending`,
-`--branch`, `--resolve` and `--allow-outside-source-root` there
-(`commit_paths_invalid`). The commit reaches the remote on the owner's next Git
-publish. `--push-only` without `--keep-checkout` is still refused with
+under the checkout's commit lock and reports `committed_local` (or
+`nothing_to_commit`) with `managed: true`: it never fetches, merges, pushes or
+moves the checkout, and refuses `--pending`, `--branch`, `--resolve` and
+`--allow-outside-source-root` there (`commit_paths_invalid`). Its
+`unpublished` field counts the commits the upstream lacks as last fetched
+(`null` when no fetched upstream can be read), `upstream` names the branch's
+configured upstream (`null` when it has none), and it writes no push-log line. Commits wait for
+the owner's next Git publish; `gbrain git commit-push --push-only --keep-checkout`
+publishes them now. `--push-only` without `--keep-checkout` is still refused with
 `writer_coordinator_required`.
 
 A checkout with no Git remote at all (`git remote` prints nothing and the
@@ -157,6 +172,29 @@ The agent reads `gbrain sync status --source <id> --json` (`git_push_holds`) or
 failures go through `gbrain sources writer retry-effects <source> --parked-pushes`
 (preview with `--dry-run`); a conflict names the user's choice first.
 
+<a id="preview-the-secret-scan"></a>
+### Preview the secret scan
+
+`gbrain git scan [--path <dir>] [--from <rev>] [--to <rev>] [--json]` runs the
+scan a push runs, over `--from..--to` (by default the upstream as last fetched,
+up to `HEAD`), with the checkout's `.gbrain-scan-allow`, and changes nothing:
+no fetch, lock, commit or push. It says whether a push would refuse
+(`would_refuse`) and lists each finding's commit, path, line, rule and
+fingerprint, never the value. Before an upgrade,
+`--from $(git rev-list -1 --before="30 days ago" HEAD)` shows what the last 30
+days of commits would have hit. `gbrain git commit-push --dry-run` names the
+marker that makes a checkout a managed canonical worktree, or none; every push
+mode scans either way.
+
+A finding that is not a secret: add its fingerprint (`sha256:` and 16 hex
+characters, as the preview prints it) as a line of `.gbrain-scan-allow` at the
+checkout root (`#` starts a comment). The scan reads the file from the working
+tree, so the next push uses it without a commit. Keep it out of commits (list it
+in `.git/info/exclude`): a commit that changes it changes what the scan sees, so
+no automatic push publishes it. A fingerprint accepts that exact value wherever
+it appears; a line without `sha256:` is a path glob and accepts every finding in
+the files it matches.
+
 <a id="outcomes"></a>
 ## Outcomes
 
@@ -169,20 +207,24 @@ Follow the error's `fix.next` as the
 | --- | --- | --- |
 | `pushed` | 0 | Done. Report the commit; a hosted link to the file works now. |
 | `push_deferred` | 0 | Only with `--require-clean` (the post-commit hook): another push was running in this checkout and was asked to publish HEAD too when it finishes. Nothing to do. |
-| `nothing_to_commit` | 0 | The paths had no change. Any earlier local commit on the branch was still pushed, so nothing is waiting (with `no_remote: true`, nothing is pushed). |
-| `committed_local` | 0 | A managed canonical worktree, or a checkout with no Git remote (`no_remote: true`): the paths were committed locally and nothing was pushed. Report the commit; it reaches a remote on the owner's next publish, or after a remote is added and `--push-only` runs. |
+| `nothing_to_commit` | 0 | The paths had no change. Any earlier local commit on the branch was still pushed, so nothing is waiting (with `no_remote: true` or `managed: true`, nothing is pushed; a managed checkout's `unpublished` counts the commits still waiting). |
+| `committed_local` | 0 | A managed canonical worktree, or a checkout with no Git remote (`no_remote: true`): the paths were committed locally and nothing was pushed (a managed result's `unpublished` counts the commits waiting). Report the commit; it reaches a remote on the owner's next publish, or after a remote is added and `--push-only` runs. |
 | `pushed_checkout_lagging` | 0 | The push landed but this checkout was not advanced; a `[gbrain notice]` names the files that blocked it. Change nothing: the next commit-push or `--pull` catches the checkout up. Never stash or reset to "fix" it. |
 | `commit_lock_busy` | 1 | Another writer held the lock for the whole wait; nothing was committed. Retry once. If it is still busy, tell the user which checkout and lock path the message names and stop. |
-| `commit_paths_invalid` | 1 | No paths, a path outside the checkout, the checkout root itself, or a path git would not stage. Name the explicit files you wrote and rerun. |
+| <a id="checkout_not_a_source"></a>`checkout_not_a_source` | 1 | The checkout commit-push resolved from the working directory (no `--path`) is not one of the brain's source checkouts on this host, typically a wrapper that changed into another repository; nothing was staged. The message lists the brain's checkouts. Tell the user to make the script pass `--path` with the absolute brain checkout. A repository that only encloses a source checkout (a brain cloned inside another repository) is not one; a source registered at a subdirectory its checkout tracks is. A host whose brain records no source checkout, or a checkout with `gbrain.sourceRoot` set, is never refused this way. |
+| `commit_paths_invalid` | 1 | No paths, a path outside the checkout, the checkout root itself, or a path git would not stage (one outside a sparse-checkout definition included). Name the explicit files you wrote and rerun. |
+| <a id="commit_paths_skipped"></a>`commit_paths_skipped` | 1 | Git left a named path out of the commit: a modified file flagged assume-unchanged or skip-worktree (`reason` `assume_unchanged`, `skip_worktree`) or a file inside a nested Git repository (`not_staged`). The other named paths were committed (and, on a classic checkout, pushed); `detail` lists each skipped path, the commit and the pushed head, or the push failure (`publish`) when the push failed too. Check the flags with `git ls-files -v -- <path>`; clear them only after the user agrees, one flag per call (`git update-index --no-assume-unchanged -- <path>`, `git update-index --no-skip-worktree -- <path>`; given both, git clears only the first), and remember skip-worktree is often set on purpose to keep local edits out of commits, or move the file out of the nested repository, then rerun. A skip-worktree file absent from disk (a sparse checkout), a flagged gitlink and ignored files under a named directory are not reported. |
 | `commit_prestaged_paths` | 1 | Another writer staged files under a directory you named; nothing was staged or committed. Name your own files explicitly. Unstage the others (`git restore --staged -- <file>`, which keeps their bytes) only after the user agrees. |
 | `commit_outside_source_root` | 1 | The commit, or a local commit about to be published, changes files outside the brain's [source root](#source-roots); nothing was pushed. Show the user `git show --stat <sha>`; rerun with `--allow-outside-source-root` only if they want it published. |
 | `git_index_locked` | 1 | A git command that does not take the writer lock held `index.lock`. Retry once after a few seconds. |
 | `git_index_stale` | 1 | An `index.lock` older than 10 minutes blocks the checkout. Check that no git command is running there, tell the user, and remove the named lock file only with their agreement. |
 | `git_operation_in_progress` | 1 | A rebase, merge, cherry-pick or revert is unfinished in the checkout. gbrain never aborts it for you. Follow [stuck rebase](#stuck-rebase). |
 | `git_detached_head` | 1 | The checkout is on a detached HEAD or an unborn branch. Check out the branch the remote tracks (`git switch <branch>`), or make the first commit, then rerun. |
+| <a id="publish_secret_found"></a>`publish_secret_found` | 1 | On every push `gbrain git commit-push` makes (commit mode, `--pending` and `--push-only`; `--scan-secrets` is accepted for older scripts), so also the post-commit hook `gbrain sources harden` installs and `scripts/brain-commit-push.sh`, and on every automatic publish: the one `gbrain sources refresh` runs on its own, the push of a managed worktree's Git effects, doctor `git_convergence`'s push fixes, the access-policy and durability-scaffolding commits, `gbrain sources push` and the first push of `gbrain bootstrap repo` (#8902; there the remote has no branch yet, so the whole history is scanned). A commit about to be pushed that gbrain did not make for a page write (its commit ledger records its own page-write commits, whose bodies are stored raw by design and are not scanned; a Git effect's commit counts only by the sha gbrain created for it, when its files held the bytes the effect wrote, so an amended or reworded copy is scanned; one that adopted a file edited outside gbrain, or one older than the retained ledger, is scanned) adds a value that looks like a secret, in its message, an added line (even one a later commit removed) or a merge resolution, adds text too large to scan, or changes `.gbrain-scan-allow` or a `.gitattributes` (files that decide what the scan sees); nothing was pushed. The message names each file, line, rule and commit, never the value. Ask the user: remove the value from those unpushed commits, or add a false positive's fingerprint to `.gbrain-scan-allow`, then retry. A commit that changes `.gbrain-scan-allow` or a `.gitattributes` is never published automatically: the user reviews it and pushes it. The exception is the commit `gbrain sources push` or `gbrain bootstrap repo` makes itself from files it has just scanned with that allowlist. Never publish them with a command that skips the scan. On a managed worktree its Git effects hold meanwhile (`gbrain sync status` and doctor list them; the page writes are safe in the database and in local commits); after the fix, `gbrain sources writer retry-effects <source> --parked-pushes` runs the ones that parked. |
+| <a id="publish_scan_unreadable"></a>`publish_scan_unreadable` | 1 | Wherever `publish_secret_found` can refuse: the scan could not read the commits about to be pushed in full (a missing or corrupt object, git output it does not recognise, or its time budget), so it reported no secret and nothing was pushed. When it ran out of time (a first push of a long history can need more than the 300 s default), the fix is the same command with `--scan-timeout <seconds>`, four times the budget and at least 1200: run it; the scan still reads every commit, and prints its progress on stderr. `gbrain git commit-push`, `gbrain sources push` and `gbrain bootstrap repo` take `--scan-timeout`. Otherwise run `git fsck` in the checkout, fix what it names, then retry. When the remote has no such branch, a managed worktree's Git effect scans the branch's whole history and creates it only when that scan passes; a history too large to scan in the owner process holds the effects with this code and names `git ls-remote --heads <remote>`: check the upstream, then point it at the right branch or review the history and push the branch yourself. Never publish with a command that skips the scan. On a managed worktree its Git effects hold meanwhile, as for `publish_secret_found`. |
 | `integrate_conflict` | 1 | Local and remote commits changed the same file; nothing was merged and the checkout is unchanged. Stop, relay the question to the user, then [resolve](#conflicts). |
 | `push_unconfirmed` | 4 | The commit is durable locally but no push destination confirmed it (network, credentials, branch protection, a remote that kept moving, or another push that held the push lock for the whole wait). Fix what the message names, then run `gbrain git commit-push --push-only`. Never force-push. |
-| `writer_coordinator_required` | 1 | This is a managed worktree. Stop using git for pages; save them through `put_page` and the other gbrain write tools. |
+| `writer_coordinator_required` | 1 | This is a managed worktree. Stop using git for pages; save them through `put_page` and the other gbrain write tools. `scripts/brain-commit-push.sh` refuses this way on a checkout marked managed and commits nothing; `gbrain git commit-push` refuses this way when git left a named page out of its commit (the same causes as `commit_paths_skipped`), after committing the other named paths locally. Ask the user before re-saving such a page through `put_page` with the managed source (`gbrain put --source-id <source> <slug>`, or `source_id` over MCP; without it the write goes to the default source): it replaces the stored page with the file's content. |
 | `git_unavailable` | 1 | A git command failed, often a missing `user.name`/`user.email` or a refusing pre-commit hook. Read the message, fix that, rerun. When the branch names a remote that does not exist (a typo or a broken clone), the run stops before committing: fix the name or add the remote, then rerun. A checkout with no remote at all commits locally instead (`committed_local`). |
 
 `--pull` reports `up_to_date`, `advanced`, `ahead` (local commits not yet
@@ -192,7 +234,7 @@ All of these exit 0. A diverged branch whose two sides changed the same file
 fails with `integrate_conflict`, the same as a push.
 
 The helper's own exits: 2 for a usage error (no message, or no paths: it
-refuses a repo-wide commit), 4 when its no-gbrain fallback could not push.
+refuses a repo-wide commit), 4 when its no-gbrain fallback committed without pushing.
 
 With `--json`, a success prints `outcome`, `sha` (the commit now on the
 remote), `committed` (your commit, or null), `branch`, `remote`, `paths`,
@@ -206,6 +248,53 @@ Every run also appends a line to `~/.gbrain/brain-push.log`, which
 reports it for that checkout until a publish resolves it.
 
 <a id="source-roots"></a>
+## Base check
+
+A script that reads a file, edits it and commits can overwrite a change another writer committed in
+between. `--base` closes that gap: record the blob when you read the file
+(`git rev-parse HEAD:<path>`, or `absent` for a file that does not exist yet) and pass it back:
+
+```bash
+gbrain git commit-push --base notes/summary.md=<blob> -m "update summary" -- notes/summary.md
+```
+
+Under the commit lock and before anything is staged, each `--base` path's blob at HEAD must still
+equal the one given. Otherwise the command refuses `commit_base_moved` naming the path, the base and
+HEAD's blob; nothing is staged or committed. Read the file at HEAD again, redo the change and rerun with
+the new base. Every `--base` path must also be one of the committed paths. Pages the agent also edits
+are better written with `gbrain put` (put_page), which carries its own revision check.
+
+<a id="untrack"></a>
+## Untrack: stop tracking files, keep them on disk
+
+`git rm --cached` followed by a plain commit is the usual way to stop tracking a file, but in a shared
+checkout the commit sweeps up whatever else is staged. `--untrack` does it in one locked step:
+
+```bash
+gbrain git commit-push --dry-run --untrack -m "stop tracking the archive" -- archive-example   # preview
+gbrain git commit-push --untrack -m "stop tracking the archive" -- archive-example
+```
+
+It removes every file the last commit holds under each named path from Git and the index, leaves the files
+on disk, and commits exactly those deletions (anything else staged stays staged and out of the commit; a commit a
+hook changed is taken back). A path the last commit holds nothing under, or a file marked skip-worktree, refuses
+`commit_paths_invalid` before anything changes. In an ordinary checkout the commit is pushed like any other.
+
+In a managed canonical worktree (the checkout gbrain's persistence owner writes), untracking a page file would
+make the next sync delete that page, so `--untrack` there only takes files under a `storage.db_only` directory
+that `gbrain.yml` at HEAD declares and that `.gitignore` ignores. The database row is canonical there, so every
+page stays live with its content. Anything else refuses `untrack_not_db_only` with the index as it was: declare
+the folder first (add it under `storage.db_only` and its `<dir>/` line to `.gitignore`, commit both with
+`gbrain git commit-push -m <msg> -- gbrain.yml .gitignore`), then rerun. The commit stays local, like every
+commit-push there; the owner's next Git publish, or `gbrain git commit-push --push-only --keep-checkout`,
+publishes it.
+
+If you already ran `git rm --cached` by hand, a plain commit-push of those paths refuses
+`commit_paths_skipped` and names the `--untrack` command that commits the removal.
+
+To undo, `git revert <untrack commit>` (then commit-push `--push-only` as usual). The revert writes the
+committed bytes back over the files on disk, so copy any local edit to them first.
+
 ## Source roots
 
 A brain can be one folder inside a larger repository. `gbrain sources harden`
@@ -239,6 +328,62 @@ and gbrain notes it in a pending ledger next to the lock
 write that gets the lock commits the pending files with its own, and
 `gbrain git commit-push --pending` commits and pushes them on demand.
 `gbrain doctor` reports pending files older than 30 minutes as `dirty_age`.
+A file flagged assume-unchanged or skip-worktree that differs from HEAD stays
+in the ledger (git add skips or refuses it), and `--pending` then fails
+`commit_paths_skipped` naming it.
+
+<a id="effect-reverted-edits"></a>
+## Edits a gbrain commit reverted
+
+When another writer committed a page file while one of gbrain's Git effects
+was committing the same file, older gbrain versions could rebuild the effect's
+commit on top of the other commit with the bytes gbrain had staged before it.
+HEAD then went back to gbrain's version without any warning, the next sync
+imported nothing for that file, and the other writer's edit survived only in
+its own commit. Current versions never lay staged bytes over a commit that
+changed the file: when that commit also changed the file on disk, it stays
+HEAD, the effect completes `superseded` (reason `committed_by_another_writer`)
+and the next sync imports it; when the file still holds gbrain's bytes, the
+effect stages them again and commits them on top. A strict source's write
+refuses `git_target_changed` instead.
+
+To find edits a brain already lost this way, look for a gbrain commit (its
+subject starts with `gbrain:`) whose one parent is someone else's commit, made at
+most two minutes earlier, that changed a file the gbrain commit also changed.
+The loop reads the history reachable from `HEAD` in one `git log` pass and then
+diffs only those pairs. It writes nothing, takes no lock and doesn't run gbrain,
+so it works the same before and after upgrading. On a synthetic history of
+200,000 commits it took about 5 seconds and 360 MB of memory.
+
+```bash
+BRAIN=/path/to/brain-checkout
+TOP=$(git -C "$BRAIN" rev-parse --show-toplevel)
+g() { git -C "$TOP" -c core.quotePath=false "$@"; }
+g log --format='%H%x09%P%x09%ct%x09%s' | awk -F'\t' '
+  { parent[$1] = $2; at[$1] = $3; ours[$1] = ($4 ~ /^gbrain:/) }
+  END { for (c in parent) { p = parent[c]; if (ours[c] && p != "" && p !~ / / && (p in at) && !ours[p] && at[c] - at[p] <= 120) print c, p } }' |
+while read -r c p; do
+  g diff-tree -r --no-commit-id --name-only "$c" | while IFS= read -r f; do
+    g diff-tree -r --no-commit-id --name-only --root -m --first-parent "$p" -- ":(literal)$f" | grep -qxF -- "$f" \
+      && echo "$f: edit in $(g log -1 --format='%h (%an, %ci)' "$p") replaced by gbrain commit $(g log -1 --format=%h "$c")"
+  done
+done
+```
+
+A hit looks like this, one line per file:
+
+```text
+notes/alice-example.md: edit in 9ee21f7422 (Alice Example, 2026-11-12 10:23:27 +0000) replaced by gbrain commit 15134a6136
+```
+
+Each line is a candidate, not proof: a gbrain write made right after someone
+else's commit on purpose looks the same. To confirm one, read both versions
+(`git show <their commit>:<file>` and `git show <gbrain commit>:<file>`).
+While the commit ledger still holds that time, the reverting effect also has an
+earlier `effect` line there whose sha is not in history and whose parent is the
+other commit's parent (`git log -1 --format=%P <sha>`). Ask the user which
+version to keep, then write the chosen content back as an ordinary page write
+(`gbrain put` or `put_page` with the page's current revision).
 
 <a id="scripts-and-the-managed-checkout"></a>
 ## Scripts and the managed checkout
@@ -252,7 +397,8 @@ commits come in. Four rules keep that checkout able to move:
    plain git leaves commits the upstream lacks and nobody publishes. The
    checkout diverges, and every later refresh refuses `refresh_diverged` and
    changes nothing. Commit the files a script wrote with
-   `gbrain git commit-push -m "<msg>" -- <paths>`: on a managed worktree it
+   `gbrain git commit-push --path <absolute checkout> -m "<msg>" -- <paths>`
+   (run from another repository without `--path`, it refuses `checkout_not_a_source`): on a managed worktree it
    commits only those paths under the commit lock (`committed_local`) and the
    owner publishes them on its next Git publish. Pages can also go through
    `put_page`, `edit_page`, `remember` or `capture`. CLI calls go through
@@ -266,9 +412,19 @@ commits come in. Four rules keep that checkout able to move:
    `git log --format='%h %an %ad %s' @{upstream}..HEAD` lists the stray
    commits. Fix that writer first, then, after the user agrees, publish the
    stray commits merged with the upstream
-   (`gbrain git commit-push --push-only --keep-checkout --path <checkout>`)
+   (`gbrain git commit-push --push-only --keep-checkout --scan-secrets --path <checkout>`)
    and retry the refresh, as the [refusal](write-refusals.md#refresh_diverged)
-   says. Never force the checkout.
+   says. Never force the checkout. When local commits there are expected
+   (automations committing alongside a sibling checkout that pushes the same
+   branch), each refresh runs that publish itself when the worktree's Git durability is
+   on (`sources.refresh_publish_diverged` unset; `false` turns it off, `true` publishes
+   with durability off too), after scanning the local commits for secrets
+   ([live sync](live-sync.md)); it never publishes over a rewritten upstream.
+   `gbrain sources git-reconcile` runs that publish for every source checkout
+   on the host, and autopilot runs it each tick. To keep one source's local
+   commits on this machine while it still syncs, set
+   `sources.auto_reconcile.source.<id> false`; `set-sync off` (below) stops
+   its sync as well.
 3. **Stop syncing a source before rewriting its history.** Before a
    force-push or `git filter-repo`, run `gbrain sources set-sync <id> off`
    (with the user's agreement) so automatic sync skips it, and
@@ -299,6 +455,9 @@ untouched and nothing is pushed. The error names the files, the local and
 remote commits (in its `detail`), and a question to relay to the user. Until it
 is resolved, every later commit-push from this checkout hits the same
 conflict, even for other files, because the unpushed commit is still waiting.
+A conflict reported by a scanned publish (a Git effect's push, a refresh
+publish) comes only after the secret scan of what the local commits add to the
+remote's current tip passed, and its resolve command keeps `--scan-secrets`.
 
 One kind of conflict settles itself on push. When the remote's version of a
 file is one this checkout already had at that path and later replaced with
@@ -543,6 +702,99 @@ A person who needs a plain commit once bypasses it for that one command:
 GBRAIN_COMMIT_GUARD=off git commit -m "fix the README by hand" -- README.md
 ```
 
+<a id="owner-path-guard"></a>
+### Owner-path guard (managed worktrees)
+
+`gbrain git guard --install` refuses a managed canonical worktree. Its owner
+installs the guard there with
+`gbrain sources guard <source> --install [--mode enforce]` instead. It runs
+only on the source's owner host (any other host is refused
+`permission_denied`), under the worktree's writer lock, from the trusted local
+CLI. The hook goes in a hooks directory private to that worktree
+(`<worktree git dir>/gbrain-hooks`), and only that worktree's
+`core.hooksPath` points at it (`git config --worktree`; gbrain enables
+`extensions.worktreeConfig` when the repository has linked worktrees), so a
+person's own linked checkout of the same repository keeps its hooks. It refuses,
+changing nothing, when another tool's hook lives at the worktree's current
+hooks path.
+
+`--mode enforce` also refuses cherry-pick, revert, rebase and sequencer
+commits: in a managed worktree only the owner commits. The owner's writers
+pass unchanged: the effect worker commits with an empty hooks directory, page
+writes through the door and the in-memory merges are plumbing that runs no
+commit hook, sync's auto-init turns hooks off, `commit-push` names the commit
+lock it holds, and a refresh fast-forward runs no commit hook.
+`gbrain sources guard <source> --status` prints whether it is installed, its
+mode and the effective hooks path; `--uninstall` removes it. A worktree added
+later with `git worktree add` inherits the hooks path (git copies
+`config.worktree`); the guard lets its commits through, and
+`git config --worktree --unset core.hooksPath` in that worktree restores its
+own hooks.
+
+A writer that turns hooks off itself (`git -c core.hooksPath=/dev/null commit`)
+is not stopped by any hook. The [commit ledger](#commit-ledger) names it.
+
+<a id="commit-ledger"></a>
+## Commit ledger
+
+Every commit gbrain makes is appended as one JSON line to
+`<git common dir>/gbrain/commit-ledger.jsonl`: the sha, the writer
+(`commit_push`, `door`, `merge`, `replay`, `effect`, `sync_init`,
+`workspace_push`, `bootstrap`, `hosted_repo`), the worktree, ref, pid and host.
+The file sits inside `.git`, so it is never tracked, and every worktree of the
+repository shares it. Appends take their own lock
+(`commit-ledger.lock` beside it) for microseconds, never while git runs. The
+first append writes a `start` line; at 4 MiB the file rotates to
+`commit-ledger.1.jsonl` (one previous file is kept). A `git commit` gbrain runs
+writes an `intent` line first (the HEAD before it and the message's sha256)
+and the commit line after; a plumbing commit is recorded before its ref moves.
+A failed append never fails the commit: gbrain logs it once, and doctor then
+reports that commit as foreign. Nothing reads or writes the ledger in a
+repo-less brain.
+
+<a id="foreign-writers"></a>
+## Foreign writers (doctor `foreign_writers`)
+
+`gbrain doctor --only foreign_writers` reads every registered source checkout
+on this host, managed worktrees included, once per repository. It is read-only.
+
+- **Foreign commits.** It reads the reflogs of local ref moves (`logs/HEAD`,
+  `logs/refs/heads/*` and each linked worktree's `HEAD` log). A commit created
+  here (`commit`, `--amend`, cherry-pick, revert, rebase or `pull --rebase`
+  picks, `am`, or an `update-ref` after `commit-tree`) that the ledger does not
+  name was made by another writer. Merges, fast-forwards, pulls, resets,
+  checkouts, branch moves and clones are not commits made here. Each is
+  labelled `plain`, `amend`, `rewrite` or `plumbing`; a plain commit made while
+  the enforce guard was installed reads `plain (guard bypassed)`. Any foreign
+  commit fails the check, naming the newest one:
+  `Commit <sha12> (<kind>, "<subject>", <time>) in <checkout> was not made by
+  gbrain; route that writer through gbrain git commit-push or a page write`.
+  An older gbrain co-installed on the host (one without the commit ledger)
+  also reads as a foreign writer; a foreign commit whose message carries a
+  `gbrain-*:` trailer is flagged `gbrain_trailer` and named as possibly that,
+  but still fails, since a trailer alone proves nothing.
+  Ask the user which job makes such commits before changing anything.
+- **Covered window.** Reflog entries older than the ledger's start (or its
+  oldest retained line after rotation) are reported as uncovered, never
+  foreign. A repository gbrain has not committed in yet has an empty window.
+- **Unconfirmed commits.** A commit whose parent and message match an open
+  intent within 60 seconds (gbrain crashed between `git commit` and the
+  ledger line) is a warning and is never written back to the ledger.
+- **Dirty page files.** Untracked and modified files under the source roots
+  are listed by age (their mtime), leaving out files gbrain is about to commit
+  (a queued or running git effect, or the write-through pending ledger). Files
+  older than 30 minutes warn.
+
+The JSON (`details`) carries the window per repository, every foreign commit
+(sha, kind, ref, time, subject, committer), the unconfirmed ones, ref moves it
+could not read, and at most 20 dirty files with the total count. Whatever the
+scan could not read leaves it partial (a warning) with the reasons in
+`partial_reasons`: a root inside a Git checkout that git cannot read, source
+roots past the 50-root cap, an unreadable ledger, a `git status` that failed
+or timed out (it gets up to 30 s within doctor's budget), or doctor's budget
+running out. A brain with no Git checkout reports `not_applicable`; a scan
+that skipped a root never does.
+
 ## Limits
 
 - **Two agents editing the same file at the same time still conflict.** The
@@ -564,9 +816,10 @@ GBRAIN_COMMIT_GUARD=off git commit -m "fix the README by hand" -- README.md
   [source root](#source-roots) recorded, gbrain refuses to publish one that
   reaches outside it. `gbrain doctor` reports such unpushed commits
   (`commits_outside_source_root`), a checkout behind its upstream for over an
-  hour (`checkout_lagging`), pending or long-staged files (`dirty_age`), and
+  hour (`checkout_lagging`), pending or long-staged files (`dirty_age`),
   local versions the opt-in [quarantine](#quarantine) parked
-  (`quarantined_changes`).
+  (`quarantined_changes`), and every commit gbrain did not make
+  ([`foreign_writers`](#foreign-writers)).
 - **No page-aware merge.** Two edits to the same page meet as a text conflict;
   a merge driver that understands page sections is a planned follow-up.
 

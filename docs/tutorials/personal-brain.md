@@ -97,6 +97,8 @@ AlphaClaw is the setup harness that manages OpenClaw deployment.
 
 Render will build a Docker container with the harness. First deploy takes about 5 minutes.
 
+**Known issue (October 2026).** On a fresh deploy with AlphaClaw 0.9.37 and OpenClaw 2026.10.x, onboarding can loop on `AUTH_PROFILE_MIGRATION_REQUIRED` and the gateway never starts. The fix is on OpenClaw's main branch ([openclaw/openclaw#187903](https://github.com/openclaw/openclaw/issues/187903)) and ships in its next release; until then, follow that issue.
+
 **Memory matters.** If the instance runs out of memory during install, upgrade to Render Pro. The base tier is too small for GBrain + OpenClaw together. My production instance runs 48 cores and 64GB RAM (about $1,500 a month) but that's overkill for a new setup. Pro tier ($85 a month) is the minimum viable.
 
 ---
@@ -157,13 +159,15 @@ In the Supabase dashboard, click **Connect** in the top navigation bar, then **C
 You want the **Transaction pooler** string. Format looks like:
 
 ```
-postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres
+postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres?sslmode=require
 ```
+
+Keep the `?sslmode=require` on the end. It makes the connection encrypted, which gbrain requires for any database that isn't on your own machine (it adds it for you if you leave it off). It does not check the server's certificate, though. To check it too, download Supabase's CA certificate (**Project Settings → Database → SSL Configuration**), set `NODE_EXTRA_CA_CERTS` to its path in `~/.gbrain/env`, and use `?sslmode=verify-full` instead ([details](../ENGINES.md#tls-for-postgres-connections)).
 
 Configure it via:
 
 ```bash
-gbrain config set database_url "postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres"
+gbrain config set database_url "postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
 ```
 
 This writes `~/.gbrain/config.json` (file-plane routed) and infers
@@ -179,7 +183,7 @@ Two ways to fix it. The free one first:
 **Free: point GBrain's direct connection at the Session pooler.** The session pooler is the same Supavisor host on port 5432, and it's IPv4. Copy the **Session pooler** string from the same **Connect → Connection String** panel and set it as the direct-connection override:
 
 ```bash
-export GBRAIN_DIRECT_DATABASE_URL="postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+export GBRAIN_DIRECT_DATABASE_URL="postgresql://postgres.YOUR-PROJECT:YOUR-PASSWORD@aws-0-us-west-1.pooler.supabase.com:5432/postgres?sslmode=require"
 ```
 
 Now both pools — reads on the transaction pooler (6543), DDL and locks on the session pooler (5432) — run over IPv4 at zero extra cost.

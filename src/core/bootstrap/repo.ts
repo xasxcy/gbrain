@@ -38,6 +38,8 @@ import { invalidateBackupStatus } from '../backup/status-file.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { defaultRunner, isProxyBlocked403, parseGithubOwnerRepo, type ExecRunner } from '../repo-visibility.ts';
 import { detectExecutionEnvironment } from '../execution-env.ts';
+import { stagedScanPublishRefusal } from '../git/range-secret-scan.ts';
+import type { OperationError } from '../ops/contract.ts';
 import { loadWorkspaceAllowlist, scanFiles, SCAN_ALLOW_FILENAME, type SecretFinding } from '../secret-scan.ts';
 import { SECRET_SCAN_REFUSAL_DOCS } from '../workspace-push.ts';
 import { shellQuote } from '../mcp-registration.ts';
@@ -52,6 +54,7 @@ import {
   type ManifestState,
 } from './format.ts';
 import { BootstrapError } from './lock.ts';
+import { recordCommitAsync, recordIntentAsync } from '../git/commit-ledger.ts';
 
 // ---------------------------------------------------------------------------
 // Exec seam (shared by uninstall.ts; the dispatcher passes the real runner)
@@ -440,7 +443,7 @@ function secretScanOrThrow(workspaceDir: string, relFiles: string[]): void {
  * scan (NEVER bypassed), commits. No-op when a commit already exists and the
  * tree is clean.
  */
-async function ensureWorkspaceCommit(runner: ExecRunner, workspaceDir: string): Promise<void> {
+export async function ensureWorkspaceCommit(runner: ExecRunner, workspaceDir: string): Promise<void> {
   const head = await runner(['git', '-C', workspaceDir, 'rev-parse', '--verify', 'HEAD']);
   const hasCommit = head.code === 0;
   const statusRes = await runner(['git', '-C', workspaceDir, 'status', '--porcelain']);
@@ -478,12 +481,17 @@ async function ensureWorkspaceCommit(runner: ExecRunner, workspaceDir: string): 
     );
   }
 
+  await recordIntentAsync(workspaceDir, { writer: 'bootstrap', head_before: hasCommit ? head.stdout.trim() || null : null, message: 'gbrain: bootstrap workspace' });
   const commit = await runner(['git', '-C', workspaceDir, 'commit', '-m', 'gbrain: bootstrap workspace']);
   if (commit.code !== 0 && !hasCommit) {
     throw new BootstrapError(
       'REPO_CREATE_FAILED',
       `git commit failed before the first push: ${commit.stderr.trim() || `exit ${commit.code}`}`,
     );
+  }
+  if (commit.code === 0) {
+    const sha = await runner(['git', '-C', workspaceDir, 'rev-parse', 'HEAD']);
+    if (sha.code === 0) await recordCommitAsync(workspaceDir, { sha: sha.stdout.trim(), writer: 'bootstrap' });
   }
 }
 
@@ -555,6 +563,7 @@ async function ensureRemoteHasWorkspace(
   workspaceDir: string,
   owner: string,
   name: string,
+  scan: HistoryScan,
 ): Promise<void> {
   const branch = await currentBranch(runner, workspaceDir);
   const ls = await runner(['git', '-C', workspaceDir, 'ls-remote', '--heads', 'origin', branch]);
@@ -564,7 +573,8 @@ async function ensureRemoteHasWorkspace(
   await ensureWorkspaceCommit(runner, workspaceDir);
   const pushBranch = await currentBranch(runner, workspaceDir);
   await assertOriginMatches(runner, workspaceDir, owner, name);
-  const push = await runner(['git', '-C', workspaceDir, 'push', '-u', 'origin', pushBranch]);
+  await assertHistoryPublishable(runner, workspaceDir, pushBranch, scan);
+  const push = await runner(['git', '-C', workspaceDir, 'push', '-u', 'origin', pushBranch, '--no-follow-tags', '--recurse-submodules=no']);
   if (push.code !== 0) {
     throw new BootstrapError(
       'REPO_CREATE_FAILED',
@@ -583,6 +593,35 @@ export interface CreatePrivateRepoOptions {
   runner?: ExecRunner;
   /** The gbrain home holding the install receipt (default: configDir()). */
   gbrainHomeDir?: string;
+  /** The refusal for publishing `target` and its whole history (default: the range secret scan; a seam for runner fakes). */
+  scanHistory?: HistoryScan;
+  /** The whole-history scan's time budget (`--scan-timeout`; default 300 s). */
+  scanTimeoutMs?: number;
+}
+
+type HistoryScan = (workspaceDir: string, target: string) => OperationError | null;
+const scanWholeHistory = (timeoutMs?: number): HistoryScan => (workspaceDir, target) => stagedScanPublishRefusal(workspaceDir, '', target,
+  { timeoutMs, progress: line => process.stderr.write(`[gbrain] ${line}\n`), retryArgv: ['gbrain', 'bootstrap', 'repo'] });
+
+/**
+ * #8902: a first push publishes the branch's whole history, including commits a script made with plain `git commit`
+ * that the staged scan never saw, so the commit about to be pushed is scanned with all of its history; a finding or
+ * an unreadable history refuses (publish_secret_found / publish_scan_unreadable) and nothing leaves the machine.
+ */
+async function assertHistoryPublishable(runner: ExecRunner, workspaceDir: string, branch: string, scan: HistoryScan): Promise<void> {
+  const tip = async () => {
+    const ref = await runner(['git', '-C', workspaceDir, 'rev-parse', '--verify', `refs/heads/${branch}^{commit}`]);
+    if (ref.code !== 0) {
+      throw new BootstrapError('REPO_CREATE_FAILED', `could not read branch ${branch} before the first push: ${ref.stderr.trim() || `exit ${ref.code}`} — nothing was pushed`);
+    }
+    return ref.stdout.trim();
+  };
+  const scanned = await tip();
+  const refusal = scan(workspaceDir, scanned);
+  if (refusal) throw refusal;
+  if (await tip() !== scanned) {
+    throw new BootstrapError('REPO_CREATE_FAILED', `branch ${branch} moved while its history was scanned — nothing was pushed; re-run \`gbrain bootstrap repo\``);
+  }
 }
 
 export interface CreatePrivateRepoResult {
@@ -615,6 +654,7 @@ export async function createPrivateRepo(
 ): Promise<CreatePrivateRepoResult> {
   const runner = opts.runner ?? defaultRunner;
   const gbrainHomeDir = opts.gbrainHomeDir ?? configDir();
+  const scan = opts.scanHistory ?? scanWholeHistory(opts.scanTimeoutMs);
 
   // Gate 1: gh on PATH. Exit-code-2 semantics — the human installs gh.
   const ghVersion = await runner(['gh', '--version']);
@@ -719,7 +759,7 @@ export async function createPrivateRepo(
     // [FIX3] Don't report success on an empty remote — a prior run may have set
     // origin but failed to push. Verify the remote has our branch; complete the
     // (scan-gated) push if it doesn't.
-    await ensureRemoteHasWorkspace(runner, workspaceDir, parsed.owner, parsed.name);
+    await ensureRemoteHasWorkspace(runner, workspaceDir, parsed.owner, parsed.name, scan);
     // Record repo_url AFTER a successful push (clears pending): recording before
     // push let a push failure look "done" to `bootstrap status` (repo_url
     // present), so a re-run skipped the repo phase and never pushed the workspace.
@@ -810,7 +850,8 @@ export async function createPrivateRepo(
   const branch = await currentBranch(runner, workspaceDir);
   // [FIX4] Bind the verified privacy result to the actual push target.
   await assertOriginMatches(runner, workspaceDir, login, name);
-  const push = await runner(['git', '-C', workspaceDir, 'push', '-u', 'origin', branch]);
+  await assertHistoryPublishable(runner, workspaceDir, branch, scan);
+  const push = await runner(['git', '-C', workspaceDir, 'push', '-u', 'origin', branch, '--no-follow-tags', '--recurse-submodules=no']);
   if (push.code !== 0) {
     throw new BootstrapError(
       'REPO_CREATE_FAILED',

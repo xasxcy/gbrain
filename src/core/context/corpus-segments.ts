@@ -134,6 +134,13 @@ export function seatFileName(sessionId: string): string {
   return `${safeIdComponent(sessionId)}${SEAT_SIDECAR_SUFFIX}`;
 }
 
+/** #8064 per-session speaker sidecar (context/session-speaker.ts owns its content): present only for agent-launched sessions. */
+export const SPEAKER_SIDECAR_SUFFIX = '.speaker.json';
+
+export function speakerFileName(sessionId: string): string {
+  return `${safeIdComponent(sessionId)}${SPEAKER_SIDECAR_SUFFIX}`;
+}
+
 /** #6268: the per-session source record in the spool (context/corpus-source.ts owns its content and lock). */
 export const SESSION_SOURCE_SUFFIX = '.source.json';
 export const SESSION_SOURCE_LOCK_SUFFIX = '.source.lock';
@@ -717,6 +724,11 @@ export function corpusFileAwaitsExtraction(full: string, name: string): boolean 
 export const CORPUS_FAILURE_SUFFIX = '.failures.json';
 /** Failed attempts after which a window is not retried until an operator retry or one extraction-config change. */
 export const CORPUS_WINDOW_FAILURE_CAP = 5;
+/**
+ * #9279: failure codes no retry on the same build can change (the write refuses the same way every time). One such
+ * failure stops the window at once; the first sweep on another gbrain build retries it once; retention keeps the file.
+ */
+export const CORPUS_DETERMINISTIC_FAILURE_CODES: readonly string[] = ['page_body_segmented'];
 
 export interface CorpusFailureRecord {
   version: 1;
@@ -732,6 +744,12 @@ export interface CorpusFailureRecord {
   fingerprint: string | null;
   /** True once a fingerprint change re-armed a capped window; a second change does not. */
   rearmed: boolean;
+  /** #9279: the gbrain version that recorded a deterministic failure (CORPUS_DETERMINISTIC_FAILURE_CODES). */
+  build?: string;
+  /** #9279: true once the automatic retry on a newer build ran; only an operator retry runs the window after that. */
+  upgrade_retried?: boolean;
+  /** #9279: true once a deterministic failure held the window; retention keeps its file until it commits or an operator retries it. */
+  held?: boolean;
 }
 
 /** The failure record, or null when absent or unparseable. Never throws. */
@@ -741,11 +759,19 @@ export function readCorpusFailure(full: string): CorpusFailureRecord | null {
     if (!r || r.version !== 1 || typeof r.key !== 'string' || !Number.isSafeInteger(r.count) || r.count < 1
       || !Number.isFinite(r.last_at) || !Number.isFinite(r.first_at) || typeof r.last_code !== 'string'
       || !(r.source_incarnation === null || typeof r.source_incarnation === 'string')
-      || !(r.fingerprint === null || typeof r.fingerprint === 'string') || typeof r.rearmed !== 'boolean') return null;
+      || !(r.fingerprint === null || typeof r.fingerprint === 'string') || typeof r.rearmed !== 'boolean'
+      || !(r.build === undefined || typeof r.build === 'string')
+      || !(r.upgrade_retried === undefined || typeof r.upgrade_retried === 'boolean')
+      || !(r.held === undefined || typeof r.held === 'boolean')) return null;
     return r;
   } catch {
     return null;
   }
+}
+
+/** #9279: a window stopped by a deterministic failure: its file is never extracted until a retry, so retention keeps it. */
+export function corpusFailureHeld(record: CorpusFailureRecord | null): boolean {
+  return !!record && (record.held === true || (record.count >= CORPUS_WINDOW_FAILURE_CAP && CORPUS_DETERMINISTIC_FAILURE_CODES.includes(record.last_code)));
 }
 
 /** Every corpus `.txt` in `dir` with a failure record. Missing dir = empty; never throws. */
@@ -772,11 +798,13 @@ export interface CorpusBacklog {
   oldestPendingMtimeMs: number | null;
   /** Pending files older than retention: kept only by the un-ingested rule, deleted at the ceiling. */
   pastRetention: number;
+  /** #9279: pending files past retention held by a deterministic failure: kept past the ceiling (corpusFailureHeld). */
+  held: number;
 }
 
 /** Count corpus turn files still waiting for extraction. Missing dir = empty backlog; never throws. */
 export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()): CorpusBacklog {
-  const backlog: CorpusBacklog = { pending: 0, oldestPendingMtimeMs: null, pastRetention: 0 };
+  const backlog: CorpusBacklog = { pending: 0, oldestPendingMtimeMs: null, pastRetention: 0, held: 0 };
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -795,7 +823,10 @@ export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()
     }
     backlog.pending++;
     if (backlog.oldestPendingMtimeMs === null || mtimeMs < backlog.oldestPendingMtimeMs) backlog.oldestPendingMtimeMs = mtimeMs;
-    if (mtimeMs < now - retentionMs) backlog.pastRetention++;
+    if (mtimeMs < now - retentionMs) {
+      backlog.pastRetention++;
+      if (corpusFailureHeld(readCorpusFailure(join(dir, name)))) backlog.held++;
+    }
   }
   return backlog;
 }
@@ -805,8 +836,8 @@ export function corpusBacklog(dir: string, retentionMs: number, now = Date.now()
  * 'done' or 'legacy') goes at `retentionMs`; one nothing has finished
  * extracting (no sidecar, a non-terminal skip such as `chat_unavailable`
  * #6786, windows still pending, or rewritten since) stays until
- * `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1).
- * Best-effort per file; never throws.
+ * `CORPUS_UNINGESTED_RETENTION_FACTOR` x `retentionMs` (E-N1); one held by a deterministic failure
+ * (corpusFailureHeld, #9279) is never extracted until a retry, so it stays. Best-effort per file; never throws.
  */
 export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.now()): void {
   try {
@@ -816,8 +847,9 @@ export function gcCorpusTurnFiles(dir: string, retentionMs: number, now = Date.n
       try {
         const age = now - statSync(p).mtimeMs;
         if (age <= retentionMs) continue;
-        const ageLimit = corpusFileFinished(corpusFileCompletion(p, name)) ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
-        if (age > ageLimit) rmSync(p, { force: true });
+        const finished = corpusFileFinished(corpusFileCompletion(p, name));
+        const ageLimit = finished ? retentionMs : retentionMs * CORPUS_UNINGESTED_RETENTION_FACTOR;
+        if (age > ageLimit && (finished || !corpusFailureHeld(readCorpusFailure(p)))) rmSync(p, { force: true });
       } catch {
         /* per-file best effort */
       }
@@ -853,7 +885,7 @@ export function gcCorpusArtifacts(
     for (const name of names) {
       const p = join(dir, name);
       try {
-        const perSession = [SEAT_SIDECAR_SUFFIX, SESSION_SOURCE_SUFFIX].find((suffix) => name.endsWith(suffix));
+        const perSession = [SEAT_SIDECAR_SUFFIX, SPEAKER_SIDECAR_SUFFIX, SESSION_SOURCE_SUFFIX].find((suffix) => name.endsWith(suffix));
         if (perSession) {
           if (!liveSessions.has(name.slice(0, -perSession.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
             rmSync(p, { force: true });

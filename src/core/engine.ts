@@ -6,6 +6,8 @@ import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './sea
 import type { KeywordPageWindow } from './search/keyword-statement.ts';
 import type { EmbeddingState, EmbeddingStateCounts, EmbeddingStateRow } from './embedding-state.ts';
 import type { DerivedLinkBatchItem, DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
+import type { FindPagesQuery, FoundPages } from './page-find.ts';
+import type { PageCountQuery, PageCounts, TypeGrouper } from './page-counts.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
 import type {
   Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
@@ -464,6 +466,9 @@ export interface TakeHit {
   kind: TakeKind;
   holder: string;
   weight: number;
+  since_date: string | null;
+  until_date: string | null;
+  source: string | null;
   score: number;            // search rank score (ts_rank for keyword, 1-cos_dist for vector)
 }
 
@@ -683,6 +688,8 @@ export interface FactRow {
   /** #5575: the stored trust tier and write origin (absent on brains before the trust migration). */
   trust_tier?: import('./trust/tier.ts').TrustTier;
   write_origin?: Record<string, unknown> | null;
+  /** The typed claim columns (NewFact.claim_*), each set only when the row stores it. */
+  claim_metric?: string | null; claim_value?: number | null; claim_unit?: string | null; claim_period?: string | null;
 }
 
 /**
@@ -801,8 +808,8 @@ export interface FactListOpts {
   excludePrivate?: boolean;
 }
 
-/** FactListOpts plus the entity the recall cursor reads (listFactsSince, listFactsKeyset) narrow to before LIMIT. */
-export type RecallFactReadOpts = FactListOpts & { entitySlug?: string };
+/** FactListOpts plus the entity (and the page the fact sits on) listFactsSince and listFactsKeyset narrow to before LIMIT. */
+export type RecallFactReadOpts = FactListOpts & { entitySlug?: string; sourceMarkdownSlug?: string };
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
 export interface FactsHealth {
@@ -880,6 +887,7 @@ export interface TrajectoryOpts {
 export interface TrajectoryPoint {
   fact_id: number;
   valid_from: Date;
+  valid_until: Date | null;
   metric: string | null;
   value: number | null;
   unit: string | null;
@@ -929,6 +937,8 @@ export interface BrainEngine {
    */
   reconnect(ctx?: { error?: unknown }): Promise<void>;
   initSchema(): Promise<void>;
+  /** GBRA-467: run `fn` under the cross-process schema migration lock; callers use schema-migration-lock.ts. */
+  holdSchemaMigrationLock?<T>(fn: (assertHeld: () => Promise<void>) => Promise<T>): Promise<T>;
   transaction<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
   /** Short control transaction on the existing direct route; honors nested transaction scope. */
   transactionDirect<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
@@ -1028,6 +1038,9 @@ export interface BrainEngine {
    * the sync loop falls back to per-slug `deletePage` to log unrecoverable
    * failures to `failedFiles`). `gbrain sync` calls this on EVERY run that
    * sees a deleted file — it is NOT admin-only.
+   *
+   * Unlike `deletePages` it scrubs nothing else: the page purge, its main
+   * caller, scrubs those stores itself and records them in its receipt.
    */
   deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
   /**
@@ -1048,7 +1061,13 @@ export interface BrainEngine {
    * phases don't waste lookups on phantom slugs (paths that were in the
    * deletion list but had no DB row).
    *
-   * ATOMICITY: one statement, one transaction. The whole batch commits or
+   * #9068: in the same transaction, after the delete, it scrubs the rows
+   * that name a deleted page outside any foreign key: retrieval_event_pages,
+   * retrieval_event_links, retrieval_feedback, retrieval_weights,
+   * context_volunteer_events, mention_gazetteer_entries and the slug in
+   * eval_candidates.retrieved_slugs (scrubPurgedSlugs, scrubPurgedNameStores).
+   *
+   * ATOMICITY: one transaction. The whole batch commits or
    * the whole batch rolls back. Coarser than the per-row `deletePage`
    * cadence — a mid-loop abort or transient connection failure can roll
    * back up to `DELETE_BATCH_SIZE - 1` successful deletes from the
@@ -1137,7 +1156,7 @@ export interface BrainEngine {
    * cutoff arithmetic, same DB `now()` clock source) instead of the DELETE,
    * so the preview and a subsequent real run agree up to whatever crosses
    * the cutoff (or is soft-deleted/restored) between the two statements.
-   * Dry-run responses additionally carry `pages` (slug + deleted_at) for
+   * Dry-run responses additionally carry `pages` (slug, source_id, deleted_at) for
    * display; the destructive path leaves `pages` undefined.
    * `opts.excludeIds` keeps those page ids out of both (GBRA-130 A-49: the
    * tombstones the unmanaged belief-ledger expiry failed or parked).
@@ -1145,12 +1164,16 @@ export interface BrainEngine {
   purgeDeletedPages(
     olderThanHours: number,
     opts?: { dryRun?: boolean; excludeIds?: number[] },
-  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date }[] }>;
+  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; source_id: string; deleted_at: Date }[] }>;
   /**
    * v0.26.5: by default `listPages` excludes soft-deleted rows. Set
    * `filters.includeDeleted: true` to surface them.
    */
   listPages(filters?: PageFilters): Promise<Page[]>;
+  /** #7191: live pages whose slug, source path or title matches a find pattern (SQL in engine-sql/page-lookup.ts). */
+  findPages(query: FindPagesQuery): Promise<FoundPages>;
+  /** #7191: live page counts per (source, type), with distinct-slug totals per type group when `groupTypes` is set. */
+  countPagesBy(query: PageCountQuery, groupTypes?: TypeGrouper): Promise<PageCounts>;
   /**
    * Fuzzy slug resolver.
    *
@@ -1536,7 +1559,7 @@ export interface BrainEngine {
    * `attendance` (#5761) excludes or selects pages whose attendance marker
    * equals their current knowledge revision.
    */
-  countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only' }): Promise<number>;
+  countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only'; wantedProducers?: readonly string[] }): Promise<number>;
   /**
    * List a keyset page (ordered by `id`, `id > afterPageId`) of stale pages
    * WITH their content so the caller extracts without an N+1 `getPage`. Same
@@ -1550,6 +1573,7 @@ export interface BrainEngine {
     sourceId?: string;
     versionTs?: string;
     held?: 'exclude';
+    wantedProducers?: readonly string[];
   }): Promise<StalePageRow[]>;
   /**
    * Stamp `links_extracted_at` for a batch of pages keyed on the unique
@@ -1930,7 +1954,7 @@ export interface BrainEngine {
   findOrphanPages(opts?: PageReadScope & {
     sourceId?: string;
     sourceIds?: string[];
-    mode?: 'inbound' | 'islanded';
+    mode?: 'inbound' | 'islanded'; scopeInbound?: boolean;
   }): Promise<Array<{
     slug: string;
     title: string;
@@ -2488,13 +2512,13 @@ export interface BrainEngine {
    * embeddings; recency fallback otherwise. `arm: 'keyword'` ranks the same
    * bucket by full-text rank instead (C2 `facts.candidate_fusion`).
    * `attributedTo` (the new fact's speaker) drops rows a different known
-   * speaker asserted before the k cap, in every arm; NULL rows stay candidates.
+   * speaker asserted before the k cap, in every arm; NULL rows stay candidates; `excludeMemberPages` drops member pages.
    */
   findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null; excludeMemberPages?: boolean; onlyPage?: string },
   ): Promise<FactRow[]>;
 
   /**
@@ -2561,8 +2585,8 @@ export interface BrainEngine {
    * without it the bare-slug lookup snapshots whichever row Postgres returns
    * first when the slug exists across multiple sources.
    */
-  /** `preimage` (#5984): the caller's own read of the page under its page guard in this transaction; versioned without a re-read. */
-  createVersion(slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot }): Promise<PageVersion>;
+  /** `preimage` (#5984): the caller's own read of the page under its page guard in this transaction; versioned without a re-read. `reason`/`historyGap` (GBRA-217, sync imports): the snapshot's change reason and the page's history-gap marker. */
+  createVersion(slug: string, opts?: { sourceId?: string; preimage?: PageSnapshot } & import('./page-state/versions.ts').VersionHistory): Promise<PageVersion>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the page-id lookup.
    * When omitted, returns versions for every same-slug page across sources

@@ -51,7 +51,7 @@ enforced structurally by actionlint on every workflow change.
   fetched over TLS; it does NOT independently verify the attestation's Sigstore
   signature (the Fulcio certificate chain or Rekor inclusion).
 - **From-source and pinned-tag installs remain trust-on-first-use.**
-  `bun install -g github:garrytan/gbrain#latest-stable` follows a force-moved
+  `bun install -g github:garrytan/gbrain#stable` follows a force-moved
   tag, and the `codex-plugin` branch / template repo are force-published; these
   paths trust TLS + GitHub without an independent integrity check. From-source
   installs also serve the committed `admin/dist` bundle (devDeps for a fresh
@@ -81,6 +81,42 @@ one-line warning when it finds a top-level `preload` there, but it cannot
 undo it. Only the compiled binary ignores a cwd `bunfig.toml`; run script-mode
 gbrain from directories you control, or use the release binary in untrusted
 checkouts.
+
+Hooks are the exception gbrain closes itself, because a harness runs them in
+the session's directory with nothing for you to approve. Every hook that
+`gbrain setup claude-code|codex` writes (the read-context and capture hooks,
+and the per-turn rule hook that `--instructions-only`, `gbrain connect
+--install` and `gbrain bootstrap harness` add) starts gbrain through
+`<gbrain config dir>/hook-launcher/gbrain-hook`. That launcher is a small
+POSIX `sh` script: it records the session directory in `GBRAIN_HOOK_CWD`,
+changes into its own directory and starts gbrain there, so Bun never reads the
+session directory's `bunfig.toml` or `.env`. Its directory holds only the
+launcher; if anything else appears there, the launcher refuses to start gbrain
+and prints one line to stderr. `gbrain post-upgrade` moves hooks written
+before the launcher onto it (for `gbrain setup codex`'s hooks it prints the
+setup command instead, since that rewrite re-trusts them), `gbrain setup`
+rewrites them on its next run, and
+`gbrain doctor` (`harness_wiring`, code `hook_session_cwd`) flags any that are
+left. The stdio MCP server gets the same treatment, since the harness starts
+it in the session's directory too (#8426): `gbrain setup` and `gbrain
+bootstrap hooks` register `command: <hook launcher>`, `args: [<gbrain>, serve,
+…]`, and `gbrain serve` reads `.gbrain-source` and the upload root from
+`GBRAIN_HOOK_CWD` without changing its own directory. So do the hooks from
+`gbrain bootstrap hooks`, `gbrain bootstrap harness` and its Codex
+`SessionEnd` capture, and the gbrain plugins' per-turn hook, whose
+`.agents/gbrain-launcher` changes into the plugin directory first (#8428).
+`gbrain post-upgrade` rewrites only a user-scope `gbrain setup claude-code`
+MCP entry setup still owns, under setup's lock; every Codex entry and every
+`gbrain bootstrap` entry is named with the command that rewrites it, because
+those writers re-trust Codex hooks or run from the workspace. A project-scope
+`.mcp.json` and committed `.claude/settings.json` hooks belong to the
+repository and stay PATH-resolved.
+
+The hook's own git probes in the bootstrapped workspace run with
+`-c core.fsmonitor=false`, and a session anywhere other than the workspace the
+install receipt names runs no git at all (#8427): a `.git/config` from an
+extracted archive or shared folder could otherwise name a command `git status`
+runs.
 
 **The trust boundary.** Security-relevant variables are honored from your
 shell environment, from a service `EnvironmentFile`, and from
@@ -136,7 +172,8 @@ for their own subtree. This costs nothing when the working directory has no
   `GBRAIN_ALLOW_SHELL_JOBS`, `GBRAIN_ALLOW_PRIVATE_REMOTES`,
   `GBRAIN_ALLOW_UNVERIFIED_REMOTE`, `GBRAIN_GIT_ALLOW_FILE_TRANSPORT`,
   `GBRAIN_ALLOW_MASS_RECONCILE`, `GBRAIN_ALLOW_DEFAULT_WRITE`,
-  `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
+  `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`, and the stdio MCP tool
+  surface `GBRAIN_SURFACE`.
 - The variable families through which a checkout could hijack the programs
   gbrain spawns rather than gbrain itself (`CWD_DOTENV_PROTECTED_PREFIXES`,
   `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`): the `LD_*`/`DYLD_*` dynamic-loader
@@ -477,6 +514,11 @@ window):
 On exhaustion the server returns `429 Too Many Requests` with a
 `Retry-After` header.
 
+`gbrain serve --http` applies each bucket only when its env var is set
+(`GBRAIN_HTTP_RATE_LIMIT_IP=30 GBRAIN_HTTP_RATE_LIMIT_TOKEN=60` gives the
+defaults above); with neither set it does not rate-limit `/mcp`. The legacy
+bearer transport always applies the defaults.
+
 **Caveat for tunneled deployments (ngrok, Tailscale Funnel, Cloudflare
 Tunnel):** all requests share one egress IP, so the pre-auth IP bucket
 becomes effectively shared by all clients on that tunnel. The
@@ -533,8 +575,9 @@ forwarded-for headers and using the socket peer address.
 
 ### Body size cap
 
-Default 1 MiB, stream-counted (chunked transfers without
-`Content-Length` are still capped). Override:
+Default 4 MiB on `gbrain serve --http` and 1 MiB on the legacy bearer
+transport, stream-counted (chunked transfers without `Content-Length` are
+still capped). `GBRAIN_HTTP_MAX_BODY_BYTES` overrides both:
 
 ```bash
 GBRAIN_HTTP_MAX_BODY_BYTES=2097152 gbrain serve --http   # 2 MiB

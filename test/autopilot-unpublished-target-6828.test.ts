@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseSemver } from '../src/core/semver.ts';
 import { VERSION } from '../src/version.ts';
+import { writeChannelCache } from './helpers/update-cache.ts';
 
 const REPO = join(import.meta.dir, '..');
 const AUTOPILOT_TS = join(REPO, 'src', 'commands', 'autopilot.ts');
@@ -53,9 +54,9 @@ function harness(label: string, opts: { spec?: string; cache?: string } = {}): H
   writeFileSync(join(dotG, 'config.json'), JSON.stringify({
     engine: 'pglite',
     database_path: join(dotG, 'brain.pglite'),
-    self_upgrade: { mode: 'auto', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
+    self_upgrade: { mode: 'auto', channel: 'alpha', quiet_hours: { start: hour, end: (hour + 2) % 24, tz: 'UTC' } },
   }));
-  if (opts.cache) writeFileSync(join(dotG, 'last-update-check'), `${opts.cache}\n`);
+  if (opts.cache) writeChannelCache(dotG, opts.cache);
 
   const bunInstall = join(root, 'bunhome');
   const globalRoot = join(bunInstall, 'install', 'global');
@@ -148,13 +149,13 @@ async function run(h: Harness, script: string, env: Record<string, string> = {})
     ? readdirSync(auditDir).flatMap((f) => readFileSync(join(auditDir, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)))
     : [];
   const config = JSON.parse(readFileSync(join(h.home, '.gbrain', 'config.json'), 'utf8'));
-  const cachePath = join(h.home, '.gbrain', 'last-update-check');
+  const cachePath = join(h.home, '.gbrain', 'update-check.alpha.json');
   return {
     code, out, err, audit,
     su: config.self_upgrade,
     calls: readFileSync(h.argvLog, 'utf8').split('\n').filter(Boolean),
     fetched: JSON.parse(/FETCHED (.*)/.exec(out)?.[1] ?? '[]') as string[],
-    cache: existsSync(cachePath) ? readFileSync(cachePath, 'utf8').trim() : null,
+    cache: existsSync(cachePath) ? JSON.parse(readFileSync(cachePath, 'utf8')).marker : null,
     upgradeState: existsSync(join(h.home, '.gbrain', 'upgrade-state.json')),
     justUpgraded: existsSync(join(h.home, '.gbrain', 'just-upgraded-from')),
   };
@@ -171,7 +172,7 @@ describe('#6828: auto-update while master is ahead of latest-stable', () => {
     expect(tick.cache).toBe(`UP_TO_DATE ${VERSION}`);
     expect(tick.out).toContain('RETURNED');
     expect(tick.out).not.toContain('EXIT_CALLED');
-    expect(tick.calls.filter((c) => c.includes('update gbrain') || c.startsWith('gbrain upgrade'))).toEqual([]);
+    expect(tick.calls.filter((c) => c.includes('update --backend=copyfile gbrain') || c.startsWith('gbrain upgrade'))).toEqual([]);
     expect(tick.audit.some((e) => e.reason === 'swapped; exiting for supervisor relaunch')).toBe(false);
 
     const boot = await run(h, h.bootDriver);
@@ -187,7 +188,7 @@ describe('#6828: auto-update while master is ahead of latest-stable', () => {
     const h = harness('noop', { cache: `UPGRADE_AVAILABLE ${VERSION} ${MASTER_AHEAD}` });
     const tick = await run(h, h.driver, { FAKE_TARGET_VERSION: MASTER_AHEAD });
     expect(tick.code, tick.err).toBe(0);
-    expect(tick.calls).toContain('bun update gbrain');
+    expect(tick.calls).toContain('bun update --backend=copyfile gbrain');
     expect(tick.out).toContain('RETURNED');
     expect(tick.out).not.toContain('EXIT_CALLED');
     expect(tick.out).not.toContain('Upgrade complete');
@@ -201,7 +202,7 @@ describe('#6828: auto-update while master is ahead of latest-stable', () => {
     expect(tick.audit.at(-1).reason).toContain('nothing newer was installed');
 
     const again = await run(h, h.driver, { FAKE_TARGET_VERSION: MASTER_AHEAD });
-    expect(again.calls.filter((c) => c === 'bun update gbrain')).toHaveLength(1);
+    expect(again.calls.filter((c) => c === 'bun update --backend=copyfile gbrain')).toHaveLength(1);
     expect(again.su.failed_versions).toBeUndefined();
 
     const boot = await run(h, h.bootDriver);
@@ -249,7 +250,7 @@ describe('#6828 review replays', () => {
     // A directory where the receipt goes: the swap cannot write it and the channel cannot read one.
     mkdirSync(join(h.home, '.gbrain', 'swap-receipt.json'));
     const tick = await run(h, h.driver, { FAKE_TARGET_VERSION: MASTER_AHEAD });
-    expect(tick.calls).toContain('bun update gbrain');
+    expect(tick.calls).toContain('bun update --backend=copyfile gbrain');
     expect(tick.out).not.toContain('EXIT_CALLED');
     expect(tick.su.attempting_version).toBeUndefined();
     expect(tick.su.failed_versions).toBeUndefined();
@@ -262,10 +263,10 @@ describe('#6828 review replays', () => {
     const h = harness('throttle', { cache: `UPGRADE_AVAILABLE ${VERSION} ${MASTER_AHEAD}` });
     setConfig(h, { last_check_ts: Date.now() - 25 * 60 * 60 * 1000 });
     const tick = await run(h, h.driver, { FAKE_TARGET_VERSION: MASTER_AHEAD });
-    expect(tick.calls).toContain('bun update gbrain');
+    expect(tick.calls).toContain('bun update --backend=copyfile gbrain');
     setConfig(h, { last_check_ts: Date.now() - 23 * 60 * 60 * 1000 });
     const held = await run(h, h.driver, { FAKE_TARGET_VERSION: MASTER_AHEAD });
-    expect(held.calls.filter((c) => c === 'bun update gbrain')).toHaveLength(1);
+    expect(held.calls.filter((c) => c === 'bun update --backend=copyfile gbrain')).toHaveLength(1);
   }, 90_000);
 
   test('the version the install would get is checked against known-bad, not only the checked version', async () => {
@@ -273,7 +274,7 @@ describe('#6828 review replays', () => {
     const h = harness('gate-installed', { cache: `UPGRADE_AVAILABLE ${VERSION} ${MASTER_AHEAD}` });
     setConfig(h, { failed_versions: [delivered] });
     const tick = await run(h, h.driver, { FAKE_TARGET_VERSION: delivered });
-    expect(tick.calls.filter((c) => c === 'bun update gbrain')).toEqual([]);
+    expect(tick.calls.filter((c) => c === 'bun update --backend=copyfile gbrain')).toEqual([]);
     expect(tick.audit.at(-1)).toMatchObject({ action: 'known_bad', outcome: 'skipped', latest: MASTER_AHEAD });
     expect(tick.audit.at(-1).reason).toContain(delivered);
   }, 90_000);

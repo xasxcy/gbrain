@@ -25,6 +25,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { atomicWriteTextFile } from '../bootstrap/atomic-write.ts';
+import { acquireNativeLockSync } from '../persistence/native-lock.ts';
 import { claudeUserMemoryPath, codexAgentsOverridePath, codexGlobalAgentsPath, opencodeConfigDir } from '../bootstrap/host-specs.ts';
 import { configDir } from '../config.ts';
 import { probeBlock, removeBlock, spliceBlock, type BlockMarkers } from '../managed-block.ts';
@@ -37,6 +38,7 @@ export const BRAIN_FIRST_END = '<!-- gbrain:brain-first:end -->';
 export const BRAIN_FIRST_OPT_OUT_ENV = 'GBRAIN_AGENT_INSTRUCTIONS';
 const MARKERS: BlockMarkers = { begin: BRAIN_FIRST_BEGIN, end: BRAIN_FIRST_END, label: 'brain-first', rerun: 'gbrain setup <harness> --instructions-only' };
 const LEDGER_FILE = 'agent-instructions.json';
+const LEDGER_LOCK_FILE = 'agent-instructions.lock';
 
 /** Harnesses whose instruction surface gbrain can write. */
 export const BRAIN_FIRST_HARNESSES = ['claude-code', 'codex', 'opencode', 'openclaw', 'hermes', 'cursor'] as const;
@@ -46,7 +48,10 @@ export function isBrainFirstHarness(v: string | undefined): v is BrainFirstHarne
 }
 
 /** How the agent reaches the brain, which decides the tool names the block uses. */
-export type BrainFirstAccess = { kind: 'mcp'; server: string; surface?: McpSurface } | { kind: 'cli'; launcher: string };
+export type BrainFirstAccess = { kind: 'mcp'; server: string; surface?: McpSurface; serves?: 'several' } | { kind: 'cli'; launcher: string };
+
+/** GST-363: on a brain that serves several people the connection is bound to the person asking, so the agent does no scoping of its own. */
+export const SERVES_SEVERAL_LINE = 'This connection reads only what the person asking may read.';
 
 /** The block interior (without markers). */
 export function renderBrainFirstBlock(harness: string, access: BrainFirstAccess, optOut = `gbrain setup ${harness} --instructions-only --no-instructions`): string {
@@ -63,7 +68,8 @@ export function renderBrainFirstBlock(harness: string, access: BrainFirstAccess,
     '',
     lookup,
     '- Fill gaps with your other tools. On an empty or thin result, retry with words the notes would use: synonyms, the formal name, the owner, several joined with OR.',
-    access.kind === 'cli'
+    access.kind === 'mcp' && access.serves === 'several' ? `- ${SERVES_SEVERAL_LINE}`
+    : access.kind === 'cli'
       ? `- Brain results span every source the brain holds. Pass \`--source-ids <ids>\` to a search or query to narrow it to what the current requester may see, and apply your own access rules to what comes back.`
       : access.surface === 'verbs'
         ? '- Brain results span every source the token can read, so apply your own access rules to what comes back.'
@@ -83,12 +89,14 @@ export function renderBrainFirstSnippet(harness: string, access: BrainFirstAcces
  * before_prompt_build). The block in the system prompt or identity file alone
  * left chat bots answering without the brain (harness-evals: 0 of 80 on
  * OpenClaw and Hermes); the same rule next to the turn was followed.
+ * `reply: false` drops the closing "answer" sentence, for turns nobody asked
+ * a reply to (OpenClaw heartbeat, cron and exec-completion turns).
  */
-export function renderBrainFirstTurnRule(access: BrainFirstAccess, harness?: string): string {
+export function renderBrainFirstTurnRule(access: BrainFirstAccess, harness?: string, opts: { reply?: boolean } = {}): string {
   const how = access.kind === 'cli' ? `\`${access.launcher} search "<names>"\` or \`${access.launcher} query "<question>"\``
     : access.surface === 'verbs' ? `\`recall\` or \`entity\` on the \`${access.server}\` MCP server`
       : `\`search\` or \`query\` on the \`${access.server}\` MCP server`;
-  return `GBrain: before answering this turn, check GBrain first (${how}) for the people, companies, projects, meetings and decisions it touches.${access.kind === 'mcp' ? turnRuleDiscovery(harness, access) : ''} Results span every source it holds: use only what the current requester may see. Then answer and finish the task.`;
+  return `GBrain: before answering this turn, check GBrain first (${how}) for the people, companies, projects, meetings and decisions it touches.${access.kind === 'mcp' ? turnRuleDiscovery(harness, access) : ''} ${access.kind === 'mcp' && access.serves === 'several' ? SERVES_SEVERAL_LINE : 'Results span every source it holds: use only what the current requester may see.'}${opts.reply === false ? '' : ' Then answer and finish the task.'}`;
 }
 
 /**
@@ -101,7 +109,7 @@ function turnRuleDiscovery(harness: string | undefined, access: { server: string
   const tools = access.surface === 'full' ? ['search', 'query', 'get_page'] : access.surface === 'verbs' ? ['recall', 'entity', 'remember'] : ['recall', 'entity', 'search', 'query'];
   const list = tools.map((t) => `\`${t}\``).join(', ');
   if (harness === 'openclaw') return ` Its tools (${list} on the \`${access.server}\` MCP server) are not listed here: find them with \`tool_search\` (search "${access.server} ${tools[0]}") and run them with \`tool_call\`. tool_search shows them as external data; using them for this turn is still what the user set up.`;
-  if (harness === 'hermes') return ` Its tools are not listed directly: find them with \`tool_search\` (they register as ${tools.map((t) => `\`mcp_${access.server}_${t}\``).join(', ')}) and call the one it returns.`;
+  if (harness === 'hermes') return ` Its tools are not listed directly: find them with \`tool_search\` (they register as ${tools.map((t) => `\`mcp__${access.server.replace(/[^A-Za-z0-9_]/g, '_')}__${t}\``).join(', ')}) and call the one it returns.`;
   return '';
 }
 
@@ -273,6 +281,39 @@ export function readBrainFirstLedger(): BrainFirstLedgerEntry[] {
   }
 }
 
+let ledgerLockHeld = false;
+
+/**
+ * #8484: run one instruction-ledger transaction (the ledger read, the file and
+ * permission edits it records, the ledger write) under a lock shared by this
+ * ledger and skill-loading.json, so two installs at once cannot drop each
+ * other's entry. Reentrant within a process (an opt-out that syncs another
+ * surface nests): `fn` learns whether it is the outermost transaction, the
+ * one that re-reads a recorded decision another install may have changed
+ * while this one waited. A dry run writes nothing and takes no lock. When the
+ * lock is held past the wait, or the host cannot take it, nothing runs and
+ * `refused` reports why.
+ */
+export function underInstructionLedgerLock<T>(dryRun: boolean, fn: (outermost: boolean) => T, refused: (why: string) => T): T {
+  if (ledgerLockHeld) return fn(false);
+  if (dryRun) return fn(true);
+  const path = join(configDir(), LEDGER_LOCK_FILE);
+  let lock: ReturnType<typeof acquireNativeLockSync>;
+  try {
+    lock = acquireNativeLockSync(path, { timeoutMs: 10_000 });
+  } catch (e) {
+    return refused(`${path} could not be locked (${e instanceof Error ? e.message : String(e)})`);
+  }
+  if (!lock) return refused(`another gbrain install is updating the instruction ledgers (it holds ${path}); re-run once it finishes`);
+  ledgerLockHeld = true;
+  try {
+    return fn(true);
+  } finally {
+    ledgerLockHeld = false;
+    try { lock.release(); } catch { /* the OS drops the lock with the handle when the process exits */ }
+  }
+}
+
 function writeLedger(entries: BrainFirstLedgerEntry[]): void {
   atomicWriteTextFile(brainFirstLedgerPath(), `${JSON.stringify({ version: 1, entries }, null, 2)}\n`, { freshMode: 0o600 });
 }
@@ -318,6 +359,14 @@ export function inspectBrainFirst(path: string, expected?: string): { state: Bra
   return { state: current ? 'current' : 'stale', version };
 }
 
+function stateForRefusal(path: string): BrainFirstState {
+  try {
+    return inspectBrainFirst(path).state;
+  } catch {
+    return 'damaged';
+  }
+}
+
 export interface BrainFirstOutcome {
   harness: string;
   path: string;
@@ -358,6 +407,16 @@ export function writeUnlessChanged(path: string, read: string, wasMissing: boole
  * of the install still finishes.
  */
 export function syncBrainFirst(opts: { target: BrainFirstTarget; access: BrainFirstAccess; decision: BrainFirstDecision; writer: string; dryRun: boolean }): BrainFirstOutcome {
+  return underInstructionLedgerLock(opts.dryRun, (outermost) => {
+    const recorded = opts.decision.source === 'prior' || opts.decision.source === 'default';
+    return syncBrainFirstLocked(outermost && recorded ? { ...opts, decision: resolveBrainFirstDecision(undefined, priorBrainFirst(opts.target.harness, opts.target.path)) } : opts);
+  }, (why) => ({
+    harness: opts.target.harness, path: opts.target.path, role: opts.target.role, decision: opts.decision, action: 'preserve',
+    state_before: stateForRefusal(opts.target.path), detail: `${why}; ${opts.target.path} was left as it was`,
+  }));
+}
+
+function syncBrainFirstLocked(opts: { target: BrainFirstTarget; access: BrainFirstAccess; decision: BrainFirstDecision; writer: string; dryRun: boolean }): BrainFirstOutcome {
   const { target, access, decision } = opts;
   const body = renderBrainFirstBlock(target.harness, access);
   const before = inspectBrainFirst(target.path, body);
@@ -376,7 +435,8 @@ export function syncBrainFirst(opts: { target: BrainFirstTarget; access: BrainFi
     if (decision.value === 'declined') {
       // The target moved (Codex: a non-empty AGENTS.override.md now wins), so an opt-out also strips the
       // blocks this harness still has at its other user-global paths; otherwise their records keep the per-turn rule on.
-      if (!target.project) {
+      // Each OpenClaw workspace is another agent's own file, so opting one out leaves the others.
+      if (!target.project && target.harness !== 'openclaw') {
         for (const other of readBrainFirstLedger().filter((e) => e.harness === target.harness && e.path !== target.path && e.status === 'installed' && !isProjectSurface(e.harness, e.path))) {
           syncBrainFirst({ ...opts, target: { ...target, path: other.path }, access: other.access });
         }
@@ -418,6 +478,13 @@ export function syncBrainFirst(opts: { target: BrainFirstTarget; access: BrainFi
 
 /** The uninstall path: strip the block, delete the file only when gbrain created it and nothing else is left, forget the record. */
 export function removeBrainFirst(opts: { harness: string; path: string; dryRun: boolean; server?: string }): BrainFirstOutcome {
+  return underInstructionLedgerLock(opts.dryRun, () => removeBrainFirstLocked(opts), (why) => ({
+    harness: opts.harness, path: opts.path, role: 'instruction file', decision: { value: 'declined', source: 'flag' }, action: 'preserve',
+    state_before: stateForRefusal(opts.path), detail: `${why}; ${opts.path} was left as it was`,
+  }));
+}
+
+function removeBrainFirstLocked(opts: { harness: string; path: string; dryRun: boolean; server?: string }): BrainFirstOutcome {
   const prior = readBrainFirstLedger().find((e) => e.harness === opts.harness && e.path === opts.path);
   const before = inspectBrainFirst(opts.path);
   const decision: BrainFirstDecision = { value: 'declined', source: 'flag' };

@@ -5,24 +5,27 @@
  * through the shared dispatcher, request logging and the admin SSE feed.
  */
 import { createHash } from 'node:crypto';
-import type { Express, Request, Response } from 'express';
+import type { Express, NextFunction, Request, Response } from 'express';
+import { buildDefaultLimiters, type RateLimiter } from '../mcp/rate-limit.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { DEFAULT_MAX_REQUEST_BODY_SIZE } from '@modelcontextprotocol/sdk/server/requestBody.js';
-import { ListToolsRequestSchema, CallToolRequestSchema, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
+import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, McpError, ErrorCode, type CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { opAllowedForBoundClient } from '../core/operations.ts';
 import { authTransport } from '../core/ops/contract.ts';
 import type { AuthInfo, Operation } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
-import { installInstructionsResolver, readInstructionContent, resolveMcpInstructions } from '../mcp/instructions.ts';
+import { installInstructionsResolver, MCP_SERVER_DESCRIPTION, readInstructionContent, resolveMcpInstructions } from '../mcp/instructions.ts';
 import { httpInstructionTools } from '../mcp/initialize-context.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { createSkillResources } from '../mcp/skill-resources.ts';
 import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
-import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
+import { ambientOptsFrom, writebackCaller, type WritebackConfig } from '../core/facts/writeback-config.ts';
+import { resolveAgentWriteback } from '../core/facts/writeback-settings.ts';
+import { OWNER_MEMBER_KEY } from '../core/search/private-visibility.ts';
 import { hasScope, operationScopesAllowed } from '../core/scope.ts';
-import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, type ToolResult } from '../mcp/dispatch.ts';
+import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult, requestMetaSessionId, hotMemoryOffIn, acceptedPendingReceipt, unknownToolEnvelope, errorResult, dispatchRenderContext, grantBlockedNotices, admitNotices, audienceRefusal, type ToolResult } from '../mcp/dispatch.ts';
 import { toAgentError } from '../core/agent-output.ts';
 import { STATUS_TOOL_NAME, statusModeOf, statusToolResult } from '../mcp/status-mode.ts';
 import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
@@ -30,6 +33,7 @@ import { scopeDeniedError } from '../core/ops/op-fix.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
 import { GBRAIN_CLIENT_HEADER, isGbrainThinClient, resolveResultRowsMode, resultRowsForRequest, type ResultRowsMode } from '../mcp/result-rows.ts';
 import { buildToolDefs } from '../mcp/tool-defs.ts';
+import { withEngineScope } from '../core/engine-scope.ts';
 import {
   filterOpsForSurface,
   advertisedOps,
@@ -41,6 +45,15 @@ import {
   type McpSurface,
 } from '../mcp/surface.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
+import { ON_BEHALF_OF_HEADER } from '../core/access/audience.ts';
+import { ACTOR_HEADER, EXTERNAL_ID_RE, QM_AUDIENCE_HEADER } from '../core/access/actor-model.ts';
+import { parseAgentLabel, AGENT_LABEL_HEADER } from '../core/persistence/attribution.ts';
+import { qmMemoryToolResult } from '../core/ops/qm-memory.ts';
+import { attestableOp } from '../core/access/actor.ts';
+
+const actorResourceRefusal = () => new McpError(ErrorCode.InvalidRequest,
+  `actor_not_attested: resources are never read as an attested person, so nothing was read. Read resources without ${ACTOR_HEADER}.`,
+  { code: 'actor_not_attested', reason: 'op_not_attested' });
 import { serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
 import { executeRawJsonb } from '../core/sql-query.ts';
@@ -61,6 +74,16 @@ interface McpRequestState {
   resultRows: ResultRowsMode;
   /** Large pages: the same header marks gbrain's thin client, whose default get_page mode stays whole. Never authority. */
   thinClient: boolean;
+  /** GBRA-231: the X-Gbrain-On-Behalf-Of header (a shared agent's audience); bounded by the credential's may_act_for in dispatch. */
+  onBehalfOfHeader: string | undefined;
+  /** GST-359 C1: the x-qm-actor header (a trusted system names the person); honoured in dispatch only for an attest credential. */
+  actorHeader: string | undefined;
+  /** GST-359 D: the x-qm-audience header (QM's channel audience, wave 2); any request carrying it is refused before any work. */
+  audienceHeader: string | undefined;
+  /** Wakeshift: the request's User-Agent, which tells it some agent programs apart. Shape only. */
+  userAgent: string | undefined;
+  /** The caller's self-declared agent label (X-Gbrain-Agent-Label): recorded on its write requests, never authority. */
+  agentLabel: string | undefined;
 }
 
 export function mountMcp(app: Express, ctx: ServeHttpContext): void {
@@ -122,9 +145,15 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
   // #5277: hint every scope a connector may need. Clients that request exactly
   // the hinted scope and never step up (claude.ai connectors) otherwise stay
   // read-only; grantScopes still caps each grant to the client row's scope.
-  app.post('/mcp', withBearerScopeHint(
+  // GBRA-431: the rate limits SECURITY.md documents for /mcp, applied when the operator sets them: the IP bucket before
+  // the token lookup, the token bucket after it. Unset, serve --http keeps its unlimited default.
+  const limiters = buildDefaultLimiters();
+  const ipLimit = rateLimitStep('GBRAIN_HTTP_RATE_LIMIT_IP', limiters.ip, req => req.ip ?? req.socket.remoteAddress ?? 'unknown', 'Too many requests');
+  const tokenLimit = rateLimitStep('GBRAIN_HTTP_RATE_LIMIT_TOKEN', limiters.token,
+    req => createHash('sha256').update(((req as any).auth as AuthInfo).token).digest('hex'), 'Too many requests for this token');
+  app.post('/mcp', ipLimit, withBearerScopeHint(
     requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read', 'write'],
-  ), (req: Request, res: Response) => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res)));
+  ), tokenLimit, (req: Request, res: Response) => withEngineScope(engine, () => withRequestConfigSnapshot(engine, () => handleMcpPost(req, res))));
 
   // #6721: one config snapshot serves every config read of one POST /mcp (the
   // surface, row-shape and writeback reads below, tools/list and a read op's
@@ -159,7 +188,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     const canWrite = hasScope(authInfo.scopes, 'write');
     const [{ ceiling: surfaceCeiling, effective: surface }, writeback, hostResultRows] = await Promise.all([
       resolveEffectiveSurface(authInfo),
-      canWrite ? resolveWritebackConfig(engine, config) : Promise.resolve(null),
+      canWrite ? resolveAgentWriteback(engine, config).then(r => r.bundle) : Promise.resolve(null),
       resolveResultRowsMode(engine, config),
     ]);
     // C1: gbrain's thin client keeps full rows. The header is unverified and
@@ -171,8 +200,10 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     const surfaceAllowedOps: ReadonlySet<string> | undefined =
       surface === 'full' && authInfo.allowedOperations == null ? undefined : new Set(mcpOperations.map(o => o.name));
     const thinClient = isGbrainThinClient(req.get(GBRAIN_CLIENT_HEADER));
-    const state: McpRequestState = { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient };
-    const server = createMcpRequestServer(ctx, state, writeback);
+    const state: McpRequestState = { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient,
+      onBehalfOfHeader: req.get(ON_BEHALF_OF_HEADER), actorHeader: req.get(ACTOR_HEADER), audienceHeader: req.get(QM_AUDIENCE_HEADER),
+      userAgent: req.get('user-agent'), agentLabel: parseAgentLabel(req.get(AGENT_LABEL_HEADER)) };
+    const server = createMcpRequestServer(ctx, state, writeback, writeback?.enabled ? await engine.getConfig(OWNER_MEMBER_KEY).catch(() => null) : null);
     await serveMcpRequest(server, req, res);
   }
 }
@@ -180,7 +211,8 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
 function createMcpRequestServer(
   ctx: ServeHttpContext,
   state: McpRequestState,
-  writeback: Awaited<ReturnType<typeof resolveWritebackConfig>> | null,
+  writeback: WritebackConfig | null,
+  ownerMember: string | null,
 ): Server {
   const { engine, config, mcpResourceUrl } = ctx;
   const { authInfo, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps } = state;
@@ -196,10 +228,11 @@ function createMcpRequestServer(
     writebackOpts = ambientOptsFrom(writeback, {
       remember: rememberOp !== undefined && opAllowedForBoundClient(authInfo, rememberOp),
       extractFacts: extractFactsOp !== undefined && opAllowedForBoundClient(authInfo, extractFactsOp),
+      ...writebackCaller(authInfo, ownerMember),
     });
   }
   const server = new Server(
-    { name: 'gbrain', version: VERSION },
+    { name: 'gbrain', version: VERSION, description: MCP_SERVER_DESCRIPTION },
     {
       capabilities: { tools: {}, resources: {} },
       // #4748: contract (+ opt-in writeback section) + deployment identity.
@@ -215,13 +248,25 @@ function createMcpRequestServer(
   installCapabilitiesResource(server, async () => {
     return { transport: authTransport(authInfo), client_id: authInfo.clientId,
       ...await resolveAuthCapabilities(authInfo, engine, config), administration: mcpAdministrationGuidance(mcpResourceUrl.toString()) };
-  }, createSkillResources(engine, async () => {
+  }, state.actorHeader != null || state.audienceHeader !== undefined ? undefined : createSkillResources(engine, async () => {
     const sourceId = authInfo.sourceId ?? 'default';
     const { noGrantFederatedScope } = await import('../core/source-resolver.ts');
     return { remote: true, transport: 'http', sourceId, auth: authInfo, config,
       localFederatedSourceIds: await noGrantFederatedScope(engine, authInfo.hasSourceGrant, sourceId),
       allowedOps: surfaceAllowedOps, surface, surfaceCeiling };
   }));
+  // GST-359 C1: resources are never read as an attested person, so a request naming one reads none.
+  if (state.actorHeader != null) server.setRequestHandler(ReadResourceRequestSchema, async () => { throw actorResourceRefusal(); });
+  // GST-359 D: a request carrying x-qm-audience is refused before any work, on every method that reads or runs a tool.
+  if (state.audienceHeader !== undefined) {
+    const refusal = (op: string) => audienceRefusal(op, { auth: authInfo, transport: 'http' });
+    const rpcRefusal = (method: string) => { const { rpc } = refusal(method); return new McpError(ErrorCode.InvalidRequest, rpc.message, rpc.data); };
+    for (const [schema, method] of [[ListResourcesRequestSchema, 'resources/list'], [ReadResourceRequestSchema, 'resources/read'], [ListToolsRequestSchema, 'tools/list']] as const) {
+      server.setRequestHandler(schema, async () => { throw rpcRefusal(method); });
+    }
+    server.setRequestHandler(CallToolRequestSchema, async (request) => refusal(request.params.name).result);
+    return server;
+  }
   server.setRequestHandler(ListToolsRequestSchema, async () => listMcpTools(ctx, state));
   server.setRequestHandler(CallToolRequestSchema, async (request) => callMcpTool(ctx, state, request));
   return server;
@@ -255,9 +300,11 @@ async function listMcpTools(ctx: ServeHttpContext, state: McpRequestState) {
   // Agent contract v1 (A2): the one callability predicate (isCallable) plus
   // the bound-client op fence.
   const publishGates = publishGatesFromDisabled(mcpOperations, gateDisabled);
+  // GST-359 C1: under a valid x-qm-actor header from an attest credential, only the operations it may run as the person.
+  const attest = state.actorHeader != null && EXTERNAL_ID_RE.test(state.actorHeader) ? authInfo.attest : null;
   const visibleOps = mcpOperations.filter(op =>
     isCallable(op, { transport: 'http', surface, scopes: authInfo.scopes, publishGates, allowedOps: surfaceAllowedOps })
-    && opAllowedForBoundClient(authInfo, op),
+    && opAllowedForBoundClient(authInfo, op) && (!attest || (attest.ops.includes(op.name) && attestableOp(op.name, op))),
   );
   // WP3 (amendment 14): ONE schema mapper — the inline map this handler
   // carried is unified onto buildToolDefs so the byte-pin test covers the
@@ -306,7 +353,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   if (statusMode && hasScope(authInfo.scopes, 'read')) return statusToolResult(statusMode, 'http');
   const op = mcpOperations.find(o => o.name === name);
   if (!op) {
-    return rejectUnknownMcpOperation(ctx, state, name, requestMetaSessionId(request.params));
+    return qmMemoryToolResult(name, await rejectUnknownMcpOperation(ctx, state, name, requestMetaSessionId(request.params)), state.actorHeader != null);
   }
 
   // Scope enforcement (v0.28: hasScope replaces exact-string-match so
@@ -322,7 +369,7 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   // denial first would tell the operator to widen the grant for nothing.
   const scopeSatisfied = op.cliOnly !== undefined || operationScopesAllowed(authInfo.scopes, op);
   if (!scopeSatisfied) {
-    return rejectInsufficientMcpScope(ctx, state, name, requiredScope, requestMetaSessionId(request.params));
+    return qmMemoryToolResult(name, await rejectInsufficientMcpScope(ctx, state, name, requiredScope, requestMetaSessionId(request.params)), state.actorHeader != null);
   }
 
   // F8: redact request payload by default (declared keys only via the
@@ -340,10 +387,12 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   // 'tools/list'. Pre-existing string-shaped rows are normalized by
   // migration v41 in src/core/migrate.ts.
   const safeParamsSummary = summarizeMcpParams(name, params);
+  // Wakeshift's session_key is a conversation credential: never logged, even under --log-full-params.
+  const fullParams = params && typeof params === 'object' && 'session_key' in params ? { ...params, session_key: '[redacted]' } : params;
   const logParamsObj: unknown = logFullParams
-    ? (params || null)
+    ? (fullParams || null)
     : (safeParamsSummary || null);
-  const broadcastParams = logFullParams ? (params || {}) : safeParamsSummary;
+  const broadcastParams = logFullParams ? (fullParams || {}) : safeParamsSummary;
 
   // v0.31 (D12 / eE1): refactor the inlined op.handler call to go through
   // src/mcp/dispatch.ts so HTTP MCP shares the same dispatch path as
@@ -403,8 +452,13 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
       // WP1/D7: network transport — the dispatch-layer localOnly
       // backstop keys off this marker.
       transport: 'http',
-      inboundFrameBytes: DEFAULT_MAX_REQUEST_BODY_SIZE,
+      inboundFrameBytes: mcpBodyCap(),
       ...(sessionId ? { sessionId } : {}),
+      ...(hotMemoryOffIn(request.params) ? { hotMemoryOff: true } : {}),
+      onBehalfOf: { header: state.onBehalfOfHeader, requestMeta: (request.params as { _meta?: unknown })._meta },
+      mcpCaller: { client: authInfo.clientName, userAgent: state.userAgent, meta: (request.params as { _meta?: Record<string, unknown> })._meta },
+      actor: { header: state.actorHeader, audience: state.audienceHeader },
+      ...(state.agentLabel ? { agentLabel: state.agentLabel } : {}),
       takesHoldersAllowList: tokenAllowList,
       sourceId: tokenSourceId,
       ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
@@ -604,7 +658,7 @@ async function recordMcpToolResult(
       `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
       [authInfo.clientId, agentName, name, latency, successStatus],
-      [logParamsObj],
+      [successStatus === 'accepted_pending' ? { ...(logParamsObj && typeof logParamsObj === 'object' ? logParamsObj : {}), write_request_id: acceptedPendingReceipt(toolResult)?.request_id } : logParamsObj],
     );
   } catch { /* best effort */ }
   broadcastEvent({
@@ -619,6 +673,32 @@ async function recordMcpToolResult(
   return toolResult;
 }
 
+/** A positive integer env var, or undefined when unset or not one. */
+function positiveEnvInt(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (Number.isSafeInteger(n) && n > 0) return n;
+  console.error(`[serve-http] ${name}=${JSON.stringify(raw)} is not a positive whole number; ignoring it.`);
+  return undefined;
+}
+
+/** GBRA-431: the POST /mcp body cap, GBRAIN_HTTP_MAX_BODY_BYTES when the operator sets it, else the SDK's 4 MiB. Over it the SDK answers 413 before the body is read. */
+function mcpBodyCap(): number {
+  return positiveEnvInt('GBRAIN_HTTP_MAX_BODY_BYTES') ?? DEFAULT_MAX_REQUEST_BODY_SIZE;
+}
+
+/** One rate-limit bucket as an Express step: a no-op while `envName` is unset, else 429 with Retry-After once the key's bucket is empty. */
+function rateLimitStep(envName: string, limiter: RateLimiter, key: (req: Request) => string, message: string) {
+  const enabled = positiveEnvInt(envName) !== undefined;
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!enabled) return next();
+    const check = limiter.check(key(req));
+    if (check.allowed) return next();
+    res.set('Retry-After', String(check.retryAfter ?? 60)).status(429).json({ error: 'rate_limited', message });
+  };
+}
+
 async function serveMcpRequest(server: Server, req: Request, res: Response): Promise<void> {
   // F14: wrap transport setup + handleRequest in try/catch. Without this,
   // an SDK-level throw (e.g., schema parse failure on a malformed request)
@@ -627,7 +707,7 @@ async function serveMcpRequest(server: Server, req: Request, res: Response): Pro
   // !res.headersSent we emit a minimal JSON 500 so the client at least
   // gets parseable JSON back.
   try {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as any });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as any, maxRequestBodySize: mcpBodyCap() });
     // #2844: per-request teardown (SDK stateless pattern) — without it every POST /mcp leaks the transport+Server pair (~3GB/day RSS). Registered BEFORE connect/handleRequest so early disconnects and handleRequest throws still clean up; best-effort catches so cleanup never surfaces an unhandledRejection.
     res.on('close', () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
     await server.connect(transport);

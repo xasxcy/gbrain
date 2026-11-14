@@ -36,6 +36,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { opError, type OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
+import { isEmbeddedEngine } from '../embedded-engine.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import type { WriteRequest } from './model.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
@@ -45,7 +46,7 @@ import { faultPoint } from './fault-points.ts';
 import { writeOriginDeletedMarker } from './sync-markers.ts';
 import { clearRebuildableCache } from './rebuildable-cache.ts';
 import { carryingNeedles, findRequestsForSlugs, JOURNAL_SWEEP_MATCH_CAP, recheckRequestsCarrying, redactRequestIntents, sweepRequestsCarrying, sweepRequestsForGroups,
-  type JournalSweep } from './intent-redaction.ts';
+  type IntentRedactionTarget, type JournalSweep } from './intent-redaction.ts';
 import { dropPurgedFenceRows } from '../facts/purge-overlay.ts';
 import { isOutcomeMarker, outcomeMarkerSql } from '../facts/audit-sources.ts';
 import { derivedRowsFrom, hideDerivedRows } from '../facts/derivation-inputs.ts';
@@ -55,14 +56,17 @@ import { rewrittenContentHash } from '../page-body/segment-rewrite.ts';
 import { stagingNeedsTextSql } from '../page-body/schema.ts';
 import { CLAIM_FORMS_BATCH, claimTextForms } from '../fence-shared.ts';
 import type { PagePurgeContext } from '../facts/purge-verify.ts';
+import { pageChangeReasons, requestsRecordingReasons, stripPageGitNotes } from '../facts/purge-reasons.ts';
 import { assertHeldPageKeys } from '../page-state/guards.ts';
 import { noteBelief } from '../belief/ledger.ts';
 import { appendPurgeIntent } from '../belief/purge-mirror.ts';
+import { scrubPurgedSlugs } from '../feedback/store.ts';
+import { scrubPurgedNameStores } from './purge-name-stores.ts';
 import { appendDerivedHidden, bumpPurgeEpoch, derivedBeliefTargets, derivedStreamSlugs, pageLifetimesOf, pagePurgeClaims, redactCarryingFields, redactPurgedKeys, registerLiveCarriers,
   sourceHasBeliefEvents, type LedgerPurgeReport } from '../belief/purge.ts';
 
 export const PURGE_RESIDUALS = 'Removed from live stores: the page row with its chunks, versions, takes, timeline, links and raw data, the facts filed on it (tombstoned), '
-  + 'its take proposals, open loops and core notices, stored write intents for the slug and its attached file records. Still out of reach: the brain repository\'s '
+  + 'its take proposals, open loops and core notices, the retrieval feedback and captured eval results naming the slug, the volunteer log rows and mention-gazetteer names for it, stored write intents for the slug and its attached file records. Still out of reach: the brain repository\'s '
   + 'git history and every other clone or remote, Markdown exports and compiled context files, backups, provider copies (embeddings, decisions), and deleted rows '
   + 'in database pages and the write-ahead log until vacuum. Rotate any exposed credential.';
 
@@ -161,6 +165,8 @@ export interface PreparedPagePurge {
   needles: string[]; sweep: JournalSweep; slugIndex: RequestIndexState['state'];
   /** Retention removal of an expired tombstone (`gbrain pages purge-deleted`): no content tombstone, no ledger redaction, `page.expired`. */
   retention: boolean;
+  /** GST-2201: a sync-made tombstone purged database-only beside its committed file: the file's return imports it, so no deletion marker. */
+  keepOrigin?: boolean;
   /**
    * The belief streams locked with the page: those of the rows the derivation walk would hide (their `derived.hidden`
    * events append under their keys) and those of the links the delete cascades away (their `link.retracted`).
@@ -267,6 +273,9 @@ async function tombstonePage(tx: BrainEngine, sourceId: string, slug: string, pa
 }
 
 /** Inside the coordinated delete transaction, before the page row is deleted. */
+/** The page's add_timeline_entry receipts one purge redacts; a page with more leaves `journal_sweep.complete` false. */
+const TIMELINE_RECEIPT_CAP = 10_000;
+
 export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest, snapshot: PageSnapshot, prepared: PreparedPagePurge): Promise<Record<string, unknown>> {
   const page = snapshot.page, sourceId = row.source_id, slug = page.slug;
   const actor = `${row.principal_kind}:${row.principal_id}`;
@@ -284,6 +293,7 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   const hashes = new Set<string>();
   if (!retention) await tombstonePage(tx, sourceId, slug, page.id, snapshot, row.id, actor, { hash: storedHash, generation: Number(stored?.body_generation) }, hashes);
   const { factRows, takeRows, needles } = await readPurgeClaims(tx, sourceId, slug, page.id);
+  const reasons = await pageChangeReasons(tx, sourceId, slug, page.id);
   const segmentClaims = await readSegmentClaims(tx, sourceId, slug, page.id);
   const factIds = factRows.map(f => Number(f.id)), takeIds = takeRows.map(t => Number(t.id));
   const derivedFrom = await derivedRowsFrom(tx, [{ table: 'pages', id: page.id }, ...factIds.map(id => ({ table: 'facts', id })), ...takeIds.map(id => ({ table: 'takes', id }))]);
@@ -320,15 +330,28 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
   // #6619: the page's free-text aliases and the redirects that resolve to it; a redirect from this slug to another page stays.
   removed.page_aliases = await count('DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2 RETURNING 1', [sourceId, slug]);
   removed.slug_aliases = await count('DELETE FROM slug_aliases WHERE source_id=$1 AND canonical_slug=$2 RETURNING 1', [sourceId, slug]);
+  removed.slug_rename_history = await count('DELETE FROM slug_rename_history WHERE source_id=$1 AND new_slug=$2 RETURNING 1', [sourceId, slug]);
   // #6511 [R2]: the preparation sweep's targets, plus the tail past its ceiling and the rows pending at scan time, re-tested here.
   const recheck = await lookup('tail_recheck', () => recheckRequestsCarrying(tx, sourceId, needles, prepared.sweep,
     { exclude: row.id, beforePending: () => faultPoint('purge:pending_recheck', { requestId: row.request_id, sourceId, operation: row.operation }) }));
-  const forSlug = await lookup('slug_lookup', () => findRequestsForSlugs(tx, sourceId, [slug]));
+  // The page's add_timeline_entry receipts keep the entry text in their outcome (`entry` summary and source, `bullet`), compacted
+  // ones included. That text is matched whole in the page's own requests (a set lookup, linear in their strings). A page past
+  // the cap leaves the journal sweep incomplete instead of claiming every receipt.
+  const timelineRows = await lookup('slug_lookup', () => tx.executeRaw<IntentRedactionTarget & { summary: string | null; source: string | null; bullet: string | null }>(`SELECT id::text AS id,
+    principal_kind, principal_id, outcome->'entry'->>'summary' AS summary, outcome->'entry'->>'source' AS source, outcome->>'bullet' AS bullet FROM persistence_requests
+    WHERE source_id=$1 AND slug=$2 AND operation='add_timeline_entry' AND outcome ? 'entry' ORDER BY sequence LIMIT $3`, [sourceId, slug, TIMELINE_RECEIPT_CAP + 1]));
+  const timeline = timelineRows.slice(0, TIMELINE_RECEIPT_CAP);
+  const timelineText = new Set(timeline.flatMap(t => [t.summary, t.source, t.bullet]).map(text => text?.trim() ?? '').filter(Boolean));
+  const forSlug = await lookup('slug_lookup', async () => [...await findRequestsForSlugs(tx, sourceId, [slug]), ...reasons.length ? await requestsRecordingReasons(tx, sourceId, slug) : [], ...timeline]);
+  const own = new Set(forSlug.map(r => r.id));
   const requests = [...new Map([...forSlug, ...prepared.sweep.targets, ...recheck.targets].map(r => [r.id, r])).values()];
-  removed.persistence_requests = await lookup('redaction_read', () => redactRequestIntents(tx, requests, row.id, { skipPending: true, needles }));
+  // GBRA-217: the page's reasons are needles in its own requests only, so a short reason never redacts another page's receipt.
+  removed.persistence_requests = await lookup('redaction_read', async () => await redactRequestIntents(tx, requests.filter(r => own.has(r.id)), row.id,
+    { skipPending: true, needles: [...needles, ...reasons], exact: timelineText }) + await redactRequestIntents(tx, requests.filter(r => !own.has(r.id)), row.id, { skipPending: true, needles }));
+  removed.persistence_effects = await stripPageGitNotes(tx, sourceId, slug);
   const journalSweep = { scanned: prepared.sweep.scanned, ceiling: prepared.sweep.ceiling, watermark: prepared.sweep.watermark ?? null, batch: prepared.sweep.batch ?? 1,
-    tail: recheck.tail, pending_rechecked: recheck.pendingRechecked, complete: prepared.sweep.complete && recheck.complete };
-  const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
+    tail: recheck.tail, pending_rechecked: recheck.pendingRechecked, complete: prepared.sweep.complete && recheck.complete && timelineRows.length <= TIMELINE_RECEIPT_CAP };
+  const files = await tx.executeRaw<{ storage_path: string }>(`DELETE FROM files WHERE (page_id=$1 OR (page_id IS NULL AND page_slug=$2 AND (source_id=$3 OR source_id IS NULL)))
     RETURNING storage_path`, [page.id, slug, sourceId]);
   removed.files = files.length;
   Object.assign(removed, await (await import('../generations/ledger-scrub.ts')).scrubGenerationLedger(tx, sourceId, { slug }));
@@ -345,14 +368,16 @@ export async function purgePageInTransaction(tx: BrainEngine, row: WriteRequest,
     derived_hidden: await appendDerivedHidden(tx, { sourceId, request: row.id, publicationId: row.id, op: 'delete_page', targets: heldTargets, truncated: walk === 'truncated' }),
     derived_walk: walk })) : null;
   if (ledger) removed.belief_events = ledger.purged_events + ledger.redacted_fields.length;
-  await writeOriginDeletedMarker(tx, { sourceId, page: { id: page.id, slug, source_path: page.source_path } });
+  if (!prepared.keepOrigin) await writeOriginDeletedMarker(tx, { sourceId, page: { id: page.id, slug, source_path: page.source_path } });
   const { shas, ...segmentRows } = await deletePageWithSegments(tx, sourceId, slug, page.id, segmentClaims);
   Object.assign(removed, segmentRows);
+  Object.assign(removed, await scrubPurgedSlugs(tx, sourceId, [slug]));
+  Object.assign(removed, await scrubPurgedNameStores(tx, sourceId, [slug]));
   if (!retention) appendPurgeIntent({ request: row.id, request_id: row.request_id, source_id: sourceId, source_incarnation: row.source_incarnation,
     scope: 'page', slug, purge_epoch: epoch, content_hashes: [...hashes], facts: mirrorFacts, takes: mirrorTakes, lifetimes });
   const key = `${sourceId}:${row.request_id}`;
   purgeContext.delete(key);
-  purgeContext.set(key, { needles, factIds, pageId: page.id, paths, segmentShas: shas.slice(0, 4096), segmentClaims, ledgerClaims: inventory.claims, ledger });
+  purgeContext.set(key, { needles, reasons, factIds, pageId: page.id, paths, segmentShas: shas.slice(0, 4096), segmentClaims, ledgerClaims: inventory.claims, ledger });
   while (purgeContext.size > PURGE_CONTEXT_LIMIT) purgeContext.delete(purgeContext.keys().next().value!);
   return { status: 'purged', slug, source_id: sourceId, residuals: PURGE_RESIDUALS, journal_sweep: journalSweep, ...(retention ? { retention: true } : {}),
     purge: { content_hash8: storedHash?.slice(0, 8) ?? null, tombstoned: hashes.size > 0, content_hashes_tombstoned: hashes.size, removed,
@@ -376,9 +401,17 @@ export async function finishPagePurge(ctx: Pick<OperationContext, 'engine' | 'co
   const remaining: string[] = [];
   if (purge.blobs?.length) {
     try {
-      const { createStorage } = await import('../storage.ts');
-      const storage = await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
-      for (const path of purge.blobs) { try { await storage.delete(path); } catch { remaining.push(path); } }
+      const { createStorage, settingsStorage } = await import('../storage.ts');
+      const embedded = isEmbeddedEngine(ctx.engine);
+      const storage = embedded ? await settingsStorage(ctx.engine)
+        : await createStorage((ctx.config as { storage?: unknown } | undefined)?.storage as never);
+      if (!storage) throw new Error('This engine was opened with no settings.storage.');
+      for (const path of purge.blobs) {
+        try {
+          if (embedded && !(await storage.exists(path))) { remaining.push(path); continue; }
+          await storage.delete(path);
+        } catch { remaining.push(path); }
+      }
     } catch { remaining.push(...purge.blobs); }
   }
   const { verifyPagePurge } = await import('../facts/purge-verify.ts');

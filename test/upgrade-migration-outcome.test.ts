@@ -32,7 +32,7 @@ function runUpgradeHarness(opts: { bunExit?: number; postUpgradeExit?: number; c
   writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nprintf 'gbrain:%s\\n' "$*" >> "$HOME/calls.log"\nif [ "$1" = '--version' ]; then echo 'gbrain ${NEWER}'; fi\nif [ "$1" = 'post-upgrade' ]; then exit ${opts.postUpgradeExit ?? 0}; fi\nexit 0\n`, { mode: 0o755 });
   const result = spawnSync(process.execPath, ['--no-env-file', driver], {
     cwd: home,
-    env: { HOME: home, GBRAIN_HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${bin}:/usr/bin:/bin` },
+    env: { HOME: home, GBRAIN_HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${bin}:/usr/bin:/bin`, GBRAIN_RELEASE_CHANNEL: 'alpha' },
     encoding: 'utf8', timeout: 60_000,
   });
   const calls = readFileSync(join(home, 'calls.log'), 'utf8');
@@ -44,7 +44,7 @@ describe('gbrain upgrade migration ownership and outcome (#5693)', () => {
   test('package postinstall under upgrade defers migrations to post-upgrade', () => {
     const r = runUpgradeHarness({});
     expect(r.status, r.out).toBe(0);
-    expect(r.calls).toContain('bun:update gbrain:owns=1');
+    expect(r.calls).toContain('bun:update --backend=copyfile gbrain:owns=1');
     expect(r.calls).not.toContain('gbrain:apply-migrations');
     expect(r.calls).toContain('gbrain:post-upgrade');
     expect(r.out).toContain(`Binary: installed ${NEWER}`);

@@ -16,7 +16,7 @@ import type { GraduationBlocker } from './engine-graduation.types.ts';
 const PENDING_REQUESTS_SQL = `SELECT r.request_id::text AS request_id, r.source_id, r.operation, r.state,
     r.recovery IS NOT NULL AS recovering, r.blocked_reason, w.owner_host_id::text AS owner_host_id
   FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id = r.worktree_id
-  WHERE r.state IN ('queued', 'running', 'recovering') OR r.recovery IS NOT NULL
+  WHERE r.state IN ('queued', 'deferred', 'running', 'recovering') OR r.recovery IS NOT NULL
   ORDER BY r.sequence`;
 
 const TERMINAL = new Set(['committed', 'conflict', 'failed', 'cancelled']);
@@ -58,11 +58,15 @@ export async function graduationBlockers(source: BrainEngine, hostId: string): P
       blockers.push({ kind: 'request', id: r.request_id, detail, needsUser: false });
     }
   }
-  const topology = await source.executeRaw<{ id: string; operation: string; source_id: string }>(
-    "SELECT id::text AS id, operation, source_id FROM persistence_topology_changes WHERE state = 'recovering' OR recovery IS NOT NULL ORDER BY created_at");
+  const topology = await source.executeRaw<{ id: string; operation: string; source_id: string; request_id: string; admission: boolean; automatic: boolean }>(
+    "SELECT id::text AS id, operation, source_id, request_id::text AS request_id, (state = 'recovering' AND recovery IS NULL) AS admission, COALESCE(outcome->>'expired_only', 'false') = 'true' AS automatic FROM persistence_topology_changes WHERE state = 'recovering' OR recovery IS NOT NULL ORDER BY created_at");
   for (const t of topology) {
-    blockers.push({ kind: 'topology_recovery', id: t.id, detail: `${t.operation} for ${t.source_id} is recovering`,
-      argv: ['gbrain', 'sources', 'writer', 'status', t.source_id, '--json'], needsUser: false });
+    blockers.push({ kind: 'topology_recovery', id: t.id, detail: t.admission && t.automatic
+      ? `automatic expired-archive purge of ${t.source_id} (request ${t.request_id}) stopped before it finished; the next automatic expired-archive purge finishes it, or gbrain sources purge with no source id finishes it now`
+      : t.admission
+      ? `${t.operation} of ${t.source_id} (request ${t.request_id}) stopped before it finished; ask the user whether to finish it (rerun the same command with all its original flags and --request-id ${t.request_id}, which deletes the rest of its pages) or keep what is left (any other lifecycle change to the source, such as a restore, abandons the request)`
+      : `${t.operation} for ${t.source_id} is recovering`,
+      argv: ['gbrain', 'sources', 'writer', 'status', t.source_id, '--json'], needsUser: t.admission && !t.automatic });
   }
   const effects = await source.executeRaw<{ id: string; kind: string; state: string; error_code: string | null; source_id: string | null; request_id: string }>(
     `SELECT e.id::text AS id, e.kind, e.state, e.error_code, COALESCE(e.source_id, r.source_id) AS source_id, r.request_id::text AS request_id
@@ -127,7 +131,7 @@ export async function drainForGraduation(source: BrainEngine, opts: { timeoutMs:
   try {
     while (Date.now() < deadline) {
       const [row] = await source.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM persistence_requests
-        WHERE request_id::text = ANY($1::text[]) AND (state IN ('queued', 'running', 'recovering') OR recovery IS NOT NULL)`, [pending]);
+        WHERE request_id::text = ANY($1::text[]) AND (state IN ('queued', 'deferred', 'running', 'recovering') OR recovery IS NOT NULL)`, [pending]);
       if (Number(row?.n ?? 0) === 0) break;
       consumer.wake();
       await new Promise(resolve => setTimeout(resolve, pollMs));
@@ -136,7 +140,7 @@ export async function drainForGraduation(source: BrainEngine, opts: { timeoutMs:
     await consumer.stop();
   }
   const terminal = await source.executeRaw<{ request_id: string }>(`SELECT request_id::text AS request_id FROM persistence_requests
-    WHERE request_id::text = ANY($1::text[]) AND state NOT IN ('queued', 'running', 'recovering') AND recovery IS NULL ORDER BY sequence`, [pending]);
+    WHERE request_id::text = ANY($1::text[]) AND state NOT IN ('queued', 'deferred', 'running', 'recovering') AND recovery IS NULL ORDER BY sequence`, [pending]);
   const blockers = (await graduationBlockers(source, opts.hostId))
     .map(b => lastError && b.kind === 'request' ? { ...b, detail: `${b.detail}; last drain error ${lastError}` } : b);
   return { drained: terminal.map(r => r.request_id), blockers };

@@ -32,6 +32,7 @@ import { appendBeliefEvents, type BeliefEventDraft } from './append.ts';
 import { appendDerivedHidden, bumpPurgeEpoch, derivedBeliefTargets, pageLifetimesOf, pagePurgeClaims, redactCarryingFields, redactPurgedKeys, registerLiveCarriers } from './purge.ts';
 import { derivedRowsFrom, hideDerivedRows, type DerivationRef } from '../facts/derivation-inputs.ts';
 import { writeOriginDeletedMarker } from '../persistence/sync-markers.ts';
+import { outcomeMarkerSql } from '../facts/audit-sources.ts';
 
 export const PURGE_MIRROR_FILE = 'purge-events.jsonl';
 
@@ -142,12 +143,22 @@ async function replayOne(tx: BrainEngine, intent: PurgeMirrorIntent, ledger: boo
         await writeOriginDeletedMarker(tx, { sourceId: src, page: restored });
         const { deletePageWithSegments } = await import('../persistence/page-purge.ts');
         await deletePageWithSegments(tx, src, restored.slug, restored.id);
+        const [feedback] = await tx.executeRaw<{ present: boolean }>("SELECT to_regclass('retrieval_event_pages') IS NOT NULL AS present");
+        if (feedback?.present) {
+          const { scrubPurgedSlugs } = await import('../feedback/store.ts');
+          await scrubPurgedSlugs(tx, src, [restored.slug]);
+        }
+        const [names] = await tx.executeRaw<{ present: boolean }>("SELECT to_regclass('mention_gazetteer_entries') IS NOT NULL AS present");
+        if (names?.present) {
+          const { scrubPurgedNameStores } = await import('../persistence/purge-name-stores.ts');
+          await scrubPurgedNameStores(tx, src, [restored.slug]);
+        }
       };
     }
   } else {
     const scope = intent.facts[0] ?? { fact_hash: '', visibility: 'world', subject: '*' };
     const rows = await tx.executeRaw<{ id: number; fact: string; slug: string | null }>(`SELECT id, fact, source_markdown_slug AS slug FROM facts WHERE source_id = $1
-      AND gbrain_fact_fingerprint(fact) = $2 AND visibility = $3 AND ($4 = '*' OR entity_slug = $4)`, [src, scope.fact_hash, scope.visibility, scope.subject]);
+      AND gbrain_fact_fingerprint(fact) = $2 AND visibility = $3 AND ($4 = '*' OR entity_slug = $4) AND NOT ${outcomeMarkerSql('facts')}`, [src, scope.fact_hash, scope.visibility, scope.subject]);
     const takes = await tx.executeRaw<{ id: number; claim: string; page_id: number }>(`SELECT k.id, k.claim, k.page_id FROM takes k JOIN pages p ON p.id = k.page_id
       WHERE p.source_id = $1 AND gbrain_fact_fingerprint(k.claim) = $2 AND ($3 = '*' OR p.slug = $3)`, [src, scope.fact_hash, scope.subject]);
     claims = [...new Set([...rows.map(r => r.fact), ...takes.map(t => t.claim)])];

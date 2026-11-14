@@ -285,7 +285,7 @@ export interface GBrainConfig {
    */
   self_upgrade?: {
     mode?: 'auto' | 'notify' | 'off';
-    channel?: 'latest' | 'stable';
+    channel?: 'stable' | 'alpha' | 'latest';
     /** Set true once the upgrade-time consent prompt has been shown. */
     mode_prompted?: boolean;
     /** Quiet-hours window for the autopilot silent channel. */
@@ -297,6 +297,8 @@ export interface GBrainConfig {
     /** Epoch ms of the last auto-channel check (24h throttle). */
     last_check_ts?: number;
     last_applied_version?: string;
+    /** #8776: a launcher outside gbrain's service starts autopilot again when it exits (`gbrain upgrade` hands it over). */
+    autopilot_launcher?: 'external';
   };
 
   /**
@@ -789,6 +791,8 @@ export function loadConfig(): GBrainConfig | null {
   const dbUrl = effectiveEnvDatabaseUrl();
 
   if (!fileConfig && !dbUrl) return null;
+  // GBRA-377: a file holding only skills.resolver settings is no brain; every other file keeps its file-plane reads.
+  if (!dbUrl && fileConfig && Object.keys(fileConfig).every((k) => k === 'skills')) return null;
 
   // Infer engine type. A DATABASE_URL-style env var is always a Postgres
   // connection target and must override a file-backed PGLite engine
@@ -1453,7 +1457,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // weak-graded query), and unlike crag_think it is reachable by remote
   // callers — attacker-shaped weak queries drive that spend (ship security
   // review). See docs/operations/spend-controls.md.
-  // #5824 one-release rollback, latched per process (search/vector-legacy-guard.ts).
+  // #5824 one-release rollback, latched per engine (search/vector-legacy-guard.ts).
   'search.vector_legacy_guard',
   'search.hnsw_iterative_scan',
   'search.cjk_keyword_deadline_ms',
@@ -1478,6 +1482,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.relational_chain_slots',
   'search.collapse', // result-time collapse of twins, redirect stubs and document copies (mode.ts reads; boolean)
   'search.rank_priors', // rank priors after the reranker (mode.ts reads; boolean)
+  'search.keyword_phrase', // keyword phrase factor, #7175 (mode.ts reads; boolean)
+  'search.qualified_aliases', // qualified alias hop (mode.ts reads; boolean)
+  'search.title_qualified', // qualified title boost (mode.ts reads; boolean)
   'search.diverse_pool_depth', // session-diverse pool before the reranker (mode.ts reads; `off` | 0..100; 0 = off)
   // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
   'search.keyword_arm_confidence_floor',
@@ -1544,6 +1551,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.eval.longmemeval', 'models.eval.cross_modal.slot_a', 'models.eval.cross_modal.slot_b', 'models.eval.cross_modal.slot_c', // #5872 D12 probe judge slots
   'facts.extraction_model',
   'recall.question_admission', // recall `question` admission rule: reserve (default) | facts_arm (facts/question-recall.ts)
+  'recall.confidence_weighting', 'recall.group_by_entity', // #2941/#2953 switches, on | off, default off (facts/recall-config.ts)
   // Brain-wide kill switch for fact extraction, read by
   // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
   // sweep.ts, operations.ts and transcripts/ingest-facts.ts. That function's
@@ -1602,6 +1610,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Fire-once sentinel for the ambient-writeback consent nudge (WP8):
   // stamped 'true' after the init/post-upgrade ask has been shown once.
   'memory.auto_writeback_notice_shown',
+  'memory.agent_writeback', // GBRA-219: DB-only override of what AGENTS are told (inherit|off|salient|all); never the capture lanes (facts/writeback-settings.ts)
   // Always-loaded core memory + context-pressure notice (docs/guides/core-memory.md#configuration).
   'memory.core.enabled', 'memory.core.max_chars', 'memory.core.remote_edit',
   'memory.pressure.enabled', 'memory.pressure.warn_ratio', 'memory.pressure.context_window',
@@ -1664,9 +1673,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.patterns.subagent_timeout_ms',
   'dream.patterns.subagent_wait_timeout_ms',
   'dream.patterns.min_interval_hours', 'dream.patterns.child_read_budget_kb', // #6297: hours (default 6) / KB (default 200), 0 = off; cycle/phase-config-values.ts
+  'dream.claim_conflicts.mode', 'dream.claim_conflicts.max_pairs', // GBRA-216: propose | off (default off) / pairs per source per run (default 500); facts/claim-conflicts.ts
   // Paid-loop breaker: dead submissions of one dream key within 24h before
   // it is refused (default 3; 0 disables). `gbrain dream reset-key` clears one.
   'dream.breaker.max_dead_submissions',
+  'dream.write_deferral.enabled', 'embed.restamp.enabled', // GBRA-224 W3 self-heal switches, default on (heal-audit.ts healEnabled)
   // Emotional weight (v0.29)
   'emotional_weight.high_tags',
   'emotional_weight.user_holder',
@@ -1715,6 +1726,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // the advisor exposes operational diagnostics (version/jobs/key presence),
   // not prose skills. Default OFF; read-only over MCP.
   'mcp.publish_advisor',
+  'mcp.publish_memory_settings', // GBRA-219: operator grant for set_memory_writeback over MCP (admin scope too); default off
   // WP3 — unknown tool-call argument posture ('warn' default | 'reject').
   // Read dual-plane by src/mcp/validate-params.ts (DB > file > 'warn').
   'mcp.strict_params',
@@ -1734,6 +1746,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'self_upgrade.attempting_version',
   'self_upgrade.last_check_ts',
   'self_upgrade.last_applied_version',
+  'self_upgrade.autopilot_launcher',
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',
@@ -1807,6 +1820,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.admission', // #6712 PR 4b: normal | imports_only | classify_only, what a managed pass admits (persistence/sync-admission.ts)
   'sync.max_deletes', 'sync.max_delete_ratio', 'sync.apply_held_deletions', // #7130 delete caps (sync-reconcile.ts), GBRA-133 held-deletion switch (persistence/sync-held-deletions.ts); per source: <key>.source.<id>
   'purge.retention_hours', // #7130: hours a soft-deleted page waits before the autopilot purge phase may purge it (default 72)
+  'cycle.purge.mcp_request_log_retention_days', // #6770: opt-in request-log retention, 30-3650 days (mcp-request-log-retention.ts)
   'sync.federated_v2',
   'sync.include_working_tree',
   'sync.metafile_pages', // GBRA-150: typed (default) | off, whether a nested folder-scaffolding file with type:/title: frontmatter is a page (core/sync.ts)
@@ -1847,6 +1861,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'embed.backfill_cooldown_min',
   'embed.backfill_max_usd_per_source_24h',
   'embed.backfill_max_usd',
+  // GBRA-438: free unattended upkeep on/off and its daily embedding cap (core/maintenance/run.ts).
+  'maintenance.auto', 'maintenance.embed_daily_usd',
   // Brain-level default source. Read by source-resolver.ts tier 5
   // (`engine.getConfig('sources.default')`) and written by
   // `gbrain sources default <id>`. Listed here so `gbrain config set`
@@ -1866,7 +1882,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'persistence.limits.principal_lifetime_ids', 'persistence.limits.brain_lifetime_ids',
   'persistence.limits.principal_terminal_bytes', 'persistence.limits.brain_terminal_bytes',
   'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes', 'persistence.limits.principal_staged_bytes', 'persistence.limits.brain_staged_bytes', 'persistence.limits.principal_uploads', 'persistence.limits.upload_idle_seconds', 'persistence.limits.upload_max_seconds',
-  'persistence.receipt_retention_days', 'persistence.unbound_write', 'persistence.max_claim_ms', // #5254: persistence/unbound-source.ts; #6176: persistence/claim-phase.ts
+  'persistence.receipt_retention_days', 'persistence.housekeeping.receipt_target_bytes', 'persistence.unbound_write', 'persistence.max_claim_ms', // #5254: persistence/unbound-source.ts; #6176: persistence/claim-phase.ts
   'persistence.sync_preparation_ms', 'persistence.maintenance_preparation_ms', 'persistence.preparation_ceiling_ms', 'persistence.max_preparation_attempts', 'persistence.preparation_deadlines', 'persistence.max_transient_retries', // #6278: persistence/preparation-budget.ts, switches.ts; transient-retry.ts
   'persistence.publication_ceiling_ms', 'persistence.terminal_failures.window_days', 'persistence.terminal_failures.spike_factor', 'persistence.terminal_failures.spike_min', // #6405: persistence/sync-drain.ts (in-pass publication ceiling); #6650: persistence/terminal-failures.ts
   'persistence.capacity.warn_days', 'persistence.capacity.fail_days', 'persistence.capacity.background_pause_pct', // #6696: persistence/capacity-forecast.ts, admission-origin.ts
@@ -1913,7 +1929,8 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'minions.',
   'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
   'decide.',            // System One decide.* (validated by src/core/ai/decide/config.ts DECIDE_CONFIG_KEYS)
-  'sync.max_deletes.source.', 'sync.max_delete_ratio.source.', 'sync.apply_held_deletions.source.', // #7130 per-source delete caps, GBRA-133 per-source held-deletion switch
+  'sync.max_deletes.source.', 'sync.max_delete_ratio.source.', 'sync.apply_held_deletions.source.', 'persistence.adopt_local_edits.source.', // #7130 per-source delete caps, GBRA-133 per-source held-deletion switch, GST-1601 per-source local-edit adoption
+  'sources.auto_reconcile.source.', // GST-2250: per-source opt-out of automatic publishing by git-reconcile and refresh (false keeps local commits unpublished; sync goes on)
   'connectors.',        // chat-connectors: source_id, sync_floor_min, embed_kickoff_min_pages, doctor_stale_hours, <provider>.{auto_sync,last_sync_at,auth_error_at,watermark_iso} (no secrets — creds are file-plane)
 ];
 

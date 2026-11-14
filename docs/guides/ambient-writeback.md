@@ -284,6 +284,62 @@ gbrain recall projects/offsite-example
 Or ask your agent: *"Remember the offsite date from the email I just pasted,
 and note that it came from that email."*
 
+## Sessions an agent launches
+
+An orchestrator that starts worker sessions on your account (`claude -p`,
+`codex exec`) writes each worker's first user turn itself, usually from a
+template. Those turns are not yours, but the transcript looks the same as one
+of your own sessions. Tell gbrain who wrote them with one environment variable
+on the worker's process:
+
+| `GBRAIN_SESSION_AGENT` | What happens |
+|---|---|
+| `<label>` (a-z, 0-9, `.`, `_`, `-`, up to 64) | The session is saved. Claims from its user turns are saved as that agent's (`attributed_to: other`, context `speaker: agent <label>, not the owner`), never as yours. |
+| `off` | Nothing from the session is saved. Context injection still runs. |
+| `owner` | The turns are yours. Detection still runs, only to report a session it finds agent-launched (heartbeat reason `speaker_owner_override_detected`), so an `owner` inherited by a worker is visible. |
+| unset | Automatic detection, below. |
+
+```bash
+GBRAIN_SESSION_AGENT=fleet-worker claude -p "$(render-brief task-42)"
+```
+
+`GBRAIN_HOOKS=0` turns off every gbrain hook, context injection included;
+`GBRAIN_SESSION_AGENT=off` turns off only saving.
+
+**Automatic detection.** With the variable unset, the hook treats a session
+as agent-launched when its harness process runs headless (`claude -p` or
+`--print`, `codex exec`) and another `claude` or `codex` process is one of
+its ancestors. Its claims are saved as agent `agent-launched`'s. A headless
+session you start yourself from a terminal is still yours, and so is a session
+a `claude remote-control` server hosts for you (a worker that session launches
+is still agent-launched). Detection reads the
+process table and can miss a launcher that detaches its workers, and it never
+fires for a launcher that is not itself claude or codex (a cron job, a script
+or a daemon running `claude -p`). For those the variable is the only signal,
+so set it in any launcher you control.
+
+The marker covers the Claude Code and Codex hook lanes and the facts they
+save. The OpenClaw context engine marks a sub-agent session (session key
+`agent:<id>:subagent:<uuid>`) as agent `agent-launched`'s, since its user turns
+are the parent agent's brief. Dream synthesis reads the marker too and tells
+the model that the session's user turns are the agent's, never yours.
+
+The marker is a `<session>.speaker.json` file beside the session's corpus
+files, written before any of them; the first record is kept. If it cannot be
+written, nothing from the session is saved (heartbeat reason
+`speaker_write_failed`); `off` records `capture_opt_out`. A resumed session
+whose speaker differs from the record (you resuming a worker's session, or
+another agent label) keeps the record and reports `speaker_mismatch`. An
+agent's `claude -p --continue` in a session already saved as yours saves
+nothing and reports `speaker_mismatch`, so your earlier turns stay yours. Agent claims are never promoted into your own takes by
+the consolidate phase and are not linked to entity pages as your statements.
+
+Facts saved as yours before this marker existed can be re-attributed:
+`gbrain doctor` (`agent_session_facts`) counts them and `gbrain repair
+agent-session-facts` previews the change ([repair guide](repair.md)). The
+repair changes attribution and retires the takes they produced; it deletes
+nothing.
+
 ## Proving an extraction ran
 
 `extract_facts` has no caller-defined binding field such as a `job_binding`
@@ -500,6 +556,72 @@ Two neighbouring checks cover capture residue: `self_capture` counts corpus
 files from gbrain's own claude-cli sessions, and `captured_facts_active`
 counts facts captured before v0.60.30.0 from those sessions or from pasted
 text (cleared by `gbrain repair captured-facts`).
+
+## Reading and changing it remotely
+
+Three MCP tools let a connected agent or a product settings screen read the
+rule, change the mode agents follow, and switch saving for one conversation.
+They keep everything in the brain's database (the config table and the
+request log), so a brain with no git repository gets all of them.
+
+| Tool | Who can call it | What it does |
+|---|---|---|
+| `get_memory_settings` | any connection (read scope) | the mode agents follow, where it came from, the exact rule text, every mode's rule, background capture state, and whether you may change it |
+| `set_memory_writeback` | admin scope, after the operator's grant | changes `memory.agent_writeback` for the whole brain; `dry_run: true` previews |
+| `memory_conversation_mode` | any connection that can call `remember` | returns the rule to follow for the rest of this conversation; stores nothing |
+
+**Two keys, two jobs.** `memory.auto_writeback` is the operator's setting: it
+drives the instruction section and the host capture lanes (Stop hook,
+compaction harvest, SessionEnd transcripts). `memory.agent_writeback`
+(`inherit` | `off` | `salient` | `all`, unset means inherit) changes only
+what agents are told over MCP. The capture lanes never read it, so a remote
+`off` can't retire the host's banked session text, and a remote `all` can't
+start capture the operator never turned on. Harness instruction blocks
+installed by `gbrain bootstrap harness` also keep following the operator's
+`memory.auto_writeback`; converge them with another bootstrap run if you
+change that. An unreadable or unrecognized `memory.agent_writeback` makes
+agents act as if writeback is off (never as if it inherited a wider mode), and
+`get_memory_settings` reports `status: degraded` with the reason instead of a
+plain `off`.
+
+**Turning on remote changes (operator, on the brain host):**
+
+```bash
+gbrain config set mcp.publish_memory_settings true      # the grant; default off
+gbrain auth create settings-app --scopes read,write,admin   # or: gbrain auth rescope --id TOKEN_ID --scopes read,write,admin
+# From an admin-scope connection:
+#   set_memory_writeback {"mode": "salient", "dry_run": true}   -> preview, writes nothing
+#   set_memory_writeback {"mode": "salient"}                    -> applied, audited
+#   get_memory_settings {}                                      -> effective_mode: "salient", source: "agent_override"
+gbrain config get memory.agent_writeback   # the same value from the CLI
+gbrain config set memory.agent_writeback inherit   # back to the operator's mode
+```
+
+Admin scope also carries `sources_admin` and `users_admin`, so grant it only
+to a connection you'd trust with those. While the grant is off, the tool is
+hidden from network tool lists; `get_memory_settings` names why in
+`can_set.blocked_by` (`gate_off`, `scope`, `bound_client`, `surface`) and
+carries the grant command in `can_set.fix`.
+
+Each change writes the setting and a `memory_setting_change` row in
+`mcp_request_log` (client, transport, old, new) in one transaction. If the
+database write doesn't confirm, the call fails with
+`memory_setting_write_outcome_unknown`: read `get_memory_settings` before
+trying again, because a lost acknowledgement looks the same as a rollback.
+On a brain that looks like a team brain, enabling returns a `caution`.
+
+**When a change takes effect:** HTTP sessions on their next initialize; a
+stdio server after it restarts; the conversation switch immediately.
+
+**The conversation switch.** When the user says "save everything from here",
+the agent calls `memory_conversation_mode {"mode": "all"}` and follows the
+returned `rule_text` for the rest of the conversation. "Stop saving" is
+`{"mode": "off"}`: save only what the user explicitly asks to keep. `brain`
+returns the brain's own rule. Nothing is stored: a new conversation starts
+from the brain's mode, and after compaction the agent calls it again. Every
+save still goes through `remember` with the connection's own scope and the
+brain's visibility posture. The switch doesn't stop background capture from
+host session hooks, and its response says so.
 
 ## Enable / verify / disable
 

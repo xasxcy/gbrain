@@ -38,11 +38,13 @@
 
 import postgres from '#postgres'
 import { traceSqlOptions } from './sql-trace.ts';
+import { tlsRequiredDefaultError, withPgTls } from './pg-tls.ts';
 import { gbrainApplicationName, readPoolPipelineOptions, transactionPipelineOptions, resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, resolveArrayTypes, endPoolBounded, poolHealthOptions, type PoolHealthHooks } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 import { directPoolProfile, type DirectPoolProfile } from './direct-pool-profile.ts';
 import { deriveDirectUrl, deriveSessionPoolerUrl, isSupabasePoolerUrl } from './supabase-pooler-url.ts';
+import { settingsConnectionOptions } from './embedded-engine.ts';
 
 export { deriveDirectUrl, deriveSessionPoolerUrl, isSupabasePoolerUrl };
 
@@ -56,6 +58,13 @@ export interface ConnectionManagerOpts {
    * Sourced from GBRAIN_DIRECT_DATABASE_URL or explicit caller config.
    */
   directUrl?: string | null;
+  /**
+   * False for an engine opened from settings (engine-open.ts): the direct URL is `directUrl` alone (absent: none, or
+   * the route a known pooler URL derives) and GBRAIN_DIRECT_DATABASE_URL is never read.
+   */
+  directUrlFromEnv?: boolean;
+  /** True for an engine opened from settings: the direct pool passes every connection field explicitly, never PG* env. */
+  settingsConnection?: boolean;
   /**
    * Inherit pools + kill-switch state from a parent manager (worker engines,
    * transaction clones). When set, this manager is a thin reference holder
@@ -178,6 +187,8 @@ export class ConnectionManager {
   /** #1915: single-flight guard for the session-pooler retry. */
   private _sessionInit: Promise<Sql> | null = null;
   private _sessionFallbackLogged = false;
+  /** #8478: bumped by disconnect() and retire(); a pool whose init began in an earlier epoch has no owner. */
+  private _epoch = 0;
 
   constructor(opts: ConnectionManagerOpts) {
     this.opts = opts;
@@ -196,7 +207,7 @@ export class ConnectionManager {
       this._isSupabase = isSupabasePoolerUrl(opts.url);
       // Direct URL: explicit override > env > derive > null. Pooler-shaped
       // overrides are normalized to a real direct host (or dropped).
-      const envOverride = process.env.GBRAIN_DIRECT_DATABASE_URL;
+      const envOverride = opts.directUrlFromEnv === false ? undefined : process.env.GBRAIN_DIRECT_DATABASE_URL;
       const override = opts.directUrl ?? envOverride;
       this._directUrl = normalizeDirectUrl(opts.url, override);
       // #1915: an operator override is respected as-is — never second-guessed
@@ -266,7 +277,7 @@ export class ConnectionManager {
     if (Object.keys(timeouts).length > 0) opts.connection = timeouts;
     const prepare = resolvePrepare(this.opts.url);
     if (typeof prepare === 'boolean') opts.prepare = prepare;
-    this._readPool = postgres(this.opts.url, traceSqlOptions(opts, 'read'));
+    this._readPool = postgres(this.opts.url, traceSqlOptions(withPgTls(this.opts.url, opts), 'read'));
     logConnectionEvent({ pool: 'read', op: 'init' });
     return this._readPool;
   }
@@ -314,14 +325,12 @@ export class ConnectionManager {
 
   private async getDirectPool(): Promise<Sql> {
     if (this._directPool) return this._directPool;
+    const epoch = this._epoch;
     // A1: cache the Promise so concurrent first callers await the same init.
     if (!this._directInit) {
-      this._directInit = this.initDirectPool().then(pool => {
-        this._directPool = pool;
-        return pool;
-      }).catch(err => {
+      this._directInit = this.initDirectPool().then(pool => this.adoptDirectPool(pool, epoch)).catch(err => {
         // Reset cache on failure so next caller can retry.
-        this._directInit = null;
+        if (this._epoch === epoch) this._directInit = null;
         throw err;
       });
     }
@@ -329,6 +338,8 @@ export class ConnectionManager {
     try {
       pool = await this._directInit;
     } catch (err) {
+      // #8478: a manager closed while this init was in flight starts no fallback.
+      if (this._epoch !== epoch) throw err;
       // #1641: the derived direct host (db.<ref>.supabase.co) is IPv6-only
       // without Supabase's IPv4 add-on. On IPv4-only networks the direct
       // pool can never connect — permanently fall back to the read pool
@@ -357,10 +368,7 @@ export class ConnectionManager {
             if (sessionUrl && sessionUrl !== this._directUrl) {
               const prevHost = this._directUrl ? this.hostOnly(this._directUrl) : 'unknown host';
               this._directUrl = sessionUrl;
-              this._sessionInit = this.initDirectPool().then(p => {
-                this._directPool = p;
-                return p;
-              });
+              this._sessionInit = this.initDirectPool().then(p => this.adoptDirectPool(p, epoch));
               const p = await this._sessionInit;
               if (!this._sessionFallbackLogged) {
                 this._sessionFallbackLogged = true;
@@ -372,7 +380,8 @@ export class ConnectionManager {
               }
               return p;
             }
-          } catch {
+          } catch (sessionErr) {
+            if (this._epoch !== epoch) throw sessionErr;
             // Session pooler also failed → fall through to the #1641
             // read-pool kill-switch below (the original behavior).
           }
@@ -394,6 +403,16 @@ export class ConnectionManager {
       // Defensive — initDirectPool should have thrown.
       throw new Error('connection-manager: direct pool init returned null');
     }
+    return pool;
+  }
+
+  /** #8478: a pool that finished opening after disconnect() or retire() is ended here; nobody else holds it. */
+  private async adoptDirectPool(pool: Sql, epoch: number): Promise<Sql> {
+    if (this._epoch !== epoch) {
+      await endPoolBounded(pool);
+      throw Object.assign(new Error('connection-manager: the direct pool finished opening after this manager was closed'), { code: 'CONNECTION_ENDED' });
+    }
+    this._directPool = pool;
     return pool;
   }
 
@@ -428,8 +447,10 @@ export class ConnectionManager {
     };
     const t0 = Date.now();
     let pool: Sql | null = null;
+    let directOpts: Record<string, unknown> = opts;
     try {
-      pool = postgres(this._directUrl, traceSqlOptions(opts, 'direct'));
+      directOpts = this.opts.settingsConnection ? { ...opts, ...settingsConnectionOptions(this._directUrl) } : opts;
+      pool = postgres(this._directUrl, traceSqlOptions(withPgTls(this._directUrl, directOpts), 'direct'));
       // Probe to validate connectivity early.
       await pool`SELECT 1`;
       logConnectionEvent({
@@ -449,7 +470,7 @@ export class ConnectionManager {
         duration_ms: Date.now() - t0,
         error: { message: err instanceof Error ? err.message : String(err) },
       });
-      throw err;
+      throw (this._directUrl ? await tlsRequiredDefaultError(this._directUrl, err, directOpts) : null) ?? err;
     }
   }
 
@@ -486,16 +507,29 @@ export class ConnectionManager {
     // instance/module pool is added downstream) and neither can hang teardown
     // past the CLI's 10s force-exit. endPoolBounded never throws.
     const ends: Promise<void>[] = [];
+    this._epoch++;
+    this._sessionInit = null;
+    this._directInit = null;
     if (this._directPool) {
       ends.push(endPoolBounded(this._directPool));
       this._directPool = null;
-      this._directInit = null;
     }
     if (this._readPool && !this._readPoolOwnedExternally) {
       ends.push(endPoolBounded(this._readPool));
       this._readPool = null;
     }
     await Promise.all(ends);
+  }
+
+  /** Ends a manager a reconnect superseded once its in-flight work finishes, with no hard bound (a long hold such as CREATE INDEX CONCURRENTLY completes). */
+  retire(): void {
+    const pools = [this._directPool, this._readPoolOwnedExternally ? null : this._readPool];
+    this._epoch++;
+    this._sessionInit = null;
+    this._directPool = null;
+    this._directInit = null;
+    this._readPool = null;
+    for (const pool of pools) pool?.end().catch(() => {});
   }
 
   /**

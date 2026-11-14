@@ -9,6 +9,7 @@
 import type { Operation } from './contract.ts';
 import { opError } from './contract.ts';
 import { hostFix, invalidParam } from './op-fix.ts';
+import { sourceScopeOpts } from './context.ts';
 import {
   LIST_SKILLS_DESCRIPTION,
   GET_SKILL_DESCRIPTION,
@@ -29,7 +30,7 @@ const list_skills: Operation = {
   description: LIST_SKILLS_DESCRIPTION,
   publishGateKey: 'mcp.publish_skills',
   params: {
-    schema_version: { type: 'number', description: '2 for the source-qualified catalog.', fullSurfaceOnly: true },
+    schema_version: { type: 'number', minimum: 1, description: '2 for the source-qualified catalog.', fullSurfaceOnly: true },
     limit: { type: 'number', description: 'Page size or rank cap (1-100).' },
     cursor: { type: 'string', description: 'Version 2 cursor.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: 'Version 2: one source.', fullSurfaceOnly: true },
@@ -82,7 +83,7 @@ const get_skill: Operation = {
   description: GET_SKILL_DESCRIPTION,
   publishGateKey: 'mcp.publish_skills',
   params: {
-    schema_version: { type: 'number', description: '2 for an exact canonical revision.', fullSurfaceOnly: true },
+    schema_version: { type: 'number', minimum: 1, description: '2 for an exact canonical revision.', fullSurfaceOnly: true },
     qualified_id: { type: 'string', description: 'Version 2 skill id.', fullSurfaceOnly: true },
     expected_brain_id: { type: 'string', description: 'Brain id to assert.', fullSurfaceOnly: true },
     source_incarnation: { type: 'string', description: 'From discovery.', fullSurfaceOnly: true },
@@ -383,6 +384,10 @@ const get_status_snapshot: Operation = {
         config: r.config ?? {},
       }));
     }
+    // Remote callers see only the sources their grant reads (the sources_list / get_health ladder); the trusted local CLI keeps every source.
+    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : undefined);
+    if (allowed) sources = sources.filter((s) => allowed.includes(s.id));
     const sync = await buildSyncStatusReport(ctx.engine, sources);
     const cycle = await buildCycleSnapshot(ctx.engine);
     // v2 sections, each fail-soft (amendment 26): a broken/pre-migration

@@ -12,16 +12,16 @@
  * marker, and each such page is counted (`segmented_pages`) and named.
  */
 import type { BrainEngine } from '../engine.ts';
+import { CONNECTOR_KINDS_SQL } from '../persistence/connector-kinds.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { conceptPreservationHold } from '../cycle/concept-publication.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, replaceOrInsertFactsFence } from '../facts-fence.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fence.ts';
 import { segmentedRegionContains } from '../page-body/segment-lines.ts';
+import { countOutsideCode, locateOutsideCode } from '../fence-scan.ts';
 import { SEGMENTED_SAMPLE } from './timeline.ts';
 import { afterCursor, repairRequestId, type RepairHandler, type RepairItem, type RepairScope, type RepairCursor } from './core.ts';
-
-const count = (text: string, marker: string) => text.split(marker).length - 1;
 
 /**
  * The page with every below-sentinel fence moved into its body, or null when
@@ -32,10 +32,10 @@ export function relocateTimelineFences(page: { compiled_truth: string | null; ti
   let timeline = page.timeline ?? '';
   let moved = false;
   for (const [begin, end] of [[FACTS_FENCE_BEGIN, FACTS_FENCE_END], [TAKES_FENCE_BEGIN, TAKES_FENCE_END]] as const) {
-    if (!timeline.includes(begin) && !timeline.includes(end)) continue;
-    if (count(timeline, begin) !== 1 || count(timeline, end) !== 1 || count(body, begin) || count(body, end)) return null;
-    const start = timeline.indexOf(begin);
-    const stop = timeline.indexOf(end, start);
+    const inTimeline = [countOutsideCode(timeline, begin), countOutsideCode(timeline, end)];
+    if (!inTimeline[0] && !inTimeline[1]) continue;
+    if (inTimeline[0] !== 1 || inTimeline[1] !== 1 || countOutsideCode(body, begin) || countOutsideCode(body, end)) return null;
+    const { beginIdx: start, endIdx: stop } = locateOutsideCode(timeline, begin, end);
     if (stop === -1) return null;
     const block = timeline.slice(start, stop + end.length);
     timeline = `${timeline.slice(0, start)}${timeline.slice(stop + end.length)}`.replace(/\n{3,}/g, '\n\n').trim();
@@ -56,14 +56,14 @@ const FENCE_MARKERS = ['gbrain:facts:', 'gbrain:takes:'];
 
 async function candidates(engine: BrainEngine, sourceIds: string[]): Promise<FencePage[]> {
   return engine.executeRaw<FencePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p JOIN sources s ON s.id=p.source_id
-    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN ('google','github')
+    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN (${CONNECTOR_KINDS_SQL})
       AND (p.timeline LIKE '%gbrain:facts:%' OR p.timeline LIKE '%gbrain:takes:%') ORDER BY p.id`, [sourceIds]);
 }
 
 /** Segmented connector pages whose timeline region holds a facts or takes fence marker, as `source:slug`. */
 async function segmentedCandidates(engine: BrainEngine, sourceIds: string[], after: RepairCursor | null): Promise<string[]> {
   const pages = await engine.executeRaw<{ id: number; source_id: string; slug: string }>(`SELECT p.id,p.source_id,p.slug FROM pages p JOIN sources s ON s.id=p.source_id
-    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN ('google','github') AND p.body_storage='segmented' ORDER BY p.id`, [sourceIds]);
+    WHERE p.source_id=ANY($1::text[]) AND p.deleted_at IS NULL AND s.config->>'kind' IN (${CONNECTOR_KINDS_SQL}) AND p.body_storage='segmented' ORDER BY p.id`, [sourceIds]);
   const found: string[] = [];
   for (const page of pages) {
     if (!afterCursor({ phase: 0, id: Number(page.id) }, after)) continue;

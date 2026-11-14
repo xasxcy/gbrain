@@ -17,6 +17,7 @@ import { tmpdir } from 'os';
 import { bunGlobalExactTagPin, bunReinstallCommand } from '../src/commands/upgrade.ts';
 import { VERSION } from '../src/version.ts';
 import { upgradeErrorResolved } from '../src/commands/doctor.ts';
+import { writeChannelCache } from './helpers/update-cache.ts';
 
 const REPO = resolve(import.meta.dir, '..');
 
@@ -35,7 +36,7 @@ async function runBareUpgrade(spec: string, observedVersion: string, cache?: str
   chmodSync(join(bin, 'gbrain'), 0o755);
   if (cache) {
     mkdirSync(join(home, '.gbrain'), { recursive: true });
-    writeFileSync(join(home, '.gbrain', 'last-update-check'), `${cache}\n`);
+    writeChannelCache(join(home, '.gbrain'), cache);
   }
   const globalRoot = join(home, '.bun', 'install', 'global');
   const pkgDir = join(globalRoot, 'node_modules', 'gbrain');
@@ -44,7 +45,8 @@ async function runBareUpgrade(spec: string, observedVersion: string, cache?: str
   writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'gbrain', repository: 'github:garrytan/gbrain' }));
   const driver = join(pkgDir, 'driver.ts');
   writeFileSync(driver, `import { runUpgrade } from '${REPO}/src/commands/upgrade.ts';\nawait runUpgrade(['--swap-only', '--no-bun-floor-check']);\n`);
-  const env: Record<string, string | undefined> = { ...process.env, HOME: home, GBRAIN_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+  // The bare-upgrade path under test is the install method's own (alpha); stable is covered in upgrade-stable-channel.
+  const env: Record<string, string | undefined> = { ...process.env, HOME: home, GBRAIN_HOME: home, GBRAIN_RELEASE_CHANNEL: 'alpha', PATH: `${bin}:${process.env.PATH}` };
   delete env.BUN_INSTALL;
   const proc = Bun.spawn([process.execPath, 'run', driver], { cwd: REPO, env, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -76,13 +78,13 @@ describe('#5311 bare upgrade on an exact-tag pin', () => {
       expect(r.stderr).toContain('Upgrade did not take effect');
       expect(r.stderr).toContain(`pinned to github:garrytan/gbrain#v${VERSION}`);
       // #5034 / B-NEW-5: remove before add; an in-place global tag swap fails (Bun 1.3) or silently corrupts the lock (Bun 1.4).
-      expect(r.stderr).toContain('bun remove -g gbrain && bun add -g github:garrytan/gbrain');
+      expect(r.stderr).toContain('bun remove -g gbrain && bun add -g --backend=copyfile github:garrytan/gbrain');
       expect(r.stderr).not.toContain('not published yet');
-      expect(readFileSync(join(r.home, 'bun-calls.log'), 'utf-8')).toContain('update gbrain');
+      expect(readFileSync(join(r.home, 'bun-calls.log'), 'utf-8')).toContain('update --backend=copyfile gbrain');
       // No false "just upgraded" breadcrumb for an upgrade that never happened.
       expect(existsSync(join(r.home, '.gbrain', 'just-upgraded-from'))).toBe(false);
       const errors = readFileSync(join(r.home, '.gbrain', 'upgrade-errors.jsonl'), 'utf-8').trim().split('\n').map(l => JSON.parse(l));
-      expect(errors.some(e => e.phase === 'verify-pin' && e.hint.startsWith('bun remove -g gbrain && bun add -g github:garrytan/gbrain'))).toBe(true);
+      expect(errors.some(e => e.phase === 'verify-pin' && e.hint.startsWith('bun remove -g gbrain && bun add -g --backend=copyfile github:garrytan/gbrain'))).toBe(true);
     } finally {
       rmSync(r.home, { recursive: true, force: true });
     }
@@ -111,8 +113,8 @@ describe('#5311 bare upgrade on an exact-tag pin', () => {
 
   test('every reinstall hint removes the global package before adding the tag (#5034, B-NEW-5)', () => {
     // #6662: a tag reinstall first proves the tag exists, so a missing tag stops before the removal.
-    expect(bunReinstallCommand('#v0.60.1.0')).toBe('git ls-remote --exit-code --tags https://github.com/garrytan/gbrain refs/tags/v0.60.1.0 && bun remove -g gbrain && bun add -g github:garrytan/gbrain#v0.60.1.0');
-    expect(bunReinstallCommand('')).toBe('bun remove -g gbrain && bun add -g github:garrytan/gbrain');
+    expect(bunReinstallCommand('#v0.60.1.0')).toBe('git ls-remote --exit-code --tags https://github.com/garrytan/gbrain refs/tags/v0.60.1.0 && bun remove -g gbrain && bun add -g --backend=copyfile github:garrytan/gbrain#v0.60.1.0');
+    expect(bunReinstallCommand('')).toBe('bun remove -g gbrain && bun add -g --backend=copyfile github:garrytan/gbrain');
   });
 
   test('an unpinned install that is already current still succeeds', async () => {

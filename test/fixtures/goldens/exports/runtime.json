@@ -29,6 +29,7 @@
         "consolidateFact",
         "countChunklessPagesWithContent",
         "countKeywordPages",
+        "countPagesBy",
         "countStaleChunks",
         "countStaleFrontmatterKeyPages",
         "countStalePagesForExtraction",
@@ -56,6 +57,7 @@
         "findDuplicatePages",
         "findOntologyConflicts",
         "findOrphanPages",
+        "findPages",
         "findTrajectory",
         "flipBodyGeneration",
         "getAdjacencyBoosts",
@@ -101,6 +103,7 @@
         "getTimelineForDate",
         "getUnverifiedExtractionPageIds",
         "getVersions",
+        "holdsDatastoreLock",
         "initSchema",
         "insertFact",
         "insertFacts",
@@ -239,6 +242,7 @@
         "consolidateFact",
         "countChunklessPagesWithContent",
         "countKeywordPages",
+        "countPagesBy",
         "countStaleChunks",
         "countStaleFrontmatterKeyPages",
         "countStalePagesForExtraction",
@@ -270,6 +274,7 @@
         "findDuplicatePages",
         "findOntologyConflicts",
         "findOrphanPages",
+        "findPages",
         "findTrajectory",
         "flipBodyGeneration",
         "getAdjacencyBoosts",
@@ -316,6 +321,7 @@
         "getTimelineForDate",
         "getUnverifiedExtractionPageIds",
         "getVersions",
+        "holdSchemaMigrationLock",
         "initSchema",
         "insertFact",
         "insertFacts",
@@ -542,7 +548,8 @@
         "toolLoop",
         "transcribe",
         "validateModelId",
-        "withBudgetTracker"
+        "withBudgetTracker",
+        "withoutBudgetTracker"
       ],
       "./ai/invocation-guard": [
         "aiInvocationObserverFailures",
@@ -609,9 +616,18 @@
         "priceAtPromptSize"
       ],
       "./core/skillopt": [
+        "READ_ONLY_BRAIN_TOOLS",
+        "SKILLOPT_HOOK_BUDGET_EXHAUSTED",
+        "SKILLOPT_HOOK_INFRA_ERROR",
+        "describeJudge",
+        "describeJudges",
         "loadHeldOut",
+        "rolloutToolsForSkill",
+        "runRollout",
         "runSkillOpt",
-        "scoreSkillOnTasks"
+        "scoreSkillOnTasks",
+        "scoreSkillPerTask",
+        "scoreTrajectory"
       ],
       "./embedding": [
         "EMBEDDING_COST_PER_1K_TOKENS",
@@ -639,6 +655,16 @@
       ],
       "./engine-factory": [
         "createEngine"
+      ],
+      "./engine-open": [
+        "DEFAULT_EMBEDDED_POOL_MAX",
+        "embeddedSettings",
+        "hostIdFor",
+        "isEmbeddedEngine",
+        "openEngine",
+        "processHasEmbeddedEngines",
+        "withEngineScope",
+        "withLocalScope"
       ],
       "./eval/longmemeval/reader": [
         "READER_MAX_SESSION_CHARS",
@@ -746,6 +772,7 @@
         "makeResolver",
         "normalizeBasename",
         "orientCanonicalAttendance",
+        "pageRelativeMarkdownSlugs",
         "parseInlineCitationTimelineEntries",
         "parseTimelineEntries",
         "queryBasenameIndex",
@@ -783,6 +810,7 @@
         "isFrontmatterHoldMessage",
         "isRelativeFileUri",
         "isTimelineHeadingAfterDash",
+        "needsEmptyTimelineSentinel",
         "nullBytesError",
         "parseMarkdown",
         "parseMarkdownHead",
@@ -981,6 +1009,30 @@
         "stampContentFlags",
         "stampUnverifiedExtractions",
         "textVectorArmNonEmpty"
+      ],
+      "./skill-resolver": [
+        "BLOCK_TOKEN_CAP",
+        "EXCLUDE_MAX",
+        "GBRAIN_VERSION",
+        "HARNESSES",
+        "MATCH_STRENGTHS",
+        "RESOLVER_FEATURES",
+        "ResolverError",
+        "SCHEMA_VERSION",
+        "buildSkillIndex",
+        "buildSkillIndexOffThread",
+        "catalogStatus",
+        "commitSessionAsync",
+        "errorTurnOutput",
+        "gcSkillSessions",
+        "listCatalogs",
+        "normalizeTurnInput",
+        "openCatalog",
+        "removeSkillIndex",
+        "resetSkillSession",
+        "resolveSkills",
+        "resolverHome",
+        "sessionStatus"
       ],
       "./think": [
         "__thinkAdapter",

@@ -66,7 +66,7 @@ import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
 import { chat as gatewayChat, withBudgetTracker } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, type GlobalLlmErrorClass } from '../ai/errors.ts';
-import { derivedWriteThrough, reportFileHolds } from './derived-write-through.ts';
+import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-through.ts';
 import { emptySessionSourceRouting, keepSessionSourceTranscripts, withSessionSourceRouting } from './synthesize-source-routing.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
@@ -85,12 +85,12 @@ import { slugifySegment } from '../sync.ts';
 import { resolveAlias, resolveTierDefault } from '../model-config.ts';
 import { isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { utcDate } from './cycle-date.ts';
-import { atomSourceDate } from './atom-source-date.ts';
-import { normalizeForGrounding } from './synthesize-verify.ts';
+import { atomSourceDate, transcriptAtomSourceDate } from './atom-source-date.ts';
+import { normalizeForGrounding, isGroundingQuoteMark } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
-import { atomOriginPin, atomWriteFailure, type AtomWriteFailure, managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, publishManagedAtomGeneration, resumeManagedGenerationMembers,
+import { atomOriginPin, atomWriteFailure, type AtomWriteFailure, concurrentAtomBatch, managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, publishManagedAtomGeneration, resumeManagedGenerationMembers,
   MANAGED_ATOM_DISCOVERY_SQL, managedAtomDiscoverySql, type AtomOrigin } from '../persistence/atom-maintenance.ts';
-import { effectiveVisibility } from '../search/private-visibility.ts';
+import { effectiveVisibility, folderRestricted } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
 import { isOpPageSlug } from '../ops/context.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
@@ -269,7 +269,9 @@ export interface ExtractAtomsOpts {
  *
  * Folding rides `normalizeForGrounding` — the v0.47.8.0 quote-repair core in
  * synthesize-verify.ts (the "ONE folding core" invariant: this module must
- * mean the same thing by "normalized substring" as the repair ladder does).
+ * mean the same thing by "normalized substring" as the repair ladder does),
+ * plus its markup fold (#8371): a quote that drops the source's line markers,
+ * quotation marks or a spaced dash still says the source's exact words.
  * Everything is decided in FOLDED space, including uniqueness: a typographic
  * twin ('“go now”' vs '"go now"') is only visible there, and returning an
  * offset that might name the wrong passage is worse than returning none.
@@ -287,9 +289,10 @@ export function locateQuote(
   quote: string,
 ): { start: number; end: number } | null {
   if (!quote || !content) return null;
-  const c = normalizeForGrounding(content);
-  const q = normalizeForGrounding(quote);
+  const c = normalizeForGrounding(content, { markup: true });
+  const q = normalizeForGrounding(quote, { markup: true });
   if (!q.norm) return null;
+  const quoted = quote.trim();
 
   // Enumerate every folded hit, keep those that survive the round-trip
   // boundary check, THEN judge ambiguity. Order matters: rejecting on raw
@@ -302,16 +305,18 @@ export function locateQuote(
   let seen = 0;
   while (at !== -1 && seen < MAX_CANDIDATES) {
     seen++;
-    const start = c.map[at]!;
+    let start = c.map[at]!;
     // map[] names the FIRST code unit of the original character; advance the
     // end by the whole code point, not +1 — a bare +1 splits the surrogate
     // pair when the quote ends with a non-BMP char ('ship it 🚀'), and the
     // half-pair slice then fails the round-trip re-fold below.
     const lastOrig = c.map[at + q.norm.length - 1]!;
     const lastCp = content.codePointAt(lastOrig);
-    const end = lastOrig + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1);
+    let end = lastOrig + (lastCp !== undefined && lastCp > 0xffff ? 2 : 1);
+    if (isGroundingQuoteMark(quoted[0]) && isGroundingQuoteMark(content[start - 1])) start--;
+    if (isGroundingQuoteMark(quoted.at(-1)) && isGroundingQuoteMark(content[end])) end++;
     if (
-      normalizeForGrounding(content.slice(start, end)).norm === q.norm &&
+      normalizeForGrounding(content.slice(start, end), { markup: true }).norm === q.norm &&
       !valid.some(v => v.start === start && v.end === end)
     ) {
       valid.push({ start, end });
@@ -705,7 +710,7 @@ export async function runPhaseExtractAtoms(
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
-  const managed = await managedAtomSession(engine, sourceId, opts._managedRetry, opts.attempt?.writeWait);
+  const managed = await managedAtomSession(engine, sourceId, opts._managedRetry, opts.attempt?.writeWait, opts.signal);
   // v0.41.2.1: loadConfigWithEngine() so the dream.* DB-plane merge from Phase 1 reaches this phase.
   let transcriptDirs: { session_corpus_dir?: string; meeting_transcripts_dir?: string } | undefined;
   try {
@@ -878,7 +883,7 @@ export async function runPhaseExtractAtoms(
 
   // Phase-level no-op: nothing to extract today.
   if (work.length === 0 && transcripts.length === 0 && pages.length === 0) {
-    return withSessionSourceRouting(reportFileHolds({
+    return withSessionSourceRouting(reportDerivedWriteThrough({
       phase: 'extract_atoms',
       status: 'skipped',
       duration_ms: 0,
@@ -898,7 +903,7 @@ export async function runPhaseExtractAtoms(
         budget_usd: DEFAULT_BUDGET_USD,
         dry_run: opts.dryRun ?? false,
       },
-    }, atomFiles?.held, 'atom'), sourceRouting, sourceId, 'extract_atoms');
+    }, atomFiles, 'atom'), sourceRouting, sourceId, 'extract_atoms');
   }
 
   // 4. Per work-item: extract atoms via the configured extract_atoms model
@@ -1108,9 +1113,9 @@ export async function runPhaseExtractAtoms(
     try {
       origin = managed ? { ...await readAtomOrigin(engine, managed, item), ...(truncated ? { partialInputChars: maxInputChars } : {}) } : null;
       const sourcePage = item.kind === 'page' ? await engine.getPage(item.slug, { sourceId }) : null;
-      const contentDate = await atomSourceDate(engine, sourcePage); // #6720: captured with the input, before inference
+      const contentDate = await (item.kind === 'page' ? atomSourceDate(engine, sourcePage) : transcriptAtomSourceDate(engine, item.content, sourceDate(item.filePath, ''))); // #6720, #7268: captured with the input, before inference
       const visibility = origin?.visibility ?? effectiveVisibility(item.kind === 'transcript' ? { kind: 'transcript' } // #5525
-        : { kind: 'page', page: sourcePage });
+        : { kind: 'page', page: sourcePage && { ...sourcePage, folder_restricted: await folderRestricted(engine, sourceId, item.slug) } });
       throwIfAborted(opts.signal, 'extract_atoms');
       const resumed = !opts.dryRun && managed && origin ? await resumeManagedAtoms(engine, managed, origin) : 'run';
       if (resumed === 'done') { duplicatesSkipped++; continue; }
@@ -1219,8 +1224,8 @@ export async function runPhaseExtractAtoms(
           // #4706: pin the quote to its origin, or don't claim one. Located:
           // store the ORIGINAL characters (not the model's rendering, so
           // typographic drift can't accumulate) + [start, end) offsets into
-          // promptContent — valid against the full item too, because the cut
-          // is a prefix. Not located: the model paraphrased; drop the quote
+          // promptContent, the item's extraction input (extract-atoms-input.ts:
+          // a page as a world reader sees it). Not located: the model paraphrased; drop the quote
           // rather than persist an unverifiable one (an atom without a
           // quotation is honest; one with a fabricated quote is not, and
           // body/lesson/concepts stay useful either way). Verified against
@@ -1345,6 +1350,8 @@ export async function runPhaseExtractAtoms(
         else pagesSkipped++;
         continue;
       }
+      const concurrent = managed && origin ? await concurrentAtomBatch(engine, managed, origin, err) : null; // #7923
+      if (concurrent) { if (concurrent === 'done') duplicatesSkipped++; else if (concurrent === 'held') heldFailed++; else writesPending++; continue; }
       const written = managed && origin ? await atomWriteFailure(engine, managed, origin, err) : null; // #7514: never a provider error
       if (written) { hardFailureCount++; failures.push({ source: originLabel, ...written }); continue; }
       // gbrain#4148: classify. Transient provider/infra errors (timeouts,
@@ -1425,7 +1432,7 @@ export async function runPhaseExtractAtoms(
     });
   }
 
-  return withSessionSourceRouting(reportFileHolds({
+  return withSessionSourceRouting(reportDerivedWriteThrough({
     phase: 'extract_atoms',
     // A phase that skipped every work item and produced nothing did not
     // succeed, even though skips are not failures and leave failures[] empty.
@@ -1472,7 +1479,7 @@ export async function runPhaseExtractAtoms(
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
     },
-  }, atomFiles?.held, 'atom'), sourceRouting, sourceId, 'extract_atoms');
+  }, atomFiles, 'atom'), sourceRouting, sourceId, 'extract_atoms');
 }
 
 /**

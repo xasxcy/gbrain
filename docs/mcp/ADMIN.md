@@ -233,8 +233,91 @@ For one bot acting for several members of a shared brain, give each member a
 separate client or token restricted to that member's sources. The grant is the
 security boundary; a request's `source_ids` can only narrow inside it. See
 [a bot acting for many members](../guides/multi-source-brains.md#a-bot-acting-for-many-members).
-Access is per source, never per page, so lay sources out by who may read them
+Grants are per source, so lay sources out by who may read them
 ([guide](../guides/multi-source-brains.md#lay-out-sources-by-who-may-read-them)).
+Inside one source, bind each member's credential with `gbrain auth rescope
+--token <name> --member <id>` (or `--client`) and put `readable_by` on the pages
+only some members may read, or keep a whole folder to them with `gbrain access
+rule add --prefix <folder>/ --readers <members> --source <id>`.
+A member-bound credential whose write source is `default` (no `--sources`, or an
+OAuth client at its registration default) or a federated source keeps a page it creates to that
+member until the member names more readers
+([details](../tutorials/company-brain.md#two-scoping-models-pick-the-one-that-matches-your-shape)).
+One agent serving several people in a shared channel holds `--may-act-for
+<members>` instead, and its harness names each request's audience
+(`X-Gbrain-On-Behalf-Of` or request-level `_meta.on_behalf_of`); it reads only
+what every named person may read.
+A trusted system that already knows who each person is (QM) instead holds the
+attest right: register a client-credentials client, grant it with `gbrain auth
+rescope --client <id> --attest-actor qm [--attest-ops <op,...>]` (default
+`get_write_request,memory_recall,memory_write`; `--attest-sources <scope sources>` lets `memory_write` save to a shared scope's
+`memory/scope` page, see the [QM guide](../guides/qm.md#shared-scopes-projects-channels-teams)), and link each person's canonical id with `gbrain
+access member link <member> --qm <id>` (`unlink`, `links`). Its `x-qm-actor`
+header then runs each attested operation as that member, never reading private
+pages; see [attested-actor refusals](../guides/write-refusals.md#attested-actor-refusals).
+`remember` saves to the person's own page `memory/members/<member>` (private,
+read back only by that member, written remotely by no one else); an attested call's
+`share: true` or `visibility: "world"` is refused (`attested_share_refused`), while a credential
+bound to a member may pass `share: true` to save on the subject's page for everyone who reads
+the source (refused with `share_target_restricted` on a page whose facts are kept private;
+only the brain host withdraws a shared fact); the reply names the `page` and `visibility`. `delta` cursors, write receipts
+(`get_write_request`, `list_write_requests`, `cancel_write_request`) and agent
+jobs (`submit_agent`, `get_agent_job`) belong to the person they were made for.
+QM's memory pair, `memory_recall` and `memory_write`, reads and saves that
+person's facts ([QM guide](../guides/qm.md)); the personal tools of its contract v3
+(`query`, `get_page`, `whois`, `context_pack` and the rest) stay out of the default
+list, so add each to `--attest-ops` only for the client serving the person's own DM; `forget` and `forget_fact` withdraw
+only a fact on the person's own page (also for a credential bound to a member).
+A request carrying `x-qm-audience` is refused (`audience_not_supported`). Not attestable yet, because what they
+read or write is not yet kept to the person: `list_write_conflicts`, `capture`,
+`extract_facts`, `takes_add|update|resolve|supersede`, and every page write (`add_timeline_entry`,
+`add_link`, `put_page`, `edit_page`, tags, deletes, uploads and the rest: the contract's `deferred_ops`); an attested timeline entry or link goes
+through `memory_propose` and waits for your `gbrain memory-proposals approve` ([QM guide](../guides/qm.md#proposed-writes)). An `--attest-ops` list that already names one of these is refused for it
+(`actor_not_attested`, reason `op_not_attested`), and a queued attested write of one fails when it publishes.
+An attested read sees what that person sees, private facts included, and gbrain
+cannot tell who else reads the answer. Use the attest client only for QM's
+personal-scope memory route: never register it as a model-callable MCP connector
+or route it to shared scopes ([QM guide](../guides/qm.md#set-up-on-the-brain-host)).
+An attested read that names `source_id` or `source_ids` (`get_page`, `entity`, `whois`, `get_backlinks`,
+`get_timeline`, `find_experts`, `volunteer_context`, `query`, `memory_recall`) reads those sources as their
+audience, never as the person; `--attest-read person` makes such reads run as the person, and `--attest-read scope`
+also refuses every call that names no person (`actor_required`) ([QM guide](../guides/qm.md#reads-that-name-sources)).
+A source bound to a member (`gbrain access member source add <member> <source>`, trusted local CLI only) is personal:
+an attested call reads its grant minus personal sources bound to anyone else, a read that names sources as their
+audience reads none, and a hidden source is refused like one outside the grant. Binding never widens a grant
+([QM guide](../guides/qm.md#each-persons-own-sources)).
+`gbrain access check --token <name>` shows the
+result ([Model C](../tutorials/company-brain.md#two-scoping-models-pick-the-one-that-matches-your-shape)).
+
+From another machine, the owner manages the attest right, members, links and
+QM's memory proposals over the running server:
+
+```bash
+gbrain mcp admin attest CLIENT_ID --attest-actor qm [--attest-ops <op,...>] --dry-run \
+  --url https://brain.example.com/mcp --admin-token-file /absolute/private/admin-token
+gbrain mcp admin member-add alice-example --email alice@example.com --url … --admin-token-file …
+gbrain mcp admin link alice-example --qm U0ALICE --dry-run --url … --admin-token-file …
+gbrain mcp admin link --email alice@example.com --qm U0ALICE --dry-run --url … --admin-token-file …
+gbrain mcp admin memory-proposals approve <request_id> --dry-run --url … --admin-token-file …
+```
+
+The other commands are `--attest-actor none` (clear the right),
+`attest CLIENT_ID --attest-read person|scope|none` (how a call that names sources reads them,
+as `gbrain auth rescope --attest-read` sets it),
+`member-set ID --email ADDR|none`, `member-disable|member-enable ID`, `members [--all]`,
+`unlink --qm ID` and `links [--member ID]`. A member's email is optional,
+stored lower-case and unique per brain; `link --email` finds the one member that
+declares it and makes the same link `link ID` makes, and an unknown email is
+`not_found` and creates nothing. `memory-proposals list [--source ID] [--cursor C]`, `show ID`,
+`approve ID` and `deny ID --reason TEXT` review proposals as `gbrain memory-proposals` does
+(text fenced, one request id per decision, `decided_by: admin-api`; an approve whose write did
+not commit reports `outcome: failed` and exits 1). They call `/admin/api/access/attest`,
+`/admin/api/access/members`, `/admin/api/access/member-links` and
+`/admin/api/memory-proposals`. These routes accept only the owner session:
+no OAuth token and no MCP tool reaches them. They refuse exactly what the
+local commands refuse, and each applied change is logged as `access_admin` in
+the request log. Removing a member stays a brain-host command
+(`gbrain access member rm`).
 
 New `memory-reader`, `memory-writer` and `coding-agent` grants are callable on
 the full surface and list the seven memory verbs plus `request_tools`, which
@@ -343,6 +426,84 @@ range and every grant change is refused until it is fixed. Add the
 example `gbrain auth rescope-client CLIENT_ID --token-ttl 7776000 --dry-run --json`,
 then apply the same flags without `--dry-run`.
 
+## One token, several people
+
+A credential reads the same pages whoever talks to its agent: an unbound one
+everything its grant reaches, one bound to a member what that member may read.
+An agent that several people talk to (a Slack, Telegram or Discord bot, a
+shared OpenClaw or Hermes, Claude Code with a chat-channel plugin) through
+such a credential can answer one person with pages only another person may
+read. In a measured multi-user pilot with
+one unscoped bot token, telling the agent that gbrain was live lowered pass
+rates by 9 to 21 points, and every added cross-scope failure cited a channel
+page the bot grant returned.
+
+gbrain warns with `unscoped_multi_user_token` (a safety notice) when an
+install route sets up such access on a brain that serves several people
+(`gbrain access serves`: config `access.serves`, else two or more enabled
+members). On a brain that serves one person every credential reads that
+person's own pages, so no route warns and the doctor check is not applicable.
+When whom the brain serves cannot be read (no local brain, a remote host), the
+warning stays on.
+
+| Route | Warns when |
+|---|---|
+| `gbrain setup openclaw`, `setup hermes`, `setup grok-bot`, `setup muse` | a bot harness |
+| `gbrain setup claude-code` | a chat-channel plugin (telegram, discord, slack, imessage, whatsapp, signal) is enabled |
+| `gbrain mcp grant`, `gbrain connect` | the harness is a bot harness, or the grant reads chat from 2+ channels |
+| `gbrain skillpack scaffold` | the target is OpenClaw's or Hermes's own workspace |
+| `gbrain auth create`, `gbrain auth register-client` | the new credential reads chat from 2+ channels |
+
+Chat pages are the slack, DM, iMessage, Discord, Telegram, WhatsApp, Signal,
+SMS, chat and channel page types that a remote caller can see. A channel is
+the page's `channel`, `chat` or `conversation` frontmatter, a leading
+`#name` in its title, or else its source; every DM page counts as its own
+channel. The warning goes to stderr (an `[AGENT]` block when stdout is not a
+terminal) and into the `notices` or `warnings` list of a `--json` result.
+It never changes a grant or an exit code. A credential holding
+`--may-act-for` is not flagged. Its reads follow the audience its harness
+names, and a call that names no audience reads the credential's full grant, so
+the harness must name one on every call.
+
+`gbrain doctor --only unscoped_multi_user_token` runs the same detection over
+every active token and OAuth client, and over the local agents setup wired: it
+warns when one of them reads chat from 2+ channels, and reports a wired bot
+harness with no such chat as information. A remote `run_doctor` caller gets a
+count, never credential names.
+
+Fix it by binding first:
+
+- Bind the credential to the person who uses the agent:
+  `gbrain auth rescope --token <name> --member <id>` (or `--client <id>`). For
+  one agent several people share, bind it to their audience instead:
+  `gbrain auth rescope --token <name> --may-act-for <members>`, and have its
+  harness name each request's audience. For a local stdio agent, label each
+  person and bind its server with
+  `gbrain setup <harness> --serves several --members <id,...>`
+  (`--stdio-member <member>` when one person alone uses it).
+- Narrowing only, which leaves the credential unbound: when the channels sit
+  in different sources, grant one audience's source with
+  `gbrain auth rescope --token <name> --sources <source>` (or for a new harness
+  grant `gbrain mcp grant <name> --source <source> --federated-read <source>`),
+  or pin a stdio agent with `GBRAIN_SOURCE=<source>` and
+  `gbrain sources unfederate <source>`. Keep a channel's source out of unscoped
+  reads with `gbrain sources unfederate <id>`.
+- When the chat sits in one source, a source grant cannot separate it: mark
+  the pages nobody else may see `visibility: private`. That hides them from
+  the agent only while its access may not read private pages.
+- Don't rely on `source_ids`: it narrows only the call that sends it, so
+  recall, list_pages or any read without it reads the token's full grant.
+  The fix is per-person access.
+- Per-person access: give each person's agent its own credential bound to
+  them (`gbrain access member add <id>`, then
+  `gbrain auth create <name> --member <id>`) and put `readable_by` on pages
+  only some people may read. One agent in a shared channel instead uses a
+  credential made with `gbrain auth create <name> --may-act-for <members>`,
+  and its harness names each request's audience on every call (see
+  [above](#inspect-clients-and-edit-access)); a call that names none reads the
+  credential's full grant. Never bind a shared agent's credential to one
+  person: it then reads as that person for everyone who talks to it.
+
 ## Dashboard API keys
 
 **Say to your agent:** *"Make a read-only API key for my notes app."* The
@@ -417,6 +578,8 @@ gbrain auth rescope --client CLIENT_ID                       # print the stored 
 gbrain auth rescope --client CLIENT_ID --sources workspace,default --operations get_page,search
 gbrain auth rescope --client CLIENT_ID --takes-holders world,brain
 gbrain auth rescope --client CLIENT_ID --sources none          # deny-all, secret unchanged
+gbrain auth rescope --token agent-example --private-pages granted-sources  # private pages in its granted sources
+gbrain auth rescope --client CLIENT_ID --private-pages none    # hide them again
 ```
 
 | Flag | Value | Effect |
@@ -426,6 +589,7 @@ gbrain auth rescope --client CLIENT_ID --sources none          # deny-all, secre
 | `--takes-holders` | `a,b` or `none` | Takes-holder allow-list for a token or client (default `world`); `none` hides every take. |
 | `--operations` | `op,...`, `none` or `all` | Operation snapshot; `none` refuses every operation. Client only: `all` stores no snapshot and clears the profile, so the scopes and the surface alone decide, including operations later upgrades add (tokens: `--reset-default operations`). |
 | `--scopes` | `read,write,...` | Replaces the scopes. |
+| `--private-pages` | `granted-sources` or `none` | Whether remote reads see `visibility: private` pages. `none` (the default for every token and client) hides them, as before. `granted-sources` shows them only in the sources this grant names: a token's `--sources` list, or a client's write source plus its read sources. The no-grant floor, federated sources the grant does not name, a client's bound source and a request's `source_id` / `source_ids` never add a source. The grant applies to `search`, `query`, `recall`, `entity`, `get_page`, `list_pages`, `get_chunks`, `get_versions`, `get_timeline`, `get_links`, `get_backlinks`, `traverse_graph` and `resolve_slugs`. `context_pack`, `delta`, `think`, recorded-time reads (`get_page` and `get_versions` with `known_as_of`) and every write keep hiding private pages even in a granted source, so a page `get_page` returns can read as missing there. In a named source it also opens privacy-alias pages (`access`, `confidentiality`), atoms, concepts and events derived from private or unknown origins, and pages with private declared lineage; pinned questions stay owner-only. Stored in its own column, not in the legacy permissions JSON, so a harness token rotation does not carry it; the rotation prints the rescope that grants it again. |
 | `--reset-default` | `sources,takes-holders,operations` | Token only: restores the `auth create` default for those axes: no source grant (the historical `default` floor), holders `world`, no operation snapshot. |
 | `--refresh-operations` | with optional `--add op,...` or `--all-new` | Token only: previews operations added since the snapshot. Without `--add` or `--all-new` nothing is widened. |
 | `--if-version` | `N` | Refuses unless the stored grant revision is `N`; the refusal names the current revision. |
@@ -538,13 +702,27 @@ gbrain attribution people/alice-example --timeline 17
 ```
 
 Each attribution is `{ request_id, operation, principal: { kind, id, name }, at,
-origin }`. Branch on `origin`:
+agent_label?, origin }`. Branch on `origin`:
 
 | `origin` | Meaning |
 | --- | --- |
 | `request` | Written by the named journaled request; `operation` and `at` come from it. |
 | `maintenance` | Written by a maintenance pass (cycle extraction, repair) as the named principal, with no request. |
 | `unrecorded` | Written before attribution existed, or by a legacy writer that records none. Not an error. |
+
+**Which AI made the write.** One credential often serves several AIs (a hosted
+app calling for Claude Code and Codex, say). An HTTP MCP caller can name the AI
+on each request with the `X-Gbrain-Agent-Label` header, for example
+`X-Gbrain-Agent-Label: Claude Code`. Writes from that request show it as
+`agent_label`; jobs the request queues run under their own authority and record
+no label. Browser callers on an origin in `GBRAIN_HTTP_CORS_ORIGIN` may send it,
+since both transports' CORS preflight allows it. It is a label the caller declares and gbrain does not verify:
+the principal is still who was authorized, and no grant, access rule or trust
+tier reads the label. Any token may send it, and it lands only on that token's
+own write requests. A value that is not 1 to 120 printable ASCII characters is
+dropped, not refused. Stdio MCP and the local CLI have no request headers and
+record no label; their principal already names the lane. Without the header a
+write is recorded exactly as before.
 
 Who can read it:
 
@@ -572,10 +750,12 @@ that inserted it. Everything else stays `unrecorded`; nothing is inferred.
 ## Read-only stdio serve
 
 **Say to your agent:** *"Connect this agent to my brain read-only."* The agent
-registers `gbrain serve --access read-only` as its stdio MCP command.
+registers `gbrain serve --access read-only` as its stdio MCP command, through
+gbrain's launcher (any `gbrain setup` run writes it), so the session
+directory's `bunfig.toml` and `.env` never load.
 
 ```bash
-claude mcp add gbrain -- "$(command -v gbrain)" serve --access read-only
+claude mcp add gbrain-ro -- "${GBRAIN_HOME:-$HOME}/.gbrain/hook-launcher/gbrain-hook" "$(command -v gbrain)" serve --access read-only
 gbrain serve --access read-only   # bare serve: the full surface, read-only
 ```
 
@@ -644,7 +824,49 @@ not revoke server access.
 Jobs accepted before token invalidation continue under their existing grant
 checks. Revocation or deletion denies those jobs at their next
 authority check; external work already admitted may complete. All three actions
-retain request history, audit records, spending reservations, and settlement.
+retain request history within the request-log retention window, audit records,
+spending reservations, and settlement.
+
+## Request log retention
+
+`gbrain serve --http` writes one `mcp_request_log` row per call, `tools/list`
+included, so the log grows without limit. Retention is off by default. Turn it
+on with a window of 30 to 3650 days:
+
+```bash
+gbrain config set cycle.purge.mcp_request_log_retention_days 90
+```
+
+Values from 1 to 29 are refused, because the built-in usage readers look back
+30 days. `0`, `off` or `gbrain config unset` turns it off again.
+
+With retention on, the cycle `purge` phase (autopilot or `gbrain dream`)
+deletes rows older than the window. On a PGLite brain held by a live
+`gbrain serve` or `gbrain serve --http`, the serve prunes once an hour instead,
+in short batches between requests. Each run deletes at most 400,000 rows; the
+next run continues.
+
+The prune keeps these:
+
+- `surface_change`, `memory_setting_change` and `access_admin` audit rows,
+  which are never pruned.
+- Per-client lifetime totals. Pruned rows are counted per token in
+  `mcp_request_log_rollup`, so the dashboard's total requests and last-used
+  times stay exact.
+
+Deleted request detail (operation, status, parameters, errors) cannot be
+restored, and raising the window later does not bring it back. A usage report
+whose window reaches past pruned history says so: `gbrain auth clients --usage`
+prints `window truncated` with the `--days` value that is complete (its `--json`
+carries `window_truncated`, `covered_days`, `pruned_before` and `window_note`),
+and `scripts/derive-starter-ops.ts` refuses with exit 1. Retention caps growth;
+it does not shrink a PGLite file that already grew.
+
+`gbrain doctor --only mcp_request_log_retention` reports the log's size and,
+with retention on, when the last prune ran and what it removed. It warns when
+the log passes about 1M rows or 1 GiB with retention off, and when no prune
+has run for 48 hours. Its fix that turns retention on asks the user first and
+is never part of `gbrain doctor --remediate`.
 
 ## Recover a failed step
 

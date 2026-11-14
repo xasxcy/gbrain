@@ -2,12 +2,15 @@
  * Read-path audit #19: get_tags had no private or soft-delete filter, so a
  * remote caller learned that a `visibility: private` page exists and read its
  * tags. Remote callers now get [] for private and soft-deleted pages; trusted
- * local callers keep the full view.
+ * local callers keep the full view of every live page. A soft-deleted page's
+ * tags are hidden from local callers too, like its facts and timeline, until
+ * restore_page brings the page back.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operations } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
+import { fenceTranscriptText } from '../src/core/search/transcript-quote.ts';
 
 let engine: PGLiteEngine;
 const get_tags = operations.find(o => o.name === 'get_tags')!;
@@ -33,7 +36,8 @@ afterAll(async () => { await engine.disconnect(); });
 
 describe('get_tags respects page visibility for remote callers', () => {
   test('world page tags are visible to remote callers', async () => {
-    expect(await get_tags.handler(ctxOf(true), { slug: 'notes/world' })).toEqual(['world-tag']);
+    // #8384: the page carries no trust declaration (`unknown`), so a remote reader gets its tags quoted.
+    expect(await get_tags.handler(ctxOf(true), { slug: 'notes/world' })).toEqual([fenceTranscriptText('world-tag', 'notes/world')]);
   });
 
   test('a private page returns no tags to a remote caller', async () => {
@@ -44,8 +48,17 @@ describe('get_tags respects page visibility for remote callers', () => {
     expect(await get_tags.handler(ctxOf(true), { slug: 'notes/gone' })).toEqual([]);
   });
 
-  test('trusted local callers keep the full view', async () => {
+  test('trusted local callers keep the full view of live pages', async () => {
     expect(await get_tags.handler(ctxOf(false), { slug: 'notes/secret' })).toEqual(['secret-tag']);
-    expect(await get_tags.handler(ctxOf(false), { slug: 'notes/gone' })).toEqual(['gone-tag']);
+  });
+
+  test('a soft-deleted page returns no tags to a trusted local caller either, and its tags come back on restore', async () => {
+    expect(await get_tags.handler(ctxOf(false), { slug: 'notes/gone' })).toEqual([]);
+    await engine.executeRaw(`UPDATE pages SET deleted_at = NULL WHERE slug = 'notes/gone'`);
+    try {
+      expect(await get_tags.handler(ctxOf(false), { slug: 'notes/gone' })).toEqual(['gone-tag']);
+    } finally {
+      await engine.executeRaw(`UPDATE pages SET deleted_at = now() WHERE slug = 'notes/gone'`);
+    }
   });
 });

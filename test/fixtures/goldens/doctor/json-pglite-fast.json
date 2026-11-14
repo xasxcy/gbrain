@@ -9,6 +9,545 @@
     ],
     "exit_code": 0,
     "report": {
+      "alert": {
+        "docs": "docs/guides/troubleshooting.md#doctor-alert",
+        "items": [],
+        "level": "unknown",
+        "unknown": [
+          {
+            "budget_ms": "<volatile>",
+            "check": "connection",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "connection",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only connection --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "connection",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "connection did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only connection --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "schema_version",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "schema_version",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only schema_version --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "schema_version",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "schema_version did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only schema_version --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "schema_missing_tables",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "schema_missing_tables",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only schema_missing_tables --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "schema_missing_tables",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "schema_missing_tables did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only schema_missing_tables --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "persistence_terminal_failures",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "persistence_terminal_failures",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only persistence_terminal_failures --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "persistence_terminal_failures",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "persistence_terminal_failures did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only persistence_terminal_failures --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "persistence_write_stall",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "persistence_write_stall",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only persistence_write_stall --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "persistence_write_stall",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "persistence_write_stall did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only persistence_write_stall --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "runtime_build_skew",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "runtime_build_skew",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only runtime_build_skew --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "runtime_build_skew",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "runtime_build_skew did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only runtime_build_skew --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "managed_sync_blocked",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "managed_sync_blocked",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only managed_sync_blocked --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "managed_sync_blocked",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "managed_sync_blocked did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only managed_sync_blocked --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "managed_sync_not_moving",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "managed_sync_not_moving",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only managed_sync_not_moving --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "managed_sync_not_moving",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "managed_sync_not_moving did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only managed_sync_not_moving --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "global_maintenance_stalled",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "global_maintenance_stalled",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only global_maintenance_stalled --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "global_maintenance_stalled",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "global_maintenance_stalled did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only global_maintenance_stalled --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "jsonb_integrity",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "jsonb_integrity",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only jsonb_integrity --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "jsonb_integrity",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "jsonb_integrity did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only jsonb_integrity --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "rls",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "rls",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only rls --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "rls",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "rls did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only rls --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "dream_paid_loop",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "dream_paid_loop",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only dream_paid_loop --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "dream_paid_loop",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "dream_paid_loop did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only dream_paid_loop --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "dream_write_deferred",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "dream_write_deferred",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only dream_write_deferred --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "dream_write_deferred",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "dream_write_deferred did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only dream_write_deferred --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          },
+          {
+            "budget_ms": "<volatile>",
+            "check": "embedding_restamp_stalled",
+            "code": "doctor_alert_unknown",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "embedding_restamp_stalled",
+                "--budget-ms",
+                "0",
+                "--json",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain doctor --only embedding_restamp_stalled --budget-ms 0 --json --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/troubleshooting.md#doctor-alert",
+              "next": "run",
+              "requires_exclusive": false,
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "embedding_restamp_stalled",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Measures only this check now, with no overall budget; read-only."
+            },
+            "message": "embedding_restamp_stalled did not run (the database checks did not run, or this tier or report skips it), so its health is unknown, not clear. Measure it with gbrain doctor --only embedding_restamp_stalled --budget-ms 0 --json --brain host, run the full tier (gbrain doctor --alert --tier standard --json) or raise the alert budget (--budget-ms).",
+            "reason": "not_run"
+          }
+        ]
+      },
       "brain_checks_score": 100,
       "budget_ms": "<volatile>",
       "category_scores": {
@@ -45,7 +584,7 @@
             "next": "report",
             "requires_exclusive": false,
             "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-            "why": "Register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+            "why": "For Claude Code or Codex, run `gbrain setup claude-code` or `gbrain setup codex` (it registers serve behind gbrain's launcher, so the session directory's bunfig.toml and .env never load). For any other host, register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
           },
           "message": "pglite — serve IPC socket not present; enabled but NO resolve path exists right now: the IPC socket is only bound by a running `gbrain serve` (stdio or --http) — until one is up, hooks/reflex degrade to no_serve on this brain (host capability may still supply pointers; policy skill carries otherwise) — policy skill not installed; run `gbrain integrations install retrieval-reflex --target <host-repo>`",
           "name": "retrieval_reflex_health",
@@ -166,6 +705,24 @@
           "status": "ok"
         },
         {
+          "category": "skill",
+          "details": {
+            "scope": "managed",
+            "totals": {
+              "bytes": 100,
+              "drift": 0,
+              "invocations": 0,
+              "size": 0,
+              "skills": 1,
+              "subcommands_unverified": 0
+            }
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "1 skill(s), 0 KB, 0 gbrain invocation(s) (0 with undeclared subcommands, flags checked); no findings",
+          "name": "skill_health",
+          "status": "ok"
+        },
+        {
           "category": "ops",
           "details": {
             "enabled": false,
@@ -236,7 +793,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "mode=notify",
+          "message": "mode=notify; channel=stable (config)",
           "name": "self_upgrade_health",
           "status": "ok"
         },
@@ -320,7 +877,7 @@
             "next": "report",
             "requires_exclusive": false,
             "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
-            "why": "Register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+            "why": "For Claude Code or Codex, run `gbrain setup claude-code` or `gbrain setup codex` (it registers serve behind gbrain's launcher, so the session directory's bunfig.toml and .env never load). For any other host, register `<absolute path to gbrain> serve --surface starter --advertise verbs` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
           },
           "message": "No agent harness was detected. Wire one when the user picks an agent app.",
           "name": "harness_wiring",

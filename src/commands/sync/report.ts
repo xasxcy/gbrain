@@ -1,7 +1,7 @@
 /** Post-sync human reporting and best-effort nudges for the sync CLI. */
 import { formatManagedSyncFailure, managedSyncRetryCommand } from '../../core/persistence/sync-failures.ts';
 import type { BrainEngine } from '../../core/engine.ts';
-import { isEmbeddingInfraCode } from '../../core/sync.ts';
+import { isEmbeddingInfraCode, STRICT_REQUIRES_MANAGED } from '../../core/sync.ts';
 import { serr } from '../../core/console-prefix.ts';
 import { printManagedSyncDiagnostic, printManagedSyncNotes } from '../sync-diagnostics.ts';
 import type { SyncResult } from '../sync.ts';
@@ -110,7 +110,8 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       write(`  ${result.added} file(s) imported, ${result.chunksCreated} chunks${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       break;
     case 'dry_run':
-      break; // already printed in performSync
+      if (result.managedCursor) write(`Sync dry run${result.toCommit ? ` to ${result.toCommit.slice(0, 8)}` : ''}: would add ${result.added}, modify ${result.modified}, soft-delete ${result.deleted}, rename ${result.renamed}${result.added + result.modified + result.deleted + result.renamed === 0 ? ' (no syncable changes)' : ''}.`);
+      break;
     case 'blocked_by_failures': {
       if (result.runId || (result.pass && result.failures?.length)) {
         write(result.runId ? `Sync BLOCKED at ${result.toCommit}: committed counts are cumulative for run ${result.runId}.`
@@ -122,12 +123,18 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
           : '  Fix the cause, then run gbrain sync --no-pull with the same source and options; it retries the recorded failure and admits a fresh run after active work drains.');
         break;
       }
+      if (!result.toCommit) {
+        write(`Sync BLOCKED: ${result.failedFiles ?? 0} file(s) failed to import (named above); fix them, then re-run 'gbrain sync'.`);
+        break;
+      }
       write(`Sync BLOCKED at ${result.toCommit.slice(0, 8)}: ${result.failedFiles ?? 0} file(s) failed.`);
       write(`  See ~/.gbrain/sync-failures.jsonl for details, or run 'gbrain doctor'.`);
       // #3875: code-aware recovery hint — provider-infra failures are not
       // fixed by --skip-failed (that would silently unindex good files).
       const infraCodes = (result.failureCodes ?? []).filter(c => isEmbeddingInfraCode(c.code));
-      if (infraCodes.length > 0) {
+      if ((result.failureCodes ?? []).some(c => c.code === STRICT_REQUIRES_MANAGED)) {
+        write(`  ${STRICT_REQUIRES_MANAGED}: ${result.failureAdvice ?? 'the source is git-canonical and this brain does not have managed persistence. Do not use --skip-failed.'}`);
+      } else if (infraCodes.length > 0) {
         write(
           `  Embedding provider errors (${infraCodes.map(c => `${c.code} x${c.count}`).join(', ')}): ` +
           `check provider health, then re-run 'gbrain sync' (or 'gbrain sync --full'). ` +

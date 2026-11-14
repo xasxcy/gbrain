@@ -34,6 +34,14 @@ import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, W
  * Runtime validators belong in separate modules; importing OperationError here
  * creates a params -> contract -> verbs -> params initialization cycle.
  */
+/** GBRA-217: the human reason for a page write (docs/guides/page-history.md#reasons). */
+export const REASON_PARAM: ParamDef = {
+  type: 'string',
+  description: 'Why this change, one line (max 500 chars); kept in page history.',
+  // GBRA-217 decision 9: the starter list cannot fit both `reason` and get_page `as_of`; as_of stays, reason is full-surface only.
+  fullSurfaceOnly: true,
+};
+
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
   description: 'Reuse only to retry.',
@@ -109,6 +117,7 @@ export const WRITE_RECEIPT_SCHEMA = {
         file_written: { type: 'boolean' },
         git_state: { type: 'string' },
         git_commit: { type: 'string' },
+        git_reason: { type: 'string' },
       },
     },
     created_at: { type: 'string' },
@@ -121,6 +130,10 @@ export const WRITE_RECEIPT_SCHEMA = {
         assessment: { type: 'string', enum: [...WRITE_HEALTH_ASSESSMENTS] },
         reason: { type: 'string', enum: [...WRITE_HEALTH_REASONS] },
         next_action: { type: 'string', enum: [...WRITE_HEALTH_ACTIONS] },
+        owner: {
+          type: 'object', required: ['last_active'],
+          properties: { last_active: { type: ['string', 'null'] } },
+        },
       },
     },
   },

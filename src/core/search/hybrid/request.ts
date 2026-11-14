@@ -11,7 +11,7 @@ import type { DegradedStageEntry, HybridSearchMeta, SearchOpts, SearchResult } f
 import { type GBrainConfig, loadConfigWithEngine } from '../../config.ts';
 import { type HybridSearchOpts, PRE_FUSION_POOL_FLOOR, compiledTruthFusionBoost } from '../hybrid.ts';
 import type { IdentityTierOpts } from '../alias-hop.ts';
-import { type IntentWeights, applyAliasMentionBoost, applyExactMatchBoost, applyTitleMentionBoost, weightsForIntent } from '../intent-weights.ts';
+import { type IntentWeights, applyAliasMentionBoost, applyExactMatchBoost, applyQualifiedTitleBoost, applyTitleMentionBoost, weightsForIntent } from '../intent-weights.ts';
 import { type QuerySuggestions, classifyQueryWithBrainPatterns } from '../query-intent.ts';
 import type { ResolveSearchModeInput, ResolvedSearchKnobs } from '../mode.ts';
 import { normalizeExpansionVariantBudget } from '../fusion-lists.ts';
@@ -71,7 +71,7 @@ export interface HybridRequest {
   ctBoost: boolean | number;
   searchOpts: SearchOpts;
   identityTierOpts: IdentityTierOpts;
-  aliasHopOpts: IdentityTierOpts & { tokenHop: boolean };
+  aliasHopOpts: IdentityTierOpts & { tokenHop: boolean; qualified: boolean };
   /** WP2/T3 degradation stamp, appended by every stage. */
   degraded: DegradedStageEntry[];
   /** v0.46.15: max-escalations searchVector exhaustion event, accumulated across vector calls. */
@@ -90,6 +90,8 @@ export interface HybridRequest {
   decide?: DecideSearchContext;
   /** Set by the rerank stage when the System One reranker answered. */
   rerankMeta?: { model_resolved: string };
+  /** #7492: set when an image-reading vector arm ran; emitted as `image_arm` (coverage counts pending images only then). */
+  imageArmRan?: boolean;
   /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
   relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
   /** Set by the collapse stage when it folded or read in a row (meta.collapse). */
@@ -249,6 +251,7 @@ export async function resolveHybridRequest(
     // Per-brain `search.source_boosts` (read in the mode snapshot) over the
     // defaults; the env override still wins inside resolveBoostMap.
     source_boosts: resolveBoostMap(undefined, modeInput.sourceBoosts),
+    keywordPhrase: resolvedMode.keyword_phrase,
     // v0.29.1: since/until take precedence over deprecated afterDate/beforeDate.
     // The engine still consumes the legacy field names; this aliasing keeps
     // PR #618 callers compiling while the new names are the public surface.
@@ -280,8 +283,8 @@ export async function resolveHybridRequest(
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
     // #5824 rollback switch, latched once per process from env/config.
-    vectorLegacyGuard: resolveVectorLegacyGuard(cfgForColumn),
-    hnswIterativeScan: resolveHnswIterativeScan(cfgForColumn),
+    vectorLegacyGuard: resolveVectorLegacyGuard(engine, cfgForColumn),
+    hnswIterativeScan: resolveHnswIterativeScan(engine, cfgForColumn),
     // #5989: bound the CJK keyword arm by one deadline; its outcome and wall time ride the meta.
     cjkKeyword: {
       deadlineMs: resolveCjkKeywordDeadlineMs(cfgForColumn),
@@ -315,6 +318,7 @@ export async function resolveHybridRequest(
   const aliasHopOpts = {
     ...identityTierOpts,
     tokenHop: opts?.aliasTokenHop ?? modeInput.aliasTokenHop === 'true',
+    qualified: resolvedMode.qualified_aliases,
   };
   // WP2/T3 — degradation stamp accumulated across stages. Emitted on EVERY
   // return path (empty array = clean run) so cache rows always carry the
@@ -339,7 +343,8 @@ export async function resolveHybridRequest(
 }
 
   // Intent identity boosts (exact/mentioned title or slug, mentioned alias),
-  // shared by the fused path and both keyword-only paths. Caller re-sorts.
+  // then the opt-in qualified title boost, which skips any row they raised.
+  // Shared by the fused path and both keyword-only paths. Caller re-sorts.
 export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[], generatedRead?: Promise<GeneratedPage[] | null>): Promise<void> {
   const { engine, query, opts, suggestions, intentWeightingOn, intentWeights, resolvedMode } = req;
   await applyGeneratedDemotion(engine, list, query, { sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate }, generatedRead);
@@ -352,12 +357,13 @@ export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult
     if (intentWeightingOn && suggestions.intent !== 'concept' && !isRelationalQuery(query, resolvedMode.relational_planner)) {
       applyTitleMentionBoost(list, query);
     }
-    return;
+  } else {
+    applyExactMatchBoost(list, query, intentWeights);
+    await applyAliasMentionBoost(list, query, intentWeights, (aliases) => engine.resolveAliases(aliases, {
+      sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate,
+    }));
   }
-  applyExactMatchBoost(list, query, intentWeights);
-  await applyAliasMentionBoost(list, query, intentWeights, (aliases) => engine.resolveAliases(aliases, {
-    sourceId: opts?.sourceId, sourceIds: opts?.sourceIds, excludePrivate: opts?.excludePrivate,
-  }));
+  if (resolvedMode.title_qualified && resolvedMode.title_boost) applyQualifiedTitleBoost(list, query, resolvedMode.title_boost);
 }
 
   // A throwing user callback must never break the search hot path — onMeta
@@ -370,7 +376,9 @@ export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult
   // never waits.
 export function emitHybridMeta(req: HybridRequest, armMeta: HybridSearchMeta): void {
   const { engine, opts } = req;
-  const rawMeta = req.keywordCandidates ? { ...armMeta, keyword_candidates: req.keywordCandidates } : armMeta;
+  const rawMeta = req.keywordCandidates || req.imageArmRan
+    ? { ...armMeta, ...(req.keywordCandidates ? { keyword_candidates: req.keywordCandidates } : {}), ...(req.imageArmRan ? { image_arm: true as const } : {}) }
+    : armMeta;
   const decide = decideMetaFor(req.decide);
   const answerability = req.decide?.answerability;
   const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan || req.collapse

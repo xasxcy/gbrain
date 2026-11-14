@@ -68,7 +68,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.4.4
@@ -170,7 +177,16 @@ jobs:
       CODEX_NPM_VERSION: "0.147.0"
       CLAUDE_NPM_VERSION: "2.1.233"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -281,7 +297,16 @@ jobs:
       HERMES_INSTALL_SHA256: "5854b15670b51a8daae8f59ddfa917062de9f74be261eb73b4b8d719710f8968"
       GBRAIN_REAL_HERMES_E2E: '1'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -533,7 +558,16 @@ jobs:
       GROK_NPM_LINUX_ARM64_INTEGRITY: "sha512-zGK42Eq3ZmIa7cSVnl6CiJ4cxTCMsNLQCmCoLJhy5eZXfAvZ1DA3K3HXmKCj4OScX8SalYlp7mx8HWl9Y6gytw=="
       GBRAIN_REAL_GROK_E2E: '1'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -761,7 +795,16 @@ jobs:
       CODEX_NPM_VERSION: "0.147.0"
       CLAUDE_NPM_VERSION: "2.1.233"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -841,7 +884,8 @@ jobs:
       fail-fast: false
       matrix:
         # #5903: GBRAIN_PAID_LANES='0' switches the credentialed lane off even when it is requested.
-        lane: ${{ fromJSON((inputs.run_opencode_paid || vars.GBRAIN_OPENCODE_PAID_E2E == '1') && format('{0}', vars.GBRAIN_PAID_LANES) != '0' && '["keyless","credentialed"]' || '["keyless"]') }}
+        # #6049: the nightly schedule always requests it, because its paid T5 turn is the gating nonce SMOKE.
+        lane: ${{ fromJSON((github.event_name == 'schedule' || inputs.run_opencode_paid || vars.GBRAIN_OPENCODE_PAID_E2E == '1') && format('{0}', vars.GBRAIN_PAID_LANES) != '0' && '["keyless","credentialed"]' || '["keyless"]') }}
     # Measured local door wall-time: full 6-test run 35.8s + one-time
     # compiled gbrain build (~2-4 min) + npm install (~15s); free-tier +
     # paid turn budgets 2 x 240s each. 20 min = measured + >50% headroom.
@@ -859,7 +903,16 @@ jobs:
       OPENCODE_NPM_LINUX_ARM64_INTEGRITY: "sha512-e8D3g0qJEIzawEg2+ygW3vkZjAYL2ssyAx4GbihjwXwZFvlZZy5zRWWzdz5KLBoHSTl0FB73vNtnNeXONyHpVQ=="
       GBRAIN_REAL_OPENCODE_E2E: '1'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
@@ -932,10 +985,12 @@ jobs:
             exit 1
           fi
 
-      # KEYLESS TIER FIRST — and on opencode that includes the nonce SMOKE
-      # (free tier). ANTHROPIC_API_KEY is absent from this step by
-      # construction, so the paid describe self-skips.
-      - name: Run opencode door tests (keyless tier — SMOKE included)
+      # KEYLESS TIER FIRST. ANTHROPIC_API_KEY is absent from this step by
+      # construction, so the paid describe self-skips. The free-tier nonce
+      # SMOKE (T4) is not requested here: the free tier caps usage per IP and
+      # runner IPs hit the cap (#6049); the canary runs it, and the nightly
+      # credentialed lane's paid T5 is the gating SMOKE.
+      - name: Run opencode door tests (keyless tier)
         if: matrix.lane == 'keyless'
         run: |
           EXIT=0
@@ -945,20 +1000,27 @@ jobs:
           if [ "$EXIT" -ne 0 ]; then
             exit "$EXIT"
           fi
-          # Exact expected shape for this tier: 5 keyless tests pass (T1, T2,
-          # T2b, T3, T4-SMOKE), the 1 paid test skips. Zero/partial-pass
+          # Exact expected shape for this tier: 4 keyless tests pass (T1, T2,
+          # T2b, T3); the free-tier T4 and the paid T5 skip. Zero/partial-pass
           # refuses green.
           pass_count=$(grep -Eo '[0-9]+ pass' door-keyless.txt | tail -1 | grep -Eo '^[0-9]+' || true)
-          if [ "$pass_count" != "5" ]; then
-            echo "::error::opencode door keyless tier expected 5 passing tests, summary shows '${pass_count:-none}' — refusing to go green (see docs/mcp/OPENCODE-CLI-PIN.md triage table)" >&2
+          if [ "$pass_count" != "4" ]; then
+            echo "::error::opencode door keyless tier expected 4 passing tests, summary shows '${pass_count:-none}' — refusing to go green (see docs/mcp/OPENCODE-CLI-PIN.md triage table)" >&2
             exit 1
           fi
 
       - name: Report credentialed coverage not run in keyless lane
         if: matrix.lane == 'keyless'
+        env:
+          GBRAIN_PAID_LANES: ${{ vars.GBRAIN_PAID_LANES }}
         run: |
           echo "## OpenCode: keyless coverage only" >> "$GITHUB_STEP_SUMMARY"
-          echo "No paid turn ran in this lane. Request run_opencode_paid on dispatch or set GBRAIN_OPENCODE_PAID_E2E=1 to enable the separate credentialed lane (GBRAIN_PAID_LANES=0 keeps it off either way)." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${GBRAIN_PAID_LANES:-}" = "0" ]; then
+            echo "::warning::opencode door: no nonce SMOKE ran. The repository variable GBRAIN_PAID_LANES='0' switches the credentialed lane off, so this run proves no gbrain MCP tool call." >&2
+            echo "No paid turn ran and no nonce SMOKE gates this run: the repository variable \`GBRAIN_PAID_LANES\` is \`0\`, which switches the credentialed lane off. Unset it (or set it to \`1\`) for the gating paid SMOKE." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No paid turn ran in this lane. The nightly schedule runs the separate credentialed lane, whose paid nonce SMOKE gates; on a dispatch, request run_opencode_paid or set GBRAIN_OPENCODE_PAID_E2E=1." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Preconditions (credentialed lane requires secret)
         if: matrix.lane == 'credentialed'
@@ -981,6 +1043,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GBRAIN_REAL_OPENCODE_PAID_E2E: '1'
+          # The test preload strips provider keys unless this is set; without it
+          # the suite refuses the requested paid tier as keyless.
+          GBRAIN_TEST_KEEP_PROVIDER_KEYS: '1'
         run: |
           EXIT=0
           bun test --timeout=600000 --test-name-pattern 'paid tier' test/e2e/install-real-opencode.serial.test.ts > door.txt 2>&1 || EXIT=$?
@@ -1070,10 +1135,22 @@ jobs:
     continue-on-error: true
     env:
       GBRAIN_REAL_OPENCODE_E2E: '1'
+      # The free-tier nonce SMOKE (T4) runs here, not in the gate: the free
+      # tier caps usage per IP and runner IPs hit the cap (#6049).
+      GBRAIN_REAL_OPENCODE_FREE_TIER_E2E: '1'
       # Deliberately NO OPENCODE_VERSION pin: T1 asserts the bare-semver
       # SHAPE only, and the suite runs against whatever `latest` is today.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          persist-credentials: false
+      - name: Check out again after a stalled first attempt
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        timeout-minutes: 3
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2

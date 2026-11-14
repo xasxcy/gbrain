@@ -1,5 +1,29 @@
 # TODOS
 
+## Busy-agent soak cell follow-ups (filed 2026-11-11, GBRA-332, #8829)
+
+- [ ] **P2 — Refresh diverged-publish child waits 0 s for the push lock (#8975).** **What:** a refresh whose checkout diverged publishes through a child that runs `commit-push` with `GBRAIN_PUBLISH_LOCK_WAIT_SECONDS=0` (`publishInChild` in `worktree-refresh.ts`), so a refresh tick racing another committer refuses `push_unconfirmed` instead of waiting its turn. The busy-agent soak cell's mode (h) shows it as an informational red, parked by its `.github/nightly-known-red.tsv` row. **Fix:** give the child the normal push-lock wait, then delete the known-red row. **Effort:** S. **Priority:** P2.
+
+## Local edit adoption follow-ups (filed 2026-11-07, GBRA-341, #8755)
+
+- [ ] **P2 — Harden `adopt_local_edits` before any source turns it on (#8755).** **What:** the adoption can import merge-conflict markers, adopt an editor's stale save over gbrain's committed write, read a huge file whole, hold the worktree queue through its quiet window, leave its Git commit behind when the publication transaction rolls back, and treat a nested checkout's unreadable `HEAD` as repo-less. **Fix:** per item in #8755. **Effort:** M. **Priority:** P2.
+
+## Memory train follow-ups (filed 2026-11-04, GBRA-286, #8481)
+
+- [ ] **P3 — `extraction_pending`'s local relink argv can carry fenced fact text (#8597).** **What:** running the owner's relink action stores the quote fence as fact text. **Fix:** unquote before building the argv. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — The `sync_write_through_off` forget refusal has no typed fix and reads as transient (#8599).** **What:** an agent may retry instead of asking the user. **Fix:** an `ask_user` fix naming the config change. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `forget_fact`'s description still says a withdrawal stays in the database when write-through is off (#8600).** **Fix:** reword to the refusal. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `checkFactAgainstSaved` is exported with no caller after the #7809 removal (#8601).** **Fix:** delete it. **Effort:** S. **Priority:** P3.
+
+## SkillOpt E1/B1 follow-ups (filed 2026-11-01, GBRA-274, #8408)
+
+- [ ] **P2 — SkillOpt review follow-ups (#8415).** **What:** held-out deferral on abort and the receipt's pending-champion score; final test eval on an unchanged skill; preflight prices the test eval at 2 runs per task instead of 6; resume does not pin the hook, criteria or cost scope; `--resume` with an unloadable checkpoint starts fresh; the one-shot output-cap check runs after baseline spend; one accepted one-shot step can replace the whole body; cat31 config C changed meaning; stale docs and comments. **Fix:** per item in #8415. **Effort:** S-M each. **Priority:** P2.
+
+## Write-cap wedge follow-ups (filed 2026-11-01, GBRA-271, #8368)
+
+- [ ] **P3 — `owner_marker_missing` can name the plain self-transfer when another process sees a drifted APFS birth time (#8381).** **What:** the refusal compares the reservation's birth time exactly in the refusing process, and the self-transfer compares it exactly in the CLI process; on APFS the two can read tens of ns apart (#6501), so a long-lived process that created the checkout and recorded its reservation can recommend a self-transfer the CLI then refuses `recovery_required`. Nothing is written either way. **Fix:** one identity rule for both sides. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Report a connection loss inside `failRefusedClaims`, and name page batches in the fair-share wording (#8383).** **What:** the group-refusal path releases the unfinished members on a transient database failure and returns without rethrowing, so the consumer's error report misses it; and the principal fair share also admits a `put_pages` or import batch whole, which the comment and `write-refusals.md` do not say. **Fix:** rethrow after the release; reword. **Effort:** S. **Priority:** P3.
+
 ## RLS backfill follow-ups (filed 2026-10-26, GBRA-95, #7625)
 
 - [ ] **P1 — Guard triggers fail open under a scoped write role without lookup-table policies (#7632).**
@@ -2316,12 +2340,12 @@ deferred M-effort issues above are NOT repeated here.
   synthesized answers, graph annotations) contains them — catching join/
   snippet/synthesis leak classes a source_id check can't see. **Where:**
   `evals/brainbench/`. **Effort:** M. **Priority:** P3.
-- [ ] **P3 — OpenClaw native remote-MCP register block, when upstream ships
-  remote support.** **What:** `gbrain agent register` renders the honest
-  thin-client CLI block for openclaw today (`openclawThinClientBlock` in
-  `src/core/mcp-registration.ts`) because OpenClaw has no native remote-MCP
-  client; when upstream ships one, add a native client-credentials wiring
-  block and demote the CLI block to the fallback. Blocked upstream. **Where:**
+- [ ] **P3 — OpenClaw native remote-MCP register block.** **What:**
+  `gbrain agent register` renders the honest thin-client CLI block for
+  openclaw today (`openclawThinClientBlock` in
+  `src/core/mcp-registration.ts`). OpenClaw now ships a native remote-MCP
+  client (streamable HTTP, `openclaw mcp login`; docs/mcp/OPENCLAW.md), so
+  add a native wiring block and demote the CLI block to the fallback. **Where:**
   `src/core/mcp-registration.ts`, `src/commands/agent-register.ts`.
   **Effort:** S. **Priority:** P3.
 - [ ] **P3 — E2: `gbrain agent list` / `gbrain agent revoke` conveniences.**
@@ -2343,7 +2367,7 @@ deferred M-effort issues above are NOT repeated here.
 - [ ] **P3 — Integrity for the from-source / `latest-stable` install paths.** **What:** the
   compiled-binary self-update now verifies the GitHub build-provenance attestation before
   installing (`src/core/binary-self-update.ts`), but the primary documented install
-  (`bun install -g github:garrytan/gbrain#latest-stable`, a force-moved tag) and the
+  (`bun install -g github:garrytan/gbrain#stable`, a force-moved tag) and the
   force-published `codex-plugin` branch / template repo remain TLS+GitHub trust-on-first-use.
   **Why:** those paths are how most users actually install; a compromised GitHub account could
   serve an unverified tree. **Context:** documented as a residual in SECURITY.md
@@ -2351,7 +2375,7 @@ deferred M-effort issues above are NOT repeated here.
   `gh attestation verify` step for tag installs) would close it, but a from-source tree has no
   single binary to attest — needs design. **Start:** `scripts/postinstall.ts` +
   SECURITY.md residual note. **Depends on:** the WS2 self-update integrity that just landed.
-- [ ] **P3 — Make `check:admin-embedded` deterministic so it can gate.** **What:**
+- [x] **P3 — Make `check:admin-embedded` deterministic so it can gate.** **Done (#7126, v0.60.554.0):** the generator no longer stamps the date and writes only when its output differs, and `check:admin-embedded` runs in verify. **What:**
   `scripts/build-admin-embedded.ts` stamps today's date into a comment in
   `src/admin-embedded.ts`, so `check-admin-embedded.sh`'s `git diff --exit-code` fails on any
   day after commit — which is why it's `EXECUTION_EXEMPT` and unwired. **Why:** if the date
@@ -3035,7 +3059,7 @@ OUT deliberately — see the plan's "NOT in scope" list).
   (absent) config defaults to warn") and `test/mcp-tool-defs.test.ts` pins
   both emission states. **Effort:** small (1-line default + test updates).
   **Priority:** P1.
-- [ ] **P2 — mcp_request_log retention/pruning.** **What:** a retention policy
+- [x] **P2 — mcp_request_log retention/pruning.** **Done (#6770 rewrite):** opt-in `cycle.purge.mcp_request_log_retention_days` (30-3650) prunes in the cycle purge phase and, on PGLite, hourly inside a live serve; `surface_change` and `memory_setting_change` rows are never pruned, pruned rows are tallied per token in `mcp_request_log_rollup`, and usage windows that reach past pruned history report it (docs/mcp/ADMIN.md#request-log-retention). **What (as filed):** a retention policy
   (age- or row-capped prune, `gbrain maintain` hook or cron). **Why:** the
   table now carries MORE than request telemetry — `surface_change` audit rows
   (ENG-8) and `denied_after_list` metric rows ride it — and it grows unbounded

@@ -8,6 +8,8 @@
  *   11 resumable budget stop · 13 harness wired, verification pending ·
  *   12 no results (a lookup matched nothing; opt-in, GBRAIN_FAIL_ON_EMPTY=1) ·
  *   14 harness wired, shared-skills/token cleanup pending ·
+ *   15 no edition in force on the as_of date · 16 host upgrade required ·
+ *   17 doctor --alert: act · 18 doctor --alert: unknown ·
  *   69 serve exited unhealthy · 75 migration
  *   lock held · 124 timeout · 130 interrupted. `test/exit-codes.test.ts` enumerates every literal
  *   exit 3 in src/ so a new one cannot reuse it.
@@ -76,8 +78,35 @@ export const HARNESS_PENDING_VERIFY_EXIT_CODE = 13;
 export const HARNESS_CLEANUP_PENDING_EXIT_CODE = 14;
 
 /**
+ * W4 `gbrain doctor --alert` (`doctor_alert_act`): a page-class check needs someone now; `--json` `alert.items`
+ * carries each check's fix. 0 is `alert.level: none`; 1 stays "doctor itself failed".
+ */
+export const DOCTOR_ALERT_ACT_EXIT_CODE = 17;
+
+/**
+ * W4 `gbrain doctor --alert` (`doctor_alert_unknown`): no page-class check needs action, but at least one did not run
+ * fresh (budget, error, last known result, tier). `alert.consecutive_unknown` counts the runs in a row; agent crons
+ * page on the second.
+ */
+export const DOCTOR_ALERT_UNKNOWN_EXIT_CODE = 18;
+
+/**
  * #6543: `gbrain serve` exited on its own because its persistence consumer
  * reported `restart_required` continuously for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS`
  * (`serve_unhealthy_exit`). EX_UNAVAILABLE: a supervisor restarts it.
  */
 export const SERVE_UNHEALTHY_EXIT_CODE = 69;
+
+/**
+ * GBRA-217: `gbrain get --as-of <date>` answered, but no edition was in force on that date (`valid_time.status` is
+ * `not_in_force`, `not_yet_in_force` or `before_recorded_history`). stdout carries the status and why, never a document,
+ * so a script cannot mistake expired or future text for the page in force. Distinct from 0 (an edition is in force) and
+ * from 1, which means the read failed.
+ */
+export const VALID_TIME_NOT_IN_FORCE_EXIT_CODE = 15;
+
+/**
+ * GBRA-217 (`host_upgrade_required`): the brain host is older than this client and answered a different question (an
+ * `as_of` read came back as the current page). Nothing was printed; upgrade the host.
+ */
+export const HOST_UPGRADE_REQUIRED_EXIT_CODE = 16;

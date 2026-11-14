@@ -270,6 +270,9 @@ export interface MinionWorkerOpts {
   longJobNames?: readonly string[];
   /** #7242: slots kept free of long jobs when concurrency >= 2 (at least one slot still takes long jobs). Default 1; 0 disables. */
   shortJobReservedSlots?: number;
+  /** GST-2529: how long a watchdog-marked job waits before this worker stops claiming to drain and run it alone. Default 60000.
+   *  The worker looks for such a job at most every 5 s and otherwise claims in plain priority order. */
+  watchdogSuspectWaitMs?: number;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -283,6 +286,8 @@ export interface MinionJobContext {
   /** Set by runWithJobSpend for a spend-authorized job: its group record and meter key. */
   spend?: JobSpendContext;
   attempts_made: number;
+  /** The job row's idempotency key (null when it was queued without one); ingest_capture records an applied capture under it (GST-1856). */
+  idempotency_key: string | null;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
   /** Absolute wall-clock deadline (epoch ms) from the claim-time `timeout_at` stamp,
@@ -838,4 +843,28 @@ export interface SubagentResult {
    * completion that `require_writes` must not dead-letter.
    */
   oneshot_skipped?: boolean;
+}
+
+/**
+ * GST-359 C2: the attested actor an agent job belongs to, then its audience (GBRA-231). submit_agent stores one of them in
+ * the accepted grant (`submission_authority.grant.actor` or `.actingFor`); every owner-fenced job read and cancel also
+ * matches both, so behind one client a job is visible only to the person or audience it was submitted for, and a job
+ * with neither only to calls asserting neither.
+ */
+export type JobActor = readonly [string, string, string, string];
+
+/** The actor of a caller without an attested actor or an audience. */
+export const NO_JOB_ACTOR: JobActor = ['', '', '', ''];
+
+/** An audience as jobActorSql compares it: its distinct entries sorted and joined by commas ('' for none). */
+export function jobAudienceKey(audience: readonly string[] | null | undefined): string {
+  return [...new Set(audience ?? [])].sort().join(',');
+}
+
+/** SQL: the job's accepted actor and audience equal the four parameters starting at `$first`. `alias` is a code-provided table alias. */
+export function jobActorSql(first: number, alias?: string): string {
+  const grant = `${alias ? alias + '.' : ''}submission_authority->'grant'`;
+  const actingFor = `${grant}->'actingFor'`;
+  const audience = `COALESCE(CASE WHEN jsonb_typeof(${actingFor}) = 'array' THEN (SELECT string_agg(DISTINCT e COLLATE "C", ',' ORDER BY e COLLATE "C") FROM jsonb_array_elements_text(${actingFor}) e) WHEN ${actingFor} IS NOT NULL THEN '!' END, '') = $${first + 3}::text`;
+  return [...['system', 'external_id', 'member'].map((key, i) => `COALESCE(${grant}->'actor'->>'${key}', '') = $${first + i}::text`), audience].join(' AND ');
 }

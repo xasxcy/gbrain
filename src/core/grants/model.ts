@@ -6,6 +6,14 @@ import { pgArray } from './encoding.ts';
 export const GRANT_PROFILES = ['memory-reader', 'memory-writer', 'coding-agent', 'operator', 'delegating-agent', 'full'] as const;
 export type GrantProfileId = typeof GRANT_PROFILES[number];
 export type GrantSurface = 'verbs' | 'starter' | 'full';
+/**
+ * GBRA-156: whether a remote caller reads `visibility: private` pages in the
+ * sources its grant names explicitly (`granted_sources`) or in none (`none`,
+ * the default). Stored in `private_pages` on access_tokens and oauth_clients,
+ * not in the legacy `permissions` mirror, so older binaries keep hiding them.
+ */
+export type PrivatePagesGrant = 'none' | 'granted_sources';
+export const PRIVATE_PAGES_GRANTS: readonly PrivatePagesGrant[] = ['none', 'granted_sources'];
 
 /** Access-token lifetime bounds for every per-client override and the server default: 1 minute to 90 days. */
 export const TOKEN_TTL_MIN_SECONDS = 60;
@@ -22,6 +30,7 @@ export interface ClientGrant {
   sourcesNone: boolean;
   /** Takes-holder allow-list; null = the default ['world'], [] = deny-all. */
   takesHolders: string[] | null;
+  privatePages: PrivatePagesGrant;
   boundSlugPrefixes: string[] | null;
   allowedOperations: string[] | null;
   boundTools: string[] | null;
@@ -79,6 +88,7 @@ export function grantFromRow(row: Record<string, unknown>): ClientGrant {
     scopes: parseScopeString(nullable(row.scope) ?? ''),
     sourceId: nullable(row.source_id), federatedRead: stringArray(row.federated_read) ?? [],
     sourcesNone: row.source_grant === 'none', takesHolders: stringArray(row.takes_holders),
+    privatePages: privatePagesFromColumn(row.private_pages),
     boundSlugPrefixes: legacyPrefixes, allowedOperations: stringArray(row.allowed_operations),
     boundTools: stringArray(row.bound_tools), boundSourceId: nullable(row.bound_source_id),
     boundBrainId: normalizeGrantBrain(nullable(row.bound_brain_id)),
@@ -94,6 +104,11 @@ export function grantFromRow(row: Record<string, unknown>): ClientGrant {
     revision: Number(row.grant_revision ?? 0), repairReasons: stringArray(row.grant_repair_reasons) ?? [],
     revoked: row.deleted_at != null,
   };
+}
+
+/** A `private_pages` column value; anything but `granted_sources` reads as `none` (fail closed). */
+export function privatePagesFromColumn(value: unknown): PrivatePagesGrant {
+  return value === 'granted_sources' ? 'granted_sources' : 'none';
 }
 
 export function validGrantPrefixes(prefixes: readonly string[] | null): boolean {
@@ -138,6 +153,7 @@ export function validateClientGrant(grant: ClientGrant, ctx: GrantValidationCont
   if (grant.tokenTtlSeconds !== null && (!Number.isSafeInteger(grant.tokenTtlSeconds) || grant.tokenTtlSeconds < TOKEN_TTL_MIN_SECONDS || grant.tokenTtlSeconds > TOKEN_TTL_MAX_SECONDS)) reasons.push('token_ttl_invalid');
   if (grant.surface !== null && !['verbs', 'starter', 'full'].includes(grant.surface)) reasons.push('surface_invalid');
   if (grant.profile !== null && !(GRANT_PROFILES as readonly string[]).includes(grant.profile)) reasons.push('profile_invalid');
+  if (grant.privatePages !== undefined && !PRIVATE_PAGES_GRANTS.includes(grant.privatePages)) reasons.push('private_pages_invalid');
   if (!Number.isSafeInteger(grant.boundMaxConcurrent) || grant.boundMaxConcurrent < 1) reasons.push('concurrency_invalid');
   if (hasScope(grant.scopes, 'agent')) reasons.push(...delegationReasons(grant, ctx));
   if (reasons.length) throw new GrantError('invalid_grant', `Invalid client grant: ${[...new Set(reasons)].join(', ')}`, [...new Set(reasons)]);
@@ -166,6 +182,7 @@ export interface PrincipalGrant {
   allowedOperations: string[] | null;
   /** null = the default ['world']; [] = deny-all. */
   takesHolders: string[] | null;
+  privatePages: PrivatePagesGrant;
   revision: number;
   shape: 'unified' | 'legacy_permissions';
   /**
@@ -227,7 +244,7 @@ function columnList(value: unknown): string[] | null {
 }
 
 /** The grant the unified columns carry; an inconsistent source state reads as `none`. */
-export function tokenGrantFromColumns(row: Record<string, unknown>): TokenGrantAxes {
+export function tokenGrantFromColumns(row: TokenGrantRow): TokenGrantAxes {
   const write = typeof row.source_id === 'string' && row.source_id.length > 0 ? row.source_id : null;
   const reads = columnList(row.federated_read);
   let sources: GrantSources = { kind: 'none' };
@@ -251,17 +268,19 @@ function sameAxis(axis: LegacyGrantAxis, a: TokenGrantAxes, b: TokenGrantAxes): 
 
 /**
  * The effective grant of an `access_tokens` row (SELECT * keeps this working
- * on brains that predate the columns). Unified rows read the columns, and any
+ * on brains that predate the columns; a reader inside a transaction selects
+ * `TOKEN_GRANT_ROW_COLUMNS` instead). Unified rows read the columns, and any
  * axis whose JSONB mirror disagrees evaluates deny-all. A `source_grant IS
  * NULL` row has not been converted yet (the bulk migration converts every
  * active one; an older binary's `auth create` can still add one): it reads as
  * the conversion `migrateLegacyTokens` would write, and a malformed
  * `permissions` value denies every axis.
  */
-export function grantFromTokenRow(row: Record<string, unknown>): PrincipalGrant {
+export function grantFromTokenRow(row: TokenGrantRow): PrincipalGrant {
   const base = {
     principal: { kind: 'legacy_token' as const, id: String(row.id) },
     scopes: normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin'],
+    privatePages: privatePagesFromColumn(row.private_pages),
     revision: Number(row.grant_revision ?? 0),
   };
   const { malformed, ...legacy } = tokenGrantFromPermissions(row.permissions);
@@ -286,7 +305,8 @@ export function grantFromClient(grant: ClientGrant): PrincipalGrant {
     : { kind: 'federated', writeSource: grant.sourceId, readSources: [...grant.federatedRead] };
   return {
     principal: { kind: 'oauth_client', id: grant.clientId }, scopes: [...grant.scopes], sources,
-    allowedOperations: grant.allowedOperations, takesHolders: grant.takesHolders ?? null, revision: grant.revision,
+    allowedOperations: grant.allowedOperations, takesHolders: grant.takesHolders ?? null,
+    privatePages: privatePagesFromColumn(grant.privatePages), revision: grant.revision,
     shape: 'unified', drift: [], permissionsMalformed: false,
   };
 }
@@ -299,6 +319,26 @@ export function authSourcesFromGrant(g: PrincipalGrant): { sourceId: string; all
     case 'federated': return { sourceId: g.sources.writeSource, allowedSources: [...g.sources.readSources], hasSourceGrant: true };
     case 'none': return { sourceId: NO_SOURCES, allowedSources: [], hasSourceGrant: true };
   }
+}
+
+/**
+ * GBRA-156: the sources whose private pages this grant's principal may read
+ * remotely. Only sources the grant names explicitly count: a scalar grant's
+ * write source, a federated grant's write and read sources. The no-grant
+ * floor (`default`), `none` and the `none` axis yield nothing.
+ */
+export function privatePagesSources(g: Pick<PrincipalGrant, 'sources' | 'privatePages'>): string[] {
+  if (g.privatePages !== 'granted_sources') return [];
+  const s = g.sources;
+  if (s.kind === 'scalar') return [s.writeSource];
+  if (s.kind === 'federated') return [...new Set([s.writeSource, ...s.readSources])];
+  return [];
+}
+
+/** The AuthInfo `privatePages` field for this grant; empty when nothing is private-readable. */
+export function privatePagesAuth(g: Pick<PrincipalGrant, 'sources' | 'privatePages'>): { privatePages?: { mode: 'granted_sources'; sources: string[] } } {
+  const sources = privatePagesSources(g);
+  return sources.length ? { privatePages: { mode: 'granted_sources', sources } } : {};
 }
 
 /**
@@ -351,3 +391,20 @@ export function tokenGrantColumnValues(g: Pick<PrincipalGrant, 'sources' | 'allo
   ];
 }
 export const TOKEN_GRANT_COLUMNS = ['source_grant', 'source_id', 'federated_read', 'allowed_operations', 'takes_holders'] as const;
+/**
+ * GST-2314: every access_tokens column `grantFromTokenRow` reads (its row type allows no other). A reader inside a
+ * transaction selects these by name: a prepared SELECT * whose plan was cached before a migration added a column
+ * fails there with 0A000 ("cached plan must not change result type") until the connection re-prepares it.
+ */
+export const TOKEN_GRANT_ROW_COLUMNS = ['id', 'scopes', 'permissions', 'private_pages', 'grant_revision', ...TOKEN_GRANT_COLUMNS] as const;
+/**
+ * The select list of `TOKEN_GRANT_ROW_COLUMNS` that this brain's access_tokens has. Admission authorizes before it
+ * replays an accepted request or refuses a schema behind this build, and membership has no schema admission, so a
+ * column a pending migration adds reads as absent, as it did under SELECT *.
+ */
+export async function tokenGrantRowSelect(engine: { executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> }): Promise<string> {
+  const present = new Set((await engine.executeRaw<{ attname: string }>(
+    "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass('access_tokens') AND attnum>0 AND NOT attisdropped")).map(c => c.attname));
+  return TOKEN_GRANT_ROW_COLUMNS.filter(c => present.has(c)).join(',');
+}
+export type TokenGrantRow = Partial<Record<(typeof TOKEN_GRANT_ROW_COLUMNS)[number], unknown>>;

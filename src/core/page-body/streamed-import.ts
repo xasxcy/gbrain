@@ -96,6 +96,8 @@ type StreamedImportOptions = {
   forceRechunk?: boolean;
   activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
   firstCommitAt?: Date;
+  /** GBRA-217: a sync import's reason from Git and history-gap marker for the snapshot this import archives. */
+  history?: import('../page-state/versions.ts').VersionHistory;
   /**
    * A page write of the file's content (`gbrain put|capture --file` on the trusted local CLI), not a file import: the
    * file records no origin (no source_path or file source_uri), no other file's slug claim applies, the staging is a
@@ -344,7 +346,7 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
   const sourceId = opts.sourceId ?? 'default';
   const parsed = { ...scan.parsed, compiled_truth: '', timeline: '' } as ParsedMarkdown;
   const frontmatterHold = classifyImportHold(parsed);
-  if (frontmatterHold) return { slug: expectedSlug, status: 'skipped', chunks: 0, error: frontmatterHold.message, refusal: frontmatterHold, skip_reason: 'invalid_frontmatter' };
+  if (frontmatterHold) return { slug: expectedSlug, status: 'skipped', chunks: 0, error: frontmatterHold.message, refusal: frontmatterHold, skip_reason: frontmatterHold.code };
   // #7848: a private request page privacy would not read is held; only an upload session (`content` plus `coordinated`) refuses it at its own guard.
   const privateHold = opts.content && opts.coordinated ? null : noncanonicalPrivateHold('', parsed.frontmatter);
   if (privateHold) return { slug: expectedSlug, status: 'skipped', chunks: 0, error: privateHold.message, refusal: privateHold, skip_reason: privateHold.code };
@@ -455,7 +457,7 @@ async function importScanned(engine: BrainEngine, input: { file: FileHandle; bom
       : { source_path: relativePath, source_kind: null, source_uri: fileOriginUri(existing?.source_uri, sourceRoot, relativePath), ingested_via: null }) };
   const refs = prepared.body.body_flags.has_protected ? [] : [...codeRefs.refs.values()];
   const apply = async (tx: BrainEngine, preimage?: PageSnapshot | null) => {
-    if (existing) await tx.createVersion(slug, preimage ? { sourceId, preimage } : { sourceId });
+    if (existing) await tx.createVersion(slug, preimage ? { sourceId, ...opts.history, preimage } : { sourceId, ...opts.history });
     const result = await applySegmentedBody(tx, { slug, sourceId, pageId: live?.id ?? null, prepared, meta, promotion: live?.storage === 'inline', retireMaxRows: input.policy.flipRetireMaxRows });
     await tx.updatePageContextualRetrievalState(slug, sourceId, mode, corpusGeneration);
     await tx.executeRaw(`DELETE FROM tags t USING pages p WHERE p.id = t.page_id AND p.source_id = $1 AND p.slug = $2

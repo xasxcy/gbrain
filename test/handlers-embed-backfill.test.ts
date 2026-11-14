@@ -59,6 +59,7 @@ function fakeJob(data: Record<string, unknown>, controller = new AbortController
     name: 'embed-backfill',
     data,
     attempts_made: 0,
+    idempotency_key: null,
     signal: controller.signal,
     deadlineAtMs: null,
     shutdownSignal: controller.signal,

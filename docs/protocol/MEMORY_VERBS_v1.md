@@ -49,7 +49,7 @@ the same registry.
 
 ```bash
 gbrain init --pglite                                      # 2-second local brain
-claude mcp add gbrain -- "$(command -v gbrain)" serve --surface starter --advertise verbs   # lists the verbs; the daily-driver tools stay callable
+gbrain setup claude-code                                  # registers serve behind gbrain's launcher; lists the verbs, the daily-driver tools stay callable
 gbrain remember "gbrain install check" --provenance install-check
 gbrain recall --query "gbrain install check"              # …now ask your agent in a NEW session
 ```
@@ -64,7 +64,7 @@ If `claude` is not found: install Claude Code first, or use a block below.
 
 **Codex**
 ```bash
-codex mcp add gbrain -- "$(command -v gbrain)" serve --surface starter --advertise verbs
+gbrain setup codex
 ```
 
 **Grok Build** (verify with `grok mcp doctor gbrain` — the add is lazy)
@@ -100,7 +100,8 @@ pins `full`, callable and advertised: in the held-out agent benchmark, listing
 only `starter` or `verbs` lowered task success and saved no tokens. A harness
 that caps its tool count can register `--surface starter` or `--surface verbs`.
 Persist a default for bare `serve` with `gbrain config set mcp_surface verbs`.
-On stdio, `GBRAIN_SURFACE` in the server's env overrides `--surface`; a
+On stdio, `GBRAIN_SURFACE` in the server's env overrides `--surface` (a
+`.env` file in the working directory cannot set it); a
 session widens itself with `request_tools {"surface":"full"}` (see
 `docs/operations/mcp-surface-runbook.md`).
 
@@ -144,7 +145,13 @@ Retrieve saved facts and (with `query`) budget-packed page snippets.
   error's `fix.mcp` is the call without it. One query
   embedding per call, no model call. Without an embedding provider, with
   embeddings turned off, or when the embed fails, facts rank by term share and
-  `facts_degraded.reason` says why. A server without question ranking ignores
+  `facts_degraded.reason` says why. A question over 12 content words is searched
+  on its last 24 and scored on the 12 of those the fewest candidate facts hold,
+  so an instruction preamble ahead of the turn does not crowd out its words.
+  When candidates were found and none cleared the admission rule, the response
+  carries `facts_below_floor: <n>`; it is absent when nothing matched. Over
+  2,000 characters is `invalid_params` reason `question_too_long` with detail
+  `max_chars=2000 received_chars=<n>`; the question is never cut. A server without question ranking ignores
   the parameter (or rejects it under `mcp.strict_params=reject`); clients detect
   support by `facts_order: "relevance"` in the response or `question` in the
   live tool schema, not by `protocol_version`.
@@ -295,7 +302,12 @@ Save ONE fact with mandatory attribution.
   consent line. An omitted `visibility` saves `private` when the target page is
   private (by `visibility` or a privacy alias such as `access: private`) or the
   operator set `facts.default_visibility` to private; a save never lands wider
-  than the page it is written into.
+  than the page it is written into. In gbrain, a remote credential bound to
+  one member saves `private` on its own member page unless it passes
+  `share: true`, and its `visibility: "world"` is refused; the brain owner's
+  own credential saves as above (shared by default, `private` on its member
+  page when it asks or the page or default keeps facts private). The response
+  names the `page` and `visibility` the fact got.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -314,7 +326,12 @@ A claim that was forgotten is refused with `invalid_params` and the message
 prefix `fact_withdrawn`: remembering the same text again does not restore it,
 and a claim forgotten without an entity is withdrawn for every entity. To link
 a fact saved without an entity, do not forget it; remember it with `entity`
-and `replaces` set to its id.
+and `replaces` set to its id. In gbrain, a fact saved without an entity is a
+row of the `memory/unattributed` page's `## Facts` table, created on first
+use; linking it strikes that row in the same write. A remote save onto a
+member's own page is refused only when that member could read what was
+forgotten (a fact on its own page, or for the brain owner a fact it reads);
+a claim it never read saves as its own fact, with the reply a new claim gets.
 
 #### remember withdrawn refusal detail (additive)
 
@@ -327,6 +344,21 @@ rides the immediate refusal, the `items[]` error, the failed write receipt and
 `get_write_request`. It covers the exact normalized claim only, never a
 paraphrase, and its absence carries no meaning: the message prefix, code and
 suggestion are unchanged.
+
+#### write-grant refusal detail (additive)
+
+A `remember` naming a `source_id` outside the connection's write grant is
+refused `scope_denied` with `write_error: permission_denied` (a page write:
+`permission_denied`), and the envelope carries `writable_source_ids`: the sources this connection's own grant
+lets it write (one id, or `[]` when the grant holds no single writable source).
+It never names a source outside the grant, a federated read source included,
+and the refusal is identical whether the named source exists or not. On
+`remember` with one writable source, `fix` is the same call with `source_id` set
+to it (no `request_id`; a `visibility` the caller left out stays out, so the
+brain's default still applies) with `next: ask_user`: its `user_message` names both
+sources, because the writable source's readers may differ from the one the user
+named. `forget`, `forget_fact` and page writes carry no fix, so a withdrawal is
+never retargeted and page content is never echoed back.
 
 #### remember replaces (additive)
 
@@ -384,6 +416,41 @@ Optional response fields; clients must ignore any they do not know.
   caller is never told about an entity it cannot read: that case is `NO_ENTITY`.
 - `hint: string` — present with `warnings`; names the `entity` input.
 
+#### remember: where the fact landed (additive)
+
+Optional response fields; clients must ignore any they do not know.
+
+- `page: string`: the page whose `## Facts` table now holds the fact. It is
+  absent when the fact is on no page: an `entity` slug that has no page, or a
+  fact with no entity on a source that cannot hold `memory/unattributed`.
+  `remember` never creates an entity page.
+- `visibility`: `world` or `private`, as saved.
+- `persistence: { mode }`: `filesystem` when the write changed a page file,
+  `database` when it changed the database alone.
+- `write_through: { written, skipped? }`: `skipped` says why no file was
+  written. `entity_page_missing`: the source has a checkout, but the entity
+  has no page to take the fact. `no_repo_configured`: the source has no
+  checkout, so the database is its record. `disabled_by_config` and
+  `subagent_sandbox`: write-through is off for the brain or for this caller.
+  `held_for: string`: on a source whose pages are canonical in Git, the
+  entity a fact was saved for while it has no page; the fact is a row of a
+  holding page (`page`) whose `entity` column names it, until maintenance
+  moves it into the entity's page. The holding page is `memory/unattributed`,
+  or for an entity under a folder access rule its folder's
+  `<folder>/memory/unattributed`; under a database-only folder that page has
+  no file (`persistence.mode` `database`, `skipped: db_only`).
+
+A fact saved for an entity with no page is stored and recalled like any
+other. Where the source's pages are in Git, the reply also carries one
+`entity_page_missing` notice per entity per session. While the fact is in the
+database only, the notice's step is `next: ask_user`: its `user_message` says
+the fact is saved in the database only and asks whether to create a page for
+the entity, and its fix is the `put_page` call to make once the user agrees.
+When the fact is held in Git (`write_through.held_for`), the notice only says
+where it is and that it moves once the page exists; it has no fix. Once the
+page exists, the next maintenance cycle can move the entity's facts into its
+Facts table and file. A brain with no Git repository gets no such notice.
+
 #### remember items: several facts in one call (additive)
 
 `items` (1 to 20) replaces `fact` for a batch, typically right before
@@ -396,18 +463,18 @@ fact, so it goes on its item; passing both `fact` and `items`, or a top-level
 
 Every item is validated before any is written: one invalid item refuses the
 whole call with `items[<i>]` in the message. Each item is then saved as its own
-write with a child `request_id` derived from the call's `request_id` (the
-string the caller sent, so a batch accepted by an older server replays to the
-same receipts) and the item index, so replaying the same `request_id` replays each child's outcome and
+write with a child `request_id` derived from the call's `request_id` (as sent, so an
+older server's batch replays to the same receipts) and the item index, so a replay repeats each child's outcome and
 writes nothing twice.
 
 Response: `{ protocol_version, request_id, client_request_id?, items[], saved, failed, partial,
 hints?, next? }`. Each `items[]` entry is a compact receipt `{ index,
-request_id, status, id?, entity_slug?, superseded_fact_id?, warnings?, valid_until?, state? }`
+request_id, status, id?, entity_slug?, page?, visibility?, persistence?, write_through?, superseded_fact_id?, warnings?, valid_until?, state? }`
 (`state` and `retry_after_ms` only when the write is not yet committed), or
-`{ index, request_id, status: "failed", error: { code, message, suggestion? } }`. Hints the
-single-fact response would repeat per item appear once in `hints`. `partial: true` means some items saved and some failed; resend
-only the failed items, in a new call with a new `request_id`.
+`{ index, request_id, status: "failed", error: { code, message, suggestion? } }`. Per-item hints
+appear once in `hints`. `partial: true`: some saved; resend
+only the failed ones with a new `request_id`. Any failed item adds `status: "error"` (CLI exit 1,
+MCP `isError`); if all were refused unaccepted, it fails with the first item's error.
 
 ### entity(name) — read, zero LLM, p99 < 100ms
 
@@ -718,6 +785,21 @@ forgetting the unlinked fact is refused with `invalid_params`, message prefix
 says to keep them, or to forget them first to withdraw the claim everywhere.
 A forget never withdraws an active fact the caller cannot read; when one
 would be reached, the refusal keeps the `claim_linked:` prefix and names no fact.
+In gbrain, a credential bound to one member withdraws only facts on its own
+member page (another fact it reads is refused naming the brain host); the
+brain owner's own credential also withdraws a shared fact it reads, and any
+other fact it reads on a page that credential can write, such as a page whose
+`readable_by` names the owner.
+
+#### forget publishes like a page write (additive note)
+
+In gbrain, a forget is a write of the pages that carry the claim: each row is
+struck (`~~claim~~`, a `valid_until` date and `forgotten: <reason>`) and every
+such file is published, in one commit, before the withdrawal commits. It is
+admitted and published like `remember`, so when the source's writer cannot
+publish yet the call returns the pending-write error with a receipt, and the
+fact stays recallable until the withdrawal publishes. The response shape is
+unchanged.
 
 #### forget and purge (additive note)
 
@@ -817,7 +899,7 @@ lock".
 | Exit | Meaning |
 | --- | --- |
 | 0 | Committed (or pending with `--accept-pending`). |
-| 10 | Accepted, still pending; the receipt names the request. |
+| 10 | Accepted, still pending; the receipt names the request. Also with `--accept-pending` when the receipt carries `diagnostic.owner` (reason `owner_unavailable`): the owner host runs no consumer and has been quiet past the stale window, so the write will not commit on its own ([stale owner](../guides/troubleshooting.md#owner-host-stale)). |
 | 1 | Not committed: a terminal failure (`conflict`, `failed`, `cancelled`), a refusal before admission (for example "the persistence owner is closing", even with `--accept-pending`), or a lost response whose submission state is unknown (`submission_status: "unknown"`, no receipt). |
 
 The verdict keys on an admitted, non-terminal receipt, never on an error code
@@ -1120,6 +1202,16 @@ explicit `since` (or `gbrain beliefs changes`). `min_trust` does not filter
 it; each change carries its `trust_tier`. The
 CLI twin is `gbrain beliefs changes [<entity>...] [--since 7d]`. Design:
 [BELIEF_LEDGER.md section 15](../designs/BELIEF_LEDGER.md#15-w4-as-built-the-weekly-change-diff).
+
+### Adjacent memory-settings ops (not verbs)
+
+Three ops sit next to `remember` without joining the frozen verb set, so
+`--surface verbs` does not serve them: `get_memory_settings` (read the
+writeback mode and rule text), `set_memory_writeback` (admin scope plus the
+operator's `mcp.publish_memory_settings` grant) and `memory_conversation_mode`
+(the per-conversation "save everything from here" / "stop saving" switch, on
+the starter surface). See
+[Reading and changing it remotely](../guides/ambient-writeback.md#reading-and-changing-it-remotely).
 
 ## Latency classes (per verb)
 

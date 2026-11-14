@@ -10,11 +10,15 @@
  */
 import type { SearchOpts, SearchResult } from '../types.ts';
 import { rowToSearchResult } from '../utils.ts';
-import { buildKeywordCountStatement, buildKeywordPagesStatement, type KeywordPageWindow } from '../search/keyword-statement.ts';
+import { buildKeywordCountStatement, buildKeywordHandlePagesStatement, buildKeywordPagesStatement, type KeywordPageWindow } from '../search/keyword-statement.ts';
 import type { ScopedReadRunner } from './cjk-search.ts';
 
-/** Engine session settings: Postgres bounds each read with a statement timeout; PGLite has none. */
-export interface KeywordPagesDialect { statementTimeout?: string }
+/**
+ * Engine session settings: Postgres bounds each read with a statement timeout and runs it at the keyword
+ * statement's work_mem (KEYWORD_STATEMENT_SETTINGS: at the 4 MB default a common term's bitmap went lossy and
+ * its sort spilled to disk); PGLite has neither.
+ */
+export interface KeywordPagesDialect { statementTimeout?: string; statementSettings?: Readonly<Record<string, string>> }
 
 /** Distinct pages matching the strict keyword query, at most KEYWORD_COUNT_CAP + 1. */
 export async function countKeywordPages(
@@ -24,7 +28,7 @@ export async function countKeywordPages(
   if (!statement) return 0;
   const timeout = dialect.statementTimeout && dialect.timeoutMs ? `${Math.max(1, Math.floor(dialect.timeoutMs))}ms` : dialect.statementTimeout;
   const rows = await scoped(async exec => (await exec.unsafe<{ n: number }>(statement.sql, statement.params)).rows,
-    timeout ? { statement_timeout: timeout } : undefined);
+    timeout ? { statement_timeout: timeout, ...dialect.statementSettings } : undefined);
   return Number(rows[0]?.n ?? 0);
 }
 
@@ -32,9 +36,19 @@ export async function countKeywordPages(
 export async function searchKeywordPages(
   scoped: ScopedReadRunner, query: string, opts: SearchOpts | undefined, page: KeywordPageWindow, dialect: KeywordPagesDialect,
 ): Promise<SearchResult[]> {
-  const statement = buildKeywordPagesStatement(query, opts, page);
+  return readPages(scoped, buildKeywordPagesStatement(query, opts, page), dialect);
+}
+
+/** GBRA-108: the pages the query's slug handles name (search/keyword-handles.ts), best chunk each; the keyword arm's rows for them. */
+export async function searchHandlePages(
+  scoped: ScopedReadRunner, query: string, handles: readonly string[], opts: SearchOpts | undefined, limit: number, dialect: KeywordPagesDialect,
+): Promise<SearchResult[]> {
+  return readPages(scoped, buildKeywordHandlePagesStatement(query, handles, opts, limit), dialect);
+}
+
+async function readPages(scoped: ScopedReadRunner, statement: { sql: string; params: unknown[] } | null, dialect: KeywordPagesDialect): Promise<SearchResult[]> {
   if (!statement) return [];
   const rows = await scoped(async exec => (await exec.unsafe(statement.sql, statement.params)).rows,
-    dialect.statementTimeout ? { statement_timeout: dialect.statementTimeout } : undefined);
+    dialect.statementTimeout ? { statement_timeout: dialect.statementTimeout, ...dialect.statementSettings } : undefined);
   return rows.map(rowToSearchResult);
 }

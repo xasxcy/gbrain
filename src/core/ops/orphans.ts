@@ -36,6 +36,7 @@ const find_orphans: Operation = {
     },
     limit: {
       type: 'number',
+      minimum: 1,
       description: `Rows per page (default ${ORPHANS_DEFAULT_LIMIT}, max ${ORPHANS_MAX_LIMIT}); total_orphans counts every orphan, complete says whether this page holds the rest, and next_cursor (or next_offset) names the next page.`,
     },
     offset: { type: 'number', description: 'Skip the first N orphans (ordered by source_id, then slug).' },
@@ -58,6 +59,7 @@ const find_orphans: Operation = {
     // source-isolation class. Local CLI callers route through `gbrain
     // orphans --source` instead (ctx.remote === false → empty scope here).
     // #5891: a named source narrows the caller's scope and never widens it.
+    // A remote caller's inbound links count only from referrers in its scope.
     const named = p.source_id === undefined ? undefined : String(p.source_id);
     if (named !== undefined) assertSourceInCallerScope(ctx, named);
     const scope = named !== undefined ? await readPolicyOpts(ctx, { sourceId: named }) : await readPolicyOpts(ctx);
@@ -73,6 +75,7 @@ const find_orphans: Operation = {
       includePseudo: (p.include_pseudo as boolean) || false,
       ...(mode ? { mode } : {}),
       ...scope,
+      scopeInbound: ctx.remote !== false,
     });
     const cursor = p.cursor === undefined ? undefined : String(p.cursor);
     if (cursor !== undefined && offset !== 0) {

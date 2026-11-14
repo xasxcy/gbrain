@@ -24,9 +24,11 @@ import {
   BRAIN_FIRST_END,
   renderBrainFirstBlock,
   renderBrainFirstSnippet,
+  renderBrainFirstTurnRule,
 } from '../src/core/setup/brain-first.ts';
 import { harnessWiringCheck, instructionBlockViews, withInstructionBlocks, withSurfaceNote, type InstructionBlockView } from '../src/commands/doctor/checks/harness-wiring.ts';
 import { installHarnessConnection } from '../src/core/harness/install.ts';
+import { ensureHookLauncher, hookLauncherPath } from '../src/core/setup/hook-launcher.ts';
 import type { HarnessCredentials } from '../src/core/harness/credentials.ts';
 
 const CLI = resolve(import.meta.dir, '..', 'src', 'cli.ts');
@@ -279,6 +281,67 @@ describe('brain-first block: placement rules', () => {
     expect(existsSync(join(b.home, '.openclaw', 'gbrain'))).toBe(false);
   });
 
+  /** A fake openclaw CLI: `config set` enables the plugin in openclaw.json (as enable + config set do), `plugins inspect` reports it loaded. */
+  function fakeOpenclaw(b: Box): Record<string, string> {
+    const cfg = join(b.home, '.openclaw', 'openclaw.json');
+    const enabled = JSON.stringify({ plugins: { entries: { 'gbrain-turn-rule': { enabled: true, hooks: { allowConversationAccess: true } } } } });
+    writeFileSync(join(b.root, 'bin', 'openclaw'), [
+      '#!/bin/sh',
+      `case "$*" in "config set"*) printf '%s' '${enabled}' > '${cfg}';; "plugins inspect"*) echo '{"id":"gbrain-turn-rule","status":"loaded","imported":true,"hooks":["before_prompt_build"]}';; esac`,
+      'exit 0',
+      '',
+    ].join('\n'));
+    chmodSync(join(b.root, 'bin', 'openclaw'), 0o755);
+    return { PATH: `${join(b.root, 'bin')}:${process.env.PATH ?? ''}` };
+  }
+
+  test('openclaw --workspace: the gateway-shared plugin is not rewritten for another server name or removed by one workspace opting out', async () => {
+    const b = box();
+    mkdirSync(join(b.home, '.openclaw', 'workspace'), { recursive: true });
+    const path = fakeOpenclaw(b);
+    const dir = join(b.home, '.openclaw', 'gbrain', 'gbrain-turn-rule');
+    const first = await setup(b, ['openclaw'], path);
+    expect(first.exitCode).toBe(0);
+    expect(first.doc.turn_hook_check.ok).toBe(true);
+    const index = read(join(dir, 'index.js'));
+    const ws = join(b.home, 'ws-a');
+    mkdirSync(ws);
+    const renamed = await setup(b, ['openclaw', '--workspace', ws, '--name', 'gbrain-a', '--instructions-only'], path);
+    expect(renamed.exitCode).toBe(0);
+    expect(renamed.doc.turn_hook.action).toBe('print');
+    expect(renamed.doc.turn_hook.commands).toEqual([`gbrain setup openclaw --remove --workspace ${ws}`]);
+    expect(read(join(dir, 'index.js'))).toBe(index);
+    const declined = await setup(b, ['openclaw', '--workspace', ws, '--no-instructions'], path);
+    expect(declined.exitCode).toBe(0);
+    expect(declined.doc.instructions.action).toBe('remove');
+    expect(declined.doc.turn_hook.action).toBe('skip');
+    expect(read(join(dir, 'index.js'))).toBe(index);
+    expect(read(join(b.home, '.openclaw', 'workspace', 'AGENTS.md'))).toContain(BRAIN_FIRST_BEGIN);
+  });
+
+  test('openclaw --workspace on a disabled plugin an older gbrain wrote: another server exits 0 with the way out, the same server rewrites and enables it', async () => {
+    const b = box();
+    mkdirSync(join(b.home, '.openclaw', 'workspace'), { recursive: true });
+    const path = fakeOpenclaw(b);
+    const dir = join(b.home, '.openclaw', 'gbrain', 'gbrain-turn-rule');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ name: 'gbrain-turn-rule', version: '1.0.0', private: true, type: 'module', openclaw: { extensions: ['./index.js'] } }, null, 2)}\n`);
+    writeFileSync(join(dir, 'index.js'), [`const RULE = ${JSON.stringify(renderBrainFirstTurnRule({ kind: 'mcp', server: 'gbrain' }, 'openclaw'))};`, 'export default {', "  id: 'gbrain-turn-rule',", '  register(api) {', "    api.on('before_prompt_build', () => ({ prependContext: RULE }));", '  },', '};', ''].join('\n'));
+    writeFileSync(join(b.home, '.openclaw', 'openclaw.json'), JSON.stringify({ plugins: { entries: { 'gbrain-turn-rule': { enabled: false } } } }));
+    const ws = join(b.home, 'ws-a');
+    mkdirSync(ws);
+    for (let i = 0; i < 2; i++) {
+      const other = await setup(b, ['openclaw', '--workspace', ws, '--name', 'gbrain-a', '--instructions-only'], path);
+      expect(other.exitCode).toBe(0);
+      expect(other.doc.turn_hook.action).toBe('print');
+    }
+    const same = await setup(b, ['openclaw', '--workspace', ws, '--instructions-only'], path);
+    expect(same.exitCode).toBe(0);
+    expect(same.doc.turn_hook.action).toBe('write');
+    expect(same.doc.turn_hook_check.ok).toBe(true);
+    expect(JSON.parse(read(join(dir, 'package.json'))).gbrain).toEqual({ access: { kind: 'mcp', server: 'gbrain' } });
+  });
+
   test('a damaged block is preserved and reported, never guessed through', async () => {
     const b = box();
     const path = join(b.home, '.claude', 'CLAUDE.md');
@@ -499,8 +562,10 @@ describe('brain-first block: full setup and the installer lanes', () => {
 });
 
 describe('doctor harness_wiring reports the block', () => {
+  /** A current stdio registration: serve behind gbrain's hook launcher, the shape setup writes (#8426). */
   function stdioRegistration(b: Box): void {
-    writeFileSync(join(b.home, '.claude.json'), JSON.stringify({ mcpServers: { gbrain: { type: 'stdio', command: b.bin, args: ['serve'] } } }));
+    const launcher = ensureHookLauncher(hookLauncherPath(join(b.home, '.gbrain')));
+    writeFileSync(join(b.home, '.claude.json'), JSON.stringify({ mcpServers: { gbrain: { type: 'stdio', command: launcher, args: [b.bin, 'serve'] } } }));
   }
   const env = (b: Box) => ({ ...b.env, CLAUDECODE: undefined, CLAUDE_CODE_ENTRYPOINT: undefined, CODEX_SANDBOX: undefined, CODEX_CI: undefined, OPENCODE: undefined, OPENCODE_PID: undefined });
 

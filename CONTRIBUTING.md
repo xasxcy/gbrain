@@ -322,7 +322,7 @@ blocker when it points anywhere but the target.
 docker run -d --name gbrain-graduation-pg \
   -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=gbrain_graduation_test \
-  -p 5436:5432 pgvector/pgvector:pg16
+  -p 127.0.0.1:5436:5432 pgvector/pgvector:pg16
 until docker exec gbrain-graduation-pg pg_isready -U postgres; do sleep 1; done
 
 # 2. Source brain with write history, in a throwaway home
@@ -420,7 +420,7 @@ Parity tests (`test/parity.test.ts`) verify CLI/MCP/tools-json stay in sync.
 An op added to a domain module under `src/core/ops/` keeps its automatic path:
 it appears in the CLI, the MCP server and `--tools-json` with no other edit
 (see [Adding a new operation](#adding-a-new-operation)). Everything else lands
-in one of these eight places. Every row ends with the same pre-merge gate:
+in one of these nine places. Every row ends with the same pre-merge gate:
 `bun run verify`, then `bun run ci:ubicloud` (or `bun run ci:local`) for the
 full unit + E2E run on PGLite, direct Postgres and PgBouncer.
 
@@ -440,8 +440,9 @@ to a sibling module. Every row also adds a behavior test of its own; the
 | CLI-only command | The implementation in `src/commands/<name>.ts`; the dispatch module `src/cli/commands/<name>.ts`; a help line in `printHelp` (`src/cli.ts`, so raise its `module-size-limits.tsv` ceiling by one) | A record in `CLI_COMMANDS` (`src/cli/command-table.ts`): `phase: 'pre-connect'` when the command never touches the database, `'post-connect'` when its `run(engine, args, ctx)` needs an engine; `thinClient: 'none'` unless remote brains must refuse it (`'refuse'`, or `'route-then-refuse'` for subcommand routing); `selfHelp: true` when the command has flags or subcommands (its `run` then prints its own `--help`); optional `skipStartupHooks`; `load: () => import('<literal>')` | `bun run build:flag-registry`; the CLI goldens, deliberately: `GBRAIN_TEST_UPDATE_GOLDENS=1 bun test test/cli-goldens.test.ts test/cli-dispatch-phase.test.ts test/cli-dispatch-thin-client.test.ts` | `test/<name>.test.ts` spawning `bun src/cli.ts <name>` and asserting output and exit code, plus `bun test test/cli-command-table.test.ts test/cli-flag-validation.test.ts` |
 | HTTP route (`gbrain serve --http`) | The route inside `mount<Area>(app, ctx)` in `src/commands/serve-http-<area>.ts` (`/admin/api/*` goes in `serve-http-admin-api.ts`, `/mcp` in `serve-http-mcp.ts`, OAuth in `serve-http-oauth.ts`); a new area is a new module plus one mount call in `buildServeHttpApp` (`src/commands/serve-http.ts`). An `/admin` route takes `ctx.requireAdmin` before its handler | None for a route in an existing area; a new area adds its mount call in `buildServeHttpApp` (order matters) | The route goldens, deliberately: `GBRAIN_TEST_UPDATE_GOLDENS=1 bun test test/serve-http-route-golden.test.ts test/serve-http-route-runtime-golden.test.ts` | A behavior test (`test/serve-http-<area>-<route>.test.ts`: mount the area on a bare `express()` app with a stub ctx; `mountAdminApi` reads `requireAdmin`, `sseClients` and `mcpResourceUrl` at mount time) plus `bun test test/serve-http-admin-route-guard.test.ts`, which finds the new route by itself |
 | Sync phase | A module under `src/commands/sync/` taking `(run, Pick<SyncPlan, ...>, ...)` and returning `SyncResult \| undefined`; state it shares across awaits becomes a field on `SyncRun` (`src/commands/sync/sync-run.ts`). A value for the final summary flows `SyncRun` field -> `finalizeIncrementalSync` (`sync/finalize.ts`) -> `SyncResult` (`src/commands/sync.ts`, raise its ceiling) -> `printSyncResult` (`sync/report.ts`) when it should print | The phase call order in `performSyncInner` (`src/commands/sync/incremental.ts`) | Nothing | A case in `test/sync-run-ordering.serial.test.ts` (it has the git-repo + PGLite harness: `commitPages`, `performSync`), plus `bun test test/sync.test.ts test/sync-run-ordering.serial.test.ts` |
-| Release version and migration numbers | Nothing by hand: when your PR is next to merge, `bun run release:restamp` (preview with `--dry-run`) merges `origin/master`, sets the PATCH version, renumbers your own migrations and commits once | None: it rewrites every required row of the CLAUDE.md "Version locations" table | It runs the generators itself and prints the golden-regeneration reason for the PR body | `bun run verify`; `bun test test/scripts/release-restamp.test.ts` when you change restamp itself ([docs](docs/RELEASING.md#release-restamp)) |
+| Release version and migration numbers | `changelog.d/<branch-slug>.md` (your entry, no version heading; /ship writes it) and one `behavior-changes.d/<id>.md` per new upgrade-notice row; number a new migration master's latest + 1 | None: the release PR writes every version stamp; never edit VERSION, the manifests or a released CHANGELOG section | On a migration-number collision, `bun run migrations:renumber`; a PR stamped the old way converts with `bun run release:unstamp` | `bun run verify` (check:regen-all builds the behavior-change table); `bun test test/scripts/release-restamp.test.ts test/scripts/build-behavior-changes.test.ts` when you change those scripts ([docs](docs/RELEASING.md#releases-per-batch)) |
 | Stress-test a touched test (flake hunt) | Nothing: `bun run test:stress [files…] [--iterations N] [--base <ref>] [--postgres]` (defaults: files changed versus `origin/master`, 10 iterations, a fresh database per iteration) | None | Nothing | The same command; a failing iteration prints its reproduce line |
+| A bundled skill (`skills/<name>/SKILL.md`), or a command, flag or operation a skill names | The skill text, in the same PR as the code it describes; follow [Changing a skill](#changing-a-skill) | `skills/skill-budgets.tsv` only for a skill over 16 KB (a ceiling goes up only in a reviewer-visible edit); `scripts/skill-drift-baseline.txt` only shrinks | `bun run scripts/generate-skills-manifest.ts` (the skills lock) | `bash scripts/skills-commit-gate.sh` (it runs `bun run check:skill-health` and prints the `Skill-size:` lines for your commit message) |
 
 The PR stress gate (`stress-changed-tests`) runs every test file the PR adds or
 changes 10 times with that same `bun run test:stress` command; a touched file
@@ -588,6 +589,64 @@ works the same way, and its older methods move over later.
    forged `ScopedRead`) and the layering guard (engine-sql never imports an
    engine). See [docs/TESTING.md, "Engine-sql"](docs/TESTING.md#engine-sql).
 
+## Changing a skill
+
+Skills are what agents follow, and every byte of a skill loads on every task
+that uses it. Before you add a line, stop at the first step that handles the
+change:
+
+1. **Fix it below the skill.** A mechanical mistake gets a clearer error, a
+   check or a test in the tool. Prose is for judgment calls.
+2. **Check the model needs it.** If a fresh session already does the right
+   thing without the line, add nothing.
+3. **Edit, don't append.** Change the line that already covers the idea. Each
+   meaning lives in one place across `SKILL.md`, its references and the
+   tool's own help.
+4. **Pick the lowest level that reaches the agent in time:** the
+   `description` (one trigger per case, loaded every session), `SKILL.md`
+   (what every task needs), `references/` behind a link that says when to
+   read it (what only some tasks need), the command's `--help`, or its errors.
+5. **Write the rule, not the story.** One positive rule under a short name;
+   the incident goes in the commit message.
+
+**Skills move with code.** A PR that renames or removes a command, subcommand,
+flag or operation updates every skill that names it in the same PR.
+`bun run check:skill-health` runs each `gbrain ...` invocation a skill shows
+through the dispatcher's own subcommand and unknown-flag checks, checks that
+each operation-shaped `tools:` entry is a real operation, and fails with the
+file, line, nearest valid name and the edit to make:
+
+```text
+SKILL_DRIFT_UNKNOWN_FLAG skills/x/SKILL.md:42 'gbrain doctor --jsn' (did you mean '--json'?)
+    fix: doctor rejects --jsn; did you mean --json. Edit the line, or restore the flag in the CLI
+```
+
+A line that shows a wrong invocation on purpose carries
+`<!-- skill-drift-ok: <reason> -->` (on that line or the one before). An
+existing finding nobody can fix yet goes in `scripts/skill-drift-baseline.txt`,
+which only shrinks. A command that skills call with a second word but that
+declares no subcommands can only have its flags checked; declare its
+subcommands in `src/cli/subcommands.ts`, or (for a positional argument) list it
+in `scripts/skill-drift-undeclared-subcommands.txt`, which also only shrinks.
+
+**Size budget.** A `SKILL.md` over 16 KB needs a row in
+`skills/skill-budgets.tsv` and stays under its ceiling; a description stays
+under 1 KB. Offset growth with a cut. Put the size before and after in the
+commit message (`skills-commit-gate.sh` prints the `Skill-size: <skill>
+<before>→<after>` lines). When a skill is more than 10% over its last diet,
+give it a diet rather than another paragraph: measure what a typical task
+loads, place every fact on its level, cut what the model already knows, and
+keep the slim version only if a blinded before/after eval on tasks written
+before cutting shows agents do at least as well. Then set its row's
+`last_diet_bytes` and lower the ceiling to the new size plus 10%.
+`gbrain skillpack health <skill>` applies the same limits to an installed
+copy and prints the fix for each finding.
+
+**Verify** by rerunning the case that prompted the change in a fresh session,
+plus any test that asserts the skill's text.
+
+The ladder and the diet are adapted from the open-source skill-diet skill (MIT).
+
 ## Adding a new engine
 
 See [`docs/ENGINES.md`](docs/ENGINES.md#adding-a-new-engine) for the full guide. In short:
@@ -706,7 +765,7 @@ accepted contribution is credited in `CHANGELOG.md`.
 
 ### gstack repo config (`.gstack/`)
 
-Two committed files tell gstack (1.91.98.0 or later) about gbrain's own gates;
+Two committed files tell gstack (1.98.0.0 or later) about gbrain's own gates;
 gstack reads both from master, so a branch's edits take effect after it merges.
 
 - `.gstack/pregate.json`: `gstack-pregate run --allow-repo-commands` runs a
@@ -725,10 +784,26 @@ gstack reads both from master, so a branch's edits take effect after it merges.
   `PREGATE_REMOTE: tree=… tests=… failed=…` line. On a clean tree whose Test and
   E2E full runs already passed on GitHub, the line comes from those runs and no
   VM starts ([remote-gate reuse](docs/ci-event-parity.md#remote-gate-reuse)).
-- `.gstack/ship-policy.json`: the stamp rule (the release stamp files and
-  version patterns) and the migration numbering `gstack-pregate regate` and
-  `gstack-tree-receipt` use to decide whether a restamped head is the same tree
-  that passed the gate.
+  `run_profiles` and `remote_gate_runs` let `gstack-pregate clear --run <Test run>
+  --run <E2E run>` clear that obligation from a slot's passed full-ci runs of
+  the same tree, checked against the inventory `bash scripts/pregate-remote-gate.sh
+  --list` prints ([run evidence](docs/ci-event-parity.md#run-evidence-for-gstack-gstack-pregate-clear---run)).
+  `ship_lanes_from` maps /ship's unit, serial, slow and E2E lane commands to
+  those runs, so /ship carries a lane from full-ci instead of running it again
+  ([/ship lanes](docs/ci-event-parity.md#ship-lanes)).
+- `.gstack/ship-policy.json`: releases per batch (`changelog_fragments` in
+  `changelog.d`, `merge: "direct"`, `restamp_command` and `release_tool` /
+  `release_outputs` for the release PR; [how](docs/RELEASING.md#releases-per-batch)),
+  the stamp rule (the release stamp files and version patterns) and the
+  migration numbering `gstack-pregate regate` and `gstack-tree-receipt` use
+  to decide whether a head is the same tree that passed the gate, plus
+  `min_gstack_version` (1.98.0.0, the gstack this policy was checked
+  against; an older one refuses with an upgrade fix).
+  `review_exclude_paths: ["docs/**", "test/fixtures/goldens/**"]` (gstack
+  1.93.33.0 or newer, read from master only) keeps docs and generated goldens
+  out of /ship's reviewer diffs, so a large wave stays under the reviewers'
+  2 MB ceiling. Those files stay covered by the privacy, gitleaks and doc
+  checks, and every code, test and config line is still reviewed.
 
 ### How a contributor PR lands
 

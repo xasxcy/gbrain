@@ -113,7 +113,8 @@ If `changelog_diff` is empty (network blip / no notes), ask without the bullets
 rather than blocking — the version numbers alone are enough to decide.
 
 - **Yes** → `gbrain self-upgrade`
-- **Always** → `gbrain config set self_upgrade.mode auto` then `gbrain self-upgrade`
+- **Always** → `gbrain config set self_upgrade.mode auto` then `gbrain self-upgrade`;
+  tell the user it applies stable releases (alpha only if they set `self_upgrade.channel alpha`)
 - **Not now** → do nothing; the snooze escalates (24h → 48h → 7d) and the marker
   stops nagging for this version until it expires or a newer version ships.
 - **Never** → `gbrain config set self_upgrade.mode off`
@@ -122,9 +123,8 @@ rather than blocking — the version numbers alone are enough to decide.
 
 A host that runs autopilot, a jobs worker or a serve must end the upgrade with
 every process on the new build, and a job that starts mid-swap can run half on
-each. A large or production brain follows the stable channel
-(`gbrain config set self_upgrade.channel stable`, or `gbrain upgrade --channel stable`
-once), which offers only releases that passed the production-shaped soak.
+each. Installs follow the stable channel by default, which offers only releases
+that passed the production-shaped soak (`self_upgrade.channel alpha` follows every release).
 With the operator's go-ahead, upgrade in this order:
 
 1. `gbrain autopilot pause --reason "upgrade"` so no new cycle starts.
@@ -137,8 +137,9 @@ With the operator's go-ahead, upgrade in this order:
    lists the installs on PATH; a harness, cron wrapper or service may run
    another by absolute path). It restarts serve, autopilot and the jobs
    supervisor onto the new build and verifies one build runs. A process it
-   cannot restart (one started by hand, a running `gbrain sync`, an MCP server
-   a harness started) refuses with `restart_refused` (exit 3) before anything
+   cannot restart (one started by hand, an autopilot a cron entry or wrapper
+   starts unless `self_upgrade.autopilot_launcher external` declares it, a
+   running `gbrain sync`, an MCP server a harness started) refuses with `restart_refused` (exit 3) before anything
    installs: relay the step it names; `--stop-mcp` only after the user agrees.
 5. Verify: `gbrain --version` per install, and
    `gbrain doctor --only runtime_build_skew,serve_build_drift --json` ok. On a

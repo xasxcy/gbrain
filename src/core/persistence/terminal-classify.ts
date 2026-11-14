@@ -25,6 +25,9 @@ import { classifySyncFault, SYNC_FAULT_TABLE, type SyncFaultClass, type SyncSafe
 import { isSyncKnockOn, knockOnRoot, SYNC_CURSOR_FENCE_ORIGIN, SYNC_KNOCK_ON_ORIGIN, cursorFenceCause, syncKnockOnSql } from './sync-knock-on.ts';
 import { writeFailureDiagnostic } from './verb-errors.ts';
 import { publicCategory, type PublicCategory } from './public-category.ts';
+import { ownerMarkerRestoreFix } from './owner-marker.ts';
+import { GRANDFATHER_RETIRED } from './publication-failure.ts';
+import { FILE_DRIFT_APPLY_STEP } from './sync-holds.ts';
 
 export type TerminalCategory =
   | 'recovery_pending' | 'recovery_blocked'
@@ -33,7 +36,9 @@ export type TerminalCategory =
   | 'writer_guard' | 'database_refusal' | 'owner_exception' | 'legacy_publication_refusal'
   | 'sync_fault' | 'transport' | 'caller_refusal' | 'gbrain_defect' | 'diagnosis_required'
   // #6904: the write met a missing relation or column (42P01 / 42703); the schema is behind this build or lost a table.
-  | 'schema_missing';
+  | 'schema_missing'
+  // #7837: a request for a write gbrain retired (the v0.13.1 grandfather, #7814) that an older build queued; nothing to do.
+  | 'retired_operation';
 
 /** The receipt columns the classifier reads; every one but `intent_kind` and `error_message` survives compaction. */
 export interface TerminalInput {
@@ -93,6 +98,8 @@ export const TERMINAL_FIXED_IN = {
   legacy_publication_refusal: '0.60.40.0',
   // #6657: a refused fact-fence adoption is no longer resubmitted every cycle and keeps its metadata.
   fence_unrenderable: '0.60.218.0',
+  // #7814: the v0.13.1 grandfather writes nothing; a queued managed_grandfather request only an older build admitted ends refused.
+  retired_operation: '0.60.479.0',
 } as const satisfies Partial<Record<TerminalCategory, string>>;
 
 /** The connection-loss texts `classifySyncFault` reads as `connection_lost`; POSIX-compatible, so readers match it in SQL (`~*`). */
@@ -126,7 +133,7 @@ function inspect(sourceId: string, why: string, userMessage?: string): Action {
  */
 export function driftSinceAction(sourceId: string, since: string): Action {
   return { argv: ['gbrain', 'repair', 'file-drift', '--source', sourceId, '--all-drifted', '--since', since, '--prefer', 'database'], consent: [], actor: 'agent', requires_exclusive: false,
-    why: `Previews keeping the database copy of every page still drifted since ${since} and writes nothing (it refuses a mix of drift classes and names --class for each); --prefer file previews importing the files instead. Decide with the user, then apply with the printed plan hash.`,
+    why: `Previews keeping the database copy of every page still drifted since ${since} and writes nothing (it refuses a mix of drift classes and names --class for each); --prefer file previews importing the files instead. Decide with the user. ${FILE_DRIFT_APPLY_STEP}`,
     verify: { argv: failuresArgv(sourceId) }, docs: 'docs/guides/write-refusals.md#file_database_drift' };
 }
 
@@ -148,7 +155,7 @@ export function classifyTerminal(input: TerminalInput): TerminalVerdict | null {
   const verdict = route(input);
   const fixedIn = (TERMINAL_FIXED_IN as Partial<Record<TerminalCategory, string>>)[verdict.category] ?? null;
   const ran = build(input);
-  const historical = fixedIn !== null && (verdict.category === 'legacy_publication_refusal' || (ran !== null && compareVersions(ran, fixedIn) < 0));
+  const historical = fixedIn !== null && (verdict.category === 'legacy_publication_refusal' || verdict.category === 'retired_operation' || (ran !== null && compareVersions(ran, fixedIn) < 0));
   return { ...verdict, public_category: publicCategory(verdict), escalate: verdict.escalate ?? escalateOf(verdict.code), defect: DEFECTS.has(verdict.category), fixed_in: fixedIn, historical };
 }
 
@@ -259,13 +266,13 @@ function route(input: TerminalInput): Partial_ {
     if (known === 'file_database_drift' || known === 'canonical_path_occupied' || known === 'unbound_source') {
       return { category: 'file_conflict', code, origin: origin ?? known, ...row('file_database_drift'),
         action: { argv: ['gbrain', 'repair', 'file-drift', '--source', source, '--slug', input.slug, '--prefer', 'database'], consent: [], actor: 'agent', requires_exclusive: false,
-          why: `Previews keeping the database copy of ${input.slug} and rewriting its file, and writes nothing; --prefer file previews importing the file instead. Decide with the user, apply with the printed plan hash, then resubmit the write with a new request id.`,
+          why: `Previews keeping the database copy of ${input.slug} and rewriting its file, and writes nothing; --prefer file previews importing the file instead. Decide with the user. ${FILE_DRIFT_APPLY_STEP} Then resubmit the write with a new request id.`,
           verify: { argv: failuresArgv(source) }, docs: 'docs/guides/write-refusals.md#file_database_drift' } };
     }
     if (known === 'canonical_file_missing') {
       return { category: 'canonical_file_missing', code, origin: origin ?? known, ...row('canonical_file_missing'),
         action: { argv: ['gbrain', 'repair', 'ghost-pages', '--source', source], consent: [], actor: 'agent', requires_exclusive: false,
-          why: 'Previews the live pages whose canonical file is missing and writes nothing; apply only after the user agrees, or restore the file and sync.',
+          why: `Previews the live pages whose canonical file is missing and writes nothing; apply only after the user agrees, or restore the file and sync. To keep ${input.slug} and only narrow who reads it, with no file written, preview a page rule instead: gbrain access rule add --slug ${input.slug} --readers <member> --source ${source} (writes nothing without --yes).`,
           verify: { argv: failuresArgv(source) }, docs: 'docs/guides/write-refusals.md#canonical_file_missing' } };
     }
     if (known === 'source_binding_changed' || known === 'unsafe_file_target') {
@@ -290,13 +297,24 @@ function route(input: TerminalInput): Partial_ {
         why: 'A fact-extraction batch was not recorded complete because some of its per-entity requests did not commit (__managed_facts_complete__ is bookkeeping, not a page). The receipt is read-only history; run the extraction again only if facts are still missing.',
         verify: { argv: failuresArgv(source) } } };
   }
+  if (code === 'revision_conflict' && (origin === GRANDFATHER_RETIRED || input.intent_kind === 'managed_grandfather')) {
+    return { category: 'retired_operation', code, origin, class: 'page', safe_actions: ['none'], needs_human: false,
+      escalate: 'never: the page was left unchanged and nothing retries it',
+      action: { argv: terminalInspectArgv(input.request_id ?? '<request_id>'), consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Retired grandfather, nothing to do: an older gbrain queued the v0.13.1 validate: false stamp for this page, and upgrades no longer rewrite pages (#7814), so the request ended without writing. Do not resubmit it; the receipt is read-only history.' } };
+  }
   if (code === 'revision_conflict' || code === 'page_identity_changed') {
     return { category: 'caller_conflict', code, origin, class: 'page', safe_actions: ['retry'], needs_human: false, escalate: escalateOf(code),
       action: { argv: ['gbrain', 'get', '--source', source, '--', input.slug], consent: [], actor: 'agent', requires_exclusive: false,
         why: 'The page changed after the caller read it. Read the current revision and resubmit against it with a new request id.',
         verify: { argv: failuresArgv(source) } } };
   }
-  if (FAULT_CODES.has(code)) return fromTable('sync_fault', code, origin, faultAction(code, input), null, input.error_message);
+  if (code === 'owner_marker_missing') return fromTable('sync_fault', code, origin, ownerMarkerRestoreFix(source));
+  if (FAULT_CODES.has(code)) {
+    const verdict = fromTable('sync_fault', code, origin, faultAction(code, input), null, input.error_message);
+    // #7646: a fault no sync and no caller retries offers only the read-only inspect, so its safe actions say so too.
+    return inspectOnlyFault(code, input) ? { ...verdict, safe_actions: ['none'] } : verdict;
+  }
   const entry = (CODES as Record<string, { class: string } | undefined>)[code];
   if (!entry) return diagnosis(input, code, origin, `The write ended with code ${code}, which this build does not know.`);
   if (entry.class === 'server') {
@@ -340,7 +358,8 @@ function schemaMissingVerdict(input: TerminalInput, code: string, origin: string
 
 /** #7630: the caller-submitted page and memory writes a caller resubmits; no sync replays them. */
 const RESUBMITTED_WRITES = new Set(['put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page', 'remember', 'forget', 'forget_fact',
-  'add_tag', 'remove_tag', 'add_link', 'remove_link', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove']);
+  'add_tag', 'remove_tag', 'add_link', 'remove_link', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve', 'takes_remove',
+  'loops_close', 'decide_proposal', 'trust_owner_page', 'trust_release', 'relink_facts']);
 
 /**
  * #7630: the operation a fault's fix depends on. A reconcile or managed write (import, repair, quarantine clear,
@@ -348,6 +367,21 @@ const RESUBMITTED_WRITES = new Set(['put_page', 'put_pages', 'capture', 'delete_
  */
 export function faultOperation(operation: string, intentKind: string | null | undefined): string {
   return operation === 'put_page' && intentKind && (intentKind === 'canonical_reconcile' || intentKind.startsWith('managed_')) ? intentKind : operation;
+}
+
+/**
+ * #7646: a caller resubmits its own write. A compacted `put_page` lost its intent kind, so it may be a reconcile or a
+ * managed write stored as one: it gets the read-only inspect, never the resubmit advice.
+ */
+function resubmitted(input: TerminalInput): boolean {
+  return RESUBMITTED_WRITES.has(input.operation) && !(input.operation === 'put_page' && input.compacted && !input.intent_kind);
+}
+
+/** #7646: a retryable fault on a write that is neither a sync, a reconcile, a managed write nor a caller's resubmittable write. */
+function inspectOnlyFault(code: string, input: TerminalInput): boolean {
+  const operation = faultOperation(input.operation, input.intent_kind);
+  return classifySyncFault({ code }).safe_actions[0] === 'retry' && input.operation !== 'submit_job' && !operation.startsWith('managed_')
+    && operation !== 'canonical_reconcile' && !resubmitted(input);
 }
 
 /**
@@ -366,7 +400,7 @@ function faultAction(code: string, input: TerminalInput): Action {
   if (v.safe_actions[0] === 'retry' && operation === 'canonical_reconcile') {
     return syncRetry(input.source_id, `The canonical reconcile recorded ${code} (${v.class}); the next sync re-admits a keep_db reconcile, and a \`gbrain sources reconcile\` run is retried by running it again.`);
   }
-  if (v.safe_actions[0] === 'retry' && input.operation !== 'submit_job' && !RESUBMITTED_WRITES.has(input.operation)) {
+  if (inspectOnlyFault(code, input)) {
     return inspect(input.source_id, `The ${input.operation} operation ended ${code}; it was not part of a sync, so a sync does not retry it. Writer status names what holds it, read-only.`, v.human_reason);
   }
   if (v.safe_actions[0] === 'retry' && input.operation !== 'submit_job') {
@@ -396,6 +430,22 @@ export function terminalKnockOnSql(alias: string): string {
 /** Page removals: a later one supersedes any earlier write of the page. */
 export const PAGE_REMOVAL_OPERATIONS: readonly string[] = ['delete_page', 'purge_page'];
 
+/** The writes `gbrain repair failed-writes` replays: a caller's own `put_page` (no owner `kind`), `add_timeline_entry` and `remember`. */
+export const CALLER_REPLAYABLE_OPERATIONS: readonly string[] = ['put_page', 'add_timeline_entry', 'remember'];
+/** A writer-guard refusal (no publication ran). */
+export const GUARD_REFUSAL_SQL = (r: string) => `(${r}.state='failed' AND (${r}.error_code='writer_coordinator_required'
+  OR (${r}.error_code='storage_error' AND ${r}.error_message LIKE 'Publication failed (P0001)%')))`;
+/** #6429: a refusal from prepareFileTarget (page-prepare.ts); the receipt keeps the code, not the refusal's detail. */
+export const DRIFT_REFUSAL_SQL = (r: string) => `(${r}.state='conflict' AND ${r}.error_code='source_changed')`;
+/**
+ * GBRA-108: a caller's refused write that `gbrain repair failed-writes` could still replay: no later request wrote, removed or
+ * repeated it (`supersessionSql`). The retention pass keeps its intent until then; `gbrain repair receipt-compaction
+ * --include-failures` is the operator's explicit drop.
+ */
+export const UNRESOLVED_CALLER_REFUSAL_SQL = (r: string) => `((${GUARD_REFUSAL_SQL(r)} OR ${DRIFT_REFUSAL_SQL(r)})
+  AND ${r}.operation IN (${CALLER_REPLAYABLE_OPERATIONS.map(op => `'${op}'`).join(',')}) AND NOT (${r}.operation='put_page' AND ${r}.intent ? 'kind')
+  AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE ${supersessionSql(r, 'c')}))`;
+
 /**
  * The supersession rule of `gbrain repair failed-writes`, as a predicate over a candidate later request `c` of the
  * failed request `r` (both `persistence_requests` aliases): the same intent committed, failed or still pending; a later
@@ -405,7 +455,7 @@ export const PAGE_REMOVAL_OPERATIONS: readonly string[] = ['delete_page', 'purge
  * write, a later committed connector retry whose recorded `retryOf` lineage reaches it (connectorRetrySql). `r` must
  * expose `id`. Literal strings only; NULL-safe for a compacted `c` (no intent).
  */
-export function supersessionSql(r: string, c: string): string {
+export function supersessionSql(r: string, c: string, rKind?: string): string {
   const removals = PAGE_REMOVAL_OPERATIONS.map(op => `'${op}'`).join(',');
   return `(${c}.source_id=${r}.source_id AND ${c}.slug=${r}.slug AND ${c}.sequence>${r}.sequence AND (
     (${c}.digest=${r}.digest AND ${c}.state IN ('committed','failed','queued','running','recovering'))
@@ -414,7 +464,7 @@ export function supersessionSql(r: string, c: string): string {
       AND COALESCE((SELECT k.intent->>'kind' FROM persistence_requests k WHERE k.id=${r}.id),'managed_sync_checkpoint')='managed_sync_checkpoint'
       AND COALESCE(${c}.intent->>'kind','managed_sync_checkpoint')='managed_sync_checkpoint')
     OR (${r}.operation='put_page' AND ${c}.state='failed' AND ${c}.operation='put_page' AND COALESCE(NOT (${c}.intent ? 'kind'), false))
-    OR ${connectorRetrySql(r, c)}))`;
+    OR ${connectorRetrySql(r, c, rKind)}))`;
 }
 
 /** Hops a connector retry's `retryOf` lineage is followed back; a longer chain leaves the refusal unresolved (fail closed). */
@@ -430,8 +480,8 @@ const UUID_TEXT = `'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
  * intent kind, at a lower sequence, within CONNECTOR_RETRY_LINEAGE_MAX_DEPTH hops. Another refusal of the same item with
  * no recorded link is not proof. Each hop is one lookup on the (principal_kind, principal_id, request_id) unique index.
  */
-function connectorRetrySql(r: string, c: string): string {
-  return `(${r}.operation='submit_job' AND ${c}.operation='submit_job' AND ${c}.state='committed' AND COALESCE(${c}.intent ? 'retryOf', false)
+function connectorRetrySql(r: string, c: string, rKind?: string): string {
+  return `(${r}.operation='submit_job' AND ${c}.operation='submit_job' AND ${c}.state='committed'${rKind ? ` AND ${rKind} IN (${CONNECTOR_WRITE_KINDS})` : ''} AND COALESCE(${c}.intent ? 'retryOf', false)
       AND EXISTS (SELECT 1 FROM persistence_requests k, persistence_requests cc WHERE k.id=${r}.id AND cc.sequence=${c}.sequence
         AND k.intent->>'kind' IN (${CONNECTOR_WRITE_KINDS})
         AND cc.intent->>'kind'=k.intent->>'kind' AND cc.principal_kind=k.principal_kind AND cc.principal_id=k.principal_id

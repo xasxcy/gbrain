@@ -20,6 +20,7 @@
  *   gbrain sources unfederate <id> — sources.config.federated = false
  *   gbrain sources mirror-readonly|mirror-writable <id> — sources.config.mirror_read_only (#5409)
  *   gbrain sources refresh <id> — drained worktree-wide ff-only refresh on a managed brain (F0)
+ *   gbrain sources git-reconcile [<id>...] — idempotent publish/fast-forward of every source checkout (sources-git-reconcile.ts)
  *   gbrain sources git-gap <id> — read-only census of the database against the commit at HEAD (sources-git-gap.ts)
  *   gbrain sources reindex <id> --from-git — a strict source's re-derive from Git, preview then apply (sources-reindex.ts)
  *   gbrain sources canonical <id> --to git|mixed — convert a source to git-canonical or back, preview then apply (sources-canonical.ts)
@@ -116,6 +117,7 @@ interface SourceListEntry {
   pull_strategy: 'rebase' | 'merge';
   page_count: number;
   last_sync_at: string | null;
+  archived: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -145,10 +147,12 @@ async function countPages(engine: BrainEngine, sourceId: string): Promise<number
 // ── Subcommand: add ─────────────────────────────────────────
 
 async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
+  const apiKind = args.includes('--kind') ? args[args.indexOf('--kind') + 1] : undefined;
+  if (args[0] && (apiKind === 'meetings' || apiKind === 'slack')) return (await import('./sources-add-api.ts')).runApiSourceAdd(engine, args);
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google] ' +
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|meetings|slack] ' +
         '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force] [--json]\n' +
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
@@ -601,7 +605,7 @@ function deriveBrainId(created: OpsSourceRow, localPath: string): string {
 // wrapper only parses args, resolves <id> → local_path, and maps statuses
 // to exit codes:
 //   0  pushed / skipped (push already in flight — clean single-flight skip)
-//   5  blocked (secrets / tracked deny-glob) or refused (unverified remote)
+//   5  blocked (secrets / tracked deny-glob / the commits it would push) or refused (unverified remote)
 //   1  pull conflict / push failure / other error
 
 async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
@@ -611,10 +615,12 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
   let message: string | undefined;
   let allowUnverified = false;
   let json = false;
+  let scanTimeout: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--path') { path = args[++i]; continue; }
+    if (a === '--scan-timeout') { scanTimeout = args[++i] ?? ''; continue; }
     if (a === '--branch') { branch = args[++i]; continue; }
     if (a === '--message') { message = args[++i]; continue; }
     if (a === '--allow-unverified-remote') { allowUnverified = true; continue; }
@@ -624,8 +630,8 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
     process.exit(2);
   }
 
-  if ((!id && !path) || (id && path)) {
-    console.error('Usage: gbrain sources push [<id> | --path <dir>] [--branch <b>] [--message <m>] [--allow-unverified-remote] [--json]');
+  if ((!id && !path) || (id && path) || (scanTimeout !== undefined && !/^[1-9]\d{0,5}$/.test(scanTimeout))) {
+    console.error('Usage: gbrain sources push [<id> | --path <dir>] [--branch <b>] [--message <m>] [--allow-unverified-remote] [--scan-timeout <seconds>] [--json]');
     process.exit(2);
   }
 
@@ -653,6 +659,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
     pullStrategy,
     commitMessage: message,
     allowUnverifiedRemote: allowUnverified,
+    ...(scanTimeout ? { scanTimeoutMs: Number(scanTimeout) * 1000 } : {}),
     logger: (l) => console.error(`[gbrain] ${l}`),
   });
 
@@ -705,6 +712,13 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
       }
       process.exit(5);
       break;
+    case 'blocked_history':
+      if (!json) {
+        console.error(`Error [${res.code}]: ${res.reason?.replace(/^\S+: /, '')}`);
+        if (res.suggestion) console.error(`Fix: ${res.suggestion}`);
+      }
+      process.exit(5);
+      break;
     default:
       if (!json) console.error(`push failed (${res.status}): ${res.reason ?? 'unknown error'}`);
       process.exit(1);
@@ -734,6 +748,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       pull_strategy: pullStrategyOf(parseConfig(r.config)),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+      archived: r.archived === true,
     });
   }
 
@@ -752,7 +767,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
     // it out of OTHER anchors' reads — its own unqualified reads still widen
     // outward (see sourceFederationState). Collapsing both to "isolated"
     // overstates what an unset flag does.
-    const fedMark = (e as any).archived ? '⚠ archived' : sourceFederationState(rows[i].config);
+    const fedMark = e.archived ? '⚠ archived' : sourceFederationState(rows[i].config);
     const pathStr = e.local_path ?? '(no local path)';
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
@@ -994,6 +1009,9 @@ async function runRestore(engine: BrainEngine, args: string[]): Promise<void> {
 
   console.log(`Source "${id}" restored. ${noFederate ? 'Not re-federated.' : 'Re-federated.'}`);
   console.log(`All pages, chunks, and embeddings are intact.`);
+  const exposure = await import('../core/access/federation-exposure.ts');
+  const exposed = await exposure.remotePagesFederationExposesOrWarn(engine, id, !noFederate && id !== 'default' && isFederated((await fetchSource(engine, id))?.config));
+  if (exposed) console.error(exposure.pagesExposedLines(id, exposed).join('\n'));
 
   // T4 (eng-review): if the source has a remote_url AND its clone dir was
   // autopurged (e.g. operator rm -rf'd $GBRAIN_HOME/clones/), re-clone
@@ -1159,7 +1177,7 @@ function runDetach(): void {
 // ── Subcommand: federate / unfederate ───────────────────────
 
 async function runFederate(engine: BrainEngine, args: string[], value: boolean): Promise<void> {
-  const id = args[0];
+  const id = args.find(a => !a.startsWith('-')), json = args.includes('--json'), say = json ? console.error : console.log;
   if (!id) {
     console.error(`Usage: gbrain sources ${value ? 'federate' : 'unfederate'} <id>`);
     process.exit(2);
@@ -1169,13 +1187,24 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     console.error(`Source "${id}" not found.`);
     process.exit(4);
   }
-  const config = parseConfig(src.config);
-  config.federated = value;
-  await engine.executeRaw(
-    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(normalizeSourceConfig(config)), id],
-  );
-  console.log(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
+  // GST-1113: the mark check and the config write hold the source row, so a concurrent --attest-sources mark commits
+  // before (and federate refuses) or after (and sees federated, so it refuses), never between them.
+  const wasFederated = await engine.transaction(async tx => {
+    const [row] = await tx.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id = $1 FOR UPDATE', [id]);
+    if (value) await (await import('../core/access/attest-sources.ts')).assertNotScopeSource(tx, id);
+    const config = parseConfig(row?.config ?? src.config), before = isFederated(config);
+    config.federated = value;
+    await tx.executeRaw(
+      `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+      [JSON.stringify(normalizeSourceConfig(config)), id],
+    );
+    return before;
+  });
+  say(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
+  const exposure = await import('../core/access/federation-exposure.ts');
+  const exposed = await exposure.remotePagesFederationExposesOrWarn(engine, id, value && id !== 'default' && !wasFederated);
+  if (exposed) console.error(exposure.pagesExposedLines(id, exposed).join('\n'));
+  if (json) console.log(JSON.stringify({ id, federated: value, ...(exposed ? { pages_exposed: exposed } : {}) }));
 
   // v0.40 D19: auto-submit embed-backfill when coverage < 100%. Federation
   // flip is a moment when the user explicitly opted into seeing this source
@@ -1196,17 +1225,17 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     const sub = await submitEmbedBackfill(engine, id, { reason: 'federation_flip' });
     if (sub.status === 'submitted') {
       const missing = m.total_chunks - m.embedded_chunks;
-      console.log(`  → embed-backfill job ${sub.jobId} queued for missing ${missing} chunks.`);
+      say(`  → embed-backfill job ${sub.jobId} queued for missing ${missing} chunks.`);
     } else if (sub.status === 'cooldown') {
-      console.log(`  → embed-backfill skipped (cooldown). Manually trigger with: gbrain jobs submit embed-backfill --params '{"sourceId":"${id}"}'`);
+      say(`  → embed-backfill skipped (cooldown). Manually trigger with: gbrain jobs submit embed-backfill --params '{"sourceId":"${id}"}'`);
     } else if (sub.status === 'spend_capped') {
-      console.log(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
+      say(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
     } else if (sub.status === 'no_worker_surface') {
-      console.log(`  → embed-backfill not queued (${sub.engineKind} has no recognized persistent worker); run: gbrain embed --stale --source ${id}`);
+      say(`  → embed-backfill not queued (${sub.engineKind} has no recognized persistent worker); run: gbrain embed --stale --source ${id}`);
     } else if (sub.status === 'stalled') {
-      console.log(`  → embed-backfill not queued: the last ${sub.failures} runs failed on the same blocked pages with nothing embedded. See: gbrain doctor --only embed_backfill_stalled`);
+      say(`  → embed-backfill not queued: the last ${sub.failures} runs failed on the same blocked pages with nothing embedded. See: gbrain doctor --only embed_backfill_stalled`);
     } else if (sub.status === 'embedding_disabled') {
-      console.log('  → embed-backfill not queued: embedding is disabled on this brain (keyless by choice; keyword search works).');
+      say('  → embed-backfill not queued: embedding is disabled on this brain (keyless by choice; keyword search works).');
     } else { sub satisfies never; }
   } catch (err) {
     // Federation flip already succeeded; embed-backfill is a follow-up nicety.
@@ -1270,9 +1299,11 @@ async function runStatus(engine: BrainEngine, rawArgs: string[]): Promise<void> 
   const movementView = await import('../core/persistence/sync-movement.ts');
   const movement = new Map((await movementView.readSourceMovement(engine, { sourceIds: sources.map(source => source.id) }).catch(() => [])).map(m => [m.source_id, m]));
   const upstreamView = await import('../core/sync-upstream-rewrite.ts'), upstream = new Map((await upstreamView.readUpstreamDivergences(engine, sources.map(source => source.id))).map(u => [u.source_id, upstreamView.renderUpstreamDivergence(u)])); const watermarkView = await import('../core/persistence/applied-watermark.ts'), watermarks = new Map(await Promise.all(sources.map(async source => [source.id, await watermarkView.readAppliedWatermark(engine, source.id).catch(() => null)] as const)));
+  const publishOff = new Set(await (await import('../core/persistence/worktree-refresh.ts')).publishOptedOut(engine, sources.map(source => source.id)));
   if (json) {
     const enriched = metrics.map((m) => ({
       ...m,
+      ...(publishOff.has(m.source_id) ? { auto_reconcile: false } : {}),
       sync_running: syncRunning.has(m.source_id),
       sync_holder: syncRunning.get(m.source_id) ?? null,
       ...(ingestion.get(m.source_id) ? { ingestion: ingestion.get(m.source_id) } : {}),
@@ -1325,6 +1356,7 @@ async function runStatus(engine: BrainEngine, rawArgs: string[]): Promise<void> 
   for (const b of backlog.values()) console.log(`  ${drainMod.formatManagedSyncBacklog(b)}`);
   for (const m of movement.values()) { const line = movementView.formatSourceMovement(m); if (line) console.log(`  ${line}`); } for (const w of watermarks.values()) if (w) console.log(`  ${watermarkView.formatAppliedWatermark(w)}`);
   for (const [sourceId, notices] of uncommitted) for (const line of uncommittedView.uncommittedFenceRepairLines(sourceId, notices)) console.log(line);
+  for (const id of publishOff) console.log(`  ${id}: automatic publishing is off (sources.auto_reconcile.source.${id} false): git-reconcile and refresh never push its local commits; sync goes on`);
   for (const view of sharedSkills.values()) if (view && (only || view.configured === false || view.parked)) for (const line of sharedSkillsView.sharedSkillsStatusLines(view)) console.log(`  ${line}`);
   for (const m of metrics) {
     const warns: string[] = [];
@@ -1914,12 +1946,15 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'federate':   return runFederate(engine, rest, true);
     case 'unfederate': return runFederate(engine, rest, false);
     case 'mirror-readonly': case 'mirror-writable': return (await import('./sources-mirror.ts')).runMirrorMode(engine, rest, sub === 'mirror-readonly');
+    case 'record-origin': return (await import('./sources-record-origin.ts')).runRecordOrigin(engine, rest);
     case 'set-strategy': return (await import('./sources-strategy.ts')).runSetStrategy(engine, rest);
     case 'set-pull-strategy': return (await import('./sources-pull-strategy.ts')).runSetPullStrategy(engine, rest);
     case 'set-sync':   return (await import('./sources-sync-enabled.ts')).runSetSync(engine, rest);
     case 'refresh':    return (await import('./sources-refresh.ts')).runSourcesRefresh(engine, rest);
+    case 'git-reconcile': return (await import('./sources-git-reconcile.ts')).runSourcesReconcile(engine, rest);
     case 'git-gap':    return (await import('./sources-git-gap.ts')).runSourcesGitGap(engine, rest);
     case 'host-repo':  return (await import('./sources-host-repo.ts')).runHostRepo(engine, rest);
+    case 'guard':      return (await import('./sources-guard.ts')).runSourcesGuard(engine, rest);
     case 'reindex':    return (await import('./sources-reindex.ts')).runSourcesReindex(engine, rest);
     case 'canonical':  return (await import('./sources-canonical.ts')).runSourcesCanonical(engine, rest);
     case 'archive':    return runArchive(engine, rest);
@@ -1975,7 +2010,7 @@ Subcommands:
   demo company-brain [--json]        Run a fictional company through the real import and graph pipeline offline.
   add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force] [--json]
                                     Register a new source. --path must be a git repo
-                                    with committed files; --force skips that check.
+                                    with committed files; --force registers a plain directory (sync imports it without Git).
   list [--json]                     List registered sources with page counts.
   writer status|movement|claim|activate|transfer  Inspect ownership, prove data moves, activate or transfer (see writer --help).
   reconcile <id> <slug> --brain <id> Preview or apply a guarded file/database repair (see reconcile --help).
@@ -2017,17 +2052,25 @@ Subcommands:
                                     brain needed. See docs/guides/github-source.md.
   federate <id>                     Make source appear in cross-source default search.
   unfederate <id>                   Isolate source from default search.
-  mirror-readonly <id> [--dry-run]  Read-only mirror (#5409): managed writes never touch its checkout.
+  mirror-readonly <id> [--dry-run]  Read-only mirror (#5409): page and fact writes skip its checkout.
   mirror-writable <id> [--dry-run]  Undo mirror-readonly. --dry-run previews either and writes nothing.
+  record-origin <id>... --remote|--local [--apply] [--json]
+                                    Record who added older URL sources (doctor url_source_origin); preview unless --apply.
   set-strategy <id> <markdown|code|auto>  Persist the sync strategy every sync of the source uses (PR #5955).
   set-pull-strategy <id> <rebase|merge>   How pulls reconcile local commits with origin (#5429); default rebase.
   set-sync <id> <on|off> [--dry-run] [--expect <on|off>]   Include or exclude the source from automatic sync (config.syncEnabled).
   host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
                                     Managed brains: host an empty source in a new bare repository with a gbrain-owned worktree; it becomes git-canonical.
+  guard <id> [--install [--mode enforce] | --uninstall | --status] [--json]
+                                    Managed brains, owner host: the commit guard on the source's worktree only.
   refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
                                     Managed brains: drain writes to the source's worktree, fast-forward
                                     it to its upstream (git merge --ff-only) and sync every source bound
                                     to it. --dry-run fetches and previews only.
+  git-reconcile [<id>...] [--dry-run] [--wait <s>] [--json]
+                                    Bring every source checkout level with its upstream: publish local
+                                    commits (merged in memory, secret-scanned) and fast-forward; in sync
+                                    is a no-op. Safe to run concurrently and repeatedly.
   git-gap <id> [--sample <n>] [--json]
                                     Read-only: how far the database is from the commit at HEAD, page by page.
   reindex <id> --from-git [--dry-run | --apply --expect <hash>] [--json]
@@ -2071,9 +2114,11 @@ Subcommands:
                                     Divergence-safe rebase-pull (skip-on-dirty).
                                     --path is DB-free (the harden cron's entry).
   push <id> | --path <dir> [--branch <b>] [--message <m>]
-       [--allow-unverified-remote] [--json]
+       [--allow-unverified-remote] [--scan-timeout <s>] [--json]
                                     Scan-gated add→commit→pull→push of a workspace
-                                    repo. Blocks on secret-scan findings (override
+                                    repo; every commit it pushes is scanned
+                                    (--scan-timeout: the scan's budget, default
+                                    300 s). Blocks on secret-scan findings (override
                                     per finding via .gbrain-scan-allow) and on
                                     tracked deny-list files (*.pglite, .env*,
                                     *.pem, *.key, .gbrain/**). Refuses remotes not

@@ -1,4 +1,6 @@
 import { writeJsonDocument } from '../core/cli-force-exit.ts';
+import { cliRenderContext, renderNotice } from '../core/agent-output.ts';
+import { ignoredPrivacyLabelRunNotice } from '../core/search/ignored-privacy-labels.ts';
 import { importFenceTally, type FencesNormalized } from '../core/fence-repair/report.ts';
 import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
@@ -42,7 +44,7 @@ import { realpathOrResolve } from '../core/path-confine.ts';
 import { slog } from '../core/console-prefix.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
 import { importAnalyzeEveryPages, maybeRefreshPlannerStats, PLANNER_STATS_REPAIR_COMMAND } from '../core/planner-stats.ts';
-import { importManagedFile, nextImportBatch, settleManagedImportBatch } from '../core/persistence/import-mutations.ts';
+import { importManagedFile, managedImportWriteThroughRefusal, nextImportBatch, settleManagedImportBatch } from '../core/persistence/import-mutations.ts';
 import { acceptedPendingReceipt } from '../core/persistence/accepted-pending.ts';
 import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
@@ -223,6 +225,7 @@ export interface RunImportResult {
   type_warnings?: Array<{ kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string; count: number }>;
   /** #5050: unchanged pages re-sealed at the safe-chunk fence, and the embedding work that left. */
   resealed?: { pages: number; pending_chunks: number; embedding_usd: number | null }; fences_normalized?: FencesNormalized; fence_issues?: unknown;
+  /** GST-2462: the run's one `privacy_label_ignored` notice (counts by value of ignored privacy labels). */ privacy_label_notice?: import('../core/agent-output.ts').Notice;
 }
 
 /**
@@ -265,12 +268,13 @@ export async function runImport(
   args: string[],
   opts: {
     signal?: AbortSignal;
-    commit?: string;
+    commit?: string; /** GBRA-217: a full sync's reason and history-gap note per file (absolute path) for the snapshot its import archives. */ history?: (filePath: string) => import('../core/page-state/versions.ts').VersionHistory | undefined;
     strategy?: SyncStrategy;
     sourceId?: string;
     managedBookmark?: boolean;
-    /** #5988: paths the caller already held this run; they are skipped without importing (not failures). */
-    heldPaths?: ReadonlySet<string>;
+    /** GST-2462: the run the privacy_label_ignored notice names. */ noticeRun?: 'sync';
+    /** Paths the caller keeps out of this run (#5988 holds, #8620 reserved skill paths); skipped without importing, not failures. */
+    heldPaths?: Pick<ReadonlySet<string>, 'has'>;
     /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
     onFileResult?: ImportFileResultCallback;
     /**
@@ -486,11 +490,7 @@ export async function runImport(
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
   // (--workers 0, -3, "foo") with a loud error instead of silently falling
   // through to 1. Mirrors sync.ts's flag handling.
-  const {
-    clampWorkersForConnectionBudget,
-    parseWorkers,
-    resolveMaxConnections,
-  } = await import('../core/sync-concurrency.ts');
+  const { clampWorkersForConnectionBudget, parseWorkers, resolveMaxConnections } = await import('../core/sync-concurrency.ts');
   let workerCount: number;
   try {
     workerCount = parseWorkers(workersArg ?? undefined) ?? 1;
@@ -503,10 +503,10 @@ export async function runImport(
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
   if (sourceIdx !== -1) flagValues.add(sourceIdx + 1);
-  const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
+  const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i) && args[i - 1] !== '--access-policy');
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--access-policy <exported-source>|none] [--include-gitignored] [--allow-noncanonical-root] [--json]');
     throw new ImportAbortError('no import directory given');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -518,13 +518,17 @@ export async function runImport(
   try {
     dir = resolveImportTargetDir(dirArg);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error(`Import target is not readable: ${dirArg} (${msg})`);
+    console.error(`Import target is not readable: ${dirArg} (${e instanceof Error ? e.message : String(e)})`);
     throw new ImportAbortError(`import target not readable: ${dirArg}`);
   }
 
   const managedImport = await readManagedMode(engine);
   if (managedImport && dir !== resolve(dirArg)) throw symlinkedRootAbort(dirArg, dir);
+  const preAdmission = managedImport && !opts.managedBookmark && !currentCompanyBrainSync(sourceId) ? await managedImportWriteThroughRefusal(engine, sourceId ?? 'default') : null;
+  if (preAdmission) {
+    console.error(`Error [${preAdmission.code}]: ${preAdmission.message}\nFix: ${preAdmission.suggestion}`);
+    throw new ImportAbortError(preAdmission.message, 1, undefined, preAdmission);
+  }
   const singleFile = managedImport && lstatSync(dir).isFile();
   const importRoot = singleFile ? dirname(dir) : dir;
 
@@ -572,6 +576,7 @@ export async function runImport(
     }
   }
 
+  if (!opts.commit && !singleFile && !currentCompanyBrainSync(sourceId)) await (await import('../core/access/policy-transfer.ts')).importPolicyBarrier(engine, sourceId ?? 'default', dir, args, info).catch(e => { throw new ImportAbortError('folder rules not installed', 1, undefined, e); });
   // v0.31.2: collect under the right strategy. Pre-fix this called
   // collectMarkdownFiles unconditionally — code-strategy first sync
   // silently no-op'd because no code file ever made it through walker
@@ -746,7 +751,7 @@ export async function runImport(
         ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
         : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, bodyPolicy, firstCommitAt: firstCommits?.get(filePath) });
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, bodyPolicy, firstCommitAt: firstCommits?.get(filePath), history: opts.history?.(filePath) });
       // An import that landed while cancellation arrived is still complete.
       // Account for it before stopping, so resume never loses a successful path.
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning); fenceTally.note(importRelPath, result);
@@ -1194,6 +1199,7 @@ export async function runImport(
   else if (existsSync(checkpointPath)) info(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  const privacyLabelNotice = await ignoredPrivacyLabelRunNotice(engine, sourceId ?? 'default', { slugs: importedSlugs }, opts.noticeRun ?? 'import');
   const resealSummary = resealed.pages > 0
     ? { pages: resealed.pages, pending_chunks: resealed.pendingChunks, embedding_usd: resealEmbeddingUsd(resealed.pendingChars) }
     : null;
@@ -1215,6 +1221,7 @@ export async function runImport(
       failures,
       // Effective destination — same expression as the import-file write (import-file.ts) and the ingest_log row below.
       source_id: sourceId ?? 'default',
+      ...(privacyLabelNotice ? { notices: [renderNotice(privacyLabelNotice, cliRenderContext())] } : {}),
     }));
   } else {
     slog(`\nImport complete (${totalTime}s):`);
@@ -1236,6 +1243,7 @@ export async function runImport(
     ...(typeWarningCounts.size > 0 && typeWarningsEnabled
       ? { type_warnings: [...typeWarningCounts.values()] }
       : {}),
+    ...(privacyLabelNotice ? { privacy_label_notice: privacyLabelNotice } : {}),
   };
 }
 

@@ -188,6 +188,8 @@ const DRIFT_COMMITTED = 'The committed edit of notes/drift.';
 async function mixedSource(brain: ManagedBrain, driftMatches = true): Promise<void> {
   const { engine, root } = brain;
   expect((await performManagedSync(engine, OPTS)).status).toBe('first_sync');
+  // A real writer archives the preimage before it rewrites a page, so notes/legacy's content evidence shows only the database moved (d4).
+  await engine.createVersion('notes/legacy', { sourceId: 'default' });
   for (const slug of ['notes/ahead', 'notes/drift', 'notes/removed', 'notes/legacy']) await databaseOnlyEdit(engine, slug, `Written to the database alone: ${slug}.`);
   writeFileSync(join(root, 'notes/drift.md'), note('notes/drift', DRIFT_COMMITTED));
   git(root, 'rm', '-q', 'notes/removed.md'); git(root, 'commit', '-qam', 'edit drift, remove removed');
@@ -804,7 +806,7 @@ for (const backend of testBackends()) describe(`[${backend}] G8a: sources canoni
     const applied = await text(['default', '--to', 'git', '--apply', '--expect', preview.preview_hash, '--no-embed', '--no-extract']);
     expect(applied).toContain('Source default is git-canonical: 0 page(s) committed in 0 door commit(s), 1 private page(s) withheld (1 removal commit(s))');
     expect(applied).toContain("Push pending (git_push_unavailable): The conversion's door commits are committed locally");
-    expect(applied).toContain(`gbrain git commit-push --push-only --path ${brain.root}`);
+    expect(applied).toContain(`gbrain git commit-push --push-only --keep-checkout --scan-secrets --path ${brain.root}`);
   }, { databaseUrl, setup: closedRemoteSetup }), 180_000);
 
   test('work that lands after the strict-equivalent pass leaves the source strict and reports incomplete', () => managedBrain(async brain => {

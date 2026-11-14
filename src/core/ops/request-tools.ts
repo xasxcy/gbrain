@@ -187,18 +187,14 @@ const request_tools: Operation = {
     // callers were never surface-bounded.
     const ceiling = ctx.surfaceCeiling ?? 'full';
 
-    // D5: the three branches are mutually exclusive. {surface, tools}
-    // together is ambiguous (persist vs descriptor fetch) — reject loudly
-    // rather than silently persisting and ignoring the tools list.
+    // GBRA-449: {surface, tools} together runs the surface branch exactly as a surface-only call (its refusals
+    // included), then the descriptor branch against the resulting surface; surface_change carries the first answer.
     if (p.surface !== undefined && p.tools !== undefined) {
-      throw opError(
-        'invalid_params',
-        'pass either {surface} (persist) or {tools} (descriptor fetch), not both.',
-        'Call request_tools once with `tools` to fetch descriptors, and separately with `surface` to change this client\'s tool surface.',
-      );
+      const surfaceChange = await request_tools.handler(ctx, { surface: p.surface });
+      return { ...(await request_tools.handler(ctx, { tools: p.tools }) as Record<string, unknown>), surface_change: surfaceChange };
     }
 
-    // ── persist branch (D5: accepts ONLY {surface}) ─────────────────────
+    // ── persist branch ({surface}) ──────────────────────────────────────
     if (p.surface !== undefined) {
       const requested = p.surface as string;
       if (!isMcpSurface(requested)) {
@@ -346,8 +342,16 @@ const request_tools: Operation = {
       const { resolveStrictParamsMode } = await import('../../mcp/validate-params.ts');
       const strictParams = (await resolveStrictParamsMode(ctx.engine, ctx.config)) === 'reject';
       if (ctx.revealTools) {
-        ctx.revealTools(picked.map(o => o.name));
-        return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+        // A widenable session's catalog reaches past what it serves; only tools it can call now are listed.
+        const callable = catalogCeiling === ceiling ? visibleSet : new Set((await visibleOpsForCaller(ctx, ceiling)).map(o => o.name));
+        const reachable = picked.filter(o => callable.has(o.name)).map(o => o.name);
+        const outside = picked.filter(o => !callable.has(o.name)).map(o => `\`${o.name}\``);
+        if (reachable.length) ctx.revealTools(reachable);
+        if (!outside.length) return { tools: buildToolDefs(picked, { strictParams }), listed: true, note: 'These tools are now in your tool list (tools/list_changed was sent); call them directly.' };
+        return {
+          tools: buildToolDefs(picked, { strictParams }), listed: false,
+          note: `${reachable.length ? `${reachable.map(n => `\`${n}\``).join(', ')} are now in your tool list (tools/list_changed was sent). ` : ''}${outside.join(', ')} are outside this session's '${ceiling}' surface, so they are not listed and cannot be called yet: call request_tools {"surface":"full"} to add them to this session, then call them by name.`,
+        };
       }
       return { tools: buildToolDefs(picked, { strictParams }) };
     }

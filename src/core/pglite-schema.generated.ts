@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 CREATE OR REPLACE FUNCTION gbrain_try_jsonb(input text) RETURNS jsonb
-  LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public AS \$fn\$
+  LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public, pg_temp AS \$fn\$
 BEGIN
   RETURN input::jsonb;
 EXCEPTION WHEN data_exception THEN
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS pages (
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
-CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$func\$
 BEGIN
   IF (TG_OP = 'INSERT') THEN
     NEW.generation := COALESCE((SELECT MAX(generation) FROM pages), 0) + 1;
@@ -125,7 +125,7 @@ SELECT setval('page_generation_clock_seq', GREATEST(
   COALESCE((SELECT MAX(generation) FROM pages), 0)
 ));
 
-CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$func\$
 BEGIN
   PERFORM nextval('page_generation_clock_seq');
   RETURN NULL;
@@ -152,9 +152,20 @@ CREATE TABLE IF NOT EXISTS page_retrievals (
   last_retrieved_at TIMESTAMPTZ NOT NULL
 );
 CREATE OR REPLACE FUNCTION gbrain_forget_page_retrievals() RETURNS trigger
-  LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+  LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
 BEGIN
-  DELETE FROM page_retrievals r USING gbrain_deleted_pages d WHERE r.page_id = d.id;
+  IF EXISTS (SELECT 1 FROM gbrain_deleted_pages) THEN
+    IF pg_catalog.row_security_active('page_retrievals') THEN
+      IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','d']) AS needed(cmd) WHERE NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_retrievals'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+            AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+          DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_retrievals')::text;
+      END IF;
+    END IF;
+    DELETE FROM page_retrievals r USING gbrain_deleted_pages d WHERE r.page_id = d.id;
+  END IF;
   RETURN NULL;
 END \$\$;
 DROP TRIGGER IF EXISTS pages_forget_retrievals ON pages;
@@ -223,7 +234,7 @@ CREATE INDEX IF NOT EXISTS embed_failures_active_idx
 -- #6370: indexing and the title query read text through gbrain_fts_input(),
 -- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
 CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text
-  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog, pg_temp
 AS \$fn\$
   SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\\1 \\2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\\1 \\2', 'g')
 \$fn\$;
@@ -670,11 +681,22 @@ ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
 CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
 CREATE INDEX IF NOT EXISTS idx_pages_title_search ON pages USING GIN (ts_filter(search_vector, '{a}'));
 
-CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$\$
 DECLARE
   timeline_text TEXT;
   timeline_lead_text TEXT;
 BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF pg_catalog.row_security_active('timeline_entries') THEN
+      IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r']) AS needed(cmd) WHERE NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'timeline_entries'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+            AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+          DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','timeline_entries')::text;
+      END IF;
+    END IF;
+  END IF;
   SELECT coalesce(string_agg(summary || ' ' || detail, ' ' ORDER BY id), '')
   INTO timeline_text
   FROM timeline_entries
@@ -1115,7 +1137,7 @@ CREATE INDEX IF NOT EXISTS think_ab_results_recent_idx
   ON think_ab_results (source_id, ran_at DESC);
 
 
-CREATE OR REPLACE FUNCTION enforce_minion_queue_protocol() RETURNS trigger SET search_path = pg_catalog, public AS \$protocol\$
+CREATE OR REPLACE FUNCTION enforce_minion_queue_protocol() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$protocol\$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.submission_authority IS NULL OR NEW.claim_generation <> 0 THEN
@@ -1176,7 +1198,7 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
     slug TEXT NOT NULL,
     PRIMARY KEY (source_incarnation, slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$fn\$
     DECLARE body_moved boolean := false;
     BEGIN
       IF OLD.knowledge_revision IS NULL THEN
@@ -1209,10 +1231,19 @@ CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS pages_knowledge_revision ON pages;
 CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision();
-CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$fn\$
     BEGIN
       IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
         RETURN NULL;
+      END IF;
+      IF pg_catalog.row_security_active('pages') THEN
+        IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','w']) AS needed(cmd) WHERE NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'pages'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+              AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+          RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+            TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+            DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','pages')::text;
+        END IF;
       END IF;
       IF TG_OP <> 'INSERT' THEN
         UPDATE pages SET knowledge_revision = gen_random_uuid() WHERE id = OLD.page_id;
@@ -1355,6 +1386,10 @@ CREATE TABLE IF NOT EXISTS chronicle_page_state (
   pricing_policy TEXT,
   campaign_max_usd NUMERIC,
   cost_attempts INTEGER[] NOT NULL DEFAULT '{}',
+  judge_input_hash TEXT,
+  judge_window_chars INTEGER CHECK (judge_window_chars >= 0),
+  judge_window_hash TEXT,
+  judge_input_failures INTEGER NOT NULL DEFAULT 0 CHECK (judge_input_failures >= 0),
   PRIMARY KEY (source_id, page_id, content_hash, extractor_version)
 );
 CREATE INDEX IF NOT EXISTS chronicle_page_state_work_idx
@@ -1535,7 +1570,7 @@ CREATE TABLE IF NOT EXISTS page_segment_derivation_purge_pages (
   page_id    INTEGER NOT NULL,
   PRIMARY KEY (request_id, page_id)
 );
-CREATE OR REPLACE FUNCTION gbrain_mark_derivation_scope_entry() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+CREATE OR REPLACE FUNCTION gbrain_mark_derivation_scope_entry() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$func\$
 DECLARE
   src TEXT;
   page INTEGER;
@@ -1562,7 +1597,7 @@ CREATE TRIGGER page_body_manifest_derivation_scope_delete AFTER DELETE ON page_b
 DROP TRIGGER IF EXISTS pages_derivation_scope_delete ON pages;
 CREATE TRIGGER pages_derivation_scope_delete AFTER UPDATE OF deleted_at ON pages
   FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
-CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS \$func\$
 BEGIN
   IF EXISTS (SELECT 1 FROM page_segment_derivation_purges x JOIN pages p ON p.source_id = x.source_id
     WHERE p.id = NEW.page_id AND (NEW.page_id = ANY(x.page_ids::int[]) OR p.deleted_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM page_body_manifest m
@@ -1686,6 +1721,10 @@ CREATE INDEX IF NOT EXISTS persistence_requests_request_id
   ON persistence_requests(source_id,request_id);
 CREATE INDEX IF NOT EXISTS persistence_requests_foreground_committed
   ON persistence_requests(worktree_id,sequence) WHERE state='committed' AND NOT COALESCE(intent->>'kind','') LIKE 'managed_sync_%';
+CREATE INDEX IF NOT EXISTS persistence_requests_replay_id
+  ON persistence_requests(request_id);
+CREATE INDEX IF NOT EXISTS persistence_requests_slug_sequence
+  ON persistence_requests(source_id,slug,sequence);
 CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC);
 CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,
@@ -1720,7 +1759,7 @@ CREATE TABLE IF NOT EXISTS persistence_consumers (
     PRIMARY KEY(host_id,pid,nonce)
   );
 
-CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$fn\$
 DECLARE managed boolean; strict_count integer; seen integer; git boolean; unreadable text; target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
 BEGIN
   -- #7636: init always writes the singleton, so a missing row means this role cannot read it (RLS), never "unmanaged".
@@ -1843,7 +1882,7 @@ CREATE TABLE IF NOT EXISTS git_canonical_brain (
   singleton INTEGER PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
   strict_sources INTEGER NOT NULL DEFAULT 0 CHECK (strict_sources >= 0)
 );
-CREATE OR REPLACE FUNCTION gbrain_count_git_canonical_sources() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_count_git_canonical_sources() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$fn\$
 BEGIN
   -- #7636: a count over the rows row-level security lets this role see would undercount and could switch G7a off.
   IF row_security_active('sources') THEN
@@ -1891,22 +1930,67 @@ CREATE TABLE IF NOT EXISTS page_projection_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY(source_incarnation,slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$fn\$
     DECLARE incarnation UUID;
     BEGIN
+      IF pg_catalog.row_security_active('sources') THEN
+        IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r']) AS needed(cmd) WHERE NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'sources'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+              AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+          RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+            TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+            DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','sources')::text;
+        END IF;
+      END IF;
       IF TG_OP='DELETE' THEN
+        IF pg_catalog.row_security_active('page_projection_jobs') THEN
+          IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','d']) AS needed(cmd) WHERE NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_projection_jobs'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+                AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+            RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+              TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+              DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_projection_jobs')::text;
+          END IF;
+        END IF;
         DELETE FROM page_projection_jobs j USING sources s
           WHERE s.id=OLD.source_id AND j.source_incarnation=s.incarnation AND j.slug=OLD.slug;
         RETURN NULL;
       END IF;
       IF TG_OP='UPDATE' AND (OLD.source_id,OLD.slug) IS DISTINCT FROM (NEW.source_id,NEW.slug) THEN
+        IF pg_catalog.row_security_active('page_projection_jobs') THEN
+          IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','d']) AS needed(cmd) WHERE NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_projection_jobs'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+                AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+            RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+              TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+              DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_projection_jobs')::text;
+          END IF;
+        END IF;
         DELETE FROM page_projection_jobs j USING sources s
           WHERE s.id=OLD.source_id AND j.source_incarnation=s.incarnation AND j.slug=OLD.slug;
       END IF;
       SELECT s.incarnation INTO incarnation FROM sources s WHERE s.id=NEW.source_id;
       IF NEW.deleted_at IS NOT NULL OR NEW.text_projection_revision=NEW.knowledge_revision THEN
+        IF pg_catalog.row_security_active('page_projection_jobs') THEN
+          IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','d']) AS needed(cmd) WHERE NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_projection_jobs'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+                AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+            RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+              TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+              DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_projection_jobs')::text;
+          END IF;
+        END IF;
         DELETE FROM page_projection_jobs j WHERE j.source_incarnation=incarnation AND j.slug=NEW.slug;
       ELSIF TG_OP='INSERT' OR NEW.knowledge_revision IS DISTINCT FROM OLD.knowledge_revision THEN
+        IF pg_catalog.row_security_active('page_projection_jobs') THEN
+          IF EXISTS (SELECT 1 FROM pg_catalog.unnest(ARRAY['r','a','w']) AS needed(cmd) WHERE NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = 'page_projection_jobs'::regclass::oid AND p.polpermissive AND p.polcmd::text IN ('*', needed.cmd)
+                AND EXISTS (SELECT 1 FROM pg_catalog.unnest(p.polroles) AS r(id) WHERE CASE WHEN r.id = 0::oid THEN true ELSE pg_catalog.pg_has_role(r.id, 'USAGE') END))) THEN
+            RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+              TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+              DETAIL=pg_catalog.jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','page_projection_jobs')::text;
+          END IF;
+        END IF;
         INSERT INTO page_projection_jobs(source_incarnation,slug,revision,reason)
           VALUES (incarnation,NEW.slug,NEW.knowledge_revision,'canonical_change')
           ON CONFLICT(source_incarnation,slug) DO UPDATE SET revision=EXCLUDED.revision,reason=EXCLUDED.reason,updated_at=now();
@@ -1960,6 +2044,8 @@ CREATE TABLE IF NOT EXISTS persistence_worktree_refreshes (
 CREATE UNIQUE INDEX IF NOT EXISTS persistence_worktree_refreshes_active
   ON persistence_worktree_refreshes(worktree_id)
   WHERE state IN ('draining','fenced','merged','syncing','recovery_required');
+CREATE INDEX IF NOT EXISTS persistence_worktree_refreshes_completed
+  ON persistence_worktree_refreshes(worktree_id, completed_at DESC) WHERE state='completed';
 
 CREATE TABLE IF NOT EXISTS source_ingestion_receipts (
   id uuid PRIMARY KEY,
@@ -2090,13 +2176,13 @@ CREATE TABLE IF NOT EXISTS persistence_writer_protocols (
     registered_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY(worktree_id,host_id)
   );
-CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   BEGIN
     IF required >= 2 AND COALESCE(current_setting('gbrain.persistence_protocol',true),'') <> '2' THEN
       RAISE EXCEPTION 'writer_upgrade_required: this mutation requires persistence protocol 2' USING ERRCODE='42501';
     END IF;
   END \$\$;
-CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   DECLARE target text; version integer; floor integer; active boolean; record jsonb;
   BEGIN
     IF TG_OP='DELETE' THEN target:=OLD.target_kind; version:=OLD.protocol_version;
@@ -2127,7 +2213,8 @@ CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGU
       RAISE EXCEPTION 'unsupported_mutation_protocol: invalid page target' USING ERRCODE='42501';
     END IF;
     record:=NEW.recovery;
-    IF record IS NOT NULL AND ((target='page' AND record->>'version' IS DISTINCT FROM '1')
+    IF record IS NOT NULL AND ((target='page' AND record->>'version' IS DISTINCT FROM '1'
+        AND NOT (record->>'version'='3' AND record->>'target'='pages' AND jsonb_typeof(record->'files')='array'))
       OR (target='skill_bundle' AND (record->>'version' IS DISTINCT FROM '2' OR record->>'target' IS DISTINCT FROM 'skill_bundle'
         OR jsonb_typeof(record->'files') IS DISTINCT FROM 'array'))) THEN
       RAISE EXCEPTION 'unsupported_mutation_protocol: recovery target mismatch' USING ERRCODE='42501';
@@ -2137,7 +2224,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGU
 DROP TRIGGER IF EXISTS gbrain_request_protocol ON persistence_requests;
 CREATE TRIGGER gbrain_request_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_requests
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_request_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   DECLARE floor integer;
   BEGIN
     SELECT writer_protocol_floor INTO floor FROM persistence_brain WHERE singleton=1 FOR SHARE;
@@ -2149,7 +2236,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS gbrain_effect_protocol ON persistence_effects;
 CREATE TRIGGER gbrain_effect_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_effects
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_effect_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   BEGIN
     IF NEW.writer_protocol_floor<OLD.writer_protocol_floor THEN
       RAISE EXCEPTION 'writer_upgrade_required: the protocol floor cannot be lowered' USING ERRCODE='42501';
@@ -2161,7 +2248,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LA
         RAISE EXCEPTION 'writer_coordinator_required: writer state is unreadable to this database role' USING ERRCODE='42501';
       END IF;
       IF COALESCE(current_setting('gbrain.writer_quiesced',true),'')<>'true' OR NOT NEW.enabled OR NEW.writer_protocol_floor<>2
-        OR EXISTS (SELECT 1 FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL)
+        OR EXISTS (SELECT 1 FROM persistence_requests WHERE state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL)
         OR EXISTS (SELECT 1 FROM persistence_effects WHERE state='running' OR recovery IS NOT NULL)
         OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE EXISTS
           (SELECT 1 FROM persistence_source_bindings b JOIN sources s ON s.id=b.source_id AND s.incarnation=b.source_incarnation
@@ -2176,7 +2263,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LA
 DROP TRIGGER IF EXISTS gbrain_protocol_activation ON persistence_brain;
 CREATE TRIGGER gbrain_protocol_activation BEFORE UPDATE ON persistence_brain
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_protocol_activation();
-CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   DECLARE permitted jsonb;
   BEGIN
     PERFORM gbrain_require_persistence_protocol(2);
@@ -2202,7 +2289,7 @@ CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON sha
 DROP TRIGGER IF EXISTS gbrain_skill_publication ON shared_skill_revisions;
 CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON shared_skill_revisions
       FOR EACH ROW EXECUTE FUNCTION gbrain_guard_skill_publication();
-CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS \$\$
   DECLARE item text; found_revision shared_skill_revisions%ROWTYPE; brain text;
   BEGIN
     SELECT brain_id::text INTO brain FROM persistence_brain WHERE singleton=1;
@@ -2384,6 +2471,10 @@ DO \$rls\$ BEGIN
   END IF;
 END \$rls\$;
 
+CREATE UNIQUE INDEX IF NOT EXISTS decide_proposals_claim_pair_uidx ON decide_proposals (source_id, LEAST(new_fact_id, old_fact_id), GREATEST(new_fact_id, old_fact_id)) WHERE sweep_id LIKE 'claim_conflicts:%';
+CREATE INDEX IF NOT EXISTS decide_proposals_pending_new_idx ON decide_proposals (new_fact_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS decide_proposals_pending_old_idx ON decide_proposals (old_fact_id) WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS decide_review_queue (
   kind            TEXT NOT NULL,
   source_id       TEXT NOT NULL,
@@ -2460,10 +2551,11 @@ CREATE TABLE IF NOT EXISTS link_transitions (
   producer        TEXT NOT NULL CHECK (producer IN ('timeline','explicit','frontmatter','manual','inline','dream')),
   origin_page_id  INTEGER REFERENCES pages(id) ON DELETE CASCADE,
   line_hash       TEXT NOT NULL DEFAULT '',
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  link_source     TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS link_transitions_identity_idx
-  ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, kind, occurred_on, producer) NULLS NOT DISTINCT;
+  ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, link_source, kind, occurred_on, producer) NULLS NOT DISTINCT;
 CREATE INDEX IF NOT EXISTS link_transitions_relationship_idx ON link_transitions (from_page_id, to_page_id, link_type);
 CREATE INDEX IF NOT EXISTS link_transitions_origin_idx ON link_transitions (origin_page_id);
 DO \$rls\$ BEGIN
@@ -2890,7 +2982,7 @@ BEGIN
   FOR f IN SELECT p.oid::regprocedure AS sig, substr(c.setting, 13) AS path
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace CROSS JOIN LATERAL unnest(p.proconfig) AS c(setting)
     WHERE n.nspname = 'public' AND p.prokind = 'f' AND c.setting IN ('search_path=pg_catalog, public', 'search_path=pg_catalog')
-      AND p.proname IN ('auto_enable_rls', 'bump_page_generation_clock_fn', 'bump_page_generation_fn', 'enforce_minion_queue_protocol', 'gbrain_advance_page_revision', 'gbrain_advance_tag_revision', 'gbrain_bump_trust_generation', 'gbrain_clear_atom_page_state', 'gbrain_count_git_canonical_sources', 'gbrain_count_modifications', 'gbrain_forget_page_retrievals', 'gbrain_fts_input', 'gbrain_graduation_fence', 'gbrain_guard_effect_protocol', 'gbrain_guard_inserted_facts', 'gbrain_guard_protocol_activation', 'gbrain_guard_request_protocol', 'gbrain_guard_skill_publication', 'gbrain_lease_shared_skill_delivery', 'gbrain_mark_derivation_scope_entry', 'gbrain_preserve_fact_withdrawal', 'gbrain_queue_page_projection', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_page', 'gbrain_refuse_purged_take', 'gbrain_refuse_purging_derivation', 'gbrain_require_managed_writer', 'gbrain_require_persistence_protocol', 'gbrain_snapshot_version_trust', 'gbrain_stamp_revision_attribution', 'gbrain_stamp_trust_tier', 'gbrain_stamp_version_attribution', 'gbrain_stamp_write_attribution', 'gbrain_try_jsonb', 'notify_minion_job_change', 'update_chunk_search_vector', 'update_page_search_vector')
+      AND p.proname IN ('auto_enable_rls', 'bump_page_generation_clock_fn', 'bump_page_generation_fn', 'enforce_minion_queue_protocol', 'gbrain_access_derive_page_readers', 'gbrain_access_folder_rules', 'gbrain_access_lineage_rules', 'gbrain_access_mark_restricted', 'gbrain_access_norm_readers', 'gbrain_access_origin_closed_for', 'gbrain_access_origin_hidden_for', 'gbrain_access_origin_labelled_for', 'gbrain_access_origin_restricted', 'gbrain_access_pending_covers', 'gbrain_access_readers', 'gbrain_access_refresh_serves', 'gbrain_access_refresh_serves_trigger', 'gbrain_access_stamp_folder_rules', 'gbrain_access_state_unreadable', 'gbrain_advance_page_revision', 'gbrain_advance_tag_revision', 'gbrain_bump_trust_generation', 'gbrain_clear_atom_page_state', 'gbrain_count_git_canonical_sources', 'gbrain_count_modifications', 'gbrain_forget_page_retrievals', 'gbrain_fts_input', 'gbrain_graduation_fence', 'gbrain_guard_deferred_request', 'gbrain_guard_effect_protocol', 'gbrain_guard_inserted_facts', 'gbrain_guard_protocol_activation', 'gbrain_guard_request_protocol', 'gbrain_guard_skill_publication', 'gbrain_lease_shared_skill_delivery', 'gbrain_mark_derivation_scope_entry', 'gbrain_preserve_fact_withdrawal', 'gbrain_queue_page_projection', 'gbrain_refuse_purged_fact', 'gbrain_refuse_purged_page', 'gbrain_refuse_purged_take', 'gbrain_refuse_purging_derivation', 'gbrain_release_refresh_barrier', 'gbrain_require_managed_writer', 'gbrain_require_persistence_protocol', 'gbrain_snapshot_version_trust', 'gbrain_stamp_revision_attribution', 'gbrain_stamp_trust_tier', 'gbrain_stamp_version_attribution', 'gbrain_stamp_write_attribution', 'gbrain_try_jsonb', 'notify_minion_job_change', 'update_chunk_search_vector', 'update_page_search_vector')
       AND pg_has_role(current_user, p.proowner, 'USAGE')
     ORDER BY 1
   LOOP

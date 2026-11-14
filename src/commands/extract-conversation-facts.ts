@@ -102,7 +102,7 @@ import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, ALLOWED_TYPE_ALIASES, isConversationFactsEligiblePage, pageTypesForAllowed, requireParseableConversationFlag, type AllowedType } from '../core/facts/conversation-types.ts';
 import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
-import { resolveDefaultVisibility, tightenToPage, type FactVisibility } from '../core/facts/visibility.ts';
+import { resolveDefaultVisibility, tightenToStoredPage, type FactVisibility } from '../core/facts/visibility.ts';
 import {
   emptySaveTimeResolutionCounts,
   formatSaveTimeResolutionCounts,
@@ -293,6 +293,11 @@ export interface ExtractConversationFactsCoreOpts {
    * unless dryRun; bypasses the fresh-outcome skip.
    */
   grammar?: string | null;
+  /**
+   * #7068: given a copy of the run's counters when the run ends in a thrown error, taken after the managed flush published
+   * the pages that finished, so a caller can report work that committed. The error is still thrown.
+   */
+  onInterrupted?: (partial: ExtractConversationFactsResult) => void;
 }
 
 export { extractExitCode, extractRunStatus };
@@ -976,7 +981,7 @@ async function processPage(
   let segmentsThisPage = 0;
   const pageRows: Array<NewFact & { row_num: number; source_markdown_slug: string }> = [];
   const pageResolution = emptySaveTimeResolutionCounts();
-  const factVisibility = tightenToPage(state.factVisibility, page);
+  const factVisibility = await tightenToStoredPage(state.engine, state.sourceId, state.factVisibility, page);
   const entityHints = await conversationEntityHints(state.engine, state.sourceId, page.slug, factVisibility); // #6731
 
   for (const seg of segments) {
@@ -1396,6 +1401,7 @@ export async function runExtractConversationFactsCore(
       // surface. NOT a thrown failure.
       return result;
     }
+    opts.onInterrupted?.(structuredClone(result));
     throw err;
   }
 

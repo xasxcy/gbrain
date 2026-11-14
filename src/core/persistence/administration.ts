@@ -1,5 +1,7 @@
 /** Trusted local administration, shared by direct CLI and its authenticated resident proxy. */
 import { isAbsolute, join } from 'node:path';
+import { claimedWorktreeRoot, inspectClaimedPhysicalRoot } from './topology-locks.ts';
+import { movedPhysicalRootRefusal } from './physical-root.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { UNSUPPORTED_MANAGED_BULK_WRITERS } from './maintenance.ts';
@@ -10,7 +12,7 @@ import { isWriteRequestId } from './types.ts';
 import { writerDiagnostics } from './control.ts';
 import { acceptWriterTransfer, claimWorktree, getWorktreeBinding, humanManifestProgress, prepareWriterTransfer, readManagedMode, storedManifestScope, worktreeManifest, type StoredWorktreeManifest } from './ownership.ts';
 import { inspectPersistenceBrain } from './managed-mode.ts';
-import { existingLocalHostId, currentVerifiedLocalWriter, persistenceHome, readLocalWriter, registerLocalWriter, revokeLocalWriter, type LocalGrant } from './identity.ts';
+import { currentVerifiedLocalWriter, persistenceHome, readLocalWriter, registerLocalWriter, revokeLocalWriter, type LocalGrant, existingHostIdFor } from './identity.ts';
 import type { PersistenceAdminOperation } from './admin-contract.ts';
 import { operationScopesAllowed } from '../scope.ts';
 import { assertWriterAdminState, requireWriterAdminIntent, writerAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
@@ -130,6 +132,25 @@ async function writerStatusMovement(engine: BrainEngine, sourceId: string | unde
       fix: readFix('Reads source movement on its own, read-only.', { argv: ['gbrain', 'sources', 'writer', 'movement', ...(sourceId === undefined ? [] : [sourceId]), '--json'] }) }));
 }
 
+async function writerClaim(engine: BrainEngine, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  keys(params, ['source_id', 'path', 'dry_run', 'admin_intent', 'expected_state']);
+  const sourceId = source(params.source_id), root = path(params.path);
+  // #5198: say at claim time what the claim retires, before and after the fact.
+  const notice = await readManagedMode(engine) ? {} : { activation_required: CLAIM_BEFORE_ACTIVATION_NOTICE };
+  // #8625: a moved checkout at the root the claim reserves is named with its exit.
+  const worktree = claimedWorktreeRoot(root);
+  if (params.dry_run) {
+    if (worktree) await inspectClaimedPhysicalRoot(engine, sourceId, worktree, 'claim', existingHostIdFor(engine));
+    return { dry_run: true, action: 'writer_claim', source_id: sourceId, path: root, current: await getWorktreeBinding(engine, sourceId, existingHostIdFor(engine)), ...notice };
+  }
+  const expectedState = await requireWriterAdminIntent(engine, 'writer_claim', params);
+  try { return { claimed: true, binding: await claimWorktree(engine, sourceId, root, undefined, expectedState), ...notice }; }
+  catch (error) {
+    if (!(error instanceof OperationError) || error.detail !== 'physical_root_moved' || !worktree) throw error;
+    throw await movedPhysicalRootRefusal(engine, worktree, { sourceId, operation: 'claim' }, existingHostIdFor(engine)) ?? error;
+  }
+}
+
 export async function runPersistenceAdministration(engine: BrainEngine, operation: PersistenceAdminOperation,
   params: Record<string, unknown>, config?: GBrainConfig, embeddingRetryPolicy: 'owner' | 'mounted_database' = 'owner'): Promise<Record<string, unknown>> {
   if (operation === 'writer_reconcile_preview') return (await import('./reconcile.ts')).runReconcilePreview(engine, params);
@@ -221,8 +242,8 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return (await import('./effect-retry.ts')).retryRequestEffects(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy, ownerHost);
   }
   if (operation === 'writer_settle_effects') {
-    keys(params, ['source_id', 'request_id', 'parked_code', 'unsettle', 'apply', 'expect', 'dry_run']);
-    bool(params, 'unsettle'); bool(params, 'apply');
+    keys(params, ['source_id', 'request_id', 'parked_code', 'unsettle', 'retire', 'apply', 'expect', 'dry_run']);
+    bool(params, 'unsettle'); bool(params, 'retire'); bool(params, 'apply');
     if (params.apply === true && params.dry_run === true) throw invalid('settle-effects takes --dry-run or --apply, not both.',
       'Preview with --dry-run, then run the apply_command it prints (--apply --expect <plan_hash>) after the user agrees.');
     if (params.parked_code !== undefined && (typeof params.parked_code !== 'string' || !/^[a-z][a-z0-9_]*$/.test(params.parked_code))) throw invalid('Invalid --parked-code value.',
@@ -233,7 +254,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     const requestId = params.request_id === undefined ? undefined : uuid(params.request_id, 'A valid original write request UUID is required.',
       'Pass --request-id with the request id doctor parked_effects or gbrain sources writer status lists for the effect.');
     return (await import('./effect-settle.ts')).settleEffects(engine, { sourceId, requestId, parkedCode: params.parked_code as string | undefined,
-      unsettle: params.unsettle === true, apply: params.apply === true, expect: params.expect as string | undefined });
+      unsettle: params.unsettle === true, retire: params.retire === true, apply: params.apply === true, expect: params.expect as string | undefined });
   }
   if (operation === 'source_add' || operation === 'source_lifecycle') {
     const { managedPersistenceEnabled } = await import('./ownership.ts');
@@ -258,11 +279,17 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     keys(params,['action','source_id','request_id','expected_incarnation','path','name','config','refederate','confirm_destructive','dry_run','remote_url','create_directory','expired_only']);
     if (params.action === 'claim') throw new OperationError('writer_admin_intent_required', 'Claims require the dedicated state-bound writer administration surface.', WRITER_INSPECTION_HINT);
     const { runManagedSourceLifecycle }=await import('./source-lifecycle.ts');
-    return runManagedSourceLifecycle(engine,{operation:params.action as import('./source-lifecycle.ts').SourceLifecycleInput['operation'],sourceId:source(params.source_id),
+    const result=await runManagedSourceLifecycle(engine,{operation:params.action as import('./source-lifecycle.ts').SourceLifecycleInput['operation'],sourceId:source(params.source_id),
       requestId:params.request_id as string|undefined,expectedIncarnation:params.expected_incarnation as string|undefined,
       path:params.path===undefined?undefined:path(params.path),name:params.name as string|undefined,config:params.config as Record<string,unknown>|undefined,
       refederate:params.refederate as boolean|undefined,confirmDestructive:params.confirm_destructive as boolean|undefined,dryRun:params.dry_run===true,
       remoteUrl:params.remote_url as string|undefined,createDirectory:params.create_directory as boolean|undefined,expiredOnly:params.expired_only as boolean|undefined});
+    // #8982: a restore that re-federates names the remote-written pages without readers it makes no-grant readable.
+    if (params.action !== 'restore' || params.dry_run === true || result.noop === true || params.source_id === 'default') return result;
+    const [restored] = await engine.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id=$1', [source(params.source_id)]);
+    const exposed = await (await import('../access/federation-exposure.ts')).remotePagesFederationExposesOrWarn(engine, source(params.source_id),
+      (await import('../sources-load.ts')).isSourceFederated(restored?.config));
+    return exposed ? { ...result, pages_exposed: exposed } : result;
   }
   if (operation === 'writer_failures') {
     keys(params, ['source_id', 'state', 'group_by', 'since', 'limit', 'before', 'code', 'origin', 'category', 'operation']);
@@ -282,7 +309,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       CASE h.git_durability WHEN 'enabled' THEN 'on' WHEN 'disabled' THEN 'off' ELSE 'unknown' END AS git_durability_state FROM persistence_source_bindings b
       JOIN persistence_worktrees w ON w.id=b.worktree_id
       LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid
-      WHERE ($2::text IS NULL OR b.source_id=$2) ORDER BY b.source_id`, [existingLocalHostId(), params.source_id === undefined ? null : source(params.source_id)]);
+      WHERE ($2::text IS NULL OR b.source_id=$2) ORDER BY b.source_id`, [existingHostIdFor(engine), params.source_id === undefined ? null : source(params.source_id)]);
     let native: unknown;
     if (params.probe === true) {
       const { nativeLockCapability, tryAcquireNativeLock } = await import('./native-lock.ts');
@@ -308,29 +335,25 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return { ...diagnostics, mode: !mode.row ? 'unknown' : mode.row.enabled ? 'managed' : 'classic', mode_epoch: Number(mode.row?.mode_epoch ?? 1),
       ...(mode.problem ? { mode_problem: mode.problem } : {}),
       local_markers: await cleanupRetiredManagedMarkers(engine),
-      host_id: existingLocalHostId(), local_host_id: existingLocalHostId(), bindings, admin_state: adminState,
+      host_id: existingHostIdFor(engine), local_host_id: existingHostIdFor(engine), bindings, admin_state: adminState,
       admin_lock: { locked: adminLock.locked, set_at: adminLock.set_at, host_id: adminLock.host_id }, blocking_effects: blockingEffects,
       // GBRA-133: effects that have waited on a busy canonical worktree for over 10 minutes.
       stalled_catchups: await (await import('./effect-catchup.ts')).readStalledCatchups(engine, params.source_id ? [params.source_id as string] : undefined),
       parked_groups: await (await import('./parked-groups.ts')).readParkedGroups(engine, params.source_id ? [params.source_id as string] : undefined),
       writer_versions: writerVersions, onboarding, shared_skills: sharedSkills, ...(native ? { native_lock: native } : {}),
       // #6317 (B3): every process holding a consumer on this host, from the heartbeat rows (kind, pid, nonce, mode, age, wedge report).
-      host: { host_id: existingLocalHostId(), ...await (await import('./consumer-diagnostics.ts')).hostConsumersReport(engine, existingLocalHostId()) },
+      host: { host_id: existingHostIdFor(engine), ...await (await import('./consumer-diagnostics.ts')).hostConsumersReport(engine, existingHostIdFor(engine)) },
       worktree_refreshes: await (await import('./worktree-refresh.ts')).activeWorktreeRefreshes(engine, params.source_id as string | undefined),
+      // #8984: stopped remove/purge requests (retire admissions) and the ones a later lifecycle change superseded.
+      topology_requests: await engine.executeRaw(`SELECT request_id::text AS request_id,operation,source_id,source_incarnation::text AS source_incarnation,state,outcome->>'error' AS error,created_at::text AS created_at
+        FROM persistence_topology_changes WHERE ($1::text IS NULL OR source_id=$1) AND operation IN ('remove','purge') AND recovery IS NULL
+        AND (state='recovering' OR state='failed' AND outcome->>'error'='source_retire_superseded') ORDER BY created_at DESC LIMIT 20`, [params.source_id === undefined ? null : source(params.source_id)]),
       // Q1: each canonical checkout on this host against its last fetched upstream: commits it holds that the upstream lacks, and its porcelain.
       checkouts: await writerStatusCheckouts(bindings as Array<{ source_id: string; local_path: string | null }>),
       // #6317 (B4): per managed source, whether sync data moves (shares the reader of sources status, doctor and writer movement).
       movement: await writerStatusMovement(engine, params.source_id === undefined ? undefined : source(params.source_id)) };
   }
-  if (operation === 'writer_claim') {
-    keys(params, ['source_id', 'path', 'dry_run', 'admin_intent', 'expected_state']);
-    const sourceId = source(params.source_id), root = path(params.path);
-    // #5198: say at claim time what the claim retires, before and after the fact.
-    const notice = await readManagedMode(engine) ? {} : { activation_required: CLAIM_BEFORE_ACTIVATION_NOTICE };
-    if (params.dry_run) return { dry_run: true, action: operation, source_id: sourceId, path: root, current: await getWorktreeBinding(engine, sourceId, existingLocalHostId()), ...notice };
-    const expectedState = await requireWriterAdminIntent(engine, operation, params);
-    return { claimed: true, binding: await claimWorktree(engine, sourceId, root, undefined, expectedState), ...notice };
-  }
+  if (operation === 'writer_claim') return writerClaim(engine, params);
   if (operation === 'writer_activate') {
     keys(params, ['confirm_quiesced', 'dry_run', 'shared_skills', 'admin_intent', 'expected_state', 'cleanup_dead_local_locks']);
     bool(params, 'cleanup_dead_local_locks');

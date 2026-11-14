@@ -134,7 +134,99 @@ queued commit against `master`.
   actually merged (`gh pr view <n> --json state,mergedAt`) before tagging,
   announcing or starting dependent work.
 
+## Releases per batch
+
+PRs no longer pick a version. A PR adds a changelog fragment and lands;
+a release PR, opened a few times a day, gives every fragment that reached
+master since the last release one version and writes all the stamps at once.
+`.gstack/ship-policy.json` turns this on (`changelog_fragments`,
+`merge: "direct"`), and gstack's /ship, receipt and land commands follow it.
+
+**What a PR carries.**
+
+- `changelog.d/<branch-slug>.md`: the PR's CHANGELOG entry with no version
+  heading (bold one-line summary, then the itemized sections; voice rules
+  below). /ship writes it. Front matter may say
+  `important: security|regression|data-loss|blocker`; releases are PATCH
+  only, so `scripts/build-behavior-changes.ts` (in `check:regen-all`) refuses
+  a `bump:` line other than `patch`. Format:
+  [changelog.d/README.md](../changelog.d/README.md).
+- One `behavior-changes.d/<id>.md` file per new upgrade-notice row, named
+  in the fragment as `<!-- behavior-change: <id> -->`
+  ([behavior-changes.d/README.md](../behavior-changes.d/README.md)).
+- Its own schema migrations, numbered master's latest + 1 when written.
+- Nothing else that carries a version: no edit to VERSION, the package.json
+  version, the plugin manifests, the BOOTSTRAP stamp, the plugin or template
+  trees, a released CHANGELOG section or a released `since:` row. The PR
+  title is plain words with no version in front.
+
+**The release PR.** The merge lane runs `gstack-release-stamp open`. On a
+fresh worktree of `origin/master` it sets VERSION to master's PATCH + 1,
+runs `bun scripts/release-restamp.ts --stamp-only <version>` (every required row
+of the CLAUDE.md "Version locations" table plus the plugin, variant and
+template stamp lines; no fetch, no merge, no commit) and
+`bun scripts/build-behavior-changes.ts`, which dates each pending
+`behavior-changes.d` marker with the new version, in the order the fold
+writes them, then folds every `changelog.d` fragment under one
+`## [<version>] - <date>` heading and deletes the fragments. It
+pushes `release/<version>` and opens the PR. The lane lands it with
+`gstack-ship-queue land --pr <n> --pin <head>`, which accepts only a head
+that is exactly the release stamp of master's tip. The release PR runs the
+cheap tier; release.yml's ci-gate waits for the full Test and E2E push runs
+on the release commit before anything publishes.
+
+**When releases happen.** At 00:00, 06:00, 12:00 and 18:00 UTC the merge
+lane opens a release when master holds at least one fragment and the last
+release is 4 hours old or more. It also opens one right after landing a PR
+whose fragment says `important:`, so an important fix is in a published
+release within about an hour and can go to the stable channel (see "Daily
+stable check").
+
+**What refuses a bad release.** gstack's land refuses a release head that
+changes anything but stamps, the CHANGELOG fold and `release_outputs` (here
+`src/core/behavior-changes.generated.ts`, which it regenerates and compares
+byte for byte). release.yml runs `bun scripts/check-behavior-since.ts --stamped`,
+which refuses a release commit that still holds a `changelog.d` fragment,
+a literal `since: 'TBD'` row or a stale behavior-change table, and fails
+closed when `.gstack/ship-policy.json` is missing or unparsable. A cancelled
+or skipped Test or E2E push run fails the gate with the `gh run rerun <id>`
+to run; the gate no longer follows to a later commit with the same VERSION,
+because between releases every master commit shares one, and a
+`workflow_dispatch` refuses unless master HEAD is the release commit.
+
+**Migration collisions.** Two open PRs can take the same migration number.
+GitHub then reports the second one conflicting (both edit the generated
+registry), and `check:schema-migration-order` fails on the merged tree.
+`bun run migrations:renumber` renumbers the branch's own migrations after
+master's latest (file name, export name and `version:` literal; the rest
+must be token-identical) and regenerates the registry, as step 5 of
+[Release restamp](#release-restamp) describes. That makes a new head, which
+needs a new full CI run. Migration numbers stay sequential for the reason
+given there.
+
+**Converting an open stamped PR.** A PR written before this switch still
+carries a version. `bun run release:unstamp` merges `origin/master`, puts
+every stamp back to master's version, moves the branch's CHANGELOG entry to
+`changelog.d/<branch-slug>.md` and its appended plain-text
+`BEHAVIOR_CHANGES` rows to `behavior-changes.d/` (with their markers),
+puts the notice file and its size-table row back to master's, and commits
+once. It refuses, with the fix, a branch with no entry of its own, one that
+edits a released CHANGELOG section, one that carries other PRs' entries (land
+or convert those first), and notice rows it can't move (rows without an id,
+rows whose text is a function, edits other than appending). Plain
+`release:restamp` refuses once master's policy says `merge: "direct"`.
+
+**Why notice rows are files.** Every PR used to append its row to the end of
+one array in `src/core/behavior-change-notice.ts`, which also raised that
+file's line in `scripts/module-size-limits.tsv`; those two lines were the
+second-largest source of master conflicts after the stamps. Rows in their
+own files, which the release never edits or deletes, touch neither line.
+
 ## CHANGELOG + VERSION are branch-scoped
+
+Under [releases per batch](#releases-per-batch) a PR writes only its
+`changelog.d` fragment; the voice rules below apply to that text, and the
+version and placement rules apply to the release PR.
 
 **VERSION and CHANGELOG describe what THIS branch adds vs master, not how we got
 here.** Every feature branch that ships gets its own version bump and CHANGELOG
@@ -181,6 +273,11 @@ If any answer is no, fix it before continuing.
 - Credit to external contributors when a community PR was incorporated.
 
 ## Release restamp
+
+Under [releases per batch](#releases-per-batch) PRs do not restamp: the
+release PR stamps, and `release:restamp` refuses. Its renumbering runs on its
+own as `bun run migrations:renumber`, and `bun run release:unstamp` converts a
+PR stamped the old way. The steps below describe the shared machinery.
 
 `bun run release:restamp` makes a branch next-to-merge in one command. Run it
 when your PR is next in the merge line, not earlier: the merge coordinator
@@ -552,15 +649,22 @@ The `ci-gate` job (`scripts/release-gate.ts`) holds build, publication and the
 succeed on the release commit.
 
 - **Failed run:** nothing is published and the job fails with the run and the
-  master-red issue. After master is green again, publish the current VERSION
-  with `gh workflow run release.yml --ref master`.
-- **Run cancelled by a newer push:** the gate follows the next master commit.
-  If it contains the release commit and carries the same VERSION, that commit
-  is gated and published. If VERSION moved on, this version is skipped and the
-  newer VERSION's release run publishes.
+  master-red issue. When the failure is outside the release commit (a flake),
+  re-run the failed run, then re-run the Release run (`gh run rerun <release
+  run id>`), which gates the same commit; otherwise land the repair and open
+  the next release.
+- **Cancelled or skipped run:** nothing is published and the job fails with
+  `gh run rerun <id>`. Master push runs are keyed by commit, so a newer push
+  no longer cancels them; and between releases many master commits share one
+  VERSION, so the gate never follows to a later commit.
 - **Backfill:** `gh workflow run release.yml --ref master` gates and publishes
-  master HEAD's VERSION. Other refs are refused.
-- The gate waits up to 110 minutes, then fails with the backfill command.
+  master HEAD's VERSION only while HEAD is the release commit (the
+  first-parent commit that last changed VERSION): between releases a later
+  commit carries the same VERSION with unreleased changes, so the gate then
+  refuses and names the re-run of the release commit's push Release run.
+  Other refs are refused.
+- The gate waits up to 110 minutes, then fails naming the re-run of the
+  Release run.
 - **Reused push run:** a push run that reused a passed full-suite run of its
   exact tree ([master-push reuse](ci-event-parity.md#master-push-reuse))
   publishes only with a readable `reuse.json` naming the same workflow, the
@@ -572,12 +676,15 @@ succeed on the release commit.
 
 The **final step of the release job** force-advances the `latest-stable` tag to
 the gated release commit (`git push origin "+${RELEASE_SHA}:refs/tags/latest-stable"`).
-`latest-stable` is the single sanctioned distribution ref: the README paste
-block, the `BOOTSTRAP_FOR_AGENTS.md` fetch URL, and
-`bun install -g github:garrytan/gbrain#latest-stable` all reference it
-permanently, so paste blocks copied into the wild never rot and there is no 404
-window between VERSION landing and assets publishing.
-`scripts/check-bootstrap-tag.sh` keeps the entry docs pinned to this ref.
+`latest-stable` is the alpha channel's ref: the alpha update check follows it,
+and so does anyone who pins it by hand. New users start on the `stable` tag
+instead ([Stable channel promotion](#stable-channel-promotion)): the README paste
+block, the `BOOTSTRAP_FOR_AGENTS.md` fetch URL and
+`bun install -g github:garrytan/gbrain#stable` name it (`INSTALL_REF` in
+`src/core/install-ref.ts`), and only the stable promotion moves it. Both refs
+move only to a release whose assets already published, so neither has a 404
+window. `scripts/check-bootstrap-tag.sh` and `bun run check:install-ref` keep the
+entry docs pinned to `INSTALL_REF` and refuse `latest-stable` there.
 
 Because it moves ONLY after binaries + provenance attestation have fully
 published, a half-built release never advances it. If the tag-advance step
@@ -590,11 +697,13 @@ git push origin "+refs/tags/v<VERSION>^{commit}:refs/tags/latest-stable"
 
 ### Stable channel promotion
 
-The stable channel is a slower ref than `latest-stable`: a release reaches it
-only after the production-shaped soak passed on its exact git tree. A
+The stable channel, the clients' default since GBRA-224, is a slower ref than
+`latest-stable` (the alpha channel): a release reaches it only after the
+production-shaped soak passed on its exact git tree. A
 maintainer promotes with `.github/workflows/promote-stable.yml`
-(`scripts/promote-stable.ts`), weekly or whenever a soak passes; both go
-through the same dispatch:
+(`scripts/promote-stable.ts`), or the scheduled
+[daily stable check](#daily-stable-check) promotes by rule; manual promotions and
+rollbacks go through the same dispatch:
 
 ```bash
 gh workflow run promote-stable.yml -f version=<VERSION> \
@@ -603,8 +712,11 @@ gh workflow run promote-stable.yml -f version=<VERSION> \
 
 - **Refs.** `refs/tags/stable` is an annotated tag on the promoted release
   commit, moved only by this workflow. Clients peel it (`refs/tags/stable^{}`)
-  and take the `v<VERSION>` tag on that commit; the update check reads
-  `https://raw.githubusercontent.com/<owner>/<repo>/stable/VERSION`.
+  and take the `v<VERSION>` tag on that commit. The same push commits the
+  evidence record `stable.json` (the tag fields plus `known_bad` and
+  `not_promotable`) to the
+  `stable-record` branch; clients read only that file and refuse a record
+  without its evidence (`stable_invalid`, `src/core/stable-channel.ts`).
   `refs/tags/stable-v<VERSION>` is an immutable annotated record created on a
   version's first promotion and never moved or deleted. Both carry the same
   message: a title line (`gbrain`, then `stable channel: v<VERSION>`), then one
@@ -615,9 +727,32 @@ gh workflow run promote-stable.yml -f version=<VERSION> \
 - **Inputs.** `version` (an existing `v<VERSION>` release tag),
   `soak_run_url` (the soak's Actions run URL, optionally
   `/attempts/<n>`), `scoreboard_url` (optional, defaults to the run URL),
-  `rollback` (default false) and `reason` (required with rollback).
+  `rollback` (default false), `reason` (required with rollback) and
+  `withdraw` (versions added to the carried-forward `known_bad` list;
+  clients on one are offered the current stable, even when older), and
+  `not_promotable` with `not_promotable_reason` and `not_promotable_fixed_in`,
+  and `not_promotable_remove` (see below).
+- **Not promotable.** A release can soak clean and still be bad, when the
+  evidence comes from outside the soak (a regression found on a large brain,
+  say). Record it so the daily check never soaks or promotes it: dispatch this
+  workflow for the current stable version and its own soak run (the re-record
+  path: no tag moves), with `not_promotable` set to the bad versions,
+  `not_promotable_reason` saying why and `not_promotable_fixed_in` naming the
+  newer release that fixes them. The list is carried forward on every later
+  record, and `promote()` refuses a release on it. Clients never read it, so
+  unlike `withdraw` it offers nobody a different release. To take a release
+  off the list (one listed by mistake), pass it in `not_promotable_remove` the
+  same way. A reason is at most 500 characters (link the evidence), and a
+  record larger than clients accept (64 KiB) is refused before anything is
+  pushed. Use `withdraw` only for a release that was stable, so its installs
+  move off it:
+
+  ```bash
+  gh workflow run promote-stable.yml -f version=<current stable> -f soak_run_url=<its soak run> \
+    -f not_promotable=<v1>,<v2> -f not_promotable_reason='<why>' -f not_promotable_fixed_in=<fix release>
+  ```
 - **Who.** Only an actor with the admin or maintain role; anyone else is
-  refused.
+  refused. The one exception is the scheduled daily check below.
 - **Soak run.** The run must belong to this repository, be completed with
   conclusion `success`, and run the workflow file named by the
   `STABLE_SOAK_WORKFLOW` repository variable (Settings → Secrets and
@@ -632,16 +767,101 @@ gh workflow run promote-stable.yml -f version=<VERSION> \
   run's head commit, even when the version string matches; soak the release
   itself, then promote that run.
 - **Ordering and rollback.** The version must be newer than the current
-  stable (numeric 3- or 4-part comparison); promoting the current stable is a
-  no-op refusal. `rollback=true` with a `reason` moves stable to an older
+  stable (numeric 3- or 4-part comparison). Promoting the current stable
+  again moves no tag: it writes `stable.json` when the published record does
+  not already name that release (see the backfill below), and is a no-op
+  refusal otherwise. `rollback=true` with a `reason` moves stable to an older
   release, or back to one promoted before (its record tag already exists and
   is kept; without rollback an existing record tag is refused).
-- **One atomic push.** The record tag and `stable` land together or not at
-  all, `stable` leased on the value the run read, so a concurrent move fails
+- **One atomic push.** The record tag, `stable` and the `stable-record`
+  branch land together or not at all, `stable` and `stable-record` leased on
+  the values the run read, so a concurrent move fails
   the run instead of being overwritten and a failed push leaves nothing to
   clean up before the re-run. The `promote-stable` concurrency group runs one promotion at a
   time. The run's step summary lists the version, commit, tree, soak run,
   scoreboard, previous stable and rollback reason.
+- **Record backfill (one time, GBRA-346).** Promotions made before this
+  script wrote the evidence record moved `stable` with no `stable.json`,
+  and a client that has the stable channel reads only the record, so it
+  would report `stable_missing`. The backfill is automatic on the first
+  scheduled run of the [daily stable check](#daily-stable-check) after the
+  channel client lands: when `stable.json` is missing or names another
+  commit than `stable`, that run writes the record for the current stable
+  and stops. The manual dispatch still works, for example to write the
+  record before the first release with the channel client publishes:
+
+  ```bash
+  git fetch --tags --force origin
+  git for-each-ref --format='%(contents)' refs/tags/stable   # version: and soak_run: lines
+  gh workflow run promote-stable.yml [--ref <branch with this script>] \
+    -f version=<that version> -f soak_run_url=<that soak_run>
+  ```
+
+  The run re-checks the release and the soak run, requires the tag message to
+  name the same release, tree and soak run, writes `stable.json` from it
+  (`known_bad` carried forward, `withdraw` accepted) and pushes only the
+  record branch, leasing `stable` unchanged. Running it from a branch before
+  the client merges is safe: older clients never read the record. A record
+  that already names the current stable makes the run a no-op refusal.
+  Every later promotion, manual or scheduled, writes the record itself.
+
+<a id="daily-stable-check"></a>
+### Daily stable check
+
+`.github/workflows/stable-daily.yml` (`scripts/stable-daily.ts`) runs at 05:17 and 13:17 UTC
+and keeps stable between one day and one week behind what matters:
+
+- **Reason first.** It acts only when a merged PR labelled `stable:important` is in a
+  published release but not in stable, or stable is more than 7 days old and
+  a newer release exists (the weekly floor). Otherwise it does nothing. The
+  merge lane sets the label at merge on a security, regression or data-loss
+  fix, or a fix for something that blocks a crew or a user (on a train PR,
+  the train carries it); a label added after the merge counts too.
+- **Soak first.** The candidate is the newest release newer than stable whose
+  commit is on master and whose exact tree passed a successful
+  `STABLE_SOAK_WORKFLOW` run with the integrity gates (`privacy_leaks`,
+  `read_errors`, `version_skew`, `residents_alive`, `session_refusals`)
+  passing in every cell; the latency gates stay record-only. The soak must be
+  the full default one: both the 65 ms and 2 ms cells, at least 2 hours each,
+  on the requested 600,000-page fixture, with privacy probes run and none
+  erroring, so a smaller smoke dispatch never qualifies. On the important-only path the candidate must contain the fix.
+  A release that was stable before (its `stable-v<version>` record tag exists,
+  so it was promoted and rolled back) or that `stable.json` lists in `known_bad`
+  or `not_promotable` is skipped, logged, and never promoted or soaked by the
+  schedule, on the important path and the weekly floor alike; a maintainer
+  re-promotes it by hand if it should return.
+  It is promoted through the same `promote()` as a manual promotion, so every
+  check above still applies and the record's `promoted_by` is
+  `schedule (.github/workflows/stable-daily.yml)` with the reason in `reason`.
+  With no qualifying soak it dispatches one soak on the newest release's tag
+  (never while another soak runs, and never after a soak on any newer release
+  failed to qualify: then a maintainer decides, and the check warns once stable
+  is past the weekly floor), and a later run promotes it.
+- **Who.** A schedule event runs only the workflow file as merged on the
+  default branch, so a scheduled run promotes by rule without a maintainer. A
+  manual dispatch defaults to `dry_run` (report only); `dry_run=false` needs an
+  admin or maintainer before it dispatches a soak or promotes. It shares the `promote-stable` concurrency group, so it
+  never races a manual promotion.
+- **Record first.** Before the reason check, when `stable.json` is missing or
+  names another commit than `stable`, it writes the record for the current
+  stable from the stable tag's message through the same re-promotion path as
+  the manual backfill (no tag moves; release, exact tree, soak run and leases
+  checked; `known_bad` carried forward) and stops; a dry run reports
+  `would: backfill the record for v<version>`. A record that already names
+  stable changes nothing. The kill switch and a rollback pause skip it.
+- **Stop it.** Set the repository variable `STABLE_AUTO_PROMOTE=off` (Settings →
+  Secrets and variables → Actions → Variables). It also pauses by itself while
+  the current stable record says `rollback: true`, until a maintainer promotes by
+  hand.
+- **Roll back.** Dispatch `promote-stable.yml` as a maintainer with `version` set to the
+  previous stable (`git tag --list 'stable-v*' --sort=-creatordate`, or the
+  record's `previous` field: `git show stable --no-patch`), `soak_run_url` set to the
+  soak run in that version's record tag, `rollback=true`, a `reason` and `withdraw`
+  set to the version you are rolling back from. `withdraw` puts it on the record's
+  `known_bad` list, so clients that already installed it are offered the previous
+  stable. Without it they stay on the bad release, because clients on stable never
+  downgrade on their own. The daily check stays paused until the next manual
+  promotion.
 
 ### The `publish-template` job
 
@@ -855,8 +1075,10 @@ bun run publish:clawhub      # clawhub package publish . --family bundle-plugin
 ```
 
 `build:all` compiles only those two targets; the full binary matrix ships
-through the GitHub release job above. ClawHub users upgrade with
-`clawhub update gbrain`, which `gbrain upgrade` runs for ClawHub installs.
+through the GitHub release job above. `gbrain upgrade` never runs
+`clawhub update gbrain` (#8464): that command updates a ClawHub *skill* named
+gbrain from any publisher, and we publish none, so it would install someone
+else's package.
 
 ## Plugin dist tree (codex/claude lanes)
 

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { open } from 'fs/promises';
 import {
   S3Client,
@@ -11,11 +12,14 @@ import {
   HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { FileDigest, type StorageBackend, type StorageConfig } from '../storage.ts';
 
 const MIN_PART_SIZE = 16 * 1024 * 1024;
 const MAX_PART_SIZE = 5 * 1024 * 1024 * 1024;
 const MAX_PARTS = 10_000;
+/** Lifetime of a presigned GET (getUrl): one hour, as the Supabase backend's signed URL. */
+const SIGNED_URL_EXPIRY_S = 3600;
 
 /** Multipart part size for `size` bytes within S3's limits: 5 MiB..5 GiB per part, at most 10,000 parts. */
 export function multipartPartSize(size: number): number {
@@ -131,6 +135,15 @@ export class S3Storage implements StorageBackend {
     return Buffer.from(await res.Body.transformToByteArray());
   }
 
+  async hashObject(path: string): Promise<{ size: number; sha256: string }> {
+    const res = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: path }));
+    if (!res.Body) throw new Error(`S3 download returned empty body: ${path}`);
+    const hash = createHash('sha256');
+    let size = 0;
+    for await (const chunk of res.Body as AsyncIterable<Uint8Array>) { hash.update(chunk); size += chunk.length; }
+    return { size, sha256: hash.digest('hex') };
+  }
+
   async delete(path: string): Promise<void> {
     await this.client.send(new DeleteObjectCommand({
       Bucket: this.bucket,
@@ -159,15 +172,9 @@ export class S3Storage implements StorageBackend {
     return (res.Contents || []).map(obj => obj.Key!).filter(Boolean);
   }
 
+  /** A SigV4 presigned GET for `path` that expires after SIGNED_URL_EXPIRY_S, so a private bucket's object opens from anywhere. */
   async getUrl(path: string): Promise<string> {
-    // For custom endpoints (R2, MinIO), use the endpoint URL
-    const endpoint = (this.client.config as any).endpoint;
-    if (endpoint) {
-      const base = typeof endpoint === 'function' ? (await endpoint()).url.toString() : endpoint;
-      return `${base}/${this.bucket}/${path}`;
-    }
-    const region = await this.client.config.region();
-    return `https://${this.bucket}.s3.${region}.amazonaws.com/${path}`;
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: path }), { expiresIn: SIGNED_URL_EXPIRY_S });
   }
 
   async getContentHash(path: string): Promise<string | null> {

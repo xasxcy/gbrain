@@ -19,7 +19,7 @@
 
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
-import { privatePagesFilterFragment } from './private-visibility.ts';
+import { privatePagesFilterForCaller } from './private-visibility.ts';
 import { chunkVisibleFilter, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
 import { pageEligibleSql } from '../eligibility/sql.ts';
 import type { TrustTier } from '../trust/tier.ts';
@@ -205,7 +205,7 @@ export function buildVisibilityClause(
   // #4352 remediation: the predicate text lives ONCE in private-visibility.ts
   // (shared with listPages + the relational-arm hydrate) so it cannot drift.
   const privateClause = opts?.excludePrivate
-    ? ` AND ${privatePagesFilterFragment(pageAlias)}`
+    ? ` AND ${privatePagesFilterForCaller(pageAlias)}`
     : '';
   const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
   // C4: a pinned question's page holds only the question and owner notes; it is
@@ -468,4 +468,18 @@ export function buildRecencyComponentSql(opts: {
 }
 
 // Exported for unit tests
+/**
+ * #7175: keyword ranking has no phrase term, so a chunk holding the query's words as one contiguous phrase
+ * (a rare exact phrase in a long transcript) ranked like any chunk that merely repeats them. A chunk that
+ * matches the query as a phrase (`phraseto_tsquery`, stemmed, stopword gaps kept) scores this many times higher.
+ * A one-word query matches every candidate equally, so its order is unchanged. Opt-in: `search.keyword_phrase true` turns it on.
+ */
+export const KEYWORD_PHRASE_FACTOR = 2;
+
+/** The phrase multiplier on a chunk's ts_rank; `param` is the SQL placeholder holding the rank query text. */
+export function keywordPhraseFactorSql(ftsLang: string, param: string, enabled = false, vector = 'cc.search_vector'): string {
+  if (!enabled) return '1';
+  return `(CASE WHEN ${vector} @@ phraseto_tsquery('${ftsLang}', ${param}) THEN ${KEYWORD_PHRASE_FACTOR} ELSE 1 END)`;
+}
+
 export const __test__ = { escapeLikePattern, escapeSqlLiteral, buildLikePrefixLiteral };

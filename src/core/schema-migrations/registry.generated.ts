@@ -280,6 +280,37 @@ import { v276 } from './v276-persistence-foreground-committed-index.ts';
 import { v277 } from './v277-function-search-path-pg-temp.ts';
 import { v278 } from './v278-writer-fence-fail-closed.ts';
 import { v279 } from './v279-outcome-markers-skip-purge-guard.ts';
+import { v280 } from './v280-principal-private-pages.ts';
+import { v281 } from './v281-derived-state-maintainers-fail-closed.ts';
+import { v282 } from './v282-member-read-access.ts';
+import { v283 } from './v283-folder-access-rules.ts';
+import { v284 } from './v284-access-page-indexes.ts';
+import { v285 } from './v285-slug-rename-history.ts';
+import { v286 } from './v286-qm-actor-links.ts';
+import { v287 } from './v287-multi-page-recovery-record.ts';
+import { v288 } from './v288-decide-proposals-claim-pair-index.ts';
+import { v289 } from './v289-page-change-reasons.ts';
+import { v290 } from './v290-wake-subscriptions.ts';
+import { v291 } from './v291-persistence-request-replay-indexes.ts';
+import { v292 } from './v292-refresh-write-barrier.ts';
+import { v293 } from './v293-qm-attest-sources.ts';
+import { v294 } from './v294-refresh-barrier-import-deferral.ts';
+import { v295 } from './v295-refresh-retry-hint-history-index.ts';
+import { v296 } from './v296-ingest-applied-captures.ts';
+import { v297 } from './v297-chronicle-judge-window.ts';
+import { v298 } from './v298-attest-read.ts';
+import { v299 } from './v299-access-member-sources.ts';
+import { v300 } from './v300-memory-proposals.ts';
+import { v301 } from './v301-member-email.ts';
+import { v302 } from './v302-link-transitions-source.ts';
+import { v303 } from './v303-access-page-rules.ts';
+import { v304 } from './v304-access-owner-origin.ts';
+import { v305 } from './v305-access-lineage-designs.ts';
+import { v306 } from './v306-member-page-withdrawal-scope.ts';
+import { v307 } from './v307-page-label-guards.ts';
+import { v308 } from './v308-access-labelled-only.ts';
+import { v309 } from './v309-requester-scope.ts';
+import { v310 } from './v310-mcp-request-log-rollup.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -558,4 +589,35 @@ export const MIGRATIONS: Migration[] = [
   v277,
   v278,
   v279,
+  v280,
+  v281,
+  v282,
+  v283,
+  v284,
+  v285,
+  v286,
+  v287,
+  v288,
+  v289,
+  v290,
+  v291,
+  v292,
+  v293,
+  v294,
+  v295,
+  v296,
+  v297,
+  v298,
+  v299,
+  v300,
+  v301,
+  v302,
+  v303,
+  v304,
+  v305,
+  v306,
+  v307,
+  v308,
+  v309,
+  v310,
 ];

@@ -19,7 +19,7 @@
  *     updates and releases it once the file and database agree again;
  *   - doctor `maintenance_write_drift` and `gbrain repair file-drift`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError, opError } from '../ops/contract.ts';
@@ -28,18 +28,21 @@ import { normalizeSlugPrefix } from '../ops/context.ts';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
 import { hardenedGitSync, hardenedPathDirty } from '../hardened-git.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { remoteReadFloorSql } from '../search/private-visibility.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { validateSlug } from '../utils.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { sha256 } from './digest.ts';
-import { existingLocalHostId } from './identity.ts';
+import { findLiveFileClaimants, recordedReconcilePath } from './file-claims.ts';
+import { existingHostIdFor } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
-import { staleMirrorPage } from './mirror-read-only.ts';
-import { prepareFileTarget } from './page-prepare.ts';
-import { readReconcileState } from './reconcile-state.ts';
+import { sourceMirrorReadOnly, staleMirrorPage } from './mirror-read-only.ts';
+import { isOriginTwinPage } from './origin-twins.ts';
+import { prepareFileTarget, publishesDatabaseOnly } from './page-prepare.ts';
+import { adoptableSlugOrigin, readReconcileState } from './reconcile-state.ts';
 import { reconcileCanonical } from './reconcile-merge.ts';
 import { classifyDrift } from './reconcile-additive.ts';
+import { loadSyncEligibility, syncGit } from './sync-discovery.ts';
 import { recordsNoFileOrigin, slugPathFile } from './unbound-pages.ts';
 
 /** The refusal message `prepareFileTarget` stores on a drift conflict receipt (the detail is not kept on the row). */
@@ -77,17 +80,35 @@ export interface LiveDrift {
  * page cannot drift).
  */
 export async function liveFileDrift(engine: BrainEngine, sourceId: string, slug: string, snapshot?: PageSnapshot | null): Promise<LiveDrift> {
-  const hostId = existingLocalHostId();
+  const hostId = existingHostIdFor(engine);
   const binding = hostId ? await getWorktreeBinding(engine, sourceId, hostId) : null;
   if (!binding?.local_path || binding.owner_host_id !== hostId || binding.state !== 'active') return { still_present: null, reason: 'not_owner_host' };
   const page = snapshot === undefined ? await engine.readPageSnapshot(slug, { sourceId }) : snapshot;
   if (!page || page.page.deleted_at) return { still_present: null, reason: 'page_missing' };
   const root = join(binding.local_path, binding.relative_path);
   // GBRA-133 (#7931): a stale mirror page publishes database-only but reconciles against the file at its slug path.
-  if (await staleMirrorPage(engine, sourceId, page.page)) {
-    const path = slugPathFile(root, slug);
-    if (!existsSync(path)) return { still_present: false, reason: 'database_only', db_revision: page.revision };
-    return { still_present: true, reason: 'file_database_drift', db_revision: page.revision, path: relative(root, path).split(sep).join('/'), file_hash: sha256(readFileSync(path)) };
+  // #7974: it is compared as reconcile reads it; a slug path that reading cannot settle (several spellings) is unknown.
+  // GBRA-108: so is an origin twin with no recorded file that adopts its slug path (twinReading). Sync imports that file
+  // into it (and holds it file_drift when they differ), so the drift is read from it as repair file-drift adopts it.
+  // A slug-path file another live page records as its source path is that page's (sync imports it there), so the twin
+  // stays database-only; one another page names only by file URI is unknown (sync still routes it to the twin).
+  let twin: Awaited<ReturnType<typeof twinReading>>;
+  try { twin = await twinReading(engine, sourceId, root, page); }
+  catch (error) { return { still_present: null, reason: error instanceof OperationError && typeof error.detail === 'string' ? error.detail : 'error' }; }
+  if (twin === 'db_only') return { still_present: null, reason: 'db_only_slug_path', db_revision: page.revision };
+  if (twin === 'adopt' || await staleMirrorPage(engine, sourceId, page.page)) {
+    try {
+      const state = await readReconcileState(engine, sourceId, slug, undefined, { adoptSlugPath: twin === 'adopt' });
+      const agrees = classifyDrift(state.file, reconcileCanonical(state.snapshot.page, state.snapshot.tags)).verdict === 'no_drift';
+      return { still_present: !agrees, reason: agrees ? 'agrees' : 'file_database_drift', db_revision: state.snapshot.revision,
+        path: relative(state.root, state.path).split(sep).join('/'), file_hash: sha256(state.raw) };
+    } catch (error) {
+      if (!(error instanceof OperationError)) return { still_present: null, reason: 'error' };
+      if (error.detail === 'canonical_file_missing' || twin && error.detail === 'shared_origin' && await claimedBySourcePath(engine, sourceId, root, page)) {
+        return { still_present: false, reason: 'database_only', db_revision: page.revision };
+      }
+      return { still_present: null, reason: typeof error.detail === 'string' ? error.detail : error.code };
+    }
   }
   try {
     const file = await prepareFileTarget(engine, { source_id: sourceId, worktree_id: binding.worktree_id, slug }, page, null, hostId!);
@@ -109,11 +130,71 @@ export async function liveFileDrift(engine: BrainEngine, sourceId: string, slug:
   }
 }
 
+/**
+ * GBRA-108: how liveFileDrift reads an origin twin with no recorded file, in a source that is not a read-only mirror (no
+ * repair writes there): `db_only` when its slug path is under a declared storage.db_only directory and holds a file (one
+ * or several), which sync imports into the twin but no repair adopts; `adopt` when it adopts its slug path as reconcile
+ * does (adoptableSlugOrigin), sync admits that path (loadSyncEligibility: scope, sync.exclude, hidden and reserved
+ * paths) and sync reads its file (syncReadsFile: committed at HEAD, or not ignored in a working tree sync reads); null (prepareFileTarget's database-only reading) otherwise, including a slug path several files import as.
+ * Any other refusal or failure throws.
+ */
+async function twinReading(engine: BrainEngine, sourceId: string, root: string, page: PageSnapshot): Promise<'adopt' | 'db_only' | null> {
+  const slug = page.page.slug;
+  if (page.page.source_path || !existsSync(root) || !await isOriginTwinPage(engine, sourceId, slug) || await sourceMirrorReadOnly(engine, sourceId)) return null;
+  const real = realpathSync(root), mode = await scannerSlugRootMode(engine, sourceId, real);
+  try {
+    if (publishesDatabaseOnly(real, slug, page)) return existsSync(slugPathFile(real, slug, mode)) ? 'db_only' : null;
+    const derived = await adoptableSlugOrigin(engine, sourceId, real, page, mode);
+    if (!derived) return null;
+    const [source] = await engine.executeRaw<{ last_commit: string | null; config: Record<string, unknown> | null }>('SELECT last_commit, config FROM sources WHERE id=$1', [sourceId]);
+    const gitRoot = realpathSync(syncGit(real, ['rev-parse', '--show-toplevel']).trim());
+    const { nativeRoot, nativeGitRoot, eligible } = await loadSyncEligibility(engine, { root: real, gitRoot, sourceId,
+      source: { last_commit: source?.last_commit ?? null, config: source?.config ?? {} } });
+    const gitPath = relative(nativeGitRoot, join(nativeRoot, relative(real, derived.path))).split(sep).join('/');
+    return eligible(gitPath) && await syncReadsFile(engine, gitRoot, gitPath) ? 'adopt' : null;
+  } catch (error) {
+    if (error instanceof OperationError && error.detail === 'slug_path_ambiguous') return publishesDatabaseOnly(real, slug, page) ? 'db_only' : null;
+    throw error;
+  }
+}
+
+/**
+ * GBRA-108: whether sync reads a Git path's file at all, as discoverManagedSync does: from the HEAD commit, or also the
+ * working tree (detached HEAD or sync.include_working_tree), where an untracked file counts unless Git ignores it.
+ */
+async function syncReadsFile(engine: BrainEngine, gitRoot: string, gitPath: string): Promise<boolean> {
+  try { syncGit(gitRoot, ['cat-file', '-e', `HEAD:${gitPath}`]); return true; } catch { /* not in the HEAD commit */ }
+  const working = syncGit(gitRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'HEAD' || await engine.getConfig('sync.include_working_tree') === 'true';
+  if (!working) return false;
+  try { syncGit(gitRoot, ['check-ignore', '-q', '--', gitPath]); return false; }
+  catch (error) { if ((error as { status?: number }).status === 1) return true; throw error; }
+}
+
+/**
+ * GBRA-108: whether another live page records an origin twin's slug-path file as its source path, so sync imports that
+ * file there and not into the twin. A page naming it only by file URI does not count: sync routes by source path. False
+ * when this cannot be read.
+ */
+async function claimedBySourcePath(engine: BrainEngine, sourceId: string, root: string, page: PageSnapshot): Promise<boolean> {
+  try {
+    const real = realpathSync(root), mode = await scannerSlugRootMode(engine, sourceId, real), slug = page.page.slug;
+    const path = slugPathFile(real, slug, mode), canonicalPath = realpathSync(path);
+    const claimants = await findLiveFileClaimants(engine, { sourceId, slug, pageId: page.page.id, root: real, mode, path, canonicalPath, recordedUri: null });
+    if (!claimants.length) return false;
+    const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>('SELECT slug, source_path FROM pages WHERE source_id=$1 AND id=ANY($2::bigint[])',
+      [sourceId, claimants.map(claimant => claimant.id)]);
+    return rows.some(row => {
+      const recorded = row.source_path ? recordedReconcilePath(real, { slug: row.slug, source_path: row.source_path, source_uri: null }, mode) : null;
+      return !!recorded && existsSync(recorded) && realpathSync(recorded) === canonicalPath;
+    });
+  } catch { return false; }
+}
+
 /** The path `prepareFileTarget` compares, resolved the same way (recorded source path, captured file URI, then the slug path). */
 async function canonicalFilePath(engine: BrainEngine, sourceId: string, root: string, snapshot: PageSnapshot, slug: string): Promise<string> {
-  const mode = snapshot.page.source_path ? await scannerSlugRootMode(engine, sourceId, root) : undefined;
+  const mode = await scannerSlugRootMode(engine, sourceId, root);
   const captured = recordedPathFromFileUri(snapshot.page.source_uri, root);
-  return resolveSourceLocalFilePath(root, snapshot.page.source_path, slug, mode) ?? (captured ? join(root, captured) : slugPathFile(root, slug));
+  return resolveSourceLocalFilePath(root, snapshot.page.source_path, slug, mode) ?? (captured ? join(root, captured) : slugPathFile(root, slug, mode));
 }
 
 /** Whether Git tracks the canonical file and whether its bytes equal the last commit (null: Git cannot say). */
@@ -239,7 +320,7 @@ export async function auditDriftConflicts(engine: BrainEngine, sourceId: string,
     where.push(`(${alternatives.join(' OR ')})`);
   }
   if (!access.trusted || access.excludePrivate) {
-    where.push(`EXISTS (SELECT 1 FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND p.deleted_at IS NULL${access.excludePrivate ? ` AND ${privatePagesFilterFragment('p')}` : ''})`);
+    where.push(`EXISTS (SELECT 1 FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND p.deleted_at IS NULL${access.excludePrivate ? ` AND ${remoteReadFloorSql('p')}` : ''})`);
   }
   const filtered = where.join(' AND ');
   const [totals] = await engine.executeRaw<{ slugs: number; receipts: number }>(
@@ -264,7 +345,7 @@ export async function auditDriftConflicts(engine: BrainEngine, sourceId: string,
       ORDER BY r.slug, r.sequence DESC`, [sourceId, slugs]) : [];
   const recorded = access.trusted && slugs.length ? await engine.executeRaw<{ slug: string; source_path: string | null; source_uri: string | null }>(
     'SELECT slug, source_path, source_uri FROM pages WHERE source_id=$1 AND slug=ANY($2::text[]) AND deleted_at IS NULL', [sourceId, slugs]) : [];
-  const hostId = access.trusted ? existingLocalHostId() : null;
+  const hostId = access.trusted ? existingHostIdFor(engine) : null;
   const binding = hostId ? await getWorktreeBinding(engine, sourceId, hostId) : null;
   const owner = !!binding?.local_path && binding.owner_host_id === hostId && binding.state === 'active';
   const root = owner ? join(binding!.local_path!, binding!.relative_path) : null;
@@ -383,6 +464,6 @@ export class ConceptDriftSkips {
       }
     }
     return this.skipped.length ? [`List them: ${auditConflictsCommand(this.sourceId)}`,
-      `Preview the resolution: ${fileDriftRepairCommand(this.sourceId)} (or --prefer database); apply with the --expect hash it prints.`] : [];
+      `Preview the resolution: ${fileDriftRepairCommand(this.sourceId)} (or --prefer database); its apply needs the user's consent (it asks; add --yes only after they agree).`] : [];
   }
 }

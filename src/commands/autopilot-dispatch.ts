@@ -5,7 +5,10 @@
  * submits. Called by runAutopilotDaemon (src/commands/autopilot-daemon.ts).
  */
 import type { BrainEngine } from '../core/engine.ts';
-import type { BrainHealth } from '../core/types.ts';
+import { assertNever, type BrainHealth } from '../core/types.ts';
+import { syncIntervalMinutes } from '../core/meetings/source-config.ts';
+import { MEETINGS_DEFAULT_SYNC_INTERVAL_MIN } from '../core/meetings/types.ts';
+import { SLACK_DEFAULT_SYNC_INTERVAL_MIN } from '../core/slack/types.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
 import { loadAllSources, parseSourceConfig, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, type SourceRow } from '../core/sources-load.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
@@ -14,7 +17,7 @@ import { connectorAccountMismatches, connectorAccountMismatchSkipWarning } from 
 import { AUTOPILOT_GIT_PULL_KEY, automaticGitPullDisabled, automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip, skipActivationPendingSync } from '../core/sync-policy.ts';
-import { resolveAutopilotAutoDrainBounds, resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
+import { autoDrainWindowClampReason, resolveAutopilotAutoDrainBounds, resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
   autopilotTargetedSteps,
@@ -387,15 +390,16 @@ export async function dispatchFreshnessSyncs(
           ? JSON.stringify({ event: 'git_pull_disabled', key: AUTOPILOT_GIT_PULL_KEY })
           : `[autopilot] git_pull: off (${AUTOPILOT_GIT_PULL_KEY}=false); remote sources sync their local checkout without pulling`) + '\n');
       }
-      const activationPending = await loadActivationPendingSourceIds(engine);
       const intervalMs = baseInterval * 1000;
       const now = Date.now();
+      const rateLimits = await readConnectorRateLimits(engine, now).catch(() => new Map<string, number>());
+      const activationPending = await loadActivationPendingSourceIds(engine);
       const refusalHolds = await readSyncRefusalHolds(engine, now).catch(() => new Map<string, SyncRefusalHold>());
       for (const src of sources) {
         if (onlySourceIds && !onlySourceIds.has(src.id)) continue;
         if (skipRefusedSync(refusalHolds, src.id, jsonMode)) { decisions.push({ source_id: src.id, outcome: 'skipped' }); continue; }
         if (isConnectorSourceKind(parseSourceConfig(src.config).kind)) {
-          await dispatchConnectorFreshnessSync(queue, src, attempted, activationPending, mismatched, { intervalMs, now, slot, timeoutMs, jsonMode });
+          await dispatchConnectorFreshnessSync(queue, src, attempted, activationPending, mismatched, { intervalMs, now, slot, timeoutMs, jsonMode, rateLimits });
           continue;
         }
         if (!src.local_path) continue;
@@ -554,13 +558,45 @@ export async function sleepWatchingHeads(
  * capture is opt-in: the DX O1 gate (`connectorAwaitingFirstSync`) keeps a
  * connector with no recorded sync attempt idle and prints the enable command once.
  */
+const rateLimitNoticePrinted = new Set<string>();
+
+/**
+ * D1: how often autopilot syncs a connector source. GitHub and Google keep the base interval; a meetings or slack
+ * source syncs every `sync_interval_min` minutes (default 60 for meetings, 30 for slack; floor 5).
+ */
+export function connectorSyncIntervalMs(config: unknown, baseIntervalMs: number): number {
+  const parsed = parseSourceConfig(config) as Record<string, unknown> & { kind?: unknown };
+  const kind = parsed.kind;
+  if (!isConnectorSourceKind(kind)) return baseIntervalMs;
+  switch (kind) {
+    case 'google':
+    case 'github': return baseIntervalMs;
+    case 'meetings': return syncIntervalMinutes(parsed, MEETINGS_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
+    case 'slack': return syncIntervalMinutes(parsed, SLACK_DEFAULT_SYNC_INTERVAL_MIN)! * 60_000;
+    default: return assertNever(kind);
+  }
+}
+
+/** Connector sources whose provider asked for a wait the last sync recorded (connectors/api-source.ts `recordRateLimit`): id → epoch ms. */
+export async function readConnectorRateLimits(engine: BrainEngine, now: number): Promise<Map<string, number>> {
+  const rows = await engine.executeRaw<{ fingerprint: string; retry_at: string | null }>(
+    `SELECT fingerprint, completed_keys->0->>'retry_at' AS retry_at FROM op_checkpoints WHERE op='connector-rate-limit'`);
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    const at = row.retry_at ? Date.parse(row.retry_at) : NaN;
+    if (Number.isFinite(at) && at > now) out.set(row.fingerprint, at);
+  }
+  return out;
+}
+
 async function dispatchConnectorFreshnessSync(
   queue: MinionQueue,
   src: SourceRow,
   attempted: Set<string> | null,
   activationPending: Awaited<ReturnType<typeof loadActivationPendingSourceIds>>,
   mismatched: ReadonlyMap<string, ConnectorAccountMismatch>,
-  { intervalMs, now, slot, timeoutMs, jsonMode }: { intervalMs: number; now: number; slot: string; timeoutMs: number; jsonMode: boolean },
+  { intervalMs, now, slot, timeoutMs, jsonMode, rateLimits }: { intervalMs: number; now: number; slot: string; timeoutMs: number; jsonMode: boolean;
+    rateLimits?: ReadonlyMap<string, number> },
 ): Promise<void> {
   if (isSyncDisabledConfig(src.config)) return;
   if (skipActivationPendingSync(activationPending, src.id, 'freshness_sync_skipped', jsonMode, (l) => process.stderr.write(l + '\n'))) return;
@@ -571,8 +607,18 @@ async function dispatchConnectorFreshnessSync(
     process.stderr.write((jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, code: 'connector_account_changed', reason }) : reason) + '\n');
     return;
   }
+  const retryAt = rateLimits?.get(src.id);
+  if (retryAt !== undefined && retryAt > now) {
+    if (!rateLimitNoticePrinted.has(`${src.id}:${retryAt}`)) {
+      rateLimitNoticePrinted.add(`${src.id}:${retryAt}`);
+      const at = new Date(retryAt).toISOString();
+      process.stderr.write((jsonMode ? JSON.stringify({ event: 'freshness_sync_rate_limited', source_id: src.id, retry_at: at })
+        : `[dispatch] ${src.id}: the provider rate-limited the last sync; the next one waits until ${at}`) + '\n');
+    }
+    return;
+  }
   const ageMs = now - (src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0);
-  if (ageMs < intervalMs) return;
+  if (ageMs < connectorSyncIntervalMs(src.config, intervalMs)) return;
   try {
     const job = await queue.add(
       'sync',
@@ -658,7 +704,9 @@ export async function submitAutoDrains(
   };
   const threshold = parsePosInt(await engine.getConfig('autopilot.auto_drain.threshold'), 25);
   const { AI_CHAT_TIMEOUT_MS } = await import('../core/ai/gateway.ts');
-  const bounds = resolveAutopilotAutoDrainBounds(timeoutMs, parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120), AI_CHAT_TIMEOUT_MS);
+  const requestedWindowSeconds = parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120);
+  const bounds = resolveAutopilotAutoDrainBounds(timeoutMs, requestedWindowSeconds, AI_CHAT_TIMEOUT_MS);
+  const clampReason = autoDrainWindowClampReason(requestedWindowSeconds, bounds, AI_CHAT_TIMEOUT_MS);
   const maxUsdPerDay = parseNonNegFloat(await engine.getConfig('autopilot.auto_drain.max_usd_per_day'), 2.0);
   // Each drain attempt runs under one BudgetTracker capped at ~$0.30
   // (cycle.extract_atoms.budget_usd); bound the brain-wide daily attempt
@@ -751,6 +799,10 @@ export async function submitAutoDrains(
       );
       submittedToday++;
       next = kind === 'checkout' ? 'connector' : 'checkout';
+      if (clampReason) {
+        process.stderr.write((jsonMode ? JSON.stringify({ event: 'auto_drain_window_clamped', job_id: job.id, source_id: src.id,
+          requested_window_seconds: requestedWindowSeconds, window_seconds: bounds.windowSeconds, timeout_ms: bounds.timeoutMs, reason: clampReason }) : clampReason) + '\n');
+      }
       if (jsonMode) {
         process.stderr.write(JSON.stringify({
           event: 'dispatched', job_id: job.id, mode: 'auto-drain',

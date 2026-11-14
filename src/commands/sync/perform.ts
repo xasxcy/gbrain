@@ -20,14 +20,30 @@ import { withRefreshingLock, LockUnavailableError, LockStolenError, syncLockId }
 import { readSyncAnchor } from '../../core/sync-anchor.ts';
 import { recordUpstreamObservation } from '../../core/sync-upstream.ts';
 import { assertSyncApplicable } from '../../core/sync-applicability.ts';
+import { performPlainDirectorySync, plainDirectorySyncRoot } from './plain-directory.ts';
 import { noteIdentityDowngrades } from '../../core/sync-identity-downgrades.ts';
 import { SyncLockBusyError, formatLockBusyMessage, buildPartialResult } from '../../core/sync-lock.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import type { IdleSkip } from '../../core/persistence/sync-idle-skips.ts';
 import { runConnectorSync } from './connector.ts';
 import { performSyncInner } from './incremental.ts';
+import { isConnectorSourceKind } from '../../core/persistence/connector-kinds.ts';
+import { ignoredPrivacyLabelRunNotice } from '../../core/search/ignored-privacy-labels.ts';
 
 export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  const since = opts.dryRun ? null : await syncStartedAt(engine);
+  const result = await routeSync(engine, opts);
+  if (!since || result.privacy_label_notice || result.status === 'up_to_date' || result.status === 'dry_run') return result;
+  const notice = await ignoredPrivacyLabelRunNotice(engine, opts.sourceId ?? 'default', result.pagesAffected?.length ? { slugs: result.pagesAffected } : { since }, 'sync');
+  return notice ? { ...result, privacy_label_notice: notice } : result;
+}
+
+/** GST-2462: the database clock when a sync starts; a managed sync lists no pages, so its notice reads the pages updated since. */
+async function syncStartedAt(engine: BrainEngine): Promise<string | null> {
+  try { return (await engine.executeRaw<{ at: string }>('SELECT clock_timestamp()::text AS at'))[0]?.at ?? null; } catch { return null; }
+}
+
+async function routeSync(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
   assertSyncDispatchActive();
   const inheritedSignal = currentSourceFilesystemSignal();
   if (inheritedSignal) opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, inheritedSignal]) : inheritedSignal };
@@ -64,6 +80,8 @@ export async function performSync(engine: BrainEngine, opts: SyncOpts): Promise<
     if (connector) return connector;
   }
   if (opts.signal?.aborted) return finish(await interruptedBeforeWork());
+  const plainRoot = await plainDirectorySyncRoot(engine, opts, managed);
+  if (plainRoot) return finish(await performPlainDirectorySync(engine, opts, plainRoot, managed), true);
   if (managed) return performManagedBranch(engine, opts);
   const filesystemRoot = opts.repoPath || await readSyncAnchor(engine, opts.sourceId, 'repo_path');
   if (filesystemRoot && !hasSourceFilesystemLock(filesystemRoot)) {
@@ -114,7 +132,7 @@ async function mayBeConnectorSource(engine: BrainEngine, opts: SyncOpts): Promis
   if (routing.id === null) return false;
   try {
     const config = typeof routing.config === 'string' ? JSON.parse(routing.config) : routing.config ?? {};
-    return config.kind === 'google' || config.kind === 'github';
+    return isConnectorSourceKind(config.kind);
   } catch { return true; }
 }
 
@@ -125,7 +143,7 @@ async function mayBeConnectorSource(engine: BrainEngine, opts: SyncOpts): Promis
  */
 async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promise<SyncResult> {
   const sourceId = outer.sourceId ?? 'default';
-  const { withDrainLease } = await import('../../core/persistence/sync-lease.ts');
+  const { currentDrainLease, withDrainLease } = await import('../../core/persistence/sync-lease.ts');
   const lockKey = syncLockId(sourceId);
   // GBRA-133: the settles an idle-clear tick leaves nothing to do (persistence/sync-idle-skips.ts), read inside the lease.
   let skips: ReadonlySet<IdleSkip> = new Set();
@@ -187,6 +205,14 @@ async function performManagedBranch(engine: BrainEngine, outer: SyncOpts): Promi
           : `[sync] following ${who}: ${done}.`);
       },
     }, work);
+    // GST-2492 (B2): a rule this sync applied moves the held facts it narrows now. It runs once the lease is released only so
+    // a follower sync does not wait on the move: the lease is re-entrant and the move's maintenance writes are not sync rows
+    // (no claim waits on the lease), so running it inside would not deadlock either.
+    const moves = await import('../../core/facts/held-fact-move.ts');
+    const held = currentDrainLease(sourceId) ? null : await moves.moveRuledSharedHeld(engine, sourceId)
+      .catch((error: unknown) => { serr(`[sync] held facts under a new folder rule wait for the next maintenance cycle: ${error instanceof Error ? error.message : String(error)}`); return null; });
+    for (const w of held ? moves.heldMoveIncomplete(held) : []) serr(`[sync] held facts moved under a new folder rule, incomplete: ${w.text}`);
+    if (held?.unmovable.length) serr(`[sync] ${held.unmovable.length} group(s) of held facts could not move yet; the next gbrain dream retries (gbrain repair facts-home --source ${sourceId} lists them).`);
     const tailed = skips.has('sync_tail') ? drained : await withSyncTail(engine, sourceId, drained, { signal: outer.signal, deadlineAtMs: outer.deadlineAtMs });
     const healed = skips.has('slug_heal') ? tailed : await healAfterManagedSync(engine, outer, tailed);
     return skips.has('origin_heal') ? healed : await healOriginTwinsAfterManagedSync(engine, outer, healed);

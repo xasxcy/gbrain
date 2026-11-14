@@ -113,7 +113,7 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   never reaches callers because the inner `ORDER BY distance` and the pooled
   outer sort re-sort it. `search.hnsw_iterative_scan` (`relaxed_order` |
   `strict_order` | `off`; env `GBRAIN_HNSW_ITERATIVE_SCAN` wins) restores the
-  older mode without a release; it is latched once per process, so restart
+  older mode without a release; it is latched once per engine (once per process on a one-brain server), so restart
   serve and autopilot after changing it. A filtered short pool is not
   proof that the corpus is exhausted. Postgres may make one exact fallback
   inside the remaining eight-second arm budget; PGLite does not pretend that
@@ -127,12 +127,26 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   inside `page.title` (or an exact full-title match), a floor-ratio-gated,
   bounded multiplier fires (`applyTitleBoost`, `search.title_boost` knob). A
   query that is a phrase from the title can't lose to a body chunk by luck.
+  Opt-in `search.title_qualified` (off by default) covers the reverse case: a
+  person or company title (2+ content words) mentioned inside a longer query
+  ("acme alice example") gets the same multiplier, unfloored, stamped
+  `title_mention_boost`, unless an identity boost already raised the row.
+  Evidence never reads that stamp as an exact title match.
 - **Alias hop** — free-text `aliases:` frontmatter is projected into a
   `page_aliases` table (separate from the `slug_aliases` wikilink redirect) and
   consulted at query time: a full normalized-query match injects/boosts the
   canonical page (`applyAliasHop`). The only layer that bridges true synonyms
   with zero surface overlap ("the Sun Room" → the Helios page). Backfill
-  existing pages with `gbrain reindex --aliases`.
+  existing pages with `gbrain reindex --aliases`. Opt-in
+  `search.qualified_aliases` (off by default) also matches a 3-6 word
+  sub-phrase with 3+ content words inside a query of up to 14 words: when
+  exactly one page the caller can read claims it, that page leads, stamped
+  `qualified_alias_hit`; two claimants suppress the hop. The stamp keeps the
+  row past autocut and the remote page cap but never sets evidence
+  `alias_hit`, and the rerank gate does not grade it. A common three-word
+  alias can lead a query about something else, so confirm on your own eval
+  before turning it on: `gbrain config set search.qualified_aliases true`
+  (`false` turns it back off).
 - **Evidence contract** — every result carries `evidence`
   (`alias_hit | exact_title_match | high_vector_match | keyword_exact |
   weak_semantic`) and `create_safety` (`exists | probable | unknown`). An agent
@@ -266,7 +280,8 @@ relational re-pin (relational-arm rows back above the reranked text rows, in
    reordered — src/core/search/relational-rerank-pin.ts)
        │
        ▼
-alias hop (exact alias match injects/boosts the canonical page; like the
+alias hop (exact alias match injects/boosts the canonical page; opt-in
+   qualified sub-phrase match leads one page; like the
    exact-lookup tier below it never re-sorts, so the reranked order holds)
        │
        ▼
@@ -404,9 +419,12 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   after the pages, in place of the facts arm. No model call. Gates:
   `docs/eval/decisions/temporal-fact-reserve/`.
 - **Facts block (default on) and fact source pages (default off), GBRA-205.**
-  Every `query` with a token budget gets the reserve's dated facts, up to 22%
-  of the budget and 40 rows, oldest first ahead of the pages, in place of the
-  facts arm and the temporal reserve. On the sealed held-out set it answered
+  Every `query` whose caller passes `token_budget` gets the reserve's dated
+  facts, up to 22% of the budget, 40 rows and the caller's `limit`, oldest
+  first ahead of the pages, in place of the facts arm and the temporal
+  reserve. The no-budget evidence plan's implicit budget does not run it, so an
+  unbudgeted `query` returns at most `limit` rows (#8411). Block rows take the
+  top page's score: they are placed ahead, not ranked above the pages. On the sealed held-out set it answered
   183 of 200 questions against 151 without it (gbrain-evals
   `docs/benchmarks/2026-10-26-gbrain-8k-conversion.md`).
   `search.query_facts_block=false` turns it off; a config read error also

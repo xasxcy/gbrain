@@ -19,6 +19,8 @@ import {
   isSkippablePath,
   resolveAutoSkipThreshold,
   summarizeFailuresByCode,
+  STRICT_REQUIRES_MANAGED,
+  strictRequiresManagedAdvice,
   isEmbeddingInfraCode,
   DEFAULT_SOURCE_ID,
   RENAME_SENTINEL_PREFIX,
@@ -52,6 +54,7 @@ import type { SyncOpts, SyncResult } from '../sync.ts';
 import { heldRenameOrigins, holdRefusedImport, moveHeldRenames, noteScreenedImport, settleFullSyncHolds, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 import { classifyItemFailure } from '../../core/item-failure.ts';
+import { fileHistory, scanClassicReasons, withReasonNotices } from './reasons.ts';
 import { OperationError } from '../../core/ops/contract.ts';
 
 /**
@@ -81,6 +84,9 @@ export async function readSourceExcludePaths(engine: BrainEngine, sourceId: stri
 export function sourceExcludeGlobs(patterns: readonly string[]): string[] {
   return patterns.flatMap(pattern => [pattern, `${pattern.replace(/\/$/, '')}/**`]);
 }
+
+/** GBRA-287: one DB-only page a full sync kept but could not re-export: its source path, the failure and what to do. */
+export interface ReexportFailure { slug: string; path: string; code: string; message: string; fix: string }
 
 export async function performFullSync(
   engine: BrainEngine,
@@ -144,11 +150,17 @@ export async function performFullSync(
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   opts.onProgress?.({ phase: 'full_import' });
   await moveHeldRenames(engine, holds, holdRoot);
+  // GBRA-217: a re-import of a source that already has pages reads its reasons from the whole history (a first sync creates
+  // every page, so it archives no snapshot to annotate and runs no scan).
+  const [known] = await engine.executeRaw<{ any: boolean }>('SELECT EXISTS (SELECT 1 FROM pages WHERE source_id = $1) AS any', [opts.sourceId ?? 'default']);
+  const reasons = await scanClassicReasons(engine, { sourceId: opts.sourceId, company, anchorPath, gitRoot: gitContextRoot, from: null, to: headCommit,
+    imports: known?.any === true ? 1 : 0 });
   let result: import('../import.ts').RunImportResult;
   try {
     result = await runImport(engine, importArgs, {
       signal: opts.signal,
       commit: headCommit,
+      history: filePath => fileHistory(reasons, filePath),
       strategy: opts.strategy,
       sourceId: opts.sourceId,
       exclude: opts.exclude,
@@ -159,6 +171,7 @@ export async function performFullSync(
       // issue #1939: performFullSync owns the failure ledger + bookmark via the
       // shared gate below; don't let runImport double-record or write its own.
       managedBookmark: true,
+      noticeRun: 'sync',
       // #5988: a held rename destination whose old page changed is held, never imported as a new page.
       heldPaths: new Set(holds?.heldPaths),
       // #5988: content refusals are held, not failed (never gating the bookmark).
@@ -227,7 +240,7 @@ export async function performFullSync(
   // that throws never clears anything, and the sweep carries the full
   // clear-then-verify-restore semantics.
   await sweepOrphanedRenameSentinels(engine, fullSourceId, fullFailureSet);
-  if (!fullGate.advanced) return await reportBlockedFullSync(engine, opts, anchorPath, headCommit, result, fullGate);
+  if (!fullGate.advanced) return withReasonNotices(await reportBlockedFullSync(engine, opts, anchorPath, headCommit, result, fullGate), reasons, opts.sourceId);
   if (fullGate.acknowledged > 0) {
     serr(`  Acknowledged ${fullGate.acknowledged} failure(s) and advanced past them.`);
   }
@@ -239,7 +252,7 @@ export async function performFullSync(
     );
   }
 
-  const reconciledDeletes = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit });
+  const { deleted: reconciledDeletes, reexportFailures } = await reconcileFullSyncDeletes(engine, opts, { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit });
 
   // #3479 blocker 2 — the post-gate sweep above ran BEFORE this reconcile,
   // so a `<rename:…>` sentinel whose stale row the reconcile just removed
@@ -272,7 +285,7 @@ export async function performFullSync(
   const { readPageSizeStates, addSizeState } = await import('../../core/page-embedding-budget.ts');
   const sizeStates = (await readPageSizeStates(engine, fullSourceId, null))
     .reduce<import('../../core/page-embedding-budget.ts').SyncSizeStates | undefined>((tally, state) => addSizeState(tally, state), undefined);
-  return {
+  return withReasonNotices({
     status: 'first_sync',
     fromCommit: null,
     toCommit: headCommit,
@@ -290,7 +303,9 @@ export async function performFullSync(
     ...(result.malformedSkipped ? { malformedSkipped: result.malformedSkipped } : {}),
     ...(result.type_warnings ? { type_warnings: result.type_warnings } : {}),
     ...(result.resealed ? { resealed: result.resealed } : {}),
-  };
+    ...(result.privacy_label_notice ? { privacy_label_notice: result.privacy_label_notice } : {}),
+    ...(reexportFailures.length ? { reexport_failures: reexportFailures } : {}),
+  }, reasons, opts.sourceId);
 }
 
 async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCommit: string, opts: SyncOpts & { metafilePages: MetafilePagesMode },
@@ -344,6 +359,7 @@ async function reportBlockedFullSync(
   fullGate: Awaited<ReturnType<typeof applySyncFailureGate>>,
 ): Promise<SyncResult> {
   const codeBreakdown = formatCodeBreakdown(result.failures);
+  const strictRefused = summarizeFailuresByCode(result.failures).some(c => c.code === STRICT_REQUIRES_MANAGED);
   if (fullGate.sentinelBlocked) {
     // #3479 review — say WHICH sentinel fired: a `<rename:…>` block here
     // used to print the history-changed message, pointing the operator at
@@ -368,7 +384,9 @@ async function reportBlockedFullSync(
     // #3875: code-aware copy — provider-infra failures must not be routed
     // to --skip-failed (same rationale as the incremental gate above).
     const infraCodes = summarizeFailuresByCode(result.failures).filter(c => isEmbeddingInfraCode(c.code));
-    if (infraCodes.length > 0) {
+    if (strictRefused) {
+      serr(`\nFull sync blocked: ${fileFailCount} file(s) failed (${STRICT_REQUIRES_MANAGED}):\n${codeBreakdown}\n${formatFailedFileList(result.failures)}\n\n${strictRequiresManagedAdvice(opts.sourceId)}`);
+    } else if (infraCodes.length > 0) {
       serr(
         `\nFull sync blocked: ${fileFailCount} file(s) failed — embedding provider errors:\n` +
         `${codeBreakdown}\n\n` +
@@ -398,6 +416,7 @@ async function reportBlockedFullSync(
     pagesAffected: [],
     failedFiles: result.failures.length,
     failureCodes: summarizeFailuresByCode(result.failures),
+    ...(strictRefused ? { failureAdvice: strictRequiresManagedAdvice(opts.sourceId) } : {}),
   };
 }
 
@@ -410,7 +429,7 @@ async function reconcileFullSyncDeletes(
   opts: SyncOpts,
   input: { company: ReturnType<typeof currentCompanyBrainSync>; gitContextRoot: string; syncScopeRoot: string; slugRoot: string | undefined;
     metafilePages: MetafilePagesMode; previousCommit: string | null },
-): Promise<number> {
+): Promise<{ deleted: number; reexportFailures: ReexportFailure[] }> {
   const { company, gitContextRoot, syncScopeRoot, slugRoot, metafilePages, previousCommit } = input;
   // #1970 (F-A): runImport is import-only — it never purges pages whose backing
   // file was deleted since the last sync. A full re-import is authoritative for
@@ -432,6 +451,7 @@ async function reconcileFullSyncDeletes(
   // Skipped on the legacy no-sourceId path (the batch delete primitives require
   // a sourceId; matches every other source-scoped feature).
   let reconciledDeletes = 0;
+  const reexportFailures: ReexportFailure[] = [];
   if (opts.sourceId) {
     const sid = opts.sourceId;
     // GBRA-150: a metafile-named row is reconcilable exactly when the walk would collect its file: its bytes on disk, or,
@@ -470,8 +490,8 @@ async function reconcileFullSyncDeletes(
     // #5988 (E13): the old page of a held rename keeps its origin until the
     // renamed file imports; its file being gone does not make it stale.
     const heldOrigins = await heldRenameOrigins(engine, sid);
-    const rows = (await engine.executeRaw<{ slug: string; source_path: string | null; body_storage: string }>(
-      `SELECT slug, source_path, body_storage FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
+    const rows = (await engine.executeRaw<{ slug: string; source_path: string | null }>(
+      `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
       [sid],
     )).filter(row => !heldOrigins.has(row.source_path!));
     // #774: a scoped full sync is authoritative ONLY for its scope — pages
@@ -524,7 +544,6 @@ async function reconcileFullSyncDeletes(
       // history (i.e. was genuinely deleted) are reconcile-deleted.
       const everCommitted = company ? null : listEverCommittedPaths(gitContextRoot);
       const pathBySlug = new Map(rows.map(r => [r.slug, r.source_path]));
-      const segmentedSlugs = new Set(rows.filter(r => r.body_storage === 'segmented').map(r => r.slug));
       let deletableSlugs = plan.staleSlugs;
       const dbOnlySlugs: string[] = [];
       if (everCommitted) {
@@ -554,20 +573,27 @@ async function reconcileFullSyncDeletes(
         const { writePageThrough } = await import('../../core/write-through.ts');
         for (const slug of dbOnlySlugs) {
           try {
-            if (segmentedSlugs.has(slug)) throw new OperationError('page_body_segmented', 'Re-export cannot render a segmented page.', 'Read it with gbrain get --body auto; the page stays in the database.');
             const r = await writePageThrough(engine, slug, { sourceId: sid, expectedFileBytes: null });
             if (r.written) { reExported++; continue; }
-            if (r.skipped === 'disabled_by_config' || r.skipped === 'url_clone') continue;
+            if (r.skipped === 'disabled_by_config' || r.skipped === 'mirror_read_only' || r.skipped === 'url_clone') continue;
             if (r.skipped === 'file_changed') throw new OperationError('file_database_drift', 'The checkout file exists; re-export only restores absent files.', `If the file holds the newer edit, run gbrain sync --source ${sid} to import it; otherwise ask the user which version to keep.`);
             if (r.error) throw new Error(r.error);
+            if (r.skipped === 'over_push_scan_cap') {
+              reExportFailures++;
+              const fix = 'Kept the database page. Its file would pass the pre-push secret-scan cap, so it stays database-only and no sync re-exports it; read it with gbrain get.';
+              reexportFailures.push({ slug, path: pathBySlug.get(slug)!, code: 'over_push_scan_cap', message: 'The rendered file is over the pre-push secret-scan cap.', fix });
+              serr(`  ${slug} (over_push_scan_cap) ${fix}`);
+              continue;
+            }
             throw new OperationError('storage_error', `The page was not re-exported (${r.skipped}).`, 'Run gbrain doctor --json for the write-through target, then sync again.');
           } catch (error) {
             const failure = classifyItemFailure(error);
             if (failure.scope === 'run') throw error;
             reExportFailures++;
-            serr(`  ${slug} (${failure.code}: ${failure.message}) Kept the database page and any existing file. ` +
-              `If the file is newer, import it with gbrain sync --source ${sid} --include-gitignored; ` +
-              `if the database is newer, re-save its copy with write-through on; when both changed, ask the user which edit wins.`);
+            const fix = `Kept the database page and any existing file. If the file is newer, import it with gbrain sync --source ${sid} --include-gitignored; ` +
+              `if the database is newer, fix the cause above and run gbrain sync --source ${sid} --full --no-pull to re-export it; when both changed, ask the user which edit wins.`;
+            reexportFailures.push({ slug, path: pathBySlug.get(slug)!, code: failure.code, message: failure.message, fix });
+            serr(`  ${slug} (${failure.code}: ${failure.message}) ${fix}`);
           }
         }
         serr(
@@ -618,5 +644,5 @@ async function reconcileFullSyncDeletes(
       }
     }
   }
-  return reconciledDeletes;
+  return { deleted: reconciledDeletes, reexportFailures };
 }

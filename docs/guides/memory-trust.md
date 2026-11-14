@@ -86,12 +86,97 @@ and `get_page`, labeled, but hook context, the context engine,
 outright. `gbrain trust disable --all` turns every protection off; labels
 stay.
 
+## How recall weighs old and low-trust facts (opt-in)
+
+`recall` with a `question` ranks saved facts by how well they match. Turn on
+confidence weighting and the match is also weighed by how much each fact
+deserves to be believed now:
+
+```bash
+gbrain config set recall.confidence_weighting on
+```
+
+- Facts you confirmed, and facts from your own notes, keep full weight at any
+  age.
+- Other facts lose weight as they age (an event after about a week, a
+  preference or commitment after about three months, other facts after about
+  a year) and by tier: tool data a little, agent-written and unverified facts
+  more, external text the most.
+- A fact the writer dated ("founded in 2010") is history and keeps its weight.
+- Weighting at most halves a fact's score. It reorders the facts that match
+  and never hides one; `relevance` stays the plain match score, and
+  `rank_score` and `confidence_factor` show the weighting.
+
+It works the same on a brain with no git repository. `gbrain config set
+recall.confidence_weighting off` turns it off.
+
+## Old and conflicting facts
+
+Two saved facts can state different figures for the same thing: one note says
+acme-example's March MRR was 40k, a later one says 44k. Save figures as typed
+claims and gbrain can find these conflicts without an API key or a model call.
+
+```text
+remember {fact: "acme-example MRR was 44k in March", entity: "companies/acme-example",
+          claim_metric: "mrr", claim_value: 44000, claim_unit: "USD",
+          claim_period: "monthly", valid_from: "2026-03-20"}
+```
+
+| Field | Meaning |
+|---|---|
+| `claim_metric` | What is measured, e.g. `mrr`, `headcount`. Required when any other claim field is set. |
+| `claim_value` | The number (finite; `"2.5M"` is refused with the corrected call as its fix). |
+| `claim_unit` | Optional, e.g. `USD`, `people`. |
+| `claim_period` | Optional, e.g. `monthly`. `weekly`, `monthly`, `quarterly` and `annual` (or `yearly`) set the bucket below; any other text is kept as written. |
+
+The claim is stored on the fact and in the entity page's `## Facts` table, so a
+re-import keeps it. In a `remember` batch each item carries its own claim
+fields; they are never shared across items. Saving the same text again with a
+claim adds the claim to a copy saved without one, and never changes a claim
+already saved (the response says `claim_ignored: existing_claim`).
+
+Two facts conflict when they are about the same entity and state the same
+metric, unit and period in the same as-of bucket: the `valid_from` day, or its
+ISO week, month, quarter or year when the period names that cadence. Figures in
+different buckets are history, so a monthly MRR series, a run of funding rounds
+or a forecast next to an actual (different metrics) are never flagged. A typed
+write never supersedes a typed fact in another bucket either.
+
+Finding conflicts is off by default. Turn it on, or run it once:
+
+```bash
+gbrain config set dream.claim_conflicts.mode propose   # the nightly dream cycle files them
+gbrain decide sweep --claims --dry-run                 # preview; no key, nothing written
+gbrain decide sweep --claims [--source <id>]           # file them now
+```
+
+Each conflict becomes one pending proposal (`dp<id>`), filed once per pair. A
+run files at most `dream.claim_conflicts.max_pairs` (default 500) per source and
+leaves the rest for the next run. Nothing changes until you decide. Both facts are shown
+as `contested` in `recall` meanwhile, only to a caller that can read the other
+fact. Decide each one from `gbrain trust review --kind contradiction`:
+
+| Action | Command | Effect | Undo |
+|---|---|---|---|
+| supersede | `gbrain decide proposals accept <id>` | The newer fact replaces the older one | `gbrain decide proposals undo <id>` |
+| forget | `gbrain forget <newer-id> --source <src>` | Withdraws the newer fact; the older stays current | none |
+| confirm | `gbrain trust confirm f<newer-id>` (at your terminal) | Marks the newer fact confirmed by you; the proposal stays open | none |
+| drop | `gbrain decide proposals reject <id>` | Not a conflict: both stay current and the pair is not filed again | none needed |
+
+`gbrain trust review --accept-all` never decides a contradiction; it lists each
+one as skipped. All of this reads and writes database rows, so it works the
+same on a brain with no git repository. On a brain with one, page changes go
+through the usual page-write path.
+
 ## Older memory
 
 Content saved before this release is flagged only after you claim your
 sources and run the scan. Older rows have no provenance, so they read as
 "unverified origin". On a long-lived brain that is most rows, including your
-own notes and synced code repositories. gbrain never scans them on its own.
+own notes and synced code repositories. Agents connected over MCP see text
+below "your notes" (including unverified origin) quoted as source material,
+so your own older notes read as quoted until you claim their source. gbrain
+never scans them on its own.
 Doctor, `gbrain post-upgrade` and the behavior-change notice tell you the
 commands to run.
 
@@ -112,7 +197,7 @@ Typing a source's id claims it as your own notes:
 - The source syncs as "your notes" from now on. This is the
   `gbrain sources set-trust` default, set to `operator_curated`.
 - Its rows from before trust tiers move from "unverified origin" to "your
-  notes". A row with a lowering signal keeps the lower tier: MCP and capture
+  notes", so agents connected over MCP no longer see them quoted. A row with a lowering signal keeps the lower tier: MCP and capture
   stamps, imported transcripts, clipped pages, connector stamps, extraction
   and dream provenance, journaled agent writes, and a `trust_tier` marker in
   the frontmatter. Nothing goes above "your notes".
@@ -186,6 +271,77 @@ The marker becomes the page's stored tier (pages at "your notes" or higher
 get no marker), and the page keeps its tier. This runs on the local CLI only.
 Run the preview again to verify: repaired pages no longer show.
 
+## Label lowerings
+
+A privacy label is not content. `gbrain repair visibility` (including
+`--slug <page>` for one page and `--readers <list>` for its `readable_by`) and `gbrain repair private-labels` keep a
+page's tier, file no `lower_page` item, and change only the label lines of its
+file. A `put_page` that adds the same label is an agent edit and lowers the
+page, because a local agent with a shell is indistinguishable from you.
+
+A local agent edit can't make a page more readable on its own. When a write
+below your tier drops or widens a page's `visibility`, `access`,
+`confidentiality` or `readable_by`, gbrain publishes the rest of the edit with
+the page's earlier labels kept, in the database and in the file it commits.
+The write's receipt names the kept keys under `privacy_labels_kept`. The
+page's `lower_page` item in `gbrain trust review` shows what the edit asked
+for, for example `visibility private -> (none)`.
+
+- `gbrain trust confirm tp<id>` applies exactly those labels, if the page
+  hasn't changed since. On a page of yours it also endorses the edit, and the
+  page takes your tier. On a page whose own tier is an agent's (one you set
+  labels on, or an agent's page that kept you as a reader), it changes only the
+  labels and the page keeps the agent's tier, so saying yes to a label change
+  never vouches for the body.
+- `gbrain trust drop tp<id>` keeps the earlier labels.
+- Undoing a confirm puts the earlier labels and the edit's tier back, if the
+  page hasn't changed since the confirm.
+
+Until you decide, the page stays private to remote callers and to members
+who weren't readers; a credential bound to you still reads it. The hold also
+applies after you drop the item, after an earlier agent edit that lowered
+the page, and after an agent deletes the page and writes it again, so a later
+agent write still can't widen the labels. A maintenance job's derived page
+(a dream patterns run rewriting one of your pages) is held the same way, and a
+page with no recorded tier (`unknown`) counts as yours. It doesn't
+apply to a write that only narrows a label, to a write that leaves the labels
+alone, to a writer at or above the page's tier, or to your own edits (a file
+you edit and sync, `gbrain repair visibility`).
+
+Labels you set on an agent's page hold too. `gbrain repair visibility` (and
+its `--readers` setter, and `gbrain repair private-labels`) keeps the page's
+agent tier, but it raises the page's label guard to your tier, so a later agent
+write at the page's tier that drops or widens your labels is held the same way.
+The guard is kept in the database and set only by a label repair run after the
+upgrade, so labels you set earlier, and a managed Git brain rebuilt from a
+clone, start without it. Run the label repair again to set it: on a page that
+already has the labels, `gbrain repair visibility --slug <page>` (for a private
+page) or `--readers <list>` (with the readers the page already names) lists it
+as `... kept, label guard raised` and raises the guard without changing the
+labels or writing the page. `gbrain repair private-labels` raises it only on
+pages it writes. A repair that leaves the page with no privacy label removes the
+guard.
+
+An agent also can't take you out of a page's readers. When a write below your
+tier sets `readable_by` to a list that leaves you, the brain owner, out of a
+page you read now, gbrain publishes the rest of the change with you still in
+the list and records the readers it asked for in the page's `lower_page` item;
+`gbrain trust confirm tp<id>` applies them. An agent narrowing that keeps you
+in the list, your own readers changes, and a brain with
+`access.owner_reads_restricted` on (you read every page anyway) are unaffected.
+
+```bash
+gbrain trust backfill --label-lowerings [--source <id>] [--json]   # read-only
+```
+
+It lists every `lower_page` item and compares the version the lowering
+replaced with the page now: `label_only` when only `visibility`, `access` or
+`confidentiality` and the server's stamps (`trust_tier`, `source_kind`,
+`ingested_via`, `ingested_at`) changed, `content` otherwise, and
+`unreadable` when the replaced version is gone. Counts are grouped by proposer
+(`agent_page_edit:put_page`, `derived_page:submit_job`, ...). It changes no
+tier: raising a page back is your decision in `gbrain trust review`.
+
 ## Scan older memory (only when you agree)
 
 ```bash
@@ -212,7 +368,8 @@ Claim your own sources first, so your notes are not treated as unverified.
 - `trust_scan` warns while older rows at "written by an agent" or below have
   not been scanned. Its fix is yours to run (`tell_user_to_run`).
 - `trust_tiers` reports the tier mix and recommends `gbrain trust backfill`.
-  The backfill classifies older rows from deterministic signals only.
+  It also names how many unverified-origin pages remote MCP readers see
+  quoted. The backfill classifies older rows from deterministic signals only.
 - `trust_release_unpreviewed_fields` warns about facts released from a held
   `## Facts` row before the preview showed that row's fields. Those releases
   confirmed the row's confidence, notability, validity and other cells

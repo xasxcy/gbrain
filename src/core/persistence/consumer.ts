@@ -1,8 +1,11 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
+import { withoutCallerAccess } from '../search/private-visibility.ts';
+import { withEngineScope } from '../engine-scope.ts';
 import type { GBrainConfig } from '../config.ts';
 import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, syncGroup, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues, independentGroup, sweepSegmentStorage, yieldToEventLoop } from './journal.ts';
+import { expireDeferredWrites, overdueDeferredWorkSql } from './refresh-barrier.ts';
 import { connectionCapFailure, finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, transientDatabaseFailure, type PreparedMutation } from './coordinator.ts';
-import { localHostId } from './identity.ts';
+import { hostIdFor } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, holdClaimForPublication, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
@@ -20,6 +23,7 @@ import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
 import { runPersistenceEffects } from './effects.ts';
 import { settleNoopEmbeddingEffects, type NoopSettleCursor } from './embedding-noop-settle.ts';
 import { runCompactionPass } from './compaction-pass.ts';
+import { runMemoryProposalUpkeep } from './memory-proposals.ts';
 import { claimHousekeepingTurn, completeHousekeepingTurn, housekeepingIntervalMs } from './housekeeping-turn.ts';
 import { currentEmbeddingSignature } from '../embedding.ts';
 import { isPersistenceDeclaration, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
@@ -32,7 +36,7 @@ import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 import { maybeRefreshPlannerStats } from '../planner-stats.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { faultPoint } from './fault-points.ts';
-import { EFFECT_OWNER_KEY_SQL, releaseAbandonedClaims } from './effect-journal.ts';
+import { abandonedClaimCutoff, EFFECT_OWNER_KEY_SQL, PROCESS_STARTED_AT, releaseAbandonedClaims } from './effect-journal.ts';
 import { readWriteSwitchSnapshot, writeSwitchOn } from './switches.ts';
 import { consumerConnectionRoute, consumerStatementEngine, poolerExposureLine } from './consumer-lane.ts';
 import { isConnectionLoss } from '../retry-matcher.ts';
@@ -60,8 +64,6 @@ const DRAIN_NOTICE_EVERY_MS = 10_000;
 const CONNECTION_LOSS_RELEASE_MS = 30_000;
 /** #6650: how often a consumer looks for claims held by an owner it can prove dead. */
 export const DEAD_OWNER_SCAN_MS = 5_000;
-/** When this process started; on PGLite no claim written earlier can belong to a live owner. */
-const PROCESS_STARTED_AT = new Date(performance.timeOrigin);
 /** #5801: the phase a connection checkout belongs to, carried through its async chain. */
 const phaseScope = new AsyncLocalStorage<{ observation: PhaseObservation; startedAt: number }>();
 
@@ -277,7 +279,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
        * interval across this host's processes (housekeeping-turn.ts).
        */
       oneShot?: { waiting: () => boolean } } = {}) {
-    this.hostId = opts.hostId ?? localHostId();
+    this.hostId = opts.hostId ?? hostIdFor(engine);
     this.statements = consumerStatementEngine(engine);
   }
   private get checkoutObservable(): ((listener: () => void) => () => void) | undefined {
@@ -313,12 +315,14 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     if (this.timer && ms !== 0 && this.timerDueAt <= Date.now() + ms) return;
     if (this.timer) clearTimeout(this.timer);
     this.timerDueAt = Date.now() + ms;
-    this.timer = setTimeout(() => {
+    // GBRA-218: a wake from inside a request must not run publication, effects or scans under that caller's access record.
+    // Whoever wakes it, the tick runs for this consumer's engine (engine-scope.ts).
+    this.timer = withoutCallerAccess(() => withEngineScope(this.engine, () => setTimeout(() => {
       this.timer = undefined;
       const afterProgress = this.progressWake;
       this.progressWake = false;
       void this.tick(afterProgress).finally(() => { const next = this.nextDelayMs ?? this.pollMs; this.nextDelayMs = undefined; this.schedule(next); });
-    }, ms);
+    }, ms)));
     this.timer.unref?.();
   }
   /**
@@ -408,6 +412,13 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     const cursor = residentProjectionCursor(this.engine);
     const params: unknown[] = [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies, [...this.laneTasks.keys()]];
     const windowCtes = residentWindowCtes(cursor, params, PROJECTION_RETRY_READY_SQL);
+    // #9227: on PGLite, claims an earlier process left behind count until the scan below has released them, so a one-shot
+    // write queued behind such a head clears it at once instead of waiting out its lease (30 s, or 365 s while publishing).
+    const cutoff = this.abandonedReleased || this.opts.oneShot?.waiting() === false ? null : abandonedClaimCutoff(this.engine);
+    if (cutoff) params.push(cutoff.toISOString());
+    const abandoned = cutoff ? `
+      OR EXISTS (SELECT 1 FROM persistence_requests r WHERE r.state='running' AND r.recovery IS NULL AND r.publication_started=false AND r.updated_at<$${params.length}::timestamptz)
+      OR EXISTS (SELECT 1 FROM persistence_effects e WHERE e.state='running' AND e.recovery IS NULL AND e.updated_at<$${params.length}::timestamptz)` : '';
     const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean; projection_work: boolean; projection_last: { source_incarnation: string; slug: string } | null; high_water: string | null }>(this.laneInUse || direct ? undefined : await this.acquireIdleLane(signal), `WITH ${windowCtes},
     pwork AS (SELECT EXISTS (SELECT 1 FROM (SELECT source_incarnation,slug FROM recent UNION ALL SELECT source_incarnation,slug FROM win) j
       CROSS JOIN LATERAL (SELECT s.id FROM sources s WHERE s.incarnation=j.source_incarnation AND NOT s.archived OFFSET 0) s
@@ -440,6 +451,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       OR EXISTS (SELECT 1 FROM persistence_topology_changes c
         JOIN persistence_worktrees w ON w.id=(c.recovery->>'worktreeId')::uuid
         WHERE c.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND NOT (c.id::text=ANY($4::text[])))
+      OR ${overdueDeferredWorkSql('$1')}${abandoned}
     ) AS work`, params, signal));
     // A window holding work stays put, so the tick it wakes reads the same rows.
     advanceProjectionCursor(cursor, row?.projection_work ? null : row?.projection_last, row?.high_water);
@@ -613,6 +625,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
             this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
           // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
           this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(yieldToEventLoop).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
+            .then(yieldToEventLoop).then(() => runMemoryProposalUpkeep(this.engine).catch(error => this.report(error)))
             .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
         }
         return;
@@ -651,6 +664,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       this.publishedSinceMaintenance = 0;
       this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice })
         .then(yieldToEventLoop).then(() => sweepSegmentStorage(this.engine).catch(error => this.report(error)))
+        .then(yieldToEventLoop).then(() => runMemoryProposalUpkeep(this.engine).catch(error => this.report(error)))
         .then(yieldToEventLoop).then(() => vacuumPersistenceQueues(this.engine))
         .then(rows => { this.maintenanceVolume = 50 + Math.ceil(rows * 0.2); }).catch(error => this.report(error))
         .finally(() => { this.maintenanceWorker = undefined; });
@@ -661,7 +675,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       .catch(error => this.report(error)).finally(() => { this.projectionWorker = undefined; });
     // Recover only our owner roots. Kernel exclusion, not elapsed heartbeat,
     // proves that a previous process can no longer be publishing this root.
-    if (scan && this.engine.kind === 'pglite' && !this.abandonedReleased) {
+    if (scan && abandonedClaimCutoff(this.engine) && !this.abandonedReleased) {
       await this.phase('abandoned_claims', () => releaseAbandonedClaims(this.engine, PROCESS_STARTED_AT, this.policy.deadlines));
       this.abandonedReleased = true;
     }
@@ -706,6 +720,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL,
           preparation_attempts=r.preparation_attempts+CASE WHEN $2::boolean THEN ${EXPIRED_PREPARING_CHARGE_SQL('r')} ELSE 0 END
         FROM expired WHERE r.id=expired.id`, [this.hostId, this.policy.deadlines, deadOwners], { signal }));
+      // PR B: a write deferred behind a refresh that outlived the barrier's wait limit ends failed, nothing applied.
+      for (const row of await this.phase('deferred_expiry', signal => expireDeferredWrites(this.engine, this.hostId, signal))) this.settled(row);
     }
     if (this.housekeepingOnly) return;
     if (publicationConcurrency(this.engine) === 0) {
@@ -1217,8 +1233,38 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       } finally { for (const member of rows) this.executing.delete(member.id); }
     } catch (error) {
       if (transientDatabaseFailure(error)) await this.releaseAfterConnectionLoss(claimed);
+      else if (error instanceof OperationError && (error.code === 'recovery_required' || error.code === 'owner_marker_missing')) return this.failRefusedClaims(claimed, error);
       throw error;
     }
+  }
+  /**
+   * #8368: a claimed group refused before it published by a deterministic ownership refusal (the checkout identity check
+   * of the group's worktree lock) is finished the way the single path finishes one request: each member still running
+   * under this claim, unpublished and without a recovery record, ends failed with the refusal's code, which releases its
+   * outstanding-request slot. Left running, every lease lapse re-claimed it into the same refusal, forever. One member
+   * that cannot be finished (its claim moved to another claimant, for one) is logged and left to its claim, and the rest
+   * still end; a connection loss gives the unfinished members back at once and is reported like the group path's.
+   */
+  private async failRefusedClaims(rows: WriteRequest[], error: OperationError): Promise<boolean> {
+    let progressed = false;
+    for (const [index, row] of rows.entries()) {
+      let done: WriteRequest;
+      try {
+        const current = await getWriteRequestById(this.engine, row.id);
+        if (!current || current.state !== 'running' || current.execution_token !== row.execution_token || current.recovery || current.publication_started) continue;
+        done = await finishUnpublishedFailure(this.engine, current, error, 'publication');
+      } catch (failure) {
+        if (transientDatabaseFailure(failure)) {
+          await this.releaseAfterConnectionLoss(rows.slice(index));
+          throw failure;
+        }
+        this.log('publication', failure instanceof OperationError ? failure.code : 'internal', failure instanceof Error ? failure.message : String(failure), '', row);
+        continue;
+      }
+      if (done.state === 'failed') this.log('publication', done.error_code ?? error.code, failureLogText(done), '', row);
+      if (this.settled(done)) progressed = true;
+    }
+    return progressed;
   }
   /**
    * #6712 (convergence mode f): a pass whose database connection died (a pooler restart, a dropped connection) gives

@@ -22,13 +22,13 @@
  *   The subprocess is spawned from a dedicated tmpdir so claude-cli's
  *   CLAUDE.md auto-discovery has no local files to find. `--system-prompt`
  *   replaces the default system prompt; `--disable-slash-commands` skips
- *   skill resolution. User-level ~/.claude/CLAUDE.md still loads because
- *   the only way to skip it is `--bare`, which forces ANTHROPIC_API_KEY
- *   auth and defeats the whole point of this provider. The ~42k cached
- *   tokens from user-level instructions are accepted as a cost-trivial
- *   trade-off on the subscription path. #4119: when those user-level
- *   instructions must NOT leak into a measurement (SkillOpt rollouts),
- *   set GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG — see resolveHermeticConfigDir.
+ *   skill resolution. On a CLI at SETTING_SOURCES_MIN_VERSION or newer,
+ *   `--setting-sources ""` keeps user-level ~/.claude/CLAUDE.md, memory and
+ *   settings out of the child (#8342) without `--bare`, which forces
+ *   ANTHROPIC_API_KEY auth; an older CLI still loads them, and
+ *   GBRAIN_CLAUDE_CLI_USER_SETTINGS=1 loads them again. #4119: to isolate
+ *   the whole config dir (SkillOpt rollouts), set
+ *   GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG — see resolveHermeticConfigDir.
  *
  * doStream is not yet implemented; the model declares no streaming. Callers
  * (gateway.toolLoop primarily) use doGenerate.
@@ -107,7 +107,7 @@ export function resolveHermeticConfigDir(
   return v;
 }
 
-/** Parsed shape of `claude --print --output-format json`. */
+/** Parsed shape of the result event `claude --print` emits. */
 interface ClaudeJsonResult {
   type: 'result';
   subtype: 'success' | string;
@@ -116,8 +116,8 @@ interface ClaudeJsonResult {
   stop_reason: string | null;
   session_id: string;
   num_turns: number;
-  /** HTTP status of the underlying API failure (e.g. 429 on a spend/rate limit). */
-  api_error_status?: number;
+  /** HTTP status of the underlying API failure (e.g. 429 on a spend/rate limit); Claude Code 2.1.305+ sends null when there is none. */
+  api_error_status?: number | null;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -153,18 +153,25 @@ type EnvelopeParse =
   | { ok: false; reason: 'no-result-event' };
 
 /**
- * Unwrap `--output-format json` stdout into the result envelope and the event
- * array it came in. `runClaude` passes `--verbose` (#6791), so the CLI emits
- * [{type:"system",subtype:"init",...}, ..., {type:"result",...}]; the bare
- * result object (events null) is still accepted. The array shape was verified on
- * CLI 2.1.145; that it carries every assistant message, in the 2.1.296 bundle.
+ * Unwrap the CLI's stdout into the result envelope and the event array it came
+ * in. `runClaude` passes `--output-format stream-json --verbose` (#7352,
+ * #6791), so the CLI prints one event per line: {type:"system",...}, the
+ * assistant messages, then {type:"result",...}; verified on CLI 2.0.60 and
+ * 2.1.319. A single JSON document (the `--output-format json` event array, or
+ * a bare result object with events null) is still accepted.
  */
 function parseResultEnvelope(stdout: string): EnvelopeParse {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
   } catch (error) {
-    return { ok: false, reason: 'not-json', error };
+    try {
+      const lines = stdout.split('\n').filter(line => line.trim().length > 0);
+      if (lines.length < 2) return { ok: false, reason: 'not-json', error };
+      parsed = lines.map(line => JSON.parse(line));
+    } catch {
+      return { ok: false, reason: 'not-json', error };
+    }
   }
   const events = Array.isArray(parsed) ? parsed : null;
   if (Array.isArray(parsed)) {
@@ -204,14 +211,15 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
  * prefix only: the trailing advice has already changed wording once, the
  * reported cap may be the default rather than the forwarded one, and the exit
  * code varies by CLI version. A quoted prefix mid-answer, a success envelope,
- * a non-string result or an envelope carrying an API status never match.
+ * a non-string result or an envelope carrying an API status never match. No
+ * status means the key is absent or null (#7273: newer CLIs send null).
  */
 const OUTPUT_CAP_RE = /^API Error: Claude's response exceeded the \d+ output token maximum\b/;
 
 function isOutputCapEnvelope(envelope: ClaudeJsonResult): boolean {
   return envelope.type === 'result'
     && envelope.is_error === true
-    && envelope.api_error_status === undefined
+    && (envelope.api_error_status === undefined || envelope.api_error_status === null)
     && typeof envelope.result === 'string'
     && OUTPUT_CAP_RE.test(envelope.result);
 }
@@ -279,13 +287,15 @@ function buildToolUseInstructions(
 }
 
 /**
- * Render the ai-sdk message array into a single text prompt for `claude --print`
- * stdin. System messages are extracted up-front and concatenated into the
- * `--system-prompt` flag value. Tool calls and tool results are rendered as
+ * Render the ai-sdk message array into one text block per conversation message
+ * for `claude --print` stdin (#7352: the CLI's prompt cache matches at block
+ * boundaries, so a tool loop's next turn reads this turn's cache only when this
+ * turn's blocks are an unchanged prefix of it). System messages are extracted
+ * up-front and concatenated into the `--system-prompt` flag value. Tool calls and tool results are rendered as
  * placeholders so the model sees the conversation in a coherent shape even
  * though the adapter does not natively round-trip tool calls through claude-cli.
  */
-function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; userPrompt: string } {
+function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; userBlocks: string[] } {
   const systemParts: string[] = [];
   const convo: string[] = [];
 
@@ -339,7 +349,7 @@ function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; user
     }
   }
 
-  return { systemText: systemParts.join('\n'), userPrompt: convo.join('\n\n') };
+  return { systemText: systemParts.join('\n'), userBlocks: convo };
 }
 
 /** Oldest claude CLI that accepts every flag `runClaude` passes (probed:
@@ -355,11 +365,36 @@ export function oldClaudeCliMessage(version: string | null): string {
   return `claude CLI ${MIN_CLAUDE_CLI_VERSION} or newer required (found ${version ?? 'an unknown version'}); upgrade Claude Code`;
 }
 
-/** `claude --version`'s version number, or null. Only called after a failed
- * run, so the extra spawn never sits on the success path. */
-function claudeCliVersion(env: NodeJS.ProcessEnv): string | null {
-  const r = spawnSync(claudeBin(), ['--version'], { encoding: 'utf8', timeout: 5_000, env });
-  return /\d+\.\d+\.\d+/.exec(typeof r.stdout === 'string' ? r.stdout : '')?.[0] ?? null;
+/** `claude --version`'s version number, or null, run like a real call (clean
+ * cwd, scrubbed env) and killed outright after 5 s. */
+function claudeCliVersion(env: NodeJS.ProcessEnv): { version: string | null; settled: boolean } {
+  const r = spawnSync(claudeBin(), ['--version'], { encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL', cwd: ensureCleanCwd(), env });
+  const version = /\d+\.\d+\.\d+/.exec(typeof r.stdout === 'string' ? r.stdout : '')?.[0] ?? null;
+  return { version, settled: version !== null || r.status === 0 || r.signal !== null };
+}
+
+/** Oldest claude CLI that gets `--setting-sources ""` (#8342): 2.1.314 fixed
+ * an excluded settings file still supplying some settings. Older CLIs keep
+ * the argv above. */
+export const SETTING_SOURCES_MIN_VERSION = '2.1.314';
+
+const settingSourcesByBin = new Map<string, boolean>();
+
+/** Whether the configured CLI is SETTING_SOURCES_MIN_VERSION or newer: one
+ * `claude --version` per binary per process, false when it cannot be read.
+ * A probe that failed to start or exited non-zero is not remembered, so the
+ * next call probes again; one that hung to the 5 s kill is, so a stuck CLI
+ * costs that wait once. */
+function takesNoSettingSources(env: NodeJS.ProcessEnv): boolean {
+  const bin = claudeBin();
+  const known = settingSourcesByBin.get(bin);
+  if (known !== undefined) return known;
+  const { version, settled } = claudeCliVersion(env);
+  const found = version?.split('.').map(Number);
+  const min = SETTING_SOURCES_MIN_VERSION.split('.').map(Number);
+  const takes = !!found && (found[0]! - min[0]! || found[1]! - min[1]! || found[2]! - min[2]!) >= 0;
+  if (settled) settingSourcesByBin.set(bin, takes);
+  return takes;
 }
 
 /**
@@ -376,12 +411,12 @@ export function thinkingDisabledBelowFloor(maxOutputTokens: number | undefined):
 
 /**
  * Spawn `claude --print` with the contamination-suppression flags and return
- * the parsed `--output-format json` envelope. Aborts propagate to SIGTERM on
+ * the parsed result envelope. Aborts propagate to SIGTERM on
  * the child.
  */
 function runClaude(
   systemPrompt: string,
-  userPrompt: string,
+  userBlocks: string[],
   model: string,
   signal?: AbortSignal,
   maxOutputTokens?: number,
@@ -398,10 +433,13 @@ function runClaude(
       : '{"disableAllHooks":true}';
     const args = [
       '--print',
-      // #6791: --verbose turns the json output into the session's event
-      // array, the only record of the segments before an automatic
-      // continuation (the envelope's result holds the last one).
-      '--output-format', 'json', '--verbose',
+      // #7352: one user message whose content blocks are the conversation's
+      // messages, read as stream-json; the CLI then answers in stream-json.
+      // #6791: --verbose keeps the session's events in that output, the only
+      // record of the segments before an automatic continuation (the
+      // envelope's result holds the last one).
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json', '--verbose',
       '--model', model,
       '--disable-slash-commands',
       // Agent isolation: this subprocess must behave like a raw LLM, not a
@@ -452,6 +490,11 @@ function runClaude(
     if (hermeticConfigDir) env.CLAUDE_CONFIG_DIR = hermeticConfigDir;
     if (outputCap) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = outputCap;
     if (thinkingOff) env.MAX_THINKING_TOKENS = '0';
+    // #8342: load no settings source, so the user's own ~/.claude/CLAUDE.md,
+    // memory and settings.json never steer this call. Unlike --bare this
+    // keeps the subscription login. GBRAIN_CLAUDE_CLI_USER_SETTINGS=1 opts
+    // back in (no flag, no version probe).
+    if (process.env.GBRAIN_CLAUDE_CLI_USER_SETTINGS !== '1' && takesNoSettingSources(env)) args.push('--setting-sources', '');
     const child = spawn(claudeBin(), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: ensureCleanCwd(),
@@ -505,7 +548,7 @@ function runClaude(
         // regexes only scan text before the marker (an auth-looking essay in
         // stdout must never read as a whole-run auth outage).
         const headline = isUnknownOptionError(stderr)
-          ? oldClaudeCliMessage(claudeCliVersion(env))
+          ? oldClaudeCliMessage(claudeCliVersion(env).version)
           : `claude-cli exited ${code}`;
         reject(new ClaudeCliProcessError(
           `${headline}\n--- raw ---\n${stderr.trim() || stdout.trim()}`,
@@ -542,7 +585,7 @@ function runClaude(
     // error itself is safe to swallow.
     child.stdin.on('error', () => { /* surfaced via child 'error'/'close' */ });
     try {
-      child.stdin.write(userPrompt);
+      child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: userBlocks.map(text => ({ type: 'text', text: text.toWellFormed() })) } }) + '\n');
       child.stdin.end();
     } catch (e) {
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -590,6 +633,9 @@ function resolveEntryInput(e: Record<string, unknown>): unknown {
   return flat;
 }
 
+/** The model's native tool-call elements, which this protocol never asks for and never dispatches. */
+const NATIVE_TOOL_MARKUP = /<(?:antml:)?(?:invoke\s+name=|function_calls>)/;
+
 /**
  * Locate and parse the `<use_tools>...</use_tools>` block in the assistant's
  * raw text response. Returns the parsed tool calls plus whatever prose
@@ -601,6 +647,8 @@ function extractToolCalls(raw: string): {
   toolCalls: ParsedToolCall[];
   beforeText: string;
   afterText: string;
+  /** No block parsed, but the reply holds the model's native tool-call markup (#9085). */
+  nativeMarkup?: boolean;
 } {
   const openTag = '<use_tools>';
   const closeTag = '</use_tools>';
@@ -649,7 +697,7 @@ function extractToolCalls(raw: string): {
     if (firstError !== null) {
       process.stderr.write(`[claude-cli] <use_tools> block failed to parse — tool call discarded: ${firstError}\n`);
     }
-    return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
+    return { toolCalls: [], beforeText: raw.trim(), afterText: '', nativeMarkup: NATIVE_TOOL_MARKUP.test(raw.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '')) };
   }
 
   const beforeText = raw.slice(0, openIdx).trim();
@@ -728,11 +776,11 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
     providerMetadata?: SharedV2ProviderMetadata;
     warnings: never[];
   }> {
-    const { systemText, userPrompt } = renderPrompt(options.prompt);
+    const { systemText, userBlocks } = renderPrompt(options.prompt);
     const toolInstructions = buildToolUseInstructions(options.tools);
     const systemPrompt = [systemText, toolInstructions].filter(s => s.length > 0).join('\n');
 
-    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal, options.maxOutputTokens);
+    const result = await runClaude(systemPrompt, userBlocks, this.modelId, options.abortSignal, options.maxOutputTokens);
     // The CLI reports Anthropic's separate buckets; LanguageModelV2Usage wants
     // the TOTAL input with the cache read as a subset (what every SDK provider
     // reports), so the gateway prices cache tokens once. Cache creation has no
@@ -765,7 +813,13 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
         warnings: [],
       };
     }
-    const { toolCalls, beforeText, afterText } = extractToolCalls(answer.text);
+    const { toolCalls, beforeText, afterText, nativeMarkup } = extractToolCalls(answer.text);
+    // #9085: a turn that called tools in the model's native markup is not a clean answer; read as prose it ends the
+    // loop with no writes. Fail the turn (a transient error, so the job's attempt limit bounds the retries).
+    if (nativeMarkup && options.tools?.length) {
+      process.stderr.write('[claude-cli] reply carried tool-call markup with no parsable <use_tools> block — turn failed for retry\n');
+      throw new Error('claude-cli reply carried tool-call markup with no parsable <use_tools> block; the tool calls were not run');
+    }
 
     const content: LanguageModelV2Content[] = [];
     if (beforeText) content.push({ type: 'text', text: beforeText });

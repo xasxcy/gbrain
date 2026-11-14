@@ -18,6 +18,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { readPrimaryEmbeddingStores, readStoredEmbeddingIdentity } from '../core/stored-embedding-identity.ts';
 import { deferInitJsonError, flushInitJsonResult, initJsonError, setInitJsonResult, writeDeferredInitJsonError } from './init-json.ts';
 import { deferredEmbeddingHint, firstRunBundle, firstRunJson, harnessRegistrationCommand } from './init-first-run.ts';
+import { keptEmbeddingIdentity, keptEmbeddingNotice } from './init-embedding-plane.ts';
 import { writeCliNotices } from '../core/interop-notices.ts';
 import { exitCodeForCode } from '../core/error-catalogue.ts';
 import { promptLineStderr } from '../core/interaction.ts';
@@ -311,6 +312,8 @@ export interface ResolvedAIOptions {
   chat_model?: string;
   /** v0.37 (D9): user opted into deferred embedding setup. */
   noEmbedding?: boolean;
+  /** GBRA-248: noEmbedding came from the no-provider-key fallback, not a choice (init-embedding-plane.ts). */
+  implicitKeyless?: boolean;
 }
 
 /**
@@ -739,7 +742,7 @@ async function resolveEmbeddingByEnv(out: ResolvedAIOptions, nonInteractive: boo
     }
     if (!isTTY) {
       printKeylessContinueNotice();
-      out.noEmbedding = true;
+      out.noEmbedding = out.implicitKeyless = true;
       return;
     }
     // TTY → picker (local providers like ollama may be selectable); a null
@@ -748,7 +751,7 @@ async function resolveEmbeddingByEnv(out: ResolvedAIOptions, nonInteractive: boo
     const picked = await pickProvider({ touchpoint: 'embedding', env: effectiveEnv, isTTY: true });
     if (!picked) {
       printKeylessContinueNotice();
-      out.noEmbedding = true;
+      out.noEmbedding = out.implicitKeyless = true;
       return;
     }
     out.embedding_model = picked.fullModel;
@@ -858,7 +861,7 @@ async function initMigrateOnly(opts: { jsonOutput: boolean }) {
     }
   } catch (e) {
     // Preserve the CLI's shared retryable busy envelope for migration callers.
-    if (e instanceof PgliteBusyError) throw e;
+    if (e instanceof PgliteBusyError || (e as { code?: unknown }).code === 'client_behind') throw e;
     const isNoConfig = e instanceof MigrateOnlyError && e.message.startsWith('No brain configured');
     const msg = e instanceof Error ? e.message : String(e);
     if (opts.jsonOutput) process.exit(initJsonError({ status: 'error', reason: isNoConfig ? 'no_config' : 'migrate_failed', message: msg },
@@ -1098,7 +1101,7 @@ export async function initPGLite(opts: {
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
     // D9 deferred-setup mode: skip preflight, no model/dim resolved.
-    console.log(deferredEmbeddingHint({ engine: 'pglite', database_path: dbPath, embedding_disabled: true }));
+    if (!opts.aiOpts.implicitKeyless) console.log(deferredEmbeddingHint({ engine: 'pglite', database_path: dbPath, embedding_disabled: true }));
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({
@@ -1143,9 +1146,11 @@ export async function initPGLite(opts: {
     await engine.connect({ database_path: dbPath, engine: 'pglite' });
     const freshContentDatabase = await isNewContentDatabase(engine);
     await assertInitEmbeddingIdentity(engine, resolvedModel);
+    const kept = await keptEmbeddingIdentity(engine, opts.aiOpts, freshContentDatabase);
+    if (opts.aiOpts?.implicitKeyless) console.log(kept ? keptEmbeddingNotice(kept) : deferredEmbeddingHint({ engine: 'pglite', database_path: dbPath, embedding_disabled: true }));
     configureGateway({
-      embedding_model: resolvedModel ?? opts.aiOpts?.embedding_model,
-      embedding_dimensions: resolvedDim ?? opts.aiOpts?.embedding_dimensions ??
+      embedding_model: resolvedModel ?? kept?.model ?? opts.aiOpts?.embedding_model,
+      embedding_dimensions: resolvedDim ?? kept?.dimensions ?? opts.aiOpts?.embedding_dimensions ??
         (opts.aiOpts?.noEmbedding ? newInstallDims : undefined),
       expansion_model: opts.aiOpts?.expansion_model,
       chat_model: opts.aiOpts?.chat_model,
@@ -1212,7 +1217,7 @@ export async function initPGLite(opts: {
       database_path: dbPath,
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
       ...(opts.aiOpts?.noEmbedding
-        ? { embedding_disabled: true }
+        ? kept ? { embedding_model: kept.model, embedding_dimensions: kept.dimensions } : { embedding_disabled: true }
         : (resolvedModel && resolvedDim)
           ? { embedding_model: resolvedModel, embedding_dimensions: resolvedDim }
           : {}),
@@ -1240,7 +1245,7 @@ export async function initPGLite(opts: {
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
     // MEMORY_VERBS v1 [D6C]: TTHW stamp — `gbrain protocol stats` derives
     // install→first-verb-call from this. Idempotent on re-init.
     config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
@@ -1305,7 +1310,7 @@ export async function initPGLite(opts: {
       writeCliNotices(await firstRunBundle(engine, searchMode, registrationSurface));
 
       // The single primary action, last-on-screen.
-      printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0, onPglite: true });
+      printMemoryVerbsQuickstart({ emptyBrain: stats.page_count === 0, onPglite: true, keyless: config.embedding_disabled === true });
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
@@ -1325,7 +1330,7 @@ const INIT_EMBEDDING_HINT = 'Pick an embedding model whose dimensions match (`gb
  */
 let registrationSurface: McpSurface | undefined;
 let searchModeChoice: import('./init-mode-picker.ts').SearchModeChoice = {};
-function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean } = {}): void {
+function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boolean; keyless?: boolean } = {}): void {
   const register = harnessRegistrationCommand(registrationSurface);
   console.log('');
   console.log(`→ Do this next — give your agent memory (copy these ${register ? 'three' : 'two'} commands):`);
@@ -1343,7 +1348,7 @@ function printMemoryVerbsQuickstart(opts: { emptyBrain?: boolean; onPglite?: boo
   console.log('');
   console.log(
     'More: ' +
-      (opts.emptyBrain ? 'bulk-load notes `gbrain import <dir>` · ' : '') +
+      (opts.emptyBrain ? `bulk-load notes \`gbrain import <dir>${opts.keyless ? ' --no-embed' : ''}\` · ` : '') +
       (opts.onPglite ? 'scale up `gbrain migrate --to postgres --plan` · ' : '') +
       'health `gbrain doctor`',
   );
@@ -1396,7 +1401,7 @@ export async function initPostgresCore(opts: {
   let resolvedDim: number | undefined;
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
-    console.log(deferredEmbeddingHint({ engine: 'postgres', database_url: databaseUrl, embedding_disabled: true }));
+    if (!opts.aiOpts.implicitKeyless) console.log(deferredEmbeddingHint({ engine: 'postgres', database_url: databaseUrl, embedding_disabled: true }));
   } else if (opts.aiOpts?.embedding_model) {
     const { resolveSchemaEmbeddingDim } = await import('../core/embedding-dim-check.ts');
     const pre = resolveSchemaEmbeddingDim({
@@ -1455,9 +1460,11 @@ export async function initPostgresCore(opts: {
 
     const freshContentDatabase = await isNewContentDatabase(engine);
     await assertInitEmbeddingIdentity(engine, resolvedModel);
+    const kept = await keptEmbeddingIdentity(engine, opts.aiOpts, freshContentDatabase);
+    if (opts.aiOpts?.implicitKeyless) console.log(kept ? keptEmbeddingNotice(kept) : deferredEmbeddingHint({ engine: 'postgres', database_url: databaseUrl, embedding_disabled: true }));
     configureGateway({
-      embedding_model: resolvedModel ?? opts.aiOpts?.embedding_model,
-      embedding_dimensions: resolvedDim ?? opts.aiOpts?.embedding_dimensions ??
+      embedding_model: resolvedModel ?? kept?.model ?? opts.aiOpts?.embedding_model,
+      embedding_dimensions: resolvedDim ?? kept?.dimensions ?? opts.aiOpts?.embedding_dimensions ??
         (opts.aiOpts?.noEmbedding ? newInstallDims : undefined),
       expansion_model: opts.aiOpts?.expansion_model,
       chat_model: opts.aiOpts?.chat_model,
@@ -1555,7 +1562,7 @@ export async function initPostgresCore(opts: {
       database_path: undefined, // clear any stale PGLite path
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
       ...(opts.aiOpts?.noEmbedding
-        ? { embedding_disabled: true }
+        ? kept ? { embedding_model: kept.model, embedding_dimensions: kept.dimensions } : { embedding_disabled: true }
         : (resolvedModel && resolvedDim)
           ? { embedding_model: resolvedModel, embedding_dimensions: resolvedDim }
           : {}),
@@ -1580,7 +1587,7 @@ export async function initPostgresCore(opts: {
     // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
     // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
     // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
-    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(freshContentDatabase && !existingFile.engine ? { channel: 'stable' as const } : {}), ...(config.self_upgrade ?? {}) };
     // MEMORY_VERBS v1 [D6C]: TTHW stamp (see the PGLite path).
     config.protocol_installed_at = config.protocol_installed_at ?? new Date().toISOString();
     preserveConversionConfig(false);
@@ -1687,7 +1694,7 @@ async function supabaseWizard(): Promise<string> {
   }
 
   console.log('\nEnter your Supabase/Postgres connection URL:');
-  console.log('  Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres'); /* allow-pg-url-literal */
+  console.log('  Format: postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres?sslmode=require'); /* allow-pg-url-literal */
   console.log('  Find it: Supabase Dashboard > Connect (top bar) > Connection String > Transaction pooler\n');
 
   const url = (await promptLineStderr('Connection URL: ')) ?? '';
@@ -1861,7 +1868,7 @@ OPTIONS
                         Default subagent driver (v0.27+)
   --no-embedding        Defer embedding setup (skips the embedding-key check)
   --surface <verbs|starter|full>  Tool surface the printed harness registration pins, listed in full
-                                  (default: full, listing the memory verbs and request_tools)
+                                  (default: starter, listing the memory verbs and request_tools)
   --search-mode <conservative|balanced|tokenmax>  Record the operator's search mode (no first-run ask; an existing brain's mode needs --force)
   --skip-embed-check    Skip the init-time embedding-key validation (config +
                         live test-embed). Also via GBRAIN_INIT_SKIP_EMBED_CHECK=1

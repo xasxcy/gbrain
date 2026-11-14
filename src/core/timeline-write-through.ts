@@ -67,7 +67,7 @@ import {
   type PushLogOutcome,
 } from './brain-repo-durability.ts';
 import { extractTimelineFromContent } from './timeline-extract.ts';
-import { urlCloneReadOnly } from './url-clone.ts';
+import { readOnlyCheckout } from './persistence/mirror-read-only.ts';
 
 /** Raw op params for one manual timeline entry (date pre-validated by caller). */
 export interface TimelineEntryWriteInput {
@@ -107,6 +107,7 @@ export interface TimelineWriteThroughOutcome {
   /** Why the FS-canonical path didn't apply (when handled=false). */
   skipped?:
     | 'disabled_by_config'
+    | 'mirror_read_only'
     | 'url_clone'
     | 'no_repo_configured'
     | 'repo_not_found'
@@ -248,6 +249,8 @@ export function spliceTimelineIntoFileText(fileText: string, date: string, block
     if (m) bullets.push({ index: i, date: m[1] });
   }
 
+  // #7738: a body that ends with an empty sentinel gets the same headed section spliceTimelineBlock('') writes.
+  if (lines.slice(sentinel + 1).every(line => !line.trim())) return `${lines.slice(0, sentinel + 1).join('\n')}\n\n## Timeline\n\n${block}\n`;
   let insertAt: number;
   if (bullets.length === 0) {
     // Empty timeline section (possibly followed by other sections): insert
@@ -311,9 +314,8 @@ export async function writeTimelineEntryThrough(
     if (await isWriteThroughDisabled(engine)) {
       return { handled: false, skipped: 'disabled_by_config' };
     }
-    if (await urlCloneReadOnly(engine, sourceId)) {
-      return { handled: false, skipped: 'url_clone' };
-    }
+    const readOnly = await readOnlyCheckout(engine, sourceId);
+    if (readOnly) return { handled: false, skipped: readOnly };
     const target = await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) {
       return { handled: false, skipped: target.skipped };

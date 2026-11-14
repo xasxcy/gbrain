@@ -418,8 +418,8 @@ put_pages with one request_id per batch and wait_ms 25000."*
   immediately and by meaning once its embedding effect finishes.
 - **Request size.** HTTP carries less than the 24 MiB page ceiling:
   `gbrain serve --http` reads at most 4 MiB per request (the MCP SDK
-  default), and the simpler HTTP transport caps a request at
-  `GBRAIN_HTTP_MAX_BODY_BYTES`. A batch goes in smaller `put_pages` calls; a
+  default) and the simpler HTTP transport 1 MiB; `GBRAIN_HTTP_MAX_BODY_BYTES`
+  sets either cap. A batch goes in smaller `put_pages` calls; a
   page over the transport limit goes by file on the brain host (sync,
   `gbrain import` or `gbrain put`), never split by hand. Every limit is in
   [limits per entry point](memory-boundaries.md#large-page-limits).
@@ -515,6 +515,12 @@ dedupe off) in the serve wrapper's environment.
   client on the host when it should stop. Self-service registration stays
   off unless you pass `--enable-dcr`, and even then every new connection waits
   for your approval in the admin dashboard.
+- **Remote `think` runs your think model.** Every `think` answer is a paid
+  call on the host's key, so a connected client's `model` is used only when it
+  is your think model (`models.think`) or you allow it with
+  `gbrain config set think.remote_models <model>,<model>`. Any other model
+  answers on your think model, with a `model_override_ignored` notice instead
+  of an error.
 - **Loopback bind.** The server keeps `127.0.0.1`; never pass
   `--bind 0.0.0.0` for this shape. Tailscale is the only way in.
 - **No secrets in chat or config.** The admin token lives in a 0600 file the

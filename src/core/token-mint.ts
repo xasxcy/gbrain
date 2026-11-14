@@ -21,7 +21,7 @@ import { ALLOWED_SCOPES_LIST, assertAllowedScopes } from './scope.ts';
 import type { SqlQuery } from './sql-query.ts';
 import { opError } from './ops/contract.ts';
 import { generateToken, hashToken, isUndefinedColumnError } from './utils.ts';
-import { permissionsMirror, tokenGrantColumnValues, tokenGrantFromPermissions, TOKEN_GRANT_COLUMNS, type GrantSources, type PrincipalGrant } from './grants/model.ts';
+import { permissionsMirror, privatePagesFromColumn, tokenGrantColumnValues, tokenGrantFromPermissions, TOKEN_GRANT_COLUMNS, type GrantSources, type PrincipalGrant, type PrivatePagesGrant } from './grants/model.ts';
 
 /** Canonical token-id shape — shared with the `auth revoke --id` CLI gate. */
 export const TOKEN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -50,6 +50,8 @@ export interface MintedLegacyToken {
   scopes: string[];
   /** Rotation only: operations this run would grant that the carried snapshot withheld. */
   withheldOperations?: string[];
+  /** Rotation only (#8104): the replaced token's private-pages grant, which a rotation never carries. */
+  uncarriedPrivatePages?: Exclude<PrivatePagesGrant, 'none'>;
 }
 
 /**
@@ -103,13 +105,21 @@ export async function insertUnifiedToken(engine: BrainEngine, opts: {
   grant: Pick<PrincipalGrant, 'sources' | 'allowedOperations' | 'takesHolders'>;
 }): Promise<Array<{ id: string }>> {
   const scopes = opts.scopes === undefined ? null : `{${opts.scopes.join(',')}}`;
+  const { assertScopeSourceGrant, sourcesOf } = await import('./access/attest-sources.ts');
+  const reads = sourcesOf(opts.grant.sources).reads;
+  const insert = (db: BrainEngine) => db.executeRaw<{ id: string }>(
+    `INSERT INTO access_tokens (name, token_hash, scopes, permissions, ${TOKEN_GRANT_COLUMNS.join(', ')}, grant_revision)
+     VALUES ($1, $2, $3::text[], $4::jsonb, $5, $6, $7::text[], $8::text[], $9::text[], 1)
+     RETURNING id`,
+    [opts.name, opts.tokenHash, scopes, permissionsMirror(opts.grant, {}), ...tokenGrantColumnValues(opts.grant)],
+  );
   try {
-    return await engine.executeRaw<{ id: string }>(
-      `INSERT INTO access_tokens (name, token_hash, scopes, permissions, ${TOKEN_GRANT_COLUMNS.join(', ')}, grant_revision)
-       VALUES ($1, $2, $3::text[], $4::jsonb, $5, $6, $7::text[], $8::text[], $9::text[], 1)
-       RETURNING id`,
-      [opts.name, opts.tokenHash, scopes, permissionsMirror(opts.grant, {}), ...tokenGrantColumnValues(opts.grant)],
-    );
+    // GST-1113: a grant reading a named source checks it and inserts in one transaction, under the source row locks.
+    if (!reads.some(s => s !== 'default')) return await insert(engine);
+    return await engine.transaction(async tx => {
+      await assertScopeSourceGrant(tx, null, reads);
+      return insert(tx);
+    });
   } catch (e) {
     // isUndefinedColumnError also matches message-shaped variants: some
     // driver-wrapped errors drop the SQLSTATE code.
@@ -175,6 +185,27 @@ export function carryLegacyGrant(priorRaw: unknown, fresh: {
   ])].sort();
   return { takesHolders, sourceGrant, allowedOperations,
     withheldOperations: fresh.allowedOperations.filter(op => !allowedOperations.includes(op)) };
+}
+
+/**
+ * #8104: an active token's private-pages grant. Rotation does not carry it (the replacement starts at `none`), so the
+ * harness names the rescope that grants it again. `none` when the token is gone or the brain predates the column.
+ */
+export async function readActiveTokenPrivatePages(engine: BrainEngine, id: string): Promise<PrivatePagesGrant> {
+  if (!TOKEN_ID_RE.test(id)) return 'none';
+  try {
+    const [row] = await engine.executeRaw<{ private_pages: unknown }>(
+      'SELECT private_pages FROM access_tokens WHERE id = $1::uuid AND revoked_at IS NULL', [id]);
+    return privatePagesFromColumn(row?.private_pages);
+  } catch (e) {
+    if (isUndefinedColumnError(e, 'private_pages')) return 'none';
+    throw e;
+  }
+}
+
+/** #8104: the note a rotation prints beside the withheld-operations note when the replaced token had a private-pages grant. */
+export function uncarriedPrivatePagesNote(name: string, mode: Exclude<PrivatePagesGrant, 'none'>): string {
+  return `token ${name}: private-pages grant not carried; run \`gbrain auth rescope --token ${name} --private-pages ${mode.replace('_', '-')}\` to grant it again.`;
 }
 
 /** The stored grant of an active token, or undefined when it is gone or revoked. */

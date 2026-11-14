@@ -13,7 +13,7 @@ import { assertNoUnreviewedJobs, authorizeJobExecution, withSubmissionAuthority 
  */
 
 import { existsSync } from 'fs';
-import { autopilotOperatorPauseMarkerPath, autopilotPausedMarkerPath } from '../autopilot-paths.ts';
+import { autopilotOperatorPauseMarkerPath, autopilotPaused, autopilotPausedMarkerPath } from '../autopilot-paths.ts';
 import type { BrainEngine } from '../engine.ts';
 import type {
   MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts,
@@ -64,6 +64,9 @@ import { isRetryableConnError } from '../retry-matcher.ts';
 import { reconnectAfterConnectionError as reconnectEngineAfterConnError } from './reconnect.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 
+/** GST-2529: how often the worker asks whether a watchdog-marked job is past its wait (never less often than the wait itself). */
+const SUSPECT_PROBE_EVERY_MS = 5_000;
+
 /**
  * Abort reasons that signal infrastructure failure (PgBouncer outage,
  * connection drop, lock reclaimed by another worker) — NOT a job
@@ -94,6 +97,8 @@ import { DEFAULT_LONG_JOB_NAMES, DEFAULT_SHORT_JOB_RESERVED_SLOTS, claimExclusio
 import { jobRefusal, refusedJobResult } from './refusal.ts';
 import { readFileSync } from 'fs';
 import { parseRssFromProcStatus } from './proc-rss.ts';
+import { withEngineScope } from '../engine-scope.ts';
+import { startWakeDrain } from '../wakeshift/drain.ts';
 
 export { parseRssFromProcStatus };
 
@@ -200,9 +205,13 @@ export class MinionWorker extends EventEmitter {
   private pausedByMarkerAnnounced = false;
   /** The idle poll wait a sync-queue wake ends early (minions/idle-wait.ts). */
   readonly idleWaiter = new IdleWaiter();
+  private wakeDrain: { stop(): void } | null = null;
   private inFlight = new Map<number, InFlightJob>();
   private executions = new Map<string, OwnedExecution>();
   private pendingClaim: { lockToken: string; promise: Promise<MinionJob | null> } | null = null;
+  /** GST-2529: when the next overdue watchdog-suspect probe is due, and whether the last one found such a job. */
+  private suspectProbeDueAt = 0;
+  private suspectOverdue = false;
   private _configurationError: LocalConfigurationError | null = null;
   private configurationDeadline = 0;
   private configurationDrainFinished = false;
@@ -312,6 +321,7 @@ export class MinionWorker extends EventEmitter {
       childTiniPath: opts?.childTiniPath ?? '',
       longJobNames: opts?.longJobNames ?? DEFAULT_LONG_JOB_NAMES,
       shortJobReservedSlots: opts?.shortJobReservedSlots ?? DEFAULT_SHORT_JOB_RESERVED_SLOTS,
+      watchdogSuspectWaitMs: opts?.watchdogSuspectWaitMs ?? 60_000,
       onJobSettled: opts?.onJobSettled ?? (() => {}),
     };
     // Process isolation contract: 'process' without a resolved child CLI
@@ -376,6 +386,14 @@ export class MinionWorker extends EventEmitter {
 
   get configurationReleaseResults(): readonly ConfigurationReleaseResult[] {
     return this._configurationReleaseResults;
+  }
+
+  /** GST-2529: at most every min(wait, 5 s), ask whether a marked job is past its wait; a failed probe errs toward the drain. */
+  private async probeOverdueSuspect(): Promise<void> {
+    if (Date.now() < this.suspectProbeDueAt) return;
+    this.suspectProbeDueAt = Date.now() + Math.min(this.opts.watchdogSuspectWaitMs, SUSPECT_PROBE_EVERY_MS);
+    this.suspectOverdue = await this.queue.hasOverdueWatchdogSuspect(this.opts.queue, this.registeredNames, this.opts.watchdogSuspectWaitMs)
+      .catch(() => true);
   }
 
   private probeDatabase(): Promise<DbProbeResult> {
@@ -526,6 +544,7 @@ export class MinionWorker extends EventEmitter {
     // run; stop() disables it so embedding hosts / test suites that cycle
     // start()/stop() don't leak a ~50Hz native sampling timer per instance.
     try { this.eldHistogram?.enable(); } catch { /* fail-open */ }
+    this.wakeDrain ??= startWakeDrain(this.engine); // Wakeshift: the 5 s wake drainer (wakeshift/drain.ts), a no-op tick while off
 
     // Graceful shutdown. Fires shutdownAbort so handlers subscribed to
     // `ctx.shutdownSignal` (currently: shell handler) can run their own cleanup
@@ -709,7 +728,7 @@ export class MinionWorker extends EventEmitter {
           // detector too would double-act (and both emitting 'unhealthy' +
           // supervisor SIGTERM race). Bare `gbrain jobs work` keeps it.
           if (!isSupervisedChild) {
-          if (this.jobsCompleted > lastKnownCompleted) {
+          if (this.jobsCompleted > lastKnownCompleted || autopilotPaused()) { // #7966: a pause holds claims, so its ticks restart the clock
             lastKnownCompleted = this.jobsCompleted;
             lastCompletionTime = Date.now();
             stallWarningSince = null;
@@ -806,6 +825,7 @@ export class MinionWorker extends EventEmitter {
           }
         }
 
+        await this.probeOverdueSuspect();
         if (!this.running) break;
 
         // Claim jobs up to concurrency limit — unless the system-wide pause
@@ -836,7 +856,7 @@ export class MinionWorker extends EventEmitter {
               this.opts.lockDuration,
               this.opts.queue,
               this.registeredNames,
-              { excludeWatchdogSuspects: this.inFlight.size > 0, excludeNames: claimExclusions(this.opts, [...this.inFlight.values()].map(f => f.job.name)) },
+              { excludeWatchdogSuspects: this.inFlight.size > 0, suspectWaitMs: this.suspectOverdue ? this.opts.watchdogSuspectWaitMs : undefined, excludeNames: claimExclusions(this.opts, [...this.inFlight.values()].map(f => f.job.name)) },
             ).then(claimed => {
               if (claimed) {
                 this.executions.set(lockToken, { job: claimed, lockToken, stopped: true });
@@ -1009,7 +1029,7 @@ export class MinionWorker extends EventEmitter {
           await this.engine.executeRaw(
             `UPDATE minion_jobs
              SET status = 'cancelled', error_text = 'skipped_quiet_hours', updated_at = now()
-             WHERE id = $1 AND status NOT IN ('completed','failed','dead')`,
+             WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')`,
             [job.id],
           );
         }
@@ -1044,6 +1064,7 @@ export class MinionWorker extends EventEmitter {
   stop(): void {
     this.running = false;
     this.idleWaiter.wake('stop');
+    this.wakeDrain?.stop(); this.wakeDrain = null;
     try { this.eldHistogram?.disable(); } catch { /* fail-open */ }
   }
 
@@ -1535,7 +1556,7 @@ export class MinionWorker extends EventEmitter {
           })
         // #4218: attribute every gateway.chat() the handler makes to this
         // job so chat_usage_log rows carry `phase = 'job:<name>'`.
-        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => runWithJobSpend(this.engine, job, context as MinionJobContext, handler)), abort.signal);
+        : await withEngineScope(this.engine, () => withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => runWithJobSpend(this.engine, job, context as MinionJobContext, handler)), abort.signal));
 
       // The child spawned and ran — the spawn path is healthy again.
       this._consecutiveChildSpawnFailures = 0;

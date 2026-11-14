@@ -21,6 +21,8 @@
  *  - keep the token where the handler on this path reads the `=` form
  *    (EQUALS_READERS, keyed by command or `command sub`), empty values
  *    included: that handler owns refusing them;
+ *  - on a path that reads no value flag (NO_VALUE_FLAG_PATHS), refuse a
+ *    value flag with advice to leave it out;
  *  - elsewhere, refuse an empty value or one that looks like a flag (`-y`, `--x`);
  *  - split `--flag value` when the command's own table declares a value;
  *  - refuse every other `=` form with the separate-token spelling. Splitting
@@ -76,6 +78,8 @@ export const EQUALS_READERS: Readonly<Record<string, readonly string[]>> = {
   'beliefs replay-purges': ['--archived-at', '--purge-mirror', '--from-url-env'],
   // core/consent.ts:126 via consentGateOrExit (book-mirror.ts:431, args :440, effects paid); book-mirror reads no --max-* itself.
   'book-mirror': ['--max-usd', '--max-cost'],
+  // cli/commands/bundled-skill.ts:51 reads --asset <p> and --asset=<p>, and refuses an empty value itself.
+  'bundled-skill': ['--asset'],
   // capture.ts:96 regex; every other = form is refused by capture's own parser (capture.ts:132).
   capture: ['--request-id', '--expected-revision'],
   // check-resolvable.ts:120 parseFlags.
@@ -89,11 +93,14 @@ export const EQUALS_READERS: Readonly<Record<string, readonly string[]>> = {
   'compile-context': ['--target', '--budget', '--include', '--out', '--source'],
   // core/consent.ts:123 parseConsentFlags via enableConsent (decide.ts:348, effects paid); decide reads no --max-* itself.
   'decide enable': ['--max-usd', '--max-cost'],
-  // doctor.ts:417 --scope=brain only (=-only); doctor/budget.ts:68 --tier/--budget-ms; cli/commands/doctor.ts:27 --tier (thin client);
+  // doctor/budget.ts:68 --tier/--budget-ms; cli/commands/doctor.ts:27 --tier (thin client); --scope is split (parseDoctorScope reads both forms, #7624);
   // doctor/registry.ts:332 --only; check-resolvable.ts:120 --skills-dir via doctor.ts:460; core/consent.ts:130 --expect (remediate-consent.ts:133).
-  doctor: ['--scope', '--tier', '--budget-ms', '--only', '--skills-dir', '--expect'],
+  doctor: ['--tier', '--budget-ms', '--only', '--skills-dir', '--expect'],
   // edge-proposals.ts:81 flag() used only by list (:91,:93); other subs take the first numeric token as the id (:86).
   'edge-proposals list': ['--status', '--limit'],
+  // memory-proposals.ts flag() reads list's --source/--limit and deny's --reason in both forms.
+  'memory-proposals list': ['--source', '--limit'],
+  'memory-proposals deny': ['--reason'],
   // embed.ts:841 parsePaceArgs (--pace bare or =mode); core/consent.ts:126 via embed-consent.ts:129 and held-embedding.ts:234.
   embed: ['--pace', '--pace-max-concurrency', '--max-usd', '--max-cost'],
   // eval-conversation-parser.ts:48-53 (main.ts handleCliOnly's eval conversation-parser branch and eval.ts:106 both reach it).
@@ -109,7 +116,7 @@ export const EQUALS_READERS: Readonly<Record<string, readonly string[]>> = {
   // recall.ts:1183-1188 runForget (plain) and forget-purge.ts:44 flagValue (:114-123, purge); --match is purge-only, ignored by plain forget in any form.
   forget: ['--request-id', '--source', '--match'],
   // forget-purge.ts:131 flagValue --reason (runForgetPurge, routed on --purge at recall.ts:1170); plain forget reads only the separate token (recall.ts:1181).
-  'forget --purge': ['--reason'],
+  'forget --purge': ['--reason', '--reason-scan-limit'],
   // frontmatter.ts:356 runValidate.
   'frontmatter validate': ['--path'],
   // frontmatter.ts:667 runAudit.
@@ -128,13 +135,13 @@ export const EQUALS_READERS: Readonly<Record<string, readonly string[]>> = {
   'jobs supervisor': ['--job-isolation'],
   // jobs/shared.ts:121 parseJobIsolationFlag via jobs/work.ts:114.
   'jobs work': ['--job-isolation'],
-  // jobs/watch.ts:11 reads only --refresh-ms=N.
+  // jobs/watch.ts parseRefreshMs reads --refresh-ms N and --refresh-ms=N (#7624).
   'jobs watch': ['--refresh-ms'],
   // lint.ts:929 runLint.
   lint: ['--exclude'],
   // migrate-graduation.ts:97 flagValue (parseGraduationArgs :121-151); graduation-only flags, the legacy copier (migrate-engine.ts) never reads them.
   migrate: ['--url-env', '--trigger-bypass', '--drain-timeout', '--batch-size', '--expect'],
-  // models.ts:853 doctor mode only (sub selection :818), repeated --skip=<provider>, =-only.
+  // models.ts parseSkipProviders, doctor mode only, repeated --skip <provider> or --skip=<provider> (#7624).
   'models doctor': ['--skip'],
   // core/bounded-listing-cli.ts:15 parseListingFlags via orphans.ts:353.
   orphans: ['--limit', '--cursor'],
@@ -190,7 +197,7 @@ export const EQUALS_READERS: Readonly<Record<string, readonly string[]>> = {
   'skillpack diff': ['--workspace', '--skills-dir'],
   // skillpack/scaffold.ts:36 lane select + :73 --workspace=; harness lane skillpack/harness.ts:91-158 parseHarnessArgs (:364).
   'skillpack scaffold': ['--workspace', '--harness', '--persona', '--skill', '--dest', '--scope', '--skills'],
-  // skillpack/reference.ts:44 harness lane (strict-args.ts:102 makes the non-harness lane STRICT); harness.ts:542.
+  // skillpack/reference.ts:44 harness lane (strict-args.ts:102 makes the non-harness lane STRICT); harness.ts:542; skillpack/update.ts readValue (--update-untouched lane).
   'skillpack reference': ['--harness', '--persona', '--skill', '--dest', '--scope', '--workspace', '--skills'],
   // core/bounded-listing-cli.ts:15 via sources.ts:1213 runStatus (+ :1214 paged regex).
   'sources status': ['--limit', '--cursor'],
@@ -225,19 +232,36 @@ export const OWN_EQUALS_PARSERS: ReadonlySet<string> = new Set([
   'takes add', 'takes remove', 'takes resolve', 'takes supersede', 'takes update',
 ]);
 
-/** Switches a command reads with `args.includes` whose name takes a value elsewhere; the command's own reading wins. */
+/**
+ * Switches a command reads with `args.includes` whose name takes a value
+ * elsewhere, or that no shared switch evidence (curated help, the operation
+ * manifest) covers: `agent` has no curated help, so its `--follow` and
+ * `--detach` need an entry here. The command's own reading wins.
+ */
 export const COMMAND_SWITCHES: Readonly<Record<string, readonly string[]>> = {
   sync: ['--detail'],
   schema: ['--fields'],
   agent: ['--follow', '--detach'],
   dream: ['--unsafe-bypass-dream-guard'],
   embed: ['--stale'],
+  'edge-proposals': ['--all-held', '--all-applied'],
 };
 
 /** Value flags of a command with no curated help that every path reads as `--flag <value>` (migrate-engine.ts parseArgs, migrate-graduation.ts flagValue and routesToGraduation); their `=` form splits. */
 export const COMMAND_VALUES: Readonly<Record<string, readonly string[]>> = {
   migrate: ['--to', '--url'],
 };
+
+/**
+ * Paths (`command sub`) whose handler reads no value flag, only switches and
+ * positionals: an `=` value flag there refuses with advice to drop it, never
+ * `--flag <value>`, because the separate value would become the target
+ * (edge-proposals.ts takes the first numeric token as the proposal id, so
+ * `accept --limit 5 12` acts on proposal 5).
+ */
+export const NO_VALUE_FLAG_PATHS: ReadonlySet<string> = new Set([
+  'edge-proposals show', 'edge-proposals accept', 'edge-proposals reject', 'edge-proposals undo', 'edge-proposals date', 'edge-proposals retry',
+]);
 
 /** Paths (`command sub`) whose handler treats a bare `--` as the end of its options; everywhere else the scan continues past it. */
 export const END_OF_OPTIONS: ReadonlySet<string> = new Set(['agent run', 'frontmatter validate']);
@@ -304,6 +328,8 @@ export async function splitFlagEquals(command: string, args: readonly string[]):
       ? [`${where} reads no = form`, `Check the flag in ${where} --help: write a switch on its own (a value never turns it off), or a value as the next argument.`]
       : isSwitch
       ? [`${flag} is a switch and takes no value`, `Write ${flag} on its own, or leave it out.`]
+      : NO_VALUE_FLAG_PATHS.has(`${keyed} ${sub}`)
+      ? [`${where} does not read ${flag}`, `Leave ${flag} out: written as ${flag} <value>, the value would be read as a positional argument (such as an id).`]
       : value === '' || /^-[-A-Za-z]/.test(value)
         ? [`the value is empty or looks like a flag`, `Write ${flag} <value> with the value as the next argument.`]
         : own === undefined && /^(true|false|yes|no|y|n|on|off|0|1)$/i.test(value)

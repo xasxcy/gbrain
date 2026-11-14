@@ -39,7 +39,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
       await disposePersistenceConsumer(engine);
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
       await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
-      const contentDate = '2026-07-09T15:45:00.000Z'; // #6720: page-derived atoms inherit it, transcript-derived ones never do
+      const contentDate = '2026-07-09T15:45:00.000Z'; // #6720: page-derived atoms inherit it; this undated transcript gives its atoms none (#7268)
       await engine.putPage('notes/example', { type: 'source', title: 'Example', compiled_truth: 'A private project record. '.repeat(40),
         frontmatter: { visibility: 'private', date: contentDate }, effective_date: new Date(contentDate), effective_date_source: 'date' }, { sourceId });
       const page = (await engine.getPage('notes/example', { sourceId }))!;
@@ -157,7 +157,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         const worker = new MinionWorker(engine, { queue: 'fixture' });
         await registerBuiltinHandlers(worker, engine, { quiet: true });
         __setChatTransportForTests(chat);
-        const job: MinionJobContext = { id: 944, name: 'extract-atoms-drain', data: { sourceId, retryRequestId: receipt.request_id }, attempts_made: 0,
+        const job: MinionJobContext = { id: 944, name: 'extract-atoms-drain', data: { sourceId, retryRequestId: receipt.request_id }, attempts_made: 0, idempotency_key: null,
           signal: new AbortController().signal, deadlineAtMs: null, shutdownSignal: new AbortController().signal,
           updateProgress: async () => {}, updateTokens: async () => {}, log: async () => {}, isActive: async () => true, readInbox: async () => [] };
         if (scenario === 'malformed_retry_failure') {

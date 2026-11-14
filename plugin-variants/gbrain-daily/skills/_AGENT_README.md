@@ -104,7 +104,9 @@ Start with keyless recall and explicit remembering:
 
 Choose verification that can read the intended visibility: trusted local CLI
 can recall private facts; MCP (including stdio) and a thin CLI connected to MCP
-currently recall and withdraw world-visible facts only. Preserve the user's intended privacy.
+recall and withdraw world-visible facts only, except a credential bound to the brain owner, which also recalls
+private facts. Preserve the user's intended privacy; new pages carry no privacy label by default
+(`skills/conventions/page-privacy.md`).
 A committed remote private-write receipt confirms storage, not private recall; explain
 when trusted local readback is unavailable rather than claiming verification or
 widening access. Use only harmless synthetic world-visible facts for an
@@ -143,7 +145,10 @@ gbrain skillpack reference --all
 ```
 
 That sweeps every bundled skill and reports per-skill `identical / differs /
-missing` counts. For each `differs`:
+missing` counts. Skills the user never edited take gbrain's version whole with
+`gbrain skillpack reference --all --update-untouched` (`--dry-run` previews;
+edited or pinned skills are skipped; `gbrain skillpack restore <id>` undoes it).
+For each remaining `differs`:
 
 ```bash
 gbrain skillpack reference <slug>

@@ -24,19 +24,21 @@ import type { FenceFix } from '../fence-repair/types.ts';
 import { parseMarkdown, RECOVERY_VERSION, type IntendedRefusal } from '../markdown.ts';
 import { fenceMessage, type FenceMessageLocation } from '../fence-repair/reasons.ts';
 import { completeFenceLocation, FENCE_VERSION, type ReceiptFenceLocation } from '../fence-repair/refusal.ts';
+import { QUOTE_SCREEN_VERSION } from '../fence-repair/quote-markers.ts';
 import { fenceFileLine } from '../fence-repair/hold-fix.ts';
 import { slugConflictHoldMessage } from '../import-file.ts';
 import { isImageFilePath, isMultimodalEnabled, resolveSlugForPath } from '../sync.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { VERSION } from '../../version.ts';
-import { sha256 } from './digest.ts';
+import { digest, sha256 } from './digest.ts';
 import { readPageBodyPolicy, type PageBodyPolicy } from '../page-body/limits.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { readPagePurgeTombstones } from './page-purge.ts';
 import { listTrustAllowRules } from '../trust/allow-rules.ts';
 import { readSyncContent, readSyncFile, syncGitPath, UNREADABLE_SYNC_FILE, type SyncDiscovery, type SyncEntry } from './sync-discovery.ts';
-import { pinnedWindowBlock, readBlobBytes, readBlobContents, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
+import { pinnedWindowBlock, readBlobBytes, readBlobContents, readFilterDrivers, readPinnedBlob, readPinnedBytes, readPinnedContent, readTreeBlobs, SYNC_READ_BOUND, type MissingAttributes, type TreeBlob } from './sync-blobs.ts';
 import { screenSyncImport, type SyncImportScreenInput } from './sync-prepare.ts';
-import { committedContentOrMissing, nullBytesRefusal } from './sync-entry-fault.ts';
+import { committedContentOrMissing, filterOwnedRefusal, missingAttributesRefusal, nullBytesRefusal } from './sync-entry-fault.ts';
 import type { SyncProcessingOptions } from './sync-authority.ts';
 import { gitHoldItem, readSyncHoldPolicy, readSyncImportProvenance, type GitHoldCode, type GitHoldItem, type GitHoldRecord, type PreparationStallMeta, type SyncHoldPolicy } from './sync-holds.ts';
 import type { WriteRequest } from './model.ts';
@@ -80,6 +82,35 @@ export function pinnedBlob(cursor: PinnedCursor, path: string): TreeBlob | null 
   return readPinnedBlob(cursor.gitRoot, cursor.target, syncGitPath(cursor, path), upcomingGitPaths(cursor));
 }
 
+let filterDrivers: { key: string; drivers: Map<string, string | null | MissingAttributes> } | null = null;
+/**
+ * GST-2312 (#9024): the Git filter driver of one entry's path at the pinned commit (`readFilterDrivers`), or null; a
+ * company plan's at its approved revision. A miss reads it with up to 2,000 of the committed imports after it in one
+ * `check-attr`; answers are kept per Git root and commit. A path under a `.gitattributes` the repository lacks throws
+ * `git_object_missing` (`missingAttributesRefusal`), and that answer is dropped once used, so the next run reads again.
+ */
+export function pinnedFilterDriver(cursor: Pick<SyncDiscovery, 'root' | 'gitRoot' | 'target' | 'entries' | 'companyPlan' | 'sourceId'> & { index?: number }, path: string): string | null {
+  const revision = cursor.companyPlan?.revision, gitRoot = revision?.git_root ?? cursor.gitRoot, target = revision?.commit ?? cursor.target;
+  const real = revision ? null : { gitRoot: realpathSync.native(cursor.gitRoot), root: realpathSync.native(cursor.root) };
+  const gitPathOf = (next: string) => real ? relative(real.gitRoot, resolve(real.root, next)).split(sep).join('/') : revision!.scope ? `${revision!.scope}/${next}` : next;
+  const gitPath = gitPathOf(path), key = `${gitRoot}\0${target}`;
+  if (filterDrivers?.key !== key) filterDrivers = { key, drivers: new Map() };
+  const known = filterDrivers.drivers;
+  if (!known.has(gitPath)) {
+    const upcoming: string[] = [];
+    for (let at = cursor.index ?? 0; at < cursor.entries.length && upcoming.length < 2000; at++) {
+      const entry = cursor.entries[at]!, next = entry.action === 'import' && !entry.working ? gitPathOf(entry.path) : gitPath;
+      if (next !== gitPath && !known.has(next)) upcoming.push(next);
+    }
+    for (const [next, driver] of readFilterDrivers(gitRoot, target, [gitPath, ...upcoming])) known.set(next, driver);
+    if (!known.has(gitPath)) known.set(gitPath, null);
+  }
+  const driver = known.get(gitPath) ?? null;
+  if (typeof driver !== 'object' || driver === null) return driver;
+  known.delete(gitPath);
+  throw missingAttributesRefusal({ gitRoot, sourceId: cursor.sourceId }, path, driver);
+}
+
 /**
  * A `both` entry's recorded disk blob (`driftBaseline`), or null. When the page still holds what it imports (sync-run.ts
  * `sameContentAtOrigin`, `pageOnly`), the database changed only what an import keeps (tags, links), so the newer file
@@ -90,6 +121,26 @@ export function pinnedBlob(cursor: PinnedCursor, path: string): TreeBlob | null 
 export function driftBaselineContent(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline'>): string | null {
   if ((entry.drift !== 'both' && entry.drift !== 'unknown') || !entry.driftBaseline) return null;
   try { return readBlobContents(gitRoot, [{ oid: entry.driftBaseline, size: SYNC_READ_BOUND }]).get(entry.driftBaseline) ?? null; } catch { return null; }
+}
+
+/**
+ * GST-2568: whether the stored frontmatter differs from a file's only by keys gbrain itself wrote to the database: a copy of
+ * the reserved `type` key (older imports) and the grandfather's `validate: false` (#6429), each absent from the file. A
+ * page with any other difference (a protected key, a label) is not treated as unchanged since that file.
+ */
+export function onlyDerivedKeysAdded(content: string, stored: Record<string, unknown> | null | undefined): boolean {
+  const file = parseMarkdown(content, 'derived-keys.md').frontmatter;
+  const page = stored ?? {};
+  return [...new Set([...Object.keys(file), ...Object.keys(page)])].every(key => digest(file[key] ?? null) === digest(page[key] ?? null)
+    || !Object.hasOwn(file, key) && (key === 'type' || key === 'validate' && page[key] === false));
+}
+
+/** #7199: whether the page still holds what the entry's baseline or one of its earlier committed versions (`driftHistory`) imports, tried in order. */
+export async function pageHoldsDriftBaseline(gitRoot: string, entry: Pick<SyncEntry, 'drift' | 'driftBaseline' | 'driftHistory'>, same: (content: string | null) => Promise<boolean>): Promise<boolean> {
+  if (await same(driftBaselineContent(gitRoot, entry))) return true;
+  if (entry.drift !== 'unknown') return false;
+  for (const oid of entry.driftHistory ?? []) if (await same(driftBaselineContent(gitRoot, { drift: 'unknown', driftBaseline: oid }))) return true;
+  return false;
 }
 
 /** The frozen import content of one entry (`readSyncContent`); a committed entry's pinned blob is read with the entries after it. */
@@ -147,7 +198,7 @@ function heldEntry(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'r
   return { path: entry.path, source_path: entry.sourcePath, slug, page_id: pageId, code: refusal.code, message: refusal.message,
     upstream_version: content === null ? null : sha256(content),
     meta: { ...(refusal.reason ? { reason: refusal.reason } : {}), ...(refusal.key ? { key: refusal.key } : {}), ...(line !== undefined ? { line } : {}),
-      recovery_version: RECOVERY_VERSION, ...(refusal.fence ? { fence: refusal.fence, fence_version: FENCE_VERSION } : {}),
+      recovery_version: RECOVERY_VERSION, ...(refusal.fence ? { fence: refusal.fence, fence_version: FENCE_VERSION, quote_version: QUOTE_SCREEN_VERSION } : {}),
       ...(blob ? { blob_oid: blob.oid } : {}), ...(entry.working ? { working: true } : {}),
       ...(entry.renameFrom ?? entry.renameHeld ? { rename_from: entry.renameFrom ?? entry.renameHeld } : {}) } };
 }
@@ -229,8 +280,9 @@ export function originConflictHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' 
 /** Wave B: the hold for a file its streamed preparation refused, by the receipt's content-refusal code and message. */
 export function streamedRefusalHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>, slug: string, pageId: number | null,
   done: Pick<WriteRequest, 'error_code' | 'error_message'>, blobOid: string | null | undefined): HeldEntry {
-  return heldEntry(entry, slug, pageId, { code: done.error_code as ContentRefusal['code'], message: done.error_message ?? 'The streamed import refused this file.' },
+  const held = heldEntry(entry, slug, pageId, { code: done.error_code as ContentRefusal['code'], message: done.error_message ?? 'The streamed import refused this file.' },
     null, blobOid ? { oid: blobOid } : null);
+  return held.code === 'file_too_large' ? { ...held, meta: { ...held.meta, streamed: { gbrain_version: VERSION } } } : held;
 }
 
 export function oversizeHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>, slug: string, pageId: number | null, size: number | null, blob: TreeBlob | null | undefined): HeldEntry {
@@ -283,7 +335,8 @@ function runWriteGateSource(engine: BrainEngine, run: SyncScreenRun, sourceId: s
 }
 
 export interface FrozenImportScreen {
-  cursor: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'root'>;
+  /** Without its Git fields (a content repair's screen of checkout bytes), no filter driver is read. */
+  cursor: Pick<SyncDiscovery, 'sourceId' | 'incarnation' | 'root'> & Partial<Pick<SyncDiscovery, 'gitRoot' | 'target' | 'entries' | 'companyPlan'>> & { index?: number };
   entry: SyncEntry; slug: string; pageId: number | null; snapshot: Snapshot;
   /** null only for an over-size file, whose content is never read. */
   content: string | null; rawHash: string | null; lineEndingOnly: boolean;
@@ -294,6 +347,8 @@ export interface FrozenImportScreen {
   retryCommand: string;
   /** #6188 dry run: told the fixes when Tier 1 admits the file by rewriting a fence. */
   onNormalized?: (fixes: FenceFix[]) => void;
+  /** GBRA-133: the freeze's timer turn, taken after the filter driver's Git read so the screen that follows starts a stretch of its own. */
+  turn?: () => Promise<void>;
 }
 
 /**
@@ -303,9 +358,11 @@ export interface FrozenImportScreen {
  */
 export async function frozenImportScreenInput(engine: BrainEngine,
   input: Pick<FrozenImportScreen, 'cursor' | 'entry' | 'slug' | 'snapshot' | 'rawHash' | 'lineEndingOnly'> & { content: string }, run: SyncScreenRun): Promise<SyncImportScreenInput> {
-  const { entry, slug, snapshot } = input;
+  const { entry, slug } = input;
   const moved = entry.renameFrom && entry.renameFrom.slug !== slug ? entry.renameFrom : undefined;
-  const base = moved ? await engine.readPageSnapshot(moved.slug, { sourceId: input.cursor.sourceId, includeDeleted: true }) : snapshot;
+  // GBRA-287: a page stored in segments up to the single-string ceiling is compared read back whole, as its publication compares it.
+  const snapshot = await materializedSnapshot(engine, input.snapshot);
+  const base = moved ? await materializedSnapshot(engine, await engine.readPageSnapshot(moved.slug, { sourceId: input.cursor.sourceId, includeDeleted: true })) : snapshot;
   return { content: input.content, rawHash: input.rawHash, lineEndingOnly: input.lineEndingOnly, slug, sourcePath: entry.sourcePath, path: entry.path,
     root: input.cursor.root, snapshot, base, renamed: !!moved, activePack: run.activePack, sanity: run.sanity,
     purgedPages: await runPurgeTombstones(engine, run, input.cursor.sourceId), writeGateSource: await runWriteGateSource(engine, run, input.cursor.sourceId) };
@@ -315,6 +372,20 @@ export async function frozenImportScreenInput(engine: BrainEngine,
 export async function screenFrozenContent(screenInput: SyncImportScreenInput, run: SyncScreenRun): Promise<ImportScreenResult> {
   const { screen } = screenSyncImport(screenInput);
   return screenNormalized(screen) && !await run.normalize() ? screenSyncImport({ ...screenInput, normalize: false }).screen : screen;
+}
+
+/**
+ * GST-1209: the screen the next sync gives a file imported over a page whose stored body cannot be read (the segmented-tiling
+ * repair's input): the run's schema pack, sanity settings, purge tombstones and write gate, the coordinated fence step and
+ * the private-visibility hold, against the page's snapshot unread. A hold policy of `fail` still screens.
+ */
+export async function unreadPageImportScreen(engine: BrainEngine, input: { sourceId: string; root: string; path: string; slug: string; content: string;
+  snapshot: SyncImportScreenInput['snapshot'] }): Promise<ImportScreenResult> {
+  const activePack = (await loadActivePackForEngine(engine, { remote: false, sourceId: input.sourceId }).catch(() => null))?.manifest;
+  const run: SyncScreenRun = { policy: await readSyncHoldPolicy(engine), sanity: await loadImportSanityConfig(engine), activePack, normalize: () => fencesNormalizeEnabled(engine) };
+  return screenFrozenContent({ content: input.content, rawHash: sha256(input.content), lineEndingOnly: false, slug: input.slug, sourcePath: input.path, path: input.path,
+    root: input.root, snapshot: input.snapshot, base: input.snapshot, renamed: false, activePack, sanity: run.sanity,
+    purgedPages: await readPagePurgeTombstones(engine, input.sourceId), writeGateSource: await runWriteGateSource(engine, run, input.sourceId) }, run);
 }
 
 /**
@@ -340,6 +411,12 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
     return { ...held, meta: { ...held.meta, legacy_slugs: entry.legacySlugs } };
   }
   if (content === null) return null;
+  // GST-2312 (#9024): a committed blob a Git filter owns is held alone; sync never runs the filter that would turn it into text.
+  const { gitRoot, target, entries } = input.cursor;
+  const filtered = filterOwnedRefusal(entry.path, content, entry.working || !gitRoot || !target || !entries ? null
+    : pinnedFilterDriver({ ...input.cursor, gitRoot, target, entries }, entry.path), input.cursor.sourceId, true);
+  if (filtered) return heldEntry(entry, slug, pageId, filtered, content, blob);
+  await input.turn?.();
   // GBRA-133 S-39: text holding NUL cannot be stored or carried in the write intent; only this file is held. A slug conflict
   // still names the hold (#6749): its message carries the path alone, and the slug-conflicts lane reports NULL_BYTES as still_invalid.
   const nul = nullBytesRefusal(entry.path, content);
@@ -376,12 +453,20 @@ export async function screenFrozenImport(engine: BrainEngine, input: FrozenImpor
 /**
  * Dry run: screens every pending import entry read-only (batched Git reads)
  * and lists the holds a real run would record. Entries the screen cannot
- * judge are reported in `screen_skipped`, never as holds.
+ * judge are reported in `screen_skipped`, never as holds. #7087: the counts are the changes still to publish (a
+ * prescreened no-op and a fenced unowned deletion change nothing); they replace the cursor's committed counts.
  */
 export async function dryRunScreen(engine: BrainEngine, discovery: SyncDiscovery & { index?: number }, run: SyncScreenRun | null, retryCommand: string): Promise<{
-  dry_run: true; would_hold?: GitHoldItem[]; would_hold_count?: number; would_normalize?: Array<{ path: string; classes: string[] }>; would_normalize_count?: number;
+  dry_run: true; added: number; modified: number; deleted: number; renamed: number; would_hold?: GitHoldItem[]; would_hold_count?: number; would_normalize?: Array<{ path: string; classes: string[] }>; would_normalize_count?: number;
   screen_skipped?: Array<{ path: string; code: string }> }> {
-  if (!run || discovery.companyPlan) return { dry_run: true };
+  const planned = { added: 0, modified: 0, deleted: 0, renamed: 0 };
+  for (const entry of discovery.entries.slice(discovery.index ?? 0)) {
+    if (entry.action === 'delete') { if (!entry.unownedDeletion) planned.deleted++; }
+    else if (entry.renameFrom) planned.renamed++;
+    else if (entry.pageId == null) planned.added++;
+    else if (!entry.prescreened) planned.modified++;
+  }
+  if (!run || discovery.companyPlan) return { dry_run: true, ...planned };
   const entries = discovery.entries.slice(discovery.index ?? 0).filter(entry => entry.action === 'import' && entry.slug);
   const committed = entries.filter(entry => !entry.working);
   const blobs = readTreeBlobs(discovery.gitRoot, discovery.target, committed.map(entry => syncGitPath(discovery, entry.path)));
@@ -422,7 +507,7 @@ export async function dryRunScreen(engine: BrainEngine, discovery: SyncDiscovery
       skipped.push({ path: entry.path, code: error instanceof OperationError ? error.code : 'storage_error' });
     }
   }
-  return { dry_run: true, ...(held.length ? { would_hold: held.slice(0, run.policy.cap), would_hold_count: held.length } : {}),
+  return { dry_run: true, ...planned, ...(held.length ? { would_hold: held.slice(0, run.policy.cap), would_hold_count: held.length } : {}),
     ...(normalized.length ? { would_normalize: normalized.slice(0, run.policy.cap), would_normalize_count: normalized.length } : {}),
     ...(skipped.length ? { screen_skipped: skipped } : {}) };
 }

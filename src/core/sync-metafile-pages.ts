@@ -9,7 +9,8 @@
 import { execFileSync } from './spawn.ts';
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
-import { gitChildEnv } from './git-env.ts';
+import { gitChildEnv, literalPathspecs } from './git-env.ts';
+import { HARDENED_GIT_ARGS, NO_LAZY_FETCH_ENV } from './hardened-git.ts';
 import { readBlobBytes, type TreeBlob } from './persistence/sync-blobs.ts';
 import type { BrainEngine } from './engine.ts';
 import { isNestedSkipMetafile, metafileIsPage, METAFILE_HEAD_BYTES, SYNC_METAFILE_PAGES_KEY, SYNC_SKIP_FILES, type MetafilePagesMode } from './sync.ts';
@@ -61,8 +62,9 @@ export function diskMetafileHeads(root: string): MetafileHeadReader {
 const nameOf = (path: string) => path.slice(path.lastIndexOf('/') + 1);
 const metafileNamed = (path: string) => (SYNC_SKIP_FILES as readonly string[]).includes(nameOf(path));
 
+/** GST-2331: a metafile read fetches nothing in a partial clone; an object the repository lacks reads as no file. */
 function git(gitRoot: string, args: string[], input: string, maxBuffer = 64 * 1024 ** 2): Buffer {
-  return execFileSync('git', ['-c', 'core.quotepath=false', '-C', gitRoot, ...args], { env: gitChildEnv(), timeout: 60_000, maxBuffer, input, stdio: ['pipe', 'pipe', 'pipe'] });
+  return execFileSync('git', ['-c', 'core.quotepath=false', ...HARDENED_GIT_ARGS, '-C', gitRoot, ...args], { env: gitChildEnv(NO_LAZY_FETCH_ENV), timeout: 60_000, maxBuffer, input, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 
 /** Blob ids and sizes of `<commit>:<path>`-style object names through one `cat-file --batch-check`; missing names are absent. */
@@ -142,7 +144,7 @@ export function levelMetafilePages(mode: MetafilePagesMode, gitRoot: string, com
 
 /** The metafile-named blobs of `commit`'s tree under `scope` (one `ls-tree`), Git-root relative. */
 export function listMetafileNamedBlobs(gitRoot: string, commit: string, scope = ''): Array<{ path: string; oid: string; size: number }> {
-  const rows = git(gitRoot, ['--literal-pathspecs', 'ls-tree', '-r', '-l', '-z', commit, ...(scope ? ['--', scope] : [])], '', 512 * 1024 ** 2).toString('utf8').split('\0');
+  const rows = git(gitRoot, ['ls-tree', '-r', '-l', '-z', commit, ...(scope ? ['--', ...literalPathspecs([scope])] : [])], '', 512 * 1024 ** 2).toString('utf8').split('\0');
   const out: Array<{ path: string; oid: string; size: number }> = [];
   for (const row of rows) {
     const tab = row.indexOf('\t');

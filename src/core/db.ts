@@ -1,6 +1,7 @@
 import postgres from '#postgres'
 import { claimOwner, isOneShotCommand } from './persistence/claim-phase.ts';
 import { traceSqlOptions } from './sql-trace.ts';
+import { tlsRequiredDefaultError, withPgTls } from './pg-tls.ts';
 import { beginReadWrite } from './postgres-engine/read-write-transactions.ts';
 import { warnPoolerPrepareOffOnce } from './pooler-notice.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
@@ -203,7 +204,8 @@ export function clearSharedTypes(...pools: unknown[]): void {
  * it) in the same round trip and loads them; a database without a `config`
  * table falls back to `SELECT 1`.
  */
-export async function checkPoolAndLoadSharedTypes(pool: ReturnType<typeof postgres>, url: string): Promise<void> {
+/** `persisted: false` (an engine opened from settings) keeps the shared descriptions in this process and reads no file under the home. */
+export async function checkPoolAndLoadSharedTypes(pool: ReturnType<typeof postgres>, url: string, opts: { persisted?: boolean } = {}): Promise<void> {
   let rows: Array<{ server: string; schema: string | null; database: string | null }>;
   try {
     rows = await pool.unsafe(`SELECT current_setting('server_version_num') AS server, (SELECT value FROM config WHERE key='version') AS schema,
@@ -213,7 +215,7 @@ export async function checkPoolAndLoadSharedTypes(pool: ReturnType<typeof postgr
     await pool`SELECT 1`;
     return;
   }
-  loadSharedParameterTypes(url, String(rows[0]?.server ?? ''), rows[0]?.schema ?? null, rows[0]?.database ?? null);
+  if (opts.persisted !== false) loadSharedParameterTypes(url, String(rows[0]?.server ?? ''), rows[0]?.schema ?? null, rows[0]?.database ?? null);
 }
 
 /**
@@ -544,7 +546,7 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
       opts.prepare = prepare;
       if (!prepare) warnPoolerPrepareOffOnce(url);
     }
-    sql = postgres(url, traceSqlOptions(opts, 'module'));
+    sql = postgres(url, traceSqlOptions(withPgTls(url, opts), 'module'));
 
     // GBRA-156: a one-shot command's startup reads its retired-marker state beside its persistence row, which opened the
     // pool's second connection on the critical path (about three round trips behind a pooler); it opens beside the first.
@@ -558,6 +560,8 @@ export async function connect(config: EngineConfig, hooks: PoolHealthHooks = {})
   } catch (e: unknown) {
     sql = null;
     connectedUrl = null;
+    const tlsRefusal = await tlsRequiredDefaultError(url, e);
+    if (tlsRefusal) throw tlsRefusal;
     const msg = e instanceof Error ? e.message : String(e);
     throw new GBrainError(
       'Cannot connect to database',

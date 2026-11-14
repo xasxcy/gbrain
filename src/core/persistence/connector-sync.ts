@@ -19,7 +19,7 @@ import { materializeTimeline, prepareCanonicalProjections } from './canonical-pr
 import { digest, sha256 } from './digest.ts';
 import { admitWriteInTransaction, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
 import { acquireWorktree, containsPath, getWorktreeBinding, probeWorktreeWriter, readManagedMode, type WorktreeBinding } from './ownership.ts';
-import { localHostId } from './identity.ts';
+import { hostIdFor } from './identity.ts';
 import { assertPersistenceAccepting, startPersistenceConsumer, waitForWrite, writeResponse } from './service.ts';
 import { maintenancePublishWaitMs } from './maintenance-wait.ts';
 import { AGENT_WRITE_WAIT_MS, configuredWriteWaitMs } from './write-wait.ts';
@@ -27,14 +27,16 @@ import { managedSyncAuthority, validateManagedSyncOptions, validateSyncAuthority
 import type { PreparedContentImport } from './prepared-import.ts';
 import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
-import { databaseOnlyPublication, prepareFileTarget } from './page-prepare.ts';
+import { databaseOnlyPublication, prepareFileTarget, preparePrivateTransition } from './page-prepare.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { sourceCanonicalGit } from './git-door.ts';
-import { isPrivatePage } from '../search/private-visibility.ts';
+import { isPrivacyPrivatePage } from '../search/private-visibility.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 import { ownedGoogleReceipts, prepareGoogleReceiptPatch, type GoogleReceipts } from './connector-google-receipts.ts';
 import { connectorCheckpointKeys, connectorIdentity, connectorIdentityMatches, type ConnectorIdentity, type ConnectorKind } from './connector-identity.ts';
+import { connectorDirKey } from './connector-kinds.ts';
 import { CONNECTOR_PURGED_LIMIT, readManagedConnectorState, recordConnectorSyncAttempt, sameConnectorAccount, writeManagedConnectorState, type ConnectorAccount, type ConnectorPendingEntry, type ConnectorPurgedItem, type ConnectorRunCounts, type ConnectorState } from './connector-state.ts';
 import { connectorConfigDigest } from './connector-account-mismatch.ts';
 import { connectorAccountChanged, connectorFenceHint, docsAnchor, receiptDeliveredHint, CONNECTOR_INTENT_OUTDATED_OLD_HOST, CONNECTOR_INTENT_OUTDATED_PRE_UPGRADE } from './connector-errors.ts';
@@ -173,8 +175,8 @@ function connectorPublicationRefusal(code: RegistryCode, message: string, row: W
 }
 
 /** The connector binding's owner and incarnation checks; returns the paths they prove present. */
-function checkedConnectorBinding(sourceId: string, source: ConnectorSource, binding: WorktreeBinding) {
-  if (binding.owner_host_id !== localHostId() || !binding.local_path || !binding.coordination_path) {
+function checkedConnectorBinding(engine: object, sourceId: string, source: ConnectorSource, binding: WorktreeBinding) {
+  if (binding.owner_host_id !== hostIdFor(engine) || !binding.local_path || !binding.coordination_path) {
     throw opError('owner_unavailable', 'The connector canonical owner is unavailable on this host.',
       `Source ${sourceId} is owned by another host or its worktree binding is incomplete; run its connector sync on the owner host that gbrain sources writer status --source ${sourceId} --json names.`,
       { fix: ownerStatusFix(sourceId, 'Shows which host owns the source and whether its binding records a local and coordination path.') });
@@ -187,13 +189,13 @@ function checkedConnectorBinding(sourceId: string, source: ConnectorSource, bind
   return { localPath: binding.local_path, coordinationPath: binding.coordination_path, sourcePath: source.local_path };
 }
 
-function connectorBindingRoot(sourceId: string, source: ConnectorSource, binding: WorktreeBinding | null): string | null {
+function connectorBindingRoot(engine: object, sourceId: string, source: ConnectorSource, binding: WorktreeBinding | null): string | null {
   if (!binding) return null;
-  const { localPath, coordinationPath, sourcePath } = checkedConnectorBinding(sourceId, source, binding);
+  const { localPath, coordinationPath, sourcePath } = checkedConnectorBinding(engine, sourceId, source, binding);
   assertPhysicalRoot(localPath, { worktreeId: binding.worktree_id, coordinationPath });
   try {
     const root = realpathSync(join(localPath, binding.relative_path));
-    const configured = source.config[source.config.kind === 'google' ? 'g_dir' : 'gh_dir'];
+    const configured = source.config[connectorDirKey(source.config.kind as ConnectorKind)];
     const directory = typeof configured === 'string' && configured.length > 0 ? configured : sourcePath;
     if (!containsPath(localPath, root) || !statSync(root).isDirectory() || realpathSync(sourcePath) !== root || realpathSync(directory) !== root) {
       throw new Error('root mismatch');
@@ -249,7 +251,20 @@ async function connectorFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 
 async function strictPrivateImport(engine: BrainEngine, sourceId: string, content: string, sourcePath: string, snapshot: PageSnapshot | null): Promise<boolean> {
   const parsed = parseMarkdown(content, sourcePath);
   const frontmatter = snapshot?.page.frontmatter.visibility === 'private' ? { ...parsed.frontmatter, visibility: 'private' } : parsed.frontmatter;
-  return isPrivatePage({ type: parsed.type, frontmatter }) && await sourceCanonicalGit(engine, sourceId);
+  return isPrivacyPrivatePage({ type: parsed.type, frontmatter }) && await sourceCanonicalGit(engine, sourceId);
+}
+
+/**
+ * #7971: the file target of a strict private import, or null when the import is not one. A page turning private (its
+ * stored snapshot is live and public) gets the removal of the file it still has in the worktree or at HEAD, which the
+ * door commits with the publication (G7a, preparePrivateTransition), so the public file leaves HEAD and no private byte
+ * is committed. A page already private, or one without a file, publishes no file.
+ */
+async function strictPrivateFile(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, content: string, sourcePath: string,
+  snapshot: PageSnapshot | null): Promise<{ file: PreparedMutation['file'] } | null> {
+  if (!await strictPrivateImport(engine, row.source_id, content, sourcePath, snapshot)) return null;
+  const turning = snapshot && !snapshot.page.deleted_at && !isPrivacyPrivatePage({ type: snapshot.page.type, frontmatter: snapshot.page.frontmatter });
+  return { file: turning ? await preparePrivateTransition(engine, row, snapshot) : undefined };
 }
 
 export async function beginConnectorSync(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
@@ -284,9 +299,9 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const authority = await managedSyncAuthority(engine, sourceId, source.incarnation, source.local_path ?? '');
   const binding = await getWorktreeBinding(engine, sourceId);
   // The locked acquisition re-stamps a device-only physical-root change (#5604) before the root is asserted.
-  if (binding) { checkedConnectorBinding(sourceId, source, binding); await probeWorktreeWriter(binding, engine); }
+  if (binding) { checkedConnectorBinding(engine, sourceId, source, binding); await probeWorktreeWriter(binding, engine); }
   else authority.writer.databaseOnlyReason = 'connector_database';
-  const canonicalRoot = connectorBindingRoot(sourceId, source, binding);
+  const canonicalRoot = connectorBindingRoot(engine, sourceId, source, binding);
   const session = new ManagedConnectorSync(engine, sourceId, identity, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true,
     opts.retryFailed === true, lease, opts.resetCheckpoint === true, opts.githubItem !== undefined, opts.full === true);
   await session.load();
@@ -397,6 +412,8 @@ export class ManagedConnectorSync {
     this.checkpointKeys = connectorCheckpointKeys(sourceId, source.incarnation, identity);
     this.checkpointKey = this.checkpointKeys[0]!;
   }
+  /** Whether this run publishes canonical files (a bound worktree root) rather than database-only rows. */
+  get bound(): boolean { return this.canonicalRoot !== null; }
   async assertLease(engine: BrainEngine): Promise<void> {
     if (!this.lease) return;
     this.lease.signal.throwIfAborted();
@@ -531,7 +548,7 @@ export class ManagedConnectorSync {
     const binding = await getWorktreeBinding(engine, this.sourceId);
     if ((binding?.worktree_id ?? null) !== (this.binding?.worktree_id ?? null) ||
         String(binding?.owner_epoch) !== String(this.binding?.owner_epoch) ||
-        connectorBindingRoot(this.sourceId, source, binding) !== this.canonicalRoot) {
+        connectorBindingRoot(engine, this.sourceId, source, binding) !== this.canonicalRoot) {
       throw opError('source_changed', 'The connector ownership changed during the sweep.',
         `The owner binding or canonical root of ${this.sourceId} changed while this sweep ran; writes it already admitted keep their receipts. Inspect the owner before running gbrain sync --source ${this.sourceId} again.`,
         { fix: ownerStatusFix(this.sourceId, 'Shows the current owner, epoch and canonical root of the source.') });
@@ -540,7 +557,7 @@ export class ManagedConnectorSync {
   }
   private async retryBlocker(engine: BrainEngine): Promise<WriteRequest | undefined> {
     const [row] = await engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
-      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL))
+      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','deferred','running','recovering') OR r.recovery IS NOT NULL))
         OR EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.recovery IS NOT NULL
           AND (e.source_id=$1 OR e.worktree_id=$2::uuid)) ORDER BY r.sequence LIMIT 1`, [this.sourceId, this.binding?.worktree_id ?? null]);
     return row;
@@ -612,15 +629,16 @@ export class ManagedConnectorSync {
   async page(slug: string) {
     slug = slugifyPath(`${slug}.md`);
     await this.recover(slug);
-    const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId });
+    const snapshot = await materializedSnapshot(this.engine, await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId }));
     if (snapshot && this.binding) await prepareFileTarget(this.engine,
       { source_id: this.sourceId, worktree_id: this.binding.worktree_id, slug }, snapshot, serializePageToMarkdown(snapshot.page, snapshot.tags));
     return snapshot?.page ?? null;
   }
-  async importMarkdown(sourcePath: string, content: string): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped'; created: boolean }> {
+  /** `purged` marks a skip because the content matches a page purge tombstone (#8938), so the caller derives nothing from it. */
+  async importMarkdown(sourcePath: string, content: string): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped'; created: boolean; purged?: true }> {
     const slug = slugifyPath(sourcePath);
     const done = await this.submit('connector_v2_import', slug, sourcePath, { content });
-    if (!done.row) return { slug, chunks: 0, status: 'skipped', created: false };
+    if (!done.row) return { slug, chunks: 0, status: 'skipped', created: false, ...(done.purged ? { purged: true as const } : {}) };
     if (done.pending) return { slug, chunks: 0, status: 'imported', created: done.created };
     return { slug, chunks: Number(done.row.outcome?.chunks ?? 0), status: done.row.outcome?.noop ? 'skipped' : 'imported', created: done.row.outcome?.status === 'created' };
   }
@@ -713,7 +731,7 @@ export class ManagedConnectorSync {
     }
   }
   /** Waits, within the run's budget, for every outstanding receipt. */
-  private async drainPending(): Promise<void> {
+  async drainPending(): Promise<void> {
     await this.refreshPending();
     while (this.pendingRows.size && this.remainingWait() > 0) {
       const [oldest] = this.pendingRows.values();
@@ -813,6 +831,14 @@ export class ManagedConnectorSync {
       + `the rest of the sync continues. To let it back in: gbrain pages unpurge ${slug}\n`);
   }
   /**
+   * #9011: slugs this run skipped because the pages guard refused their admitted receipt as purged content; with
+   * `persisted`, also those earlier runs recorded (a refusal can resolve after a run's cleanup).
+   */
+  refusedPurgedSlugs(persisted = false): string[] {
+    const items = persisted ? [...this.purged, ...(this.connectorState.purged_items ?? [])] : this.purged;
+    return [...new Set(items.filter(item => item.request_id !== null).map(item => item.slug))];
+  }
+  /**
    * #6831: screens a page import against the source's page purge tombstones before admission, with the content hash
    * the pages guard compares (`intentCarriesPurgedContent`), so a purged item that keeps being listed costs no refused
    * receipt per run. A miss here (the publication renders different bytes, or a purge lands mid-run) still ends in the
@@ -892,7 +918,7 @@ export class ManagedConnectorSync {
       if (kind === 'connector_v2_delete') {
         if (this.binding || prepared.noop !== true) return false;
       } else {
-        const databaseOnly = !this.binding || await strictPrivateImport(this.engine, this.sourceId, intent.content ?? '', sourcePath ?? `${slug}.md`, snapshot);
+        const databaseOnly = !this.binding || !prepared.file && await strictPrivateImport(this.engine, this.sourceId, intent.content ?? '', sourcePath ?? `${slug}.md`, snapshot);
         const verdict = await inspectUnchanged(this.engine, { prepared, snapshot, sourcePath, databaseOnly });
         if (verdict.admitReason) return false;
       }
@@ -904,7 +930,7 @@ export class ManagedConnectorSync {
     }
   }
   private async submit(kind: ConnectorIntentKind, slug: string, sourcePath: string | null, extra: Partial<ConnectorIntent>):
-    Promise<{ row: WriteRequest | null; pending: boolean; created: boolean }> {
+    Promise<{ row: WriteRequest | null; pending: boolean; created: boolean; purged?: true }> {
     await this.awaitPagePending(slug);
     await this.awaitPageMirror(slug);
     await this.recover(slug);
@@ -916,9 +942,11 @@ export class ManagedConnectorSync {
       extra.googleReceipts = ownedGoogleReceipts(snapshot, (this.identity.config as GoogleSourceConfig).account, extra.googleReceipts!);
       sourcePath = snapshot!.page.source_path!;
     }
-    const file = kind === 'connector_v2_checkpoint' || kind === 'connector_v2_import' && sourcePath && typeof extra.content === 'string'
-      && await strictPrivateImport(this.engine, this.sourceId, extra.content, sourcePath, snapshot) ? undefined : await connectorFileTarget(this.engine,
-      { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug }, snapshot, extra.content ?? null, sourcePath, this.canonicalRoot);
+    const target = { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug };
+    const strictPrivate = kind === 'connector_v2_import' && sourcePath && typeof extra.content === 'string'
+      ? await strictPrivateFile(this.engine, target, extra.content, sourcePath, snapshot) : null;
+    const file = kind === 'connector_v2_checkpoint' ? undefined : strictPrivate ? strictPrivate.file
+      : await connectorFileTarget(this.engine, target, snapshot, extra.content ?? null, sourcePath, this.canonicalRoot);
     if (file && sourcePath && resolve(file.path) !== resolve(this.canonicalRoot!, sourcePath)) {
       throw opError('source_changed', 'The connector source path no longer names its canonical file.',
         `The recorded path of ${slug} no longer resolves to its canonical file under the root of ${this.sourceId}, so nothing was submitted. Inspect the root and binding before running gbrain sync --source ${this.sourceId} again.`,
@@ -962,7 +990,7 @@ export class ManagedConnectorSync {
     // #6831: a replayed purged refusal stays skipped (even under --retry-failed) while its tombstone stands; once the
     // owner cleared it, the item gets one automatic retry through the guarded retry path below.
     if (kind === 'connector_v2_import' && row && purgedRefusal(row) && row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId)) {
-      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (await this.purgedNow(slug, extra.content)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false, purged: true }; }
       this.autoRetry.add(baseRequestId);
     }
     const automatic = this.autoRetry.has(baseRequestId);
@@ -1025,7 +1053,7 @@ export class ManagedConnectorSync {
       }
       if (kind === 'connector_v2_import' && await this.carriesPurgedPage(slug, extra.content)) {
         this.skipPurged(slug, null);
-        return { row: null, pending: false, created: false };
+        return { row: null, pending: false, created: false, purged: true };
       }
       row = await this.engine.transaction(async tx => {
         await this.assertLease(tx);
@@ -1058,7 +1086,7 @@ export class ManagedConnectorSync {
       return { row, pending: false, created: false };
     }
     if (isTerminal(row)) {
-      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false }; }
+      if (page && purgedRefusal(row)) { this.skipPurged(slug, row); return { row: null, pending: false, created: false, purged: true }; }
       if (row.state !== 'committed') this.lastFailedItem = { slug, requestId: row.request_id };
       writeResponse(row);
       this.receipts.push(row.id);
@@ -1100,7 +1128,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       throw connectorPublicationRefusal('source_changed', 'The connector ownership binding changed after admission.', row,
         `The owner binding of ${row.source_id} changed after this write was admitted.`);
     }
-    if (connectorBindingRoot(row.source_id, source, binding) !== p.canonicalRoot) throw connectorPublicationRefusal('source_changed', 'The connector canonical root changed after admission.', row,
+    if (connectorBindingRoot(engine, row.source_id, source, binding) !== p.canonicalRoot) throw connectorPublicationRefusal('source_changed', 'The connector canonical root changed after admission.', row,
       `The canonical root of ${row.source_id} changed after this write was admitted.`);
     if (p.filePath !== null && (!p.canonicalRoot || !isWriteTargetContained(p.filePath, p.canonicalRoot) || persistenceFileHash(p.filePath) !== p.fileBeforeHash)) {
       throw connectorPublicationRefusal('source_changed', 'The connector canonical file changed after admission.', row,
@@ -1129,7 +1157,8 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       [row.source_id, row.source_incarnation, p.newestContentAt ?? null]);
     return { status: 'checkpointed', source_id: row.source_id };
   } };
-  const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+  // #9062: a page stored in segments is read back as strings (up to PAGE_MAX_BYTES), so its re-render carries its timeline and fences like an inline page's.
+  const snapshot = await materializedSnapshot(engine, await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true }));
   if ((snapshot?.revision ?? null) !== p.expected_revision || (snapshot?.page.id ?? null) !== row.page_id ||
       snapshot?.page.source_path != null && snapshot.page.source_path !== p.sourcePath) {
     throw connectorPublicationRefusal('revision_conflict', 'The connector page changed after admission.', row,
@@ -1179,12 +1208,15 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     ? serializePageToMarkdown({ ...snapshot.page, ...parsed, compiled_truth: fenced, timeline: carried.timeline, type: parsed.typeExplicit ? parsed.type : snapshot.page.type }, parsed.tags)
     : p.content;
   let prepared: PreparedContentImport | undefined;
+  const tier = 'external_untrusted';
   const result = await importFromContent(engine, row.slug, content, { sourceId: row.source_id, sourcePath: p.sourcePath,
     filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), noEmbed: true, allowEmptyOverwrite: true, activePack,
     // #5575 A3: connector free text (mail bodies, invite descriptions, issue text) is external and gated.
-    writeGate: { tier: 'external_untrusted', origin: { channel: `connector:${p.connector}`, connector: String(p.connector), source_uri: p.sourcePath }, requestId: row.id },
+    writeGate: { tier, origin: { channel: `connector:${p.connector}`, connector: String(p.connector), source_uri: p.sourcePath }, requestId: row.id },
     prepareFrontmatter: page => {
       if (snapshot?.page.frontmatter.visibility === 'private') page.frontmatter.visibility = 'private';
+      // #8052: keep the marker `gbrain repair provenance` stamped, only when it names the tier this import assigns.
+      if (snapshot?.page.frontmatter.trust_tier === tier) page.frontmatter.trust_tier = tier;
     },
     prepare: async value => { prepared = value; return value.result; } });
   if (!prepared || prepared.slug !== row.slug) throw connectorPublicationRefusal('revision_conflict', result.error ?? 'A different page owns this connector content.', row,
@@ -1195,7 +1227,8 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, snapshot, 'preserving');
   const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const page: Page = { ...(snapshot?.page ?? { id: 0, slug: row.slug, source_id: row.source_id, created_at: new Date(row.created_at), updated_at: new Date(row.created_at) }), ...ready.parsedPage };
-  const target = await strictPrivateImport(engine, row.source_id, p.content, p.sourcePath, snapshot) ? undefined
+  const strictPrivate = await strictPrivateFile(engine, row, p.content, p.sourcePath, snapshot);
+  const target = strictPrivate ? strictPrivate.file
     : await connectorFileTarget(engine, row, snapshot, serializePageToMarkdown(page, tags), p.sourcePath, p.canonicalRoot);
   // Google pages hold private mail: derived here from the stored connector, never submitted, so request ids are unchanged.
   const file = target && p.connector === 'google' ? { ...target, publishMode: 0o600 } : target;
@@ -1203,9 +1236,11 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     `The canonical file of ${row.slug} in ${row.source_id} changed on disk while this connector write was being prepared.`);
   return { observedRevision: ready.observedRevision, sourceExclusive: true,
     validate: async tx => { await validate(tx); await ready.validate(tx); },
-    file, ...databaseOnlyPublication(row, file), noop: ready.noop, deferEmbedding: p.noEmbed, apply: async tx => {
-    await ready.apply(tx);
-    if (!ready.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
+    file, ...databaseOnlyPublication(row, file), noop: ready.noop, deferEmbedding: p.noEmbed,
+    ...(ready.afterCommit ? { afterCommit: (target: BrainEngine) => ready.afterCommit!(target) } : {}), apply: async tx => {
+    const installed = await ready.apply(tx);
+    // A body stored in segments was sealed by its import's apply when complete (sealSegmentedPage); the inline text seal reads the whole timeline.
+    if (!ready.noop) { await project(tx); if (!installed?.segmented) await sealPageTextProjection(tx, row.slug, row.source_id); }
     return { status: ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
       chunks: result.chunks, noop: ready.noop, imported_file: true, connector_database: !row.worktree_id };
   } };

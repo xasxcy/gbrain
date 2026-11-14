@@ -32,7 +32,7 @@ import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { colonFileRefusal, COLON_REFUSAL_MESSAGES, readSyncFile, resolveManagedSyncContext, syncExcludePatterns, syncGitAsync, type ManagedSyncContext, type SyncFileRefusal } from './sync-discovery.ts';
 import { isWindowsColonTarget } from './native-file-target.ts';
 import { confirmedSyncDelta } from '../sync-rename-identity.ts';
-import { fileDriftSide, holdBasisMoved, holdRescreenDue, type DeletionCandidate, readGitHoldRetryPaths, readGitSourceHolds, SYNC_IMPORT_PROVENANCE_OP, syncImportParser, syncImportParsers,
+import { FILE_DRIFT_VERSION, fileDriftSide, holdBasisMoved, holdRescreenDue, type DeletionCandidate, readGitHoldRetryPaths, readGitSourceHolds, SYNC_IMPORT_PROVENANCE_OP, syncImportParser, syncImportParsers,
   type GitHoldRecord, type SyncImportParser, type SyncImportProvenance } from './sync-holds.ts';
 import { movedDriftHolds, sameParser } from './sync-prescreen.ts';
 import { sameSyncOrigin, selectOriginClaimant, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
@@ -48,6 +48,7 @@ import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 import { filterYielding, loopYield, progressYield, sortYielding, turnYield, whileActive, type LoopYield } from './sync-yield.ts';
 import { countsMatch, proveConfirm, readLevelMark, type ConfirmProof, type LevelMark } from './sync-pass-confirm.ts';
 import { domainCache, levelDomain, narrowedWalk, walkAttestations, type LevelDomainCache } from './sync-pass-narrow.ts';
+import { syncDeleteOrigin } from './sync-delete-tombstones.ts';
 
 export { MANAGED_SYNC_PASS_OP, SYNC_ORIGIN_DELETED_OP };
 
@@ -85,7 +86,19 @@ export interface PassLevelInput {
   onProgress?: () => void;
   /** Throws once the pass must stop (a job deadline, a lost drain lease): checked at the read's pauses and while its origin history walk runs. */
   assertActive?: () => void;
+  /** The conversion apply's strict passes (SyncOpts.conversionBinding, persistence/git-conversion.ts): the only Git verdicts that may replace a database version. */
+  conversion?: ConversionBinding;
 }
+
+/**
+ * PR A admission binding: the paths (source-root relative) whose database version the conversion plan approved Git
+ * replacing, each with the page, revision and committed blob (null for a deletion; unset when any blob will do, as for a
+ * page the apply itself adopted) it approved. In a pass that carries
+ * it, any other Git verdict that would replace a database version (`gitWins`), or one whose page, revision or blob
+ * moved since the plan, is reclassified as the drift (or held deletion) a mixed pass gives it, so the pass holds the
+ * path instead of overwriting the page; `reclassified` collects those paths for the apply.
+ */
+export interface ConversionBinding { expect: ReadonlyMap<string, { id: string; revision: string | null; blob?: string | null }>; reclassified: Set<string> }
 /** PGLite's keyset page size (design v3.2 §2.1). */
 const PGLITE_KEYSET_ROWS = 2_000;
 /**
@@ -275,7 +288,7 @@ export interface ShadowLevel {
   /** Holds on paths outside the level's domain (no file at L, no page, or no longer eligible): the stamp releases them, as discovery did (#6278 B7). */
   releasableHolds: string[];
   /**
-   * GBRA-133: deleted-side `file_drift` holds whose file is gone from `L` and the disk. The stamp releases each whose page is
+   * GBRA-133: deleted-side `file_drift` and `concurrent_write` holds whose file is gone from `L` and the disk. The stamp releases each whose page is
    * no longer live (`settledDeletionHolds`): a soft delete, a purge or the file's removal decided it.
    */
   deletionCandidates: DeletionCandidate[];
@@ -312,7 +325,7 @@ const recordOids = (record: PageRow['record'], level?: string | null): string[] 
 const recordNames = (record: PageRow['record'], oid: string | null): boolean => !!record && typeof oid === 'string' && oid.length > 0
   && (record.blob_oid === oid || record.disk_blob_oid === oid);
 
-const PAGE_DELETED = 1, PAGE_RECORD = 2, PAGE_REVISION_NULL = 4, PAGE_PARSER_EXPECTED = 8, PAGE_WORKING = 16, PAGE_WORKING_TRUE = 32, PAGE_DERIVED_CURRENT = 64;
+const PAGE_DELETED = 1, PAGE_RECORD = 2, PAGE_REVISION_NULL = 4, PAGE_PARSER_EXPECTED = 8, PAGE_WORKING = 16, PAGE_WORKING_TRUE = 32, PAGE_DERIVED_CURRENT = 64, PAGE_SYNC_DELETED = 128;
 
 /**
  * `I⋈P` as columns, one slot per page, instead of a `PageRow` and a record object per page (about 200 B a page at 600k). A
@@ -330,6 +343,8 @@ export class PageTable {
   hasRecord(i: number): boolean { return (this.bits[i]! & PAGE_RECORD) !== 0; }
   /** `SyncPathState.derivedCurrent`: the page's chunks, text projection and contextual mode are current (`readPages`). */
   derivedCurrent(i: number): boolean { return (this.bits[i]! & PAGE_DERIVED_CURRENT) !== 0; }
+  /** `SyncPathState.page.syncDeleted`: a tombstone a managed sync deletion made (sync-delete-tombstones.ts), still open. */
+  syncDeleted(i: number): boolean { return (this.bits[i]! & PAGE_SYNC_DELETED) !== 0; }
   /** The record's fields `row(i).record` would carry (undefined without a record), read without building it: the classifier's per-path reads. */
   diskBlobOidOf(i: number): string | null | undefined { return !this.hasRecord(i) ? undefined : this.diskBlobOid.has(i) ? this.diskBlobOid.get(i)! : this.blobOid[i] ?? null; }
   recordRevisionOf(i: number): string | undefined { return !this.hasRecord(i) || this.bits[i]! & PAGE_REVISION_NULL ? undefined : this.recordRevision.get(i) ?? this.revision[i]!; }
@@ -400,7 +415,8 @@ async function readPages(exec: Exec, kind: 'postgres' | 'pglite', sourceId: stri
       CASE WHEN c.parser IS DISTINCT FROM $4::jsonb THEN c.parser::text END AS rec_parser, c.parser = $4::jsonb AS rec_parser_expected,
       c.full_episode AS rec_full_episode, c.working AS rec_working,
       (p.page_kind = 'markdown' AND p.chunker_version = ${MARKDOWN_CHUNKER_VERSION} AND p.body_storage IS DISTINCT FROM 'segmented'
-        AND p.text_projection_revision IS NOT DISTINCT FROM p.knowledge_revision AND p.contextual_retrieval_mode IS NOT NULL) AS derived_current
+        AND p.text_projection_revision IS NOT DISTINCT FROM p.knowledge_revision AND p.contextual_retrieval_mode IS NOT NULL) AS derived_current,
+      CASE WHEN p.deleted_at IS NOT NULL THEN ${syncDeleteOrigin('p')} ELSE false END AS sync_deleted
     FROM pages p LEFT JOIN (SELECT fingerprint, completed_keys->0->>'origin' AS origin, completed_keys->0->>'blob_oid' AS blob_oid,
         completed_keys->0->>'disk_blob_oid' AS disk_blob_oid, completed_keys->0->>'revision' AS revision,
         completed_keys->0->'parser' AS parser, completed_keys->0->>'full_episode' AS full_episode, (completed_keys->0->'working')::text AS working
@@ -408,7 +424,7 @@ async function readPages(exec: Exec, kind: 'postgres' | 'pglite', sourceId: stri
     WHERE p.source_id=$1 AND p.source_path IS NOT NULL`;
   const params = [sourceId, SYNC_IMPORT_PROVENANCE_OP, `${sourceId}:${incarnation}:`, JSON.stringify(expected)];
   type Raw = Omit<PageRow, 'record' | 'arm1' | 'attested_hash'> & { has_record: boolean; rec_origin_same: boolean; rec_origin: string | null; rec_blob_oid: string | null;
-    rec_disk_same: boolean; rec_disk_blob_oid: string | null; rec_revision_null: boolean; rec_revision: string | null; rec_parser: string | null; rec_parser_expected: boolean | null; rec_full_episode: string | null; rec_working: string | null; derived_current: boolean | null };
+    rec_disk_same: boolean; rec_disk_blob_oid: string | null; rec_revision_null: boolean; rec_revision: string | null; rec_parser: string | null; rec_parser_expected: boolean | null; rec_full_episode: string | null; rec_working: string | null; derived_current: boolean | null; sync_deleted: boolean | null };
   const pages = only?.table ?? new PageTable(expected);
   const parsers = new Map<string, SyncImportProvenance['parser'] | undefined>(), episodes = new Map<string, string>();
   const parserOf = (text: string | null) => {
@@ -422,7 +438,7 @@ async function readPages(exec: Exec, kind: 'postgres' | 'pglite', sourceId: stri
     pages.id[i] = raw.id; pages.slug[i] = raw.slug; pages.sourcePath[i] = raw.source_path; pages.revision[i] = raw.revision; pages.requestId[i] = raw.request_id;
     pages.bits[i] = (raw.deleted ? PAGE_DELETED : 0) | (raw.has_record ? PAGE_RECORD : 0) | (raw.rec_revision_null ? PAGE_REVISION_NULL : 0)
       | (raw.rec_parser_expected ? PAGE_PARSER_EXPECTED : 0) | (working ? PAGE_WORKING : 0) | (raw.rec_working === 'true' ? PAGE_WORKING_TRUE : 0)
-      | (raw.derived_current ? PAGE_DERIVED_CURRENT : 0);
+      | (raw.derived_current ? PAGE_DERIVED_CURRENT : 0) | (raw.deleted && raw.sync_deleted ? PAGE_SYNC_DELETED : 0);
     const episode = raw.has_record ? raw.rec_full_episode : null;
     if (typeof episode === 'string' && !episodes.has(episode)) episodes.set(episode, episode);
     pages.blobOid[i] = raw.has_record ? raw.rec_blob_oid ?? undefined : undefined; pages.fullEpisode[i] = typeof episode === 'string' ? episodes.get(episode)! : episode;
@@ -615,9 +631,24 @@ async function reclassifyByOrigin(gitRoot: string, tips: Array<string | null | u
   return true;
 }
 
-/** GBRA-133: the deleted-side `file_drift` holds whose file is gone (`gone`, on the Git path); the stamp releases those whose page is no longer live. */
+/**
+ * GBRA-133: the deleted-side `file_drift` holds and the `concurrent_write` holds (#8751) whose file is gone (`gone`, on the
+ * Git path); the stamp releases those whose page is no longer live, where both sides agree the path is deleted.
+ */
+/**
+ * Whether the pass releases a held path: one outside the sync domain, a `storage_invalid` hold once gbrain.yml's storage
+ * loads and resolves its folder (#8007), and (GST-2568) a live page whose file is gone once gbrain.yml declares its folder
+ * database-only, which is no drift.
+ */
+function releasableHold(hold: GitHoldRecord, inDomain: boolean, dbOnlyUnknown: boolean, storage: Parameters<typeof dbOnlyVerdict>[1]): boolean {
+  if (!inDomain) return true;
+  if (dbOnlyUnknown || hold.code !== 'file_drift') return false;
+  if (hold.meta.reason === 'storage_invalid') return !hold.slug || dbOnlyVerdict(hold.slug, storage) !== 'unknown';
+  return hold.meta.state === 'file_gone' && !!hold.slug && dbOnlyVerdict(hold.slug, storage) === true;
+}
+
 function deletionCandidates(holds: readonly GitHoldRecord[], gone: (path: string) => boolean, toGit: (path: string) => string): DeletionCandidate[] {
-  return holds.filter(hold => hold.code === 'file_drift' && fileDriftSide(hold.meta) === 'deleted' && gone(toGit(hold.path)))
+  return holds.filter(hold => (hold.code === 'concurrent_write' || hold.code === 'file_drift' && fileDriftSide(hold.meta) === 'deleted') && gone(toGit(hold.path)))
     .map(hold => ({ path: hold.path, page_id: hold.page_id ?? null, slug: hold.slug ?? null }));
 }
 
@@ -800,11 +831,11 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
     const needsBaseline = live && recordRevision == null && level !== null && !recordBlobOids.includes(level);
     const state: SyncPathState = {
       mode, tree: committed?.oid ?? null, level, present: presentNow, dirty, diskOid: probe?.rawOid ?? null,
-      page: row ? { live, revision: pages.revision[at!]!, originMatches: record && originPath(pages.origin.get(at!) ?? pages.sourcePath[at!]!) === pageOrigin(pages.sourcePath[at!]!, pages.slug[at!]!) } : null,
+      page: row ? { live, revision: pages.revision[at!]!, originMatches: record && originPath(pages.origin.get(at!) ?? pages.sourcePath[at!]!) === pageOrigin(pages.sourcePath[at!]!, pages.slug[at!]!), ...(!live && pages.syncDeleted(at!) ? { syncDeleted: true } : {}) } : null,
       record: record ? { blobOids: recordBlobOids, revision: recordRevision != null ? String(recordRevision) : null, parserSame: sameParser(pages.parserOf(at!), fp(path)) } : null,
       attested, levelSha256: probe?.rawSha256 ?? null,
       published: !!attested?.hash && probe?.rawSha256 === attested.hash,
-      hold: hold ? { atLevel: holdAtLevel(hold, level, probe?.rawSha256 ?? null) && !moved.has(path), rescreenDue: holdRescreenDue(hold, retry.has(hold.path)), retried: retry.has(hold.path) } : null,
+      hold: hold ? { atLevel: holdAtLevel(hold, level, probe?.rawSha256 ?? null) && !moved.has(path), rescreenDue: holdRescreenDue(hold, retry.has(hold.path)), retried: retry.has(hold.path), ...(unscreenedDrift(hold) ? { unscreened: true } : {}), ...(hold.code === 'file_drift' && fileDriftSide(hold.meta) === 'deleted' ? { deletionSide: true } : {}) } : null,
       marker: marker ?? virtualMarker, baseline: needsBaseline ? baselineOf(path) : null,
       spelling: legacySpelling.has(path) ? 'legacy' : twins.has(path),
       episodeUnsatisfied: input.pass ? !!input.pass.episodeFullId && live && (record ? pages.fullEpisode[at!] : undefined) !== input.pass.episodeFullId
@@ -906,7 +937,7 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
     }
     timings.level_bytes = t();
   }
-
+  if (strict && input.pass?.conversion) bindConversion(paths, scope, input.pass.conversion);
   const kind = syncPassKind({ converged: null, head, parserFp: '', pack: pack?.identity ?? null, selectionFp: '', now: Date.now(), openEpisode: input.full === true, owedTail: false,
     retryRow: retry.size > 0, notConvergedStreak: 0, mismatchStreak: 0, requestNewer: false, openAtStampFinished: false, workingChange: false,
     rescreenDueHold: holds.some(hold => holdRescreenDue(hold, retry.has(hold.path))), full: input.full === true });
@@ -917,7 +948,7 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
   }
   return { sourceId, incarnation, root, gitRoot, scope, slugMode, mode, strict, head, baselineCommit, full: input.full === true, kind: kind.kind, kindBlockers: kind.blockers,
     heldRenames: holds.flatMap(hold => hold.meta.rename_from ? [{ path: toGit(hold.path), rename: hold.meta.rename_from }] : []),
-    releasableHolds: holds.filter(hold => !domain.has(toGit(hold.path)) || (!dbOnlyUnknown && hold.code === 'file_drift' && hold.meta.reason === 'storage_invalid' && (!hold.slug || dbOnlyVerdict(hold.slug, storage) !== 'unknown'))).map(hold => hold.path),
+    releasableHolds: holds.filter(hold => releasableHold(hold, domain.has(toGit(hold.path)), dbOnlyUnknown, storage)).map(hold => hold.path),
     deletionCandidates: deletionCandidates(holds, path => domain.has(path) && !tree.has(path)
       && !(mode === 'working' && (untracked.has(path) || index.has(path))) && !readPresent(root, path, scope), toGit),
     paths, reconcilable, ...(colon.refusals.size ? { fileRefusals: [...colon.refusals.values()] } : {}), timings_ms: timings, statements: statements + attestationStatements + 3,
@@ -1071,6 +1102,24 @@ async function confirmPages(exec: Exec, input: { kind: 'postgres' | 'pglite'; so
  * #6926, folded into 4b: what a folded checkpoint needs of the round's `I⋈P` (S1): its mark, its page count and its largest
  * page id (a page past it is one the pass created). Null when the round left no marked `I⋈P` (working mode, a failed mark).
  */
+/** See ConversionBinding: an unapproved or moved Git verdict over a database version becomes the hold a mixed pass gives it. */
+function bindConversion(paths: ShadowPath[], scope: string, binding: ConversionBinding): void {
+  for (const [i, entry] of paths.entries()) {
+    const r = entry.result;
+    const gitWins = r.gitWins ?? (r.cls === 'held' && r.action === 'import' ? classifySyncPath({ ...entry.state, hold: null }, { strict: true }).gitWins : undefined);
+    if (!gitWins || r.settled || r.inFlight || (r.action !== 'import' && r.action !== 'delete')) continue;
+    const path = scope && entry.path.startsWith(`${scope}/`) ? entry.path.slice(scope.length + 1) : entry.path;
+    const expected = binding.expect.get(path);
+    if (expected && String(entry.pageId) === expected.id && (entry.revision ?? null) === expected.revision && (expected.blob === undefined || (entry.state.level ?? null) === expected.blob)) continue;
+    binding.reclassified.add(path);
+    const result: SyncClassified = r.action === 'delete'
+      ? { cls: 'delete_drift', settled: false, action: 'hold', side: 'deleted', state: 'file_gone', inFlight: false, classAction: 'repair' }
+      : { cls: 'drift', settled: false, action: 'hold', side: entry.state.record?.revision != null ? 'both' : 'unknown', inFlight: false, classAction: 'repair' };
+    paths[i] = { path: entry.path, slug: entry.slug, pageId: entry.pageId, revision: entry.revision, state: entry.state, result,
+      ...(entry.legacyPageless ? { legacyPageless: entry.legacyPageless } : {}), ...(entry.ambiguousOrigin ? { ambiguousOrigin: entry.ambiguousOrigin } : {}) };
+  }
+}
+
 export function passFoldBase(cache: PassLevelCache): { mark: LevelMark; pages: number; maxId: string } | null {
   const table = cache.pages?.table;
   if (!table || !cache.pages) return null;
@@ -1186,6 +1235,13 @@ function readPresent(root: string, gitPath: string, scope: string): boolean {
   const path = scope ? gitPath.slice(scope.length + 1) : gitPath;
   try { return readSyncFile(root, path) !== null; } catch { return true; }
 }
+
+/**
+ * #7199: a side-`unknown` drift hold written before the drift screen compared the page with the file at the baseline commit
+ * (`drift_version` below FILE_DRIFT_VERSION). The pass that wrote it moved the baseline to the held file, so its one re-screen
+ * (sync-holds.ts holdRescreenDue) also compares the page with the file's earlier committed versions.
+ */
+const unscreenedDrift = (hold: GitHoldRecord) => hold.code === 'file_drift' && fileDriftSide(hold.meta) === 'unknown' && (hold.meta.drift_version ?? 0) < FILE_DRIFT_VERSION;
 
 /** Whether a hold still describes the path at level `L`, in the hold's own domain (a pinned blob, working bytes, or a deletion). */
 function holdAtLevel(hold: GitHoldRecord, level: string | null, diskSha256: string | null): boolean {

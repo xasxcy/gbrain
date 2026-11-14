@@ -1,6 +1,9 @@
 {
   "golden": {
     "switchCaseImports": {
+      "access": [
+        "./commands/access.ts"
+      ],
       "advisor": [
         "./commands/advisor.ts"
       ],
@@ -100,7 +103,10 @@
         "./commands/graph-query.ts"
       ],
       "import": [
-        "./commands/import.ts"
+        "./commands/import.ts",
+        "./core/agent-output.ts",
+        "./core/agent-markers.ts",
+        "./core/interaction.ts"
       ],
       "jobs": [
         "./commands/jobs.ts"
@@ -116,6 +122,9 @@
       ],
       "mcp": [
         "./commands/mcp.ts"
+      ],
+      "memory-proposals": [
+        "./commands/memory-proposals.ts"
       ],
       "migrate": [
         "./commands/migrate-embeddings.ts",
@@ -157,6 +166,7 @@
         "./commands/reindex.ts",
         "./commands/reindex-multimodal.ts",
         "./core/sync-concurrency.ts",
+        "./commands/reindex-synopsis.ts",
         "./core/oversized-backfill.ts",
         "./commands/reindex-vectors.ts",
         "./commands/reindex-aliases.ts",
@@ -220,10 +230,14 @@
         "./commands/trust-claim.ts",
         "./core/eligibility/explain.ts",
         "./core/eligibility/scan.ts",
+        "./core/trust/label-lowerings.ts",
         "./core/trust/backfill.ts"
       ],
       "waiting": [
         "./commands/loops.ts"
+      ],
+      "wakeshift": [
+        "./commands/wakeshift.ts"
       ],
       "watch": [
         "./commands/watch.ts"

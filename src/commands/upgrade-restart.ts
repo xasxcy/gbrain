@@ -8,18 +8,18 @@
  * onto the build already installed (doctor's `runtime_build_skew` fix);
  * `--dry-run` prints the plan and changes nothing.
  */
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
-import { spawnSync } from '../core/spawn.ts';
-import { isThinClient, loadConfig, toEngineConfig } from '../core/config.ts';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
+import { spawn, spawnSync } from '../core/spawn.ts';
+import { gbrainPath, isThinClient, loadConfig, toEngineConfig } from '../core/config.ts';
 import { opError } from '../core/ops/contract.ts';
 import type { Action } from '../core/agent-output.ts';
 import { writeCliError } from '../cli/cli-error.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
-import { SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT, serveServiceRestartArgv } from '../core/serve-service.ts';
-import { resolveAutopilotJob } from '../core/autopilot-paths.ts';
-import { plistPath, systemdUnitPath } from './autopilot/jobs.ts';
+import { SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT, serveServiceRestartArgv, serveServiceRunsWrapper } from '../core/serve-service.ts';
+import { autopilotLockPath, resolveAutopilotJob } from '../core/autopilot-paths.ts';
+import { cronLineBelongsToBrain, plistPath, scriptWrapperPath, systemdUnitPath } from './autopilot/jobs.ts';
 import { readSupervisorBuild, readSupervisorPid } from '../core/minions/supervisor-pid.ts';
 import { parseEtimeToMs, readWorkers } from '../core/minions/worker-registry.ts';
 import { installedVersion, runtimeInstallRoot } from '../core/runtime-build.ts';
@@ -29,14 +29,16 @@ import { resolveQuietHoursWindow, resolveSelfUpgradeMode } from '../core/self-up
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
 import {
-  classifyGbrainCommand, collectHostProcesses, copyFix, gbrainEntry, mismatchedBuilds, PENDING_BUILD, planRestart, runRestartSteps, verifyRestart,
-  type HostProcess, type ProcessSources, type ProcessTableRow, type RestartExecutor, type RestartPlan, type ServiceHandle, type WarmSocketState,
+  classifyGbrainCommand, collectHostProcesses, copyFix, gbrainEntry, launcherName, mismatchedBuilds, PENDING_BUILD, planRestart, runRestartSteps, verifyRestart,
+  type AutopilotLauncher, type HostProcess, type ProcessSources, type ProcessTableRow, type RestartExecutor, type RestartPlan, type ServiceHandle, type WarmSocketState,
 } from '../core/upgrade-restart.ts';
 
 const DOCS = 'docs/guides/upgrades-auto-update.md#restart';
 const DRY_RUN_VERIFY = ['gbrain', 'upgrade', '--restart-only', '--dry-run', '--json'];
 const VERIFY_TIMEOUT_MS = 180_000;
 const VERIFY_POLL_MS = 2_000;
+/** #8776: how long verification waits for a launcher to start autopilot again: gbrain's cron line runs every 5 minutes. */
+const HANDOFF_WAIT_MS = 360_000;
 
 const brainHome = () => process.env.GBRAIN_HOME?.trim() || homedir();
 
@@ -46,6 +48,21 @@ function processHome(pid: number): string | null | undefined {
     const vars = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
     const get = (name: string) => vars.find(v => v.startsWith(`${name}=`))?.slice(name.length + 1).trim() || null;
     return get('GBRAIN_HOME') ?? get('HOME');
+  } catch {
+    return undefined;
+  }
+}
+
+/** A process's working directory, which a relative entry point resolves against; null when it cannot be read (only Linux exposes it). */
+function processCwd(pid: number): string | null {
+  try { return readlinkSync(`/proc/${pid}/cwd`); } catch { return null; }
+}
+
+/** The package name at a directory; undefined when it holds no readable package.json. */
+function packageNameAt(root: string): string | null | undefined {
+  try {
+    const name = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name?: unknown }).name;
+    return typeof name === 'string' ? name : null;
   } catch {
     return undefined;
   }
@@ -62,16 +79,16 @@ function readProcessTable(uid: number | undefined, pids?: number[]): ProcessTabl
     if (!m) return [];
     const elapsed = parseEtimeToMs(m[3]!);
     const pid = Number(m[1]);
-    return [{ pid, ppid: Number(m[2]), command: m[4]!, started_ms: elapsed === null ? null : now - elapsed, gbrain_home: processHome(pid) }];
+    return [{ pid, ppid: Number(m[2]), command: m[4]!, started_ms: elapsed === null ? null : now - elapsed, gbrain_home: processHome(pid), cwd: processCwd(pid) }];
   });
 }
 
 /** The gbrain install a command line starts from: the package directory above its entry point and the version it holds now (null for a compiled binary). */
-function installOf(command: string): { root: string | null; version: string | null } {
-  const entry = gbrainEntry(command)?.entry;
+function installOf(command: string, cwd?: string | null): { root: string | null; version: string | null } {
+  const entry = gbrainEntry(command, { cwd, packageName: packageNameAt })?.entry;
   if (!entry) return { root: null, version: null };
   try {
-    const found = entry.includes('/') ? entry : (process.env.PATH ?? '').split(delimiter).map(dir => join(dir, entry)).find(path => existsSync(path));
+    const found = entry.includes('/') ? (isAbsolute(entry) ? entry : undefined) : (process.env.PATH ?? '').split(delimiter).map(dir => join(dir, entry)).find(path => existsSync(path));
     if (!found) return { root: null, version: null };
     let dir = dirname(realpathSync(found));
     for (let i = 0; i < 4; i++, dir = dirname(dir)) {
@@ -103,13 +120,47 @@ export function hostServices(platform: string = process.platform, home: string =
   };
 }
 
-/** The real process sources; `close` releases the database connection the heartbeat read holds (Postgres only). */
-async function hostSources(): Promise<{ sources: ProcessSources; notes: string[]; close: () => Promise<void>; pidFile: string }> {
+function readCrontab(): string | null {
+  if (process.platform === 'win32') return null;
+  const r = spawnSync('crontab', ['-l'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+  return r.status === 0 && typeof r.stdout === 'string' ? r.stdout : null;
+}
+
+/**
+ * #8776: what starts autopilot again when it exits, for an autopilot launchd or systemd does not run: this brain's own
+ * gbrain cron line (`gbrain autopilot --install` on Linux without a user systemd bus: its wrapper every 5 minutes or more often), else a launcher the operator
+ * declared with `self_upgrade.autopilot_launcher external`; null when neither, so the upgrade refuses as before.
+ * `pid` is the daemon this brain's autopilot lock names, the only one the hand-off may stop.
+ */
+export function autopilotLauncher(crontab: () => string | null = readCrontab, declared: string | undefined = loadConfig()?.self_upgrade?.autopilot_launcher,
+  lockPid: number | null = readAutopilotLockPid()): AutopilotLauncher | null {
+  const job = resolveAutopilotJob();
+  const relaunches = (line: string) => /^\*(?:\/[1-5])?\s+\*\s+\*\s+\*\s+\*\s/.test(line.trim()) && scriptWrapperPath(line) !== null && cronLineBelongsToBrain(line, job);
+  if (crontab()?.split('\n').some(relaunches)) return { kind: 'cron', wait_ms: HANDOFF_WAIT_MS, pid: lockPid };
+  return declared === 'external' ? { kind: 'declared', wait_ms: HANDOFF_WAIT_MS, pid: lockPid } : null;
+}
+
+/** The launcher matters only for a running autopilot, so a host without one never reads the crontab. */
+export function launcherFor(processes: HostProcess[], launcher: () => AutopilotLauncher | null = autopilotLauncher): AutopilotLauncher | null {
+  return processes.some(p => p.role === 'autopilot') ? launcher() : null;
+}
+
+function readAutopilotLockPid(): number | null {
+  try {
+    const pid = Number(readFileSync(autopilotLockPath(), 'utf8').trim());
+    return Number.isInteger(pid) && pid > 1 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The real process sources; `close` releases the database connection the heartbeat read holds (Postgres only, and only with `heartbeats`). */
+async function hostSources(withHeartbeats = true): Promise<{ sources: ProcessSources; notes: string[]; close: () => Promise<void>; pidFile: string }> {
   const notes: string[] = [];
   let heartbeats: ProcessSources['heartbeats'] = async () => [];
   let close = async () => {};
   const config = loadConfig();
-  if (config?.engine === 'postgres' && !isThinClient(config)) {
+  if (withHeartbeats && config?.engine === 'postgres' && !isThinClient(config)) {
     try {
       const { createEngine } = await import('../core/engine-factory.ts');
       const { listHostConsumers } = await import('../core/persistence/consumer-heartbeat.ts');
@@ -136,6 +187,7 @@ async function hostSources(): Promise<{ sources: ProcessSources; notes: string[]
     workers: () => { try { return readWorkers(() => null).map(w => ({ pid: w.pid, version: w.version ?? null })); } catch { return []; } },
     processTable: () => readProcessTable(uid),
     install: installOf,
+    packageName: packageNameAt,
     home: brainHome(),
     exclude: [process.pid, process.ppid],
   };
@@ -143,23 +195,33 @@ async function hostSources(): Promise<{ sources: ProcessSources; notes: string[]
 }
 
 /** The real executor for restart steps; `pidFile` is the default supervisor PID file. */
-function hostExecutor(pidFile: string): RestartExecutor {
+/** Runs restart commands without blocking the event loop (the autopilot daemon keeps its timers and signals); a command still running after `timeoutMs` is killed. */
+export function hostExecutor(pidFile: string, timeoutMs = 600_000): RestartExecutor {
   return {
-    run: (argv, env) => {
-      const r = spawnSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 600_000, stdio: ['ignore', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : process.env });
-      return { status: r.error ? null : r.status, output: `${r.stdout ?? ''}${r.stderr ?? ''}${r.error ? r.error.message : ''}` };
-    },
+    run: (argv, env) => new Promise(resolve => {
+      let output = '';
+      let timedOut = false;
+      const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'], env: env ? { ...process.env, ...env } : process.env });
+      const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+      child.stdout?.on('data', chunk => { output += chunk; });
+      child.stderr?.on('data', chunk => { output += chunk; });
+      child.on('error', error => { clearTimeout(timer); resolve({ status: null, output: `${output}${error.message}` }); });
+      child.on('close', code => {
+        clearTimeout(timer);
+        resolve({ status: timedOut ? null : code, output: timedOut ? `${output}${argv[0]} timed out after ${Math.round(timeoutMs / 1000)}s` : output });
+      });
+    }),
     terminate: terminateIfUnchanged,
     supervisorPid: file => { const status = readSupervisorPid(file ?? pidFile); return status.running ? status.pid : null; },
     sleep: ms => new Promise(r => setTimeout(r, ms)),
   };
 }
 
-/** SIGTERM pid only while it is still the MCP server the plan saw: same role, same start time (ps reports it to the second). */
-function terminateIfUnchanged(pid: number, startedMs: number | null): 'stopped' | 'gone' | 'changed' {
+/** SIGTERM pid only while it is still the MCP server or autopilot the plan saw: same role, same start time (ps reports it to the second). */
+function terminateIfUnchanged(pid: number, startedMs: number | null, role: 'mcp' | 'autopilot'): 'stopped' | 'gone' | 'changed' {
   const row = readProcessTable(undefined, [pid])?.find(r => r.pid === pid);
   if (!row) return 'gone';
-  if (classifyGbrainCommand(row.command) !== 'mcp' || startedMs === null || row.started_ms === null || Math.abs(row.started_ms - startedMs) > 2_000) return 'changed';
+  if (classifyGbrainCommand(row.command, { cwd: row.cwd, packageName: packageNameAt }) !== role || startedMs === null || row.started_ms === null || Math.abs(row.started_ms - startedMs) > 2_000) return 'changed';
   try { process.kill(pid, 'SIGTERM'); return 'stopped'; } catch { return 'gone'; }
 }
 
@@ -171,6 +233,7 @@ function describeSteps(plan: RestartPlan): string[] {
   return plan.steps.map(step => step.kind === 'service' ? `${step.pids.map(name).join(', ')}: \`${step.argv.join(' ')}\``
     : step.kind === 'supervisor' ? `${[step.pid, ...step.workers].map(name).join(', ')}: \`${step.stop.join(' ')}\`, then \`${step.start.join(' ')}\``
     : step.kind === 'replace_copy' ? `${step.pids.map(name).join(', ')} run from the Bun global copy at ${step.root} (${step.from ? `v${step.from}` : 'version unknown'}): replace it with v${step.to} (BUN_INSTALL=${step.bun_install}: bun remove -g gbrain, then bun add -g the tag) before the restarts`
+    : step.kind === 'handoff' ? `${name(step.pid)}: stop it (SIGTERM drains it); ${launcherName(step.launcher)} starts the installed build again (verified for up to ${Math.round(step.launcher.wait_ms / 60_000)} minutes)`
     : `${name(step.pid)}: stop it (reconnect gbrain in its harness afterwards)`);
 }
 
@@ -194,8 +257,9 @@ export function restartRefusal(plan: RestartPlan, rerunArgv: readonly string[], 
 export interface HostRestartOptions { stopMcp: boolean; json: boolean; rerunArgv: string[] }
 
 /**
- * `gbrain upgrade --restart-only [--dry-run]`. `--dry-run` belongs to `--restart-only`: anywhere else it is refused,
- * never ignored while the upgrade installs for real (#2185). True when this handled the invocation.
+ * `gbrain upgrade --restart-only [--dry-run]`. True when this handled the invocation. A `--dry-run` without
+ * `--restart-only` is the channel preview (commands/upgrade-channel.ts runUpgradeDryRun), which installs nothing, so it
+ * is still never ignored while the upgrade installs for real (#2185).
  */
 export async function handleRestartOnly(args: readonly string[], opts: HostRestartOptions): Promise<boolean> {
   const dryRun = args.includes('--dry-run');
@@ -203,9 +267,7 @@ export async function handleRestartOnly(args: readonly string[], opts: HostResta
     await runHostRestart({ ...opts, rerunArgv: ['gbrain', 'upgrade', '--restart-only', ...(opts.stopMcp ? ['--stop-mcp'] : [])], dryRun });
     return true;
   }
-  if (!dryRun) return false;
-  setCliExitVerdict(writeCliError(opError('invalid_params', '--dry-run previews only a restart; nothing was installed.', 'Run gbrain upgrade --restart-only --dry-run to preview the restart.'), 'upgrade', { json: opts.json }));
-  return true;
+  return false;
 }
 
 /** The package directory this process loaded its code from (realpath), the install the upgrade replaces. */
@@ -240,7 +302,8 @@ export async function preflightHostRestart(opts: HostRestartOptions): Promise<bo
   const { sources, close } = await hostSources();
   try {
     const services = hostServices();
-    const plan = planRestart(await collectHostProcesses(sources), { expected: PENDING_BUILD, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
+    const processes = await collectHostProcesses(sources);
+    const plan = planRestart(processes, { expected: PENDING_BUILD, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot(), autopilotLauncher: launcherFor(processes) });
     const refusal = restartRefusal(plan, opts.rerunArgv, false);
     if (!refusal) return true;
     setCliExitVerdict(writeCliError(refusal, 'upgrade', { json: opts.json }));
@@ -250,13 +313,28 @@ export async function preflightHostRestart(opts: HostRestartOptions): Promise<bo
   }
 }
 
+/**
+ * #8776, for doctor's `self_upgrade_health`: the plan the next `gbrain upgrade` makes before it installs (the preflight
+ * plan), from the process table alone (no database connection). Read-only; null when ps cannot run.
+ */
+export async function upgradeRestartReadiness(): Promise<RestartPlan | null> {
+  const { sources } = await hostSources(false);
+  // FORK: GBRAIN_TEST_DOCTOR_NO_CRONTAB also hides this host's other gbrain processes (as on CI), so a golden refreshed
+  // on a dev box never records their pids, install paths and versions (the fork repo is public).
+  const hidden = process.env.GBRAIN_TEST_DOCTOR_NO_CRONTAB === '1';
+  const processes = hidden ? [] : sources.processTable() === null ? null : await collectHostProcesses(sources);
+  if (!processes) return null;
+  const services = hostServices();
+  return planRestart(processes, { expected: PENDING_BUILD, serveService: services.serve, autopilotService: services.autopilot, stopMcp: false, ownInstallRoot: ownInstallRoot(), autopilotLauncher: launcherFor(processes) });
+}
+
 /** `gbrain upgrade --restart-only [--stop-mcp] [--dry-run] [--json]`: restart every process onto the installed build and verify. */
 export async function runHostRestart(opts: HostRestartOptions & { dryRun: boolean }): Promise<void> {
   const { sources, notes, close, pidFile } = await hostSources();
   try {
     const services = hostServices();
     const before = await collectHostProcesses(sources);
-    const plan = planRestart(before, { expected: VERSION, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot() });
+    const plan = planRestart(before, { expected: VERSION, serveService: services.serve, autopilotService: services.autopilot, stopMcp: opts.stopMcp, ownInstallRoot: ownInstallRoot(), autopilotLauncher: launcherFor(before) });
     const { probeCliSocket } = await import('../core/cli-socket/probe.ts');
     const warmBefore = await probeCliSocket();
     const planDoc = { expected: VERSION, processes: before, steps: plan.steps, manual: plan.manual, warm_socket: warmBefore, notes };
@@ -273,8 +351,8 @@ export async function runHostRestart(opts: HostRestartOptions & { dryRun: boolea
     if (!opts.json) for (const r of results) console.log(`  ${r.ok ? 'ok' : 'FAILED'}: ${r.detail}`);
     const verified = await verifyRestart(plan, startedMs, warmBefore, {
       collect: () => collectHostProcesses(sources), probeWarmSocket: () => probeCliSocket(),
-      sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
-    }, { timeoutMs: plan.steps.length ? VERIFY_TIMEOUT_MS : 0, pollMs: VERIFY_POLL_MS });
+      sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(), autopilotLockPid: readAutopilotLockPid,
+    }, { timeoutMs: plan.steps.length ? Math.max(VERIFY_TIMEOUT_MS, ...plan.steps.map(step => step.kind === 'handoff' ? step.launcher.wait_ms : 0)) : 0, pollMs: VERIFY_POLL_MS });
     const doc = { status: verified.ok ? 'ok' : 'unverified', ...planDoc, results, verified: { processes: verified.processes, warm_socket: verified.warm_socket, problems: verified.problems, unverified: verified.unverified } };
     if (!verified.ok) {
       const failed = results.find(r => !r.ok);
@@ -325,6 +403,7 @@ export function planServeRestart(processes: readonly HostProcess[], serveService
 export async function restartStaleServeService(): Promise<ServeRestartOutcome> {
   const services = hostServices();
   if (!services.serve) return { outcome: 'no_service' };
+  if (!serveServiceRunsWrapper(process.platform, homedir())) return { outcome: 'manual', detail: 'the serve service on this host starts another brain\'s serve wrapper (another GBRAIN_HOME), so this autopilot leaves it alone; run `gbrain upgrade --restart-only` with that brain\'s GBRAIN_HOME' };
   const { sources, close, pidFile } = await hostSources();
   try {
     const collectServe = async () => (await collectHostProcesses(sources)).filter(p => p.role === 'serve');
@@ -338,7 +417,7 @@ export async function restartStaleServeService(): Promise<ServeRestartOutcome> {
     const { probeCliSocket } = await import('../core/cli-socket/probe.ts');
     const warmBefore = await probeCliSocket();
     const startedMs = Date.now();
-    const results = await runRestartSteps(plan, hostExecutor(pidFile));
+    const results = await runRestartSteps(plan, hostExecutor(pidFile, SERVE_RESTART_TIMEOUT_MS));
     const verified = await verifyRestart(plan, startedMs, warmBefore, {
       collect: collectServe, probeWarmSocket: () => probeCliSocket(),
       sleep: ms => new Promise(r => setTimeout(r, ms)), now: () => Date.now(),
@@ -352,12 +431,18 @@ export async function restartStaleServeService(): Promise<ServeRestartOutcome> {
 
 export type ServeRestartDeps = { state: { tried: boolean }; restart: () => Promise<ServeRestartOutcome> };
 const SERVE_RESTART_DEPS: ServeRestartDeps = { state: { tried: false }, restart: restartStaleServeService };
+const SERVE_RESTART_TIMEOUT_MS = 120_000;
+const serveRestartMarkerPath = () => gbrainPath('serve-restart-attempt.json');
+
+function serveRestartAttemptedOnThisBuild(): boolean {
+  try { return (JSON.parse(readFileSync(serveRestartMarkerPath(), 'utf8')) as { version?: unknown }).version === VERSION; } catch { return false; }
+}
 
 /**
  * #7475: the autopilot daemon calls this each tick. In auto mode, under the self-upgrade swap's own quiet-hours and
  * idle gates, the autopilot (relaunched on the new build after its swap) restarts the stale serve the serve service
- * runs, and audits the outcome as `restart_serve`. One attempt per autopilot process; the relaunch after the next
- * swap tries again. Never throws.
+ * runs, and audits the outcome as `restart_serve`. One attempt per build: `serve-restart-attempt.json` remembers it
+ * across autopilot relaunches (#8013), and the relaunch after the next swap tries again. Never throws.
  */
 export async function restartServeAfterSelfUpgrade(isIdle: () => Promise<boolean>, deps: ServeRestartDeps = SERVE_RESTART_DEPS): Promise<void> {
   if (deps.state.tried) return;
@@ -367,6 +452,9 @@ export async function restartServeAfterSelfUpgrade(isIdle: () => Promise<boolean
     if (evaluateQuietHours(resolveQuietHoursWindow(cfg.self_upgrade?.quiet_hours), new Date()) === 'allow') return;
     if (!await isIdle()) return;
     deps.state.tried = true;
+    if (serveRestartAttemptedOnThisBuild()) return;
+    mkdirSync(dirname(serveRestartMarkerPath()), { recursive: true });
+    writeFileSync(serveRestartMarkerPath(), `${JSON.stringify({ version: VERSION, ts: new Date().toISOString() })}\n`);
     const result = await deps.restart();
     if (!('detail' in result)) return;
     logSelfUpgrade({ channel: 'autopilot', action: 'restart_serve', current: VERSION, outcome: result.outcome === 'restarted' ? 'applied' : 'skipped', reason: result.outcome });

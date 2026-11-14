@@ -1,20 +1,28 @@
 import { PENDING_IMPORT, pendingImportRefusal } from './pending-import.ts';
+import { deferredWaiting } from './refresh-barrier.ts';
+import { withSupersedes } from './import-deferral.ts';
+import { withAdoptedLocalEdit } from './local-edit-adoption.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
+import { isPhysicalRootDirectoryChangedMessage, relocatedRootTransferFix } from './physical-root-record.ts';
 import { LANE_BUSY, PersistenceConsumer, type PersistenceConsumerLike, type PrepareMutation } from './consumer.ts';
 import { WaiterOnlyConsumer, type ElectedOwner } from './consumer-election.ts';
 import { RESIDENT_CONSUMER_KINDS, startConsumerHeartbeat, type ConsumerHeartbeat } from './consumer-heartbeat.ts';
 import { enginePoolStats } from '../postgres-engine/pool-stats.ts';
 import { claimOwnerKind, isOneShotCommand } from './claim-phase.ts';
 import { noteDirectPoolLease } from '../direct-pool-profile.ts';
+import { withEngineScope } from '../engine-scope.ts';
 import { preparePageMutation } from './page-prepare.ts';
+import { withChangeReason } from './change-reason.ts';
+import { withValidTimeAdvisory } from './valid-time-advisory.ts';
 import { prepareSemanticPageMutation } from './semantic-pages.ts';
 import { getWriteRequestById, getWriteRequestProgress, receiptFor, type WriteRequestProgress } from './journal.ts';
+import { OWNER_READ_BUDGET_MS, startOwnerRead, type OwnerActivity } from './owner-activity.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { isWriteErrorCode, type WriteReceipt } from './types.ts';
 import { registerPgliteReopen } from '../pglite-lifecycle.ts';
-import { localHostId } from './identity.ts';
+import { hostIdFor } from './identity.ts';
 import { assertMutationProtocol } from './protocol.ts';
 import { writeSwitchOn } from './switches.ts';
 import { pendingWriteHint } from './health.ts';
@@ -24,7 +32,7 @@ import type { PgAccessReason } from '../pg-access-classify.ts';
 import { contentRefusalFromReceipt } from '../import-screen.ts';
 import { fenceIssuesFromDetail, fenceLocationFromDetail } from '../fence-repair/refusal.ts';
 import { withdrawnFromDetail } from '../facts/withdrawal.ts';
-import { heldFileDiagnostic } from './verb-errors.ts';
+import { heldFileDiagnostic, storedCheckoutRefusal } from './verb-errors.ts';
 import { isMissingPageMessage } from './page-identity.ts';
 import { registerPersistenceConsumerConfig } from '../embedding-disabled.ts';
 
@@ -75,6 +83,10 @@ export function registerMutationPreparer(operation: string, prepare: PrepareMuta
  * phase clock, which carries the preparation's cancellation to every preparer's `enterClaimStep` boundaries.
  */
 export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) {
+  // GST-1601: a write prepared again after its page's local edit was adopted names the adoption on its receipt.
+  return withAdoptedLocalEdit(row, await prepareByOperation(e, row, cfg, signal, clock));
+}
+async function prepareByOperation(e: BrainEngine, row: WriteRequest, cfg: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) {
   assertMutationProtocol(row);
   enterClaimStep(clock, 'dispatch');
   const registered = preparers.get(row.operation);
@@ -100,7 +112,8 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (row.operation === 'submit_job' && String(row.intent?.kind).startsWith('managed_maintenance_')) return (await import('./prepared-maintenance.ts')).prepareMaintenanceMutation(e, row, cfg, clock);
   if (row.operation === 'put_page' && row.intent?.kind === 'managed_file_import') return (await import('./import-prepare.ts')).prepareManagedImportMutation(e, row, cfg);
   if (row.operation === 'put_page' && row.intent?.kind === 'managed_file_repair') return (await import('./file-repair.ts')).prepareManagedFileRepairMutation(e, row, cfg);
-  if (row.operation === 'remember') return (await import('./memory-mutations.ts')).prepareMemoryMutation(e, row, cfg, signal);
+  if (row.operation === 'remember') return (await import('./memory-mutations.ts')).prepareMemoryMutation(e, row, cfg, signal, clock);
+  if (row.operation === 'forget' || row.operation === 'forget_fact') return (await import('./forget-prepare.ts')).prepareForgetMutation(e, row, cfg, signal);
   if (row.operation === 'loops_close' && row.intent?.kind === 'retire_loop_fact') return (await import('./loop-fact-retirement.ts')).prepareLoopFactRetirement(e, row, cfg);
   if (row.operation === 'decide_proposal') return (await import('../facts/proposal-supersede.ts')).prepareProposalMutation(e, row, cfg);
   if (row.operation === 'trust_owner_page') return (await import('../trust/page-handlers.ts')).prepareTrustOwnerPageMutation(e, row, cfg);
@@ -110,8 +123,8 @@ export async function preparePersistedMutation(e: BrainEngine, row: WriteRequest
   if (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation)) return prepareSemanticPageMutation(e, row, cfg);
   if (row.operation === 'add_link' || row.operation === 'remove_link') return (await import('./manual-links.ts')).prepareManualLinkMutation(e, row, cfg);
   if (row.operation === 'append_page') return (await import('./page-upload.ts')).withStagedBodyIf(e, row, async () => (await import('./page-append.ts')).prepareAppendMutation(e, row, cfg, signal, clock));
-  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return preparePageMutation(e, row, cfg, undefined, signal,
-    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true });
+  if (['put_page','capture','delete_page','restore_page','revert_version','edit_page'].includes(row.operation)) return withValidTimeAdvisory(row, withChangeReason(row, await withSupersedes(row, await preparePageMutation(e, row, cfg, undefined, signal,
+    { coordinated: await writeSwitchOn(e, 'single_write_group').catch(() => true), clock, boundedChunkWrites: true }))));
   throw new OperationError('unsupported_mutation_protocol', 'No compatible mutation preparer is registered for this operation.', `Request ${row.request_id} (${row.operation}) was accepted by a gbrain version whose preparer this one lacks, so it has not run. Run gbrain upgrade on every host that serves this brain; the request stays journaled and resumes after the upgrade.`);
 }
 /**
@@ -135,7 +148,7 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
   const full = () => new PersistenceConsumer(engine, config, preparePersistedMutation,
     { drainNotice: kind === 'serve', oneShot, onSettled: row => { recordSettlement(engine); rememberSettled(engine, row.id); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
   const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
-    ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
+    ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: hostIdFor(engine), pool: () => enginePoolStats(engine) }), stopping: false }
     : (() => { const consumer = full(); return { consumer, stopping: false, heartbeat: startConsumerHeartbeat(engine, consumer.hostId,
         // #6317 (C1): the row's pool numbers come from the vendored driver's own queues (postgres-engine/pool-stats.ts).
         { kind, mode: 'full', report: () => ({ restart_required: consumer.restartRequired(), root_barrier_age_ms: consumer.oldestRootBarrierAgeMs(), pool: enginePoolStats(engine) }) }) }; })();
@@ -150,7 +163,8 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     // An explicit switch to another datastore must not inherit the old brain's config.
     if (sameDatastore) startPersistenceConsumer(engine, config);
   });
-  consumer.start();
+  // The consumer's publications (embeddings included) run in its engine's scope (engine-scope.ts).
+  withEngineScope(engine, () => consumer.start());
   return consumer;
 }
 export async function stopPersistenceConsumer(engine: BrainEngine): Promise<void> {
@@ -212,7 +226,7 @@ export function assertPersistenceAccepting(engine: BrainEngine): void {
 }
 /** DX-A3: pending heads that need intervention, not more waiting. */
 export const BLOCKED_WRITE_REASONS = ['recovery_required', 'owner_unavailable', 'unexpected_file_bytes', 'unexpected_staging_bytes'] as const;
-const FATAL_READ_REASONS: readonly PgAccessReason[] = ['auth_failed', 'permission_denied', 'tenant_not_found', 'db_missing', 'schema_missing', 'storage_corrupt'];
+const FATAL_READ_REASONS: readonly PgAccessReason[] = ['auth_failed', 'permission_denied', 'tenant_not_found', 'db_missing', 'schema_missing', 'storage_corrupt', 'tls_required_default'];
 /** CEO-A7: the first poll waits this long (at most half the wait) for an in-process handoff, or not at all when this process already settled the request; later polls back off from 50 to 250 ms. */
 export const WRITE_POLL_START_MS = 200;
 export type WriteWait =
@@ -231,6 +245,9 @@ export type WriteWait =
 export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config: GBrainConfig,
   opts: { waitMs?: number; signal?: AbortSignal; whileHeldMs?: number } = {}): Promise<WriteWait> {
   if (isTerminal(row)) return { kind: 'terminal', row };
+  // PR B: a write deferred behind a refresh still running (GST-1582: or an import not landed) cannot publish before it ends,
+  // so its pending receipt is returned at once.
+  if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row };
   const consumer = startPersistenceConsumer(engine, config);
   const service = services.get(engine)!;
   const id = row.id;
@@ -250,10 +267,18 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
   let deadline = started + waitMs;
   const firstPoll = recentlySettled.get(engine)?.has(id) ? 0 : Math.min(WRITE_POLL_START_MS, waitMs / 2);
   let delay = firstPoll, failure: { error: unknown; attempts: number } | undefined;
+  // GBRA-248: owner facts for a write that may be left pending or blocked, read during the wait's last OWNER_READ_BUDGET_MS (a
+  // shorter wait is extended to that budget); waiters on one worktree share the read and reuse its answer (sharedOwnerRead).
+  let ownerRead: SharedOwnerRead | undefined;
   try {
     while (!service.stopping && !opts.signal?.aborted) {
-      if (handed) { row = handed; handed = undefined; if (isTerminal(row)) return { kind: 'terminal', row }; }
+      if (handed) {
+        row = handed; handed = undefined;
+        if (isTerminal(row)) return { kind: 'terminal', row };
+        if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row };
+      }
       const remaining = deadline - performance.now();
+      if (!ownerRead && row.worktree_id && remaining <= OWNER_READ_BUDGET_MS) ownerRead = sharedOwnerRead(engine, row.worktree_id);
       if (remaining <= 0) {
         if (opts.whileHeldMs && opts.whileHeldMs > waitMs && deadline === started + waitMs
           && (consumer.holds(id) || row.state === 'queued' && !row.blocked_reason)) { deadline = started + opts.whileHeldMs; continue; }
@@ -279,6 +304,7 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
       if (!read.row) continue;
       row = { ...row, ...read.row };
       if (isTerminal(row)) return { kind: 'terminal', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
+      if (row.state === 'deferred' && await deferredWaiting(engine, row)) return { kind: 'pending', row: await getWriteRequestById(engine, id).catch(() => null) ?? row };
     }
     // A stopped wait settles only what this process can settle at once: one consumer tick (it claims and publishes the
     // request when nothing holds it back) and the request this consumer is still executing. A write that cannot move
@@ -312,8 +338,14 @@ export async function awaitWrite(engine: BrainEngine, row: WriteRequest, config:
     return { kind: 'read_failed', row, request_id: row.request_id, reason: diagnosis.reason, transient: diagnosis.transient,
       ...(diagnosis.sqlstate ? { sqlstate: diagnosis.sqlstate } : {}), attempts: failure.attempts, message: diagnosis.message, why: diagnosis.remediation };
   }
+  // GBRA-248: a write left pending or blocked names a stale owner, so the receipt (and --accept-pending) can tell it from a slow commit.
+  if (row.worktree_id) {
+    const owner = await (ownerRead ?? sharedOwnerRead(engine, row.worktree_id)).answer();
+    if (owner) observedOwners.set(row, owner);
+  }
   const cause = BLOCKED_WRITE_REASONS.find(reason => reason === row.blocked_reason);
-  return cause ? { kind: 'blocked', row, request_id: row.request_id, cause, command: `gbrain sources writer status ${row.source_id} --json` } : { kind: 'pending', row };
+  if (cause) return { kind: 'blocked', row, request_id: row.request_id, cause, command: `gbrain sources writer status ${row.source_id} --json` };
+  return { kind: 'pending', row };
 }
 /** At most four progress reads per engine; concurrent waiters on one request share a read. */
 async function readProgress(engine: BrainEngine, id: string, remaining: number): Promise<ProgressRead> {
@@ -356,8 +388,30 @@ function terminalReceiptHint(row: WriteRequest, reason: string): string {
     ? `${what} Submit again only if the change is still wanted, with a new request_id.`
     : `${what} Read the receipt and the current state before deciding to submit again; a new attempt needs a new request_id.`;
 }
+/** GBRA-248: owner facts awaitWrite observed for a row it left pending (by identity; the row object travels to writeResponse unchanged). */
+const observedOwners = new WeakMap<WriteRequest, OwnerActivity>();
+/** GBRA-248: staleness moves on a 24 h scale, so an owner answer is reused for a few seconds and a batch of waiters pays one read. */
+const OWNER_CACHE_MS = 10_000;
+interface SharedOwnerRead { at: number; answer(): Promise<OwnerActivity | undefined> }
+const ownerReads = new WeakMap<BrainEngine, Map<string, SharedOwnerRead>>();
+/** One owner read per engine and worktree at a time; it answers within OWNER_READ_BUDGET_MS of its start (undefined: no stale-owner facts). */
+function sharedOwnerRead(engine: BrainEngine, worktreeId: string): SharedOwnerRead {
+  let reads = ownerReads.get(engine);
+  if (!reads) { reads = new Map(); ownerReads.set(engine, reads); }
+  const current = reads.get(worktreeId);
+  if (current && performance.now() - current.at < OWNER_CACHE_MS) return current;
+  const at = performance.now();
+  const settled = startOwnerRead(engine, [worktreeId])(OWNER_READ_BUDGET_MS).then(owners => {
+    if (!owners && reads!.get(worktreeId) === read) reads!.delete(worktreeId);
+    return owners?.get(worktreeId);
+  });
+  const read: SharedOwnerRead = { at, answer: () => settled };
+  reads.set(worktreeId, read);
+  return read;
+}
 export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number | null; waiterOnlyOwner?: ElectedOwner | null } = {}): Record<string, unknown> {
-  const receipt = receiptFor(row);
+  const owner = isTerminal(row) ? undefined : observedOwners.get(row);
+  const receipt = receiptFor(row, owner ? { owner } : undefined);
   // #6007: an in-process estimate beats the fixed fallback, never an owner-inspection hold.
   if (!isTerminal(row) && hints.retryAfterMs != null && receipt.diagnostic?.next_action !== 'inspect_owner') receipt.retry_after_ms = hints.retryAfterMs;
   if (row.state === 'committed') return { ...receipt, write_request: receipt };
@@ -372,11 +426,19 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
       ? pendingWriteHint(receipt, row.operation)
       : delivered?.suggestion ?? content?.suggestion ?? held?.suggestion ?? terminalReceiptHint(row, reason), delivered?.docs);
   if (delivered?.detail ?? held?.reason) error.detail = delivered?.detail ?? held?.reason;
+  // #7671: a copied or restored checkout; the receipt kept only the message, so name the relocated-root self-transfer here.
+  if (isTerminal(row) && reason === 'recovery_required' && isPhysicalRootDirectoryChangedMessage(row.error_message)) {
+    Object.assign(error, { detail: 'physical_root_directory_changed', fix: relocatedRootTransferFix(row.source_id) });
+  }
   // #6693: a write refused while its page's file awaited import says so, with the wait (remember) or the sync to run first.
   if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === PENDING_IMPORT) {
     const pending = pendingImportRefusal(row, row.authority?.remote === true);
     Object.assign(error, { suggestion: pending.suggestion, fix: pending.fix, reason: pending.reason, detail: pending.detail, docs: pending.docs ?? error.docs });
   }
+  const checkout = isTerminal(row) ? storedCheckoutRefusal((row.error_detail as { origin?: unknown } | null | undefined)?.origin, row.source_id, row.slug || null) : undefined;
+  if (checkout) Object.assign(error, { suggestion: checkout.suggestion, fix: checkout.fix, detail: checkout.detail, docs: checkout.docs });
+  // GST-2462 (D2): a page whose file left git can still be narrowed: name the page rule, not only the ghost-page repair (which deletes it).
+  if (isTerminal(row) && reason === 'source_changed' && (row.error_detail as { origin?: unknown } | null | undefined)?.origin === 'canonical_file_missing') error.suggestion = `${error.suggestion} The page's file is gone, so a visibility edit cannot publish; to narrow who reads it without restoring the file, add a page rule on the brain host: gbrain access rule add --slug ${row.slug} --readers <member> --source ${row.source_id} (it previews; --yes applies, and removing the rule undoes it). See docs/guides/write-refusals.md#canonical_file_missing.`;
   // #6317 (B1b): a waiter-only process names the owner that publishes for it, so the caller is told who holds the write instead of polling blind.
   if (!isTerminal(row) && hints.waiterOnlyOwner) {
     const owner = hints.waiterOnlyOwner;

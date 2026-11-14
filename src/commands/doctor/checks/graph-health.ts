@@ -13,7 +13,7 @@ import { quarantineFilterFragment } from '../../../core/quarantine.ts';
 import { entityTypePredicateSql, resolveEntityTypes } from '../../../core/schema-pack/entity-types.ts';
 import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../../../core/types.ts';
 import type { Check } from '../../doctor.ts';
-import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth } from '../context.ts';
+import { connectedEngine, type DoctorContext, type DoctorEntry, doctorHealth, doctorSourceIds } from '../context.ts';
 import { agentFix, brainScorePlanFix, checkError } from '../check-fix.ts';
 import { ORPHAN_FULL_SCAN_KEY, countLivePages, estimateOrphanRatio, orphanFullScanMaxPages, type OrphanEstimate } from './orphan-estimate.ts';
 
@@ -320,7 +320,7 @@ async function runTimelineHistory(ctx: DoctorContext): Promise<Check[]> {
     }
     // Wave checks registered in doctor/wave-checks.ts rather than inline here.
     const { runWaveChecks } = await import('../wave-checks.ts');
-    for (const finding of await runWaveChecks(engine, { only: 'wave', ids: only ?? undefined, sourceIds: orphanRatioSourceId ? [orphanRatioSourceId] : undefined })) checks.push(finding.check);
+    for (const finding of await runWaveChecks(engine, { only: 'wave', ids: only ?? undefined, sourceIds: doctorSourceIds(ctx) })) checks.push(finding.check);
   }
   return checks;
 }
@@ -340,10 +340,29 @@ export const derivedVisibilityEntry: DoctorEntry = {
   run: runDerivedVisibility,
 };
 
+/**
+ * GST-1209 follow-up: damaged segmented pages are their own entry with their own budget, so a default run reports the
+ * finding even when the wave checks of timeline_history run out of theirs (and never serves an older entry's last known result for it).
+ */
+async function runSegmentedTiling(ctx: DoctorContext): Promise<Check[]> {
+  ctx.progress.heartbeat('segmented_tiling');
+  const { segmentedTilingCheck } = await import('./segmented-tiling.ts');
+  const checks: Check[] = [];
+  checks.push(await segmentedTilingCheck(connectedEngine(ctx), ctx.orphanRatioSourceId ? [ctx.orphanRatioSourceId] : undefined));
+  return checks;
+}
+
+export const segmentedTilingEntry: DoctorEntry = {
+  name: 'segmented_tiling',
+  emits: ['segmented_tiling'],
+  run: runSegmentedTiling,
+};
+
 export const timelineHistoryEntry: DoctorEntry = {
   name: 'timeline_history',
   emits: [
     'timeline_history',
+    'privacy_label_ignored',
     'safe_index_pending',
     'credential_projection_pending',
     'connector_checkpoints',
@@ -355,10 +374,13 @@ export const timelineHistoryEntry: DoctorEntry = {
     'connector_held_items',
     'git_held_files',
     'frontmatter_hook',
+    'url_source_origin',
     'orphan_persistence_bindings',
     'foreign_ownership_marker',
     'coordination_lock_location',
     'unbound_source',
+    'dream_write_deferred',
+    'embedding_restamp_stalled',
     'writer_version',
     'segmented_storage',
     'self_capture',
@@ -369,13 +391,16 @@ export const timelineHistoryEntry: DoctorEntry = {
     'google_calendar_readable',
     'google_api_access',
     'atom_retirements_restorable',
+    'atom_fence_rows',
     'generation_retirements',
     'generation_held',
     'generation_pending',
     'extractor_facts_expired',
+    'unwithdrawn_facts',
     'conversation_label_facts',
     'conversation_outcomes_stale',
     'captured_facts_active',
+    'agent_session_facts',
     'facts_redaction_marker',
     'fact_bulk_dates',
     'loop_facts_drift',

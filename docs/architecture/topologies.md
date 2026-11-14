@@ -566,6 +566,34 @@ neither relaxes anything else:
   binding move to the real directory, the reservation is written under the new
   `sha256(root)` name, the old one is removed and the stamp names the new root.
   A token or worktree mismatch keeps the refusal and moves nothing.
+- <a id="moved-root"></a>*Moved to a new path, no symlink (#8625):* `gbrain sources
+  set-path <source> <new>`, `gbrain sources add <id> --path <new>` and
+  `gbrain sources writer claim <id> --path <new>`, dry runs included, refuse
+  `recovery_required` with detail `physical_root_moved` when the folder's stamp
+  names this brain, a worktree this host owns and a recorded root that no longer
+  exists, and the reservation under the recorded name carries the stamp's token.
+  That reservation sits beside the old root when the checkout itself moved, or
+  beside the new root when a parent folder was renamed and carried it along; the
+  refusal then names that parent. The refusal names the recorded path, the
+  worktree and its sources, and the exit (its `fix` is `ask_user`, since it
+  moves the user's folders):
+  - *The worktree still has sources:* `ln -s <new> <old>` (the moved folder or
+    parent), `gbrain sources set-path <source> <new>` (the symlinked relocation
+    above), `rm <old>`, then `set-path` for each further source of the worktree.
+  - *Its source was removed* (`remove` keeps the worktree and its history):
+    `mv <new> <old>`, then `gbrain sources add <id> --path <old>` (add `--force`
+    for a plain directory), which reattaches the worktree; move it again with the
+    steps above.
+  - *The folder is a copy* (another filesystem, a copy and delete: its device,
+    inode or birth time differs from the stamp) *and its source was removed:*
+    moving it back would not reattach the worktree, so restore the original from a
+    backup or switch the brain to classic mode with `gbrain sources writer
+    deactivate --dry-run`.
+
+  A lookalike (another brain's stamp, a token the reservation does not carry, a
+  recorded root that still exists, a worktree another host owns, no reservation)
+  keeps the generic refusal. A remote page write that reaches the automatic claim
+  of such a folder gets the detail only, with no path or worktree id.
 
 `gbrain sources writer deactivate --dry-run` lists a `physical_root` blocker
 exactly when its real run would refuse: the managed run takes the strict
@@ -830,7 +858,7 @@ elsewhere), and never during a pending recovery or transfer
 or rebases the checkout.
 
 <a id="files-that-are-not-pages"></a>**Files that are not pages.** The owner's
-Git effect commits only the page paths it wrote (`git commit --only`) and then
+Git effect commits only the page paths it wrote (a `commit-tree` of them) and then
 pushes HEAD. Everything else in the checkout (`MEMORY.md`, daily notes,
 `AGENTS.md`, scripts) is the operator's: commit it with
 `gbrain git commit-push -m "<msg>" -- <paths>`, which commits only those paths
@@ -848,9 +876,12 @@ guards against; bring remote commits in with `gbrain sources refresh <source>`.
 The durability block `sources harden` writes into `AGENTS.md`/`RESOLVER.md`
 before activation says the opposite (run the push helper after every write,
 pull before writing), so `writer git-durability <source> --enable` and
-`--pat-file` rewrite that block in place to the managed variant (#5808); the
-preview reports it as `agents`, the rewrite touches nothing outside the
-markers, and the file is left for you to commit.
+`--pat-file` write the managed variant (#5808); the preview reports it as
+`agents`. An existing block is rewritten in place and nothing outside its
+markers changes. With no block, the managed block is appended to the root
+instruction file (`RESOLVER.md` or `AGENTS.md`, whichever is found first), or
+`AGENTS.md` is created when neither exists (#7733). Either way the file is
+left for you to commit, so a clean-tree check fails until you do.
 
 ### Supported managed work and explicit repair
 
@@ -959,6 +990,84 @@ disk-brain CLI regression verifies refusal with a live owner, malformed-output
 recovery, idempotent replay and fresh readback after a clean restart. Do not
 disable persistence to bypass this, and do not confuse live fact-backfill IPC
 with live-owner dream delegation.
+
+## Embedded core (planned)
+
+Status: planned (GBRA-248). None of this runs yet, and nothing reads the
+setting below. Today one process serves one brain; to serve several, run one
+process per brain ([running gbrain on servers today](../guides/servers-today.md)).
+
+The embedded core lets a host such as a hosted service run many customers'
+brains in one server process. Each brain is opened from a settings object, and
+everything that belongs to a brain lives on the engine that settings object
+opened.
+
+**What the host supplies.** One settings object per brain: the database (URL,
+direct URL, pool size and an optional process-wide connection budget), storage
+(a `StorageBackend` and a per-brain key prefix), AI (keys, models, base URLs),
+the host identity, and whether the engine may touch a worktree.
+
+**What the core promises.** `openEngine(settings)` (a new name, because
+`createEngine(EngineConfig)` is already exported from `gbrain/engine-factory`)
+returns an engine that reads only its argument: no `~/.gbrain/config.json`, no
+process environment, no per-brain module state. The pool, the AI gateway with
+its model clients and caches, and the usage and telemetry sinks hang off the
+engine. Opening never migrates; a separate `migrate(settings)` does, and an
+engine refuses an older or newer schema. Every failure carries the
+[agent operator contract](../protocol/AGENT_OPERATOR_v1.md).
+
+**What the local app adds.** The CLI keeps reading `~/.gbrain/config.json` and
+the environment, builds the same settings and passes them in, and still
+migrates on connect. Process exit, signal handlers, timers, files under
+`GBRAIN_HOME` and child processes stay in the local app.
+
+**`database_only`.** A hosted brain with no repository is the existing no-root
+source state (`gbrain init --db-only`), not a new mode. Git stays the parent
+wherever a repository exists. Markdown and files leave a database-only brain
+through `gbrain export` and a `StorageBackend`, not through a mirror.
+
+**The `embedded_core` setting.** Every hosted or embedded behavior the program
+adds is opt-in behind one setting, `embedded_core`, off by default: no-root
+hosted sources opened through `openEngine`, the explicit-migration mode for
+servers, and export to a `StorageBackend`. A brain that never sets it sees no
+behavior change, which every wave proves with the upgrade-from-previous-release
+harness. No code reads the setting yet.
+
+**Guards.** `bun run check:core-world-reads` (in `bun run verify`) counts,
+per file in `src/core`, `loadConfig` calls, environment reads, `fs` imports,
+module-level mutable collections, spawn imports, process-wide hooks and
+`AsyncLocalStorage` stores against `scripts/core-world-reads-baseline.tsv`,
+whose rows name the wave that removes each count. Counts only fall: a rise
+fails (take the value from the settings the caller passes in, or justify a
+raised row in the same PR), and so does a stale row (`--prune` lowers it).
+Rules are in the script's header. The two-engine suite
+(`test/helpers/two-engine.ts`) runs two brains in one process on PGLite and
+Postgres and lists each dimension that still leaks with the wave that fixes
+it. `test/embedded-hermeticity.test.ts` runs
+[`examples/embedded-two-brains.ts`](../../examples/embedded-two-brains.ts) in a
+cold process with canary homes and environment. The upgrade harness
+(`test/helpers/upgrade-from-previous-release.ts`) opens the previous
+release's brain and config under the new build for the repo,
+content-directory and no-root shapes.
+
+**Per-process state and the wave that moves it.**
+
+| State | Where | Wave |
+|---|---|---|
+| Postgres pool singleton; a second `connect()` reuses it | `src/core/db.ts` | W2 |
+| AI gateway config, model-client cache (keyed without the key or endpoint), shrink state | `src/core/ai/gateway.ts` | W2 for the hosted slice, W3 for every caller |
+| Query-embedding cache (keyed without brain, key or caller) | `src/core/ai/query-embed-cache.ts` | W2 |
+| Chat usage sink (top of a process-wide stack) | `src/core/ai/chat-usage.ts` | W2 |
+| Search telemetry writer (bound to the first engine) | `src/core/search/telemetry.ts` | W2 |
+| Schema-pack link semantics | `src/core/link-validity.ts` | W2 |
+| Strict-params and default-surface fallbacks | `src/mcp/validate-params.ts`, `src/commands/serve-http-mcp.ts` | W2 |
+| Minion admission policy cache (keyed by job name) | `src/core/minions/admission.ts` | W6 |
+| Retrieval-tracking switch cache | `src/core/last-retrieved.ts` | W6 |
+| Sources query-shape memo | `src/core/source-resolver.ts` | W6 |
+| Full-text language cache | `src/core/fts-language.ts` | W6 |
+| `loadConfig` rereads and `GBRAIN_HOME` paths | `src/core/config.ts` | W6 |
+| Page-lock root and slug-only key | `src/core/page-lock.ts` | W5 |
+| Process handlers, telemetry and supervisor timers, claim leases | `src/core/process-cleanup.ts`, `src/core/minions/supervisor.ts`, `src/core/persistence/claim-lease.ts` | W7 |
 
 ## When NOT to use these topologies
 

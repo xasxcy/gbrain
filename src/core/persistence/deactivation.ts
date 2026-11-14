@@ -34,7 +34,7 @@ import { configDir } from '../config.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { acquireWorktree, getWorktreeBinding, readPersistenceBrain, type PersistenceBrainRow } from './ownership.ts';
-import { existingLocalHostId } from './identity.ts';
+import { existingHostIdFor } from './identity.ts';
 import type { NativeLockHandle } from './native-lock.ts';
 import { assertWriterAdminState } from './admin-intent.ts';
 import { assertWriterAdminUnlocked, readWriterAdminLock, WRITER_ADMIN_LOCKED_DOCS } from './admin-lock.ts';
@@ -107,17 +107,21 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
     exit: 'gbrain sources writer unlock' });
   const requests = await engine.executeRaw<{ request_id: string; source_id: string; slug: string; operation: string; state: string; recovering: boolean }>(
     `SELECT request_id::text AS request_id, source_id, slug, operation, state, recovery IS NOT NULL AS recovering FROM persistence_requests
-     WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL ORDER BY sequence LIMIT 50`);
+     WHERE state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL ORDER BY sequence LIMIT 50`);
   for (const r of requests) {
     blockers.push({ kind: 'request', id: r.request_id, source_id: r.source_id, detail: `${r.operation} ${r.state}${r.recovering ? ', recovering' : ''} (${r.source_id}:${r.slug})`,
       exit: r.state === 'queued' && !r.recovering ? `gbrain cancel-write-request ${r.request_id} (MCP: cancel_write_request), or wait for the owner to publish it`
         : r.state === 'running' && !r.recovering ? 'wait for the owner to finish publishing it, then rerun deactivate'
           : `gbrain sync --source ${r.source_id} --no-pull` });
   }
-  const topology = await engine.executeRaw<{ id: string; operation: string; source_id: string }>(
-    "SELECT id::text AS id, operation, source_id FROM persistence_topology_changes WHERE state='recovering' OR recovery IS NOT NULL ORDER BY created_at LIMIT 20");
-  for (const t of topology) blockers.push({ kind: 'topology_recovery', id: t.id, source_id: t.source_id, detail: `${t.operation} for ${t.source_id} is recovering`,
-    exit: `gbrain sources writer status ${t.source_id} --json, then let the owner finish recovery` });
+  const topology = await engine.executeRaw<{ id: string; operation: string; source_id: string; request_id: string; admission: boolean; automatic: boolean }>(
+    "SELECT id::text AS id, operation, source_id, request_id::text AS request_id, (state='recovering' AND recovery IS NULL) AS admission, COALESCE(outcome->>'expired_only','false')='true' AS automatic FROM persistence_topology_changes WHERE state='recovering' OR recovery IS NOT NULL ORDER BY created_at LIMIT 20");
+  for (const t of topology) blockers.push({ kind: 'topology_recovery', id: t.id, source_id: t.source_id,
+    detail: !t.admission ? `${t.operation} for ${t.source_id} is recovering`
+      : `${t.automatic ? 'automatic expired-archive purge' : t.operation} of ${t.source_id} (request ${t.request_id}) stopped before it finished`,
+    exit: t.admission && t.automatic ? `the next automatic expired-archive purge finishes it, or gbrain sources purge with no source id finishes it now (gbrain sources writer status --source ${t.source_id} --json lists the request), then rerun deactivate`
+      : t.admission ? `ask the user whether to finish it, because finishing deletes the rest of ${t.source_id}'s pages: to finish, rerun the same gbrain sources ${t.operation} command with all its original flags and --request-id ${t.request_id} (an automatic expired-archive purge finishes on its next run); to keep what is left, any other lifecycle change to the source (gbrain sources restore of an archived source, or archive then restore) abandons the request; then rerun deactivate`
+      : `gbrain sources writer status ${t.source_id} --json, then let the owner finish recovery` });
   // GBRA-130 A-15: only work that can still change blocks, as activation checks; terminal failures are failedEffectHistory's.
   const effects = await engine.executeRaw<EffectRow>(`${EFFECT_ROWS} WHERE e.state IN ('queued','running') OR e.recovery IS NOT NULL ORDER BY e.id LIMIT 50`);
   for (const e of effects) {
@@ -130,7 +134,7 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
   }
   // Managed connector holds live in the managed checkpoint, which classic mode does not read. Deactivation copies
   // them into each source's classic state file; only a source whose holds have nowhere to go blocks it.
-  for (const carry of await planHoldCarry(engine, existingLocalHostId())) {
+  for (const carry of await planHoldCarry(engine, existingHostIdFor(engine))) {
     if (!holdCarryBlocked(carry)) continue;
     const resolve = `gbrain sources status ${carry.source_id} names each item's error; fix its cause, then gbrain sources retry-held ${carry.source_id} and gbrain sync --source ${carry.source_id} (a successful re-attempt clears the hold)`;
     blockers.push({ kind: 'connector_holds', id: carry.source_id, source_id: carry.source_id,
@@ -183,7 +187,7 @@ export async function failedEffectHistory(engine: BrainEngine): Promise<FailedEf
  * Each preview therefore lists what its own real run would refuse on.
  */
 export async function physicalRootBlockers(engine: BrainEngine, mode: 'managed' | 'classic'): Promise<DeactivationBlocker[]> {
-  const hostId = existingLocalHostId();
+  const hostId = existingHostIdFor(engine);
   const sources = mode === 'managed'
     ? await engine.executeRaw<{ id: string }>('SELECT source_id AS id FROM persistence_source_bindings ORDER BY source_id')
     : (await preActivationClaims(engine)).map(claim => ({ id: claim.source_id }));
@@ -257,13 +261,13 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
   }
   const blockers = [...await deactivationBlockers(engine), ...await physicalRootBlockers(engine, 'managed')];
   if (opts.dryRun) {
-    const carried_holds = (await planHoldCarry(engine, existingLocalHostId())).filter(c => c.items > 0 && !holdCarryBlocked(c));
+    const carried_holds = (await planHoldCarry(engine, existingHostIdFor(engine))).filter(c => c.items > 0 && !holdCarryBlocked(c));
     return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers, carried_holds, failed_effects: await failedEffectHistory(engine) };
   }
   if (blockers.length) throw blockedError(blockers);
   const principal = await topologyPrincipal(engine);
   const requestId = opts.requestId ?? randomUUID();
-  const hostId = existingLocalHostId();
+  const hostId = existingHostIdFor(engine);
   const locks: NativeLockHandle[] = [];
   let report: DeactivationReport;
   try {

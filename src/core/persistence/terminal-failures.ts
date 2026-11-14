@@ -28,6 +28,7 @@ import { readReceiptRetentionDays, DEFAULT_RECEIPT_RETENTION_DAYS } from './limi
 import { MANAGED_SYNC_PASS_OP } from './sync-pass-row.ts';
 import { SYNC_PASS_SUPERSEDED } from './sync-checkpoint-replaced.ts';
 import type { PublicCategory } from './public-category.ts';
+import { GRANDFATHER_RETIRED } from './publication-failure.ts';
 import { classifyTerminal, dispositionOf, driftSinceAction, faultOperation, TERMINAL_FIXED_IN, supersessionOrderSql, supersessionSql, terminalInspectArgv, terminalKnockOnSql, type TerminalCategory,
   type TerminalDisposition, type TerminalVerdict, CONNECTION_MESSAGE_PATTERN, LEGACY_PUBLICATION_PREFIX } from './terminal-classify.ts';
 
@@ -77,6 +78,7 @@ export const TERMINAL_HISTORICAL_SQL: Readonly<Record<keyof typeof TERMINAL_FIXE
   knock_on: b => `(${b}.knock_on AND NOT ${b}.has_recovery AND ${OLDER_THAN(`${b}.build`, TERMINAL_FIXED_IN.knock_on)})`,
   legacy_publication_refusal: b => `(NOT ${b}.has_recovery AND NOT ${b}.knock_on AND ${b}.routed_message = '${LEGACY_PUBLICATION_PREFIX}' AND ${b}.origin IS NULL AND ${b}.error_code IN ('storage_error','writer_coordinator_required'))`,
   fence_unrenderable: b => `(NOT ${b}.has_recovery AND NOT ${b}.knock_on AND ${b}.origin IS NULL AND ${b}.error_code = 'fence_unrenderable' AND ${OLDER_THAN(`${b}.build`, TERMINAL_FIXED_IN.fence_unrenderable)})`,
+  retired_operation: b => `(NOT ${b}.has_recovery AND NOT ${b}.knock_on AND ${b}.error_code = 'revision_conflict' AND (${b}.origin IS NOT DISTINCT FROM '${GRANDFATHER_RETIRED}' OR ${b}.intent_kind IS NOT DISTINCT FROM 'managed_grandfather'))`,
 };
 const HISTORICAL_BY_BUILD = (b: string) => `COALESCE(${Object.values(TERMINAL_HISTORICAL_SQL).map(sql => sql(b)).join(' OR ')}, false)`;
 const BUILD = (r: string) => `COALESCE(${r}.error_detail->'attempt'->>'consumer_version', ${r}.admitter_version)`;
@@ -144,7 +146,7 @@ export async function readTerminalFailureSummary(engine: BrainEngine, opts: { so
       WHERE (${RECOVERY('r')} OR (${TERMINAL('r')} AND ${ENDED('r')} > now()-($1::int*interval '1 day')))
         AND ($2::text[] IS NULL OR r.source_id=ANY($2::text[]))
     ), resolved AS (
-      SELECT r.id FROM base r WHERE NOT r.has_recovery AND EXISTS (SELECT 1 FROM persistence_requests c WHERE ${supersessionSql('r', 'c')})
+      SELECT r.id FROM base r WHERE NOT r.has_recovery AND EXISTS (SELECT 1 FROM persistence_requests c WHERE ${supersessionSql('r', 'c', 'r.intent_kind')})
     ), tagged AS (
       SELECT b.*, (x.id IS NOT NULL OR (NOT b.has_recovery AND b.error_code='${SYNC_PASS_SUPERSEDED}')) AS resolved, (b.has_recovery OR b.ended_at > now()-($3::int*interval '1 day')) AS in_window, ${HISTORICAL_BY_BUILD('b')} AS historical_build
       FROM base b LEFT JOIN resolved x ON x.id=b.id
@@ -330,17 +332,18 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
   const want = q.groupBy ? MAX_SCAN : limit + 1;
   while (out.length < want && scanned < MAX_SCAN && !exhausted) {
     const batch = await bounded<KeyColumns & { request_id: string; sequence: string; slug: string; error_detail: Record<string, unknown> | null; ended_at: string; admitted_at: string; later_state: string | null; same_intent: boolean | null }>(engine,
-      `SELECT r.request_id::text AS request_id, r.sequence::text AS sequence, r.source_id, r.slug, r.operation, r.intent->>'kind' AS intent_kind, r.state, r.error_code, r.error_detail,
+      `SELECT r.request_id::text AS request_id, r.sequence::text AS sequence, r.source_id, r.slug, r.operation, r.intent_kind, r.state, r.error_code, r.error_detail,
           r.error_detail->>'origin' AS origin, r.error_detail->>'reason' AS reason, r.error_detail->>'cause' AS cause,
           r.recovery IS NOT NULL AS has_recovery, r.blocked_reason, r.compacted, ${terminalKnockOnSql('r')} AS knock_on, ${ROUTED_MESSAGE('r')} AS routed_message, ${BUILD('r')} AS build,
           to_char(${ENDED('r')} AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ended_at, to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') AS admitted_at,
           later.state AS later_state, later.same_intent
-        FROM persistence_requests r
-        LEFT JOIN LATERAL (SELECT c.state, c.digest=r.digest AS same_intent FROM persistence_requests c WHERE ${supersessionSql('r', 'c')}
+        FROM (SELECT p.*, p.intent->>'kind' AS intent_kind FROM persistence_requests p
+          WHERE p.source_id=$1 AND (${RECOVERY('p')} OR (${TERMINAL('p')} AND ${ENDED('p')} > now()-($2::int*interval '1 day')))
+            AND ($3::bigint IS NULL OR p.sequence < $3::bigint)
+          ORDER BY p.sequence DESC LIMIT $4) r
+        LEFT JOIN LATERAL (SELECT c.state, c.digest=r.digest AS same_intent FROM persistence_requests c WHERE ${supersessionSql('r', 'c', 'r.intent_kind')}
           ORDER BY ${supersessionOrderSql('r', 'c')} LIMIT 1) later ON r.recovery IS NULL
-        WHERE r.source_id=$1 AND (${RECOVERY('r')} OR (${TERMINAL('r')} AND ${ENDED('r')} > now()-($2::int*interval '1 day')))
-          AND ($3::bigint IS NULL OR r.sequence < $3::bigint)
-        ORDER BY r.sequence DESC LIMIT $4`, [q.sourceId, t.windowDays, cursor, BATCH]);
+        ORDER BY r.sequence DESC`, [q.sourceId, t.windowDays, cursor, BATCH]);
     if (batch === 'unknown') return { status: 'unknown', source_id: q.sourceId, reason: `the read did not finish within ${TERMINAL_STATEMENT_MS} ms (or no connection within ${TERMINAL_ACQUIRE_MS} ms)` };
     if (batch.length < BATCH) exhausted = true;
     for (const row of batch) {
@@ -377,7 +380,7 @@ export async function readTerminalFailures(engine: BrainEngine, q: TerminalFailu
     const key = `${row.code}\0${row.origin ?? ''}\0${row.category}${operation === undefined ? '' : `\0${operation}`}`;
     let g = groups.get(key);
     if (!g) {
-      const filter = { code: row.code, origin: row.origin, category: row.category, ...(operation === undefined ? {} : { operation }) };
+      const filter = { code: row.code, origin: row.origin, category: row.category, ...(operation ?? q.operation ? { operation: operation ?? q.operation } : {}) };
       groups.set(key, g = { code: row.code, origin: row.origin, category: row.category, ...(operation === undefined ? {} : { operation }), public_category: row.public_category, rows: 0, class: row.class, needs_human: row.needs_human,
         ...(row.human_reason ? { human_reason: row.human_reason } : {}), filter, fix: row.fix, samples: [],
         drill_down: terminalFailuresArgv({ sourceId: q.sourceId, state: q.state, sinceDays: q.sinceDays, category: row.category, code: row.code, origin: row.origin ?? NO_ORIGIN, operation: operation ?? q.operation }) });

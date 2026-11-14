@@ -102,7 +102,7 @@ The run ends in exactly one outcome:
 
 | Outcome | Exit | Meaning | What to do |
 | --- | --- | --- | --- |
-| `synced` | 0 | The pass converged and stamped (a company-brain source: the cursor reached its target). A pass at a selection other than the configured one adds `selection_scoped` and does not advance `last_commit`. | Nothing. |
+| `synced` | 0 | The pass converged and stamped (a company-brain source: the cursor reached its target). A pass at a selection other than the configured one adds `selection_scoped` and does not advance `last_commit`; a pass that held files a person must decide adds `held_needs_human` (their count in `held_needs_human`). | Nothing; held files wait on a person (`gbrain sync status --source <id>`). |
 | `resumable` | 0 | A deadline, `--timeout` or Ctrl-C stopped it; accepted writes are intact. | Rerun `next.command`; safe in a loop. |
 | `resumable` / `not_converged` | 0 | The pass used its four rounds while another writer kept changing the level; everything it admitted stands. | Rerun `next.command`. After three in a row `next` is a report (`gbrain doctor --json`), not another sync. |
 | `resumable` / `admission_paused` | 0 | `sync.admission` is `imports_only` or `classify_only`. | Ask the user; `gbrain config set sync.admission normal` ends the pause. |
@@ -507,7 +507,8 @@ vars — incident-time escape hatches, not everyday knobs.
    last good revision and is read-only for `put_page` until the file is
    repaired. A hold clears when the file changes, is deleted, or a newer
    gbrain can read it; `gbrain sync --dry-run` lists would-be holds
-   (`would_hold`) without writing anything. The backlog fix is one previewed,
+   (`would_hold`) and counts the files the run would add, modify, soft-delete
+   and rename, without writing anything. The backlog fix is one previewed,
    hash-bound command per kind of hold:
 
    ```bash
@@ -653,6 +654,18 @@ vars — incident-time escape hatches, not everyday knobs.
    `--wait-drain <seconds>` (default 60; `sources.refresh_drain_wait_ms`,
    `GBRAIN_REFRESH_DRAIN_WAIT_MS`) and `--fetch-timeout-ms` (default 120000;
    `sources.refresh_fetch_timeout_ms`, `GBRAIN_REFRESH_FETCH_TIMEOUT_MS`).
+   The member syncs of one run share a budget,
+   `sources.refresh_sync_budget_ms` (default 300000; `GBRAIN_REFRESH_SYNC_BUDGET_MS`),
+   and each member gets an equal share of what is left, so a scheduled run
+   never holds the refresh lock much longer than that and one stalled source
+   cannot starve the others. A member that ran out of time is `deferred`:
+   the run reports `sync_deferred`, the refresh still completes (writes to
+   the checkout are admitted again) and the next
+   `gbrain sources refresh <source-id>` or sync continues from the member's
+   last commit. A member whose sync committed nothing in its share (a write no
+   consumer claims) is reported in `sync_blocked` as
+   [`refresh_sync_timeout`](write-refusals.md#refresh_sync_timeout) and
+   catches up on its next sync.
    A refresh whose process died (a crash, a replaced container) does not
    wedge the checkout: the owner finishes what it can on its own, and the next
    `gbrain sources refresh <source-id>` on the owner host finishes the rest
@@ -668,6 +681,37 @@ vars — incident-time escape hatches, not everyday knobs.
    means something commits into the checkout outside gbrain: fix that writer
    instead of forcing the checkout
    ([scripts and the managed checkout](shared-checkout-git.md#scripts-and-the-managed-checkout)).
+   When the worktree's Git durability is on, a diverged refresh publishes the
+   local commits itself (`sources.refresh_publish_diverged` unset; `false` turns it
+   off, `true` publishes even with durability off): under its publish lock it scans
+   what those commits add (messages, added lines, merge resolutions) and refuses
+   `publish_secret_found` naming the file, line and rule when one looks like a
+   secret, otherwise it pushes
+   the local commits merged with the upstream in memory, the same publish as
+   `gbrain git commit-push --push-only --keep-checkout` run as a child process
+   with `--scan-secrets` (it skips the checkout's pre-push hook), and fast-forwards
+   to the merge. It never moves the checkout to merge, a conflicting file refuses
+   `integrate_conflict` naming it with nothing pushed (with `gbrain.quarantine`
+   on, the remote's version is published, this machine's is kept under
+   `refs/gbrain/quarantine/`, and the refresh says so), an uncommitted edit to a
+   file the upstream changed refuses `refresh_dirty` before anything is pushed,
+   an upstream rewritten by a force-push (or one gbrain has no earlier record
+   of) still refuses `refresh_diverged`, and `--dry-run` never publishes.
+   The Git effects of page writes push the same local commits with the same
+   scan: a script's commit holding a secret holds them with `publish_secret_found`
+   and nothing is pushed until the user removes it or allowlists a false positive.
+
+   `gbrain sources git-reconcile` does this for every source checkout, and
+   autopilot runs it each tick (`autopilot.git_pull false` skips it). A
+   checkout gbrain cloned also publishes its local commits;
+   `sources.refresh_publish_diverged false` keeps them local. A level
+   checkout costs one fetch, so call it as often as you like. To leave one
+   source out of publishing and keep its sync, run
+   `gbrain config set sources.auto_reconcile.source.<id> false`. Neither
+   git-reconcile nor refresh then pushes that checkout's local commits (a
+   Git repository several sources share stays unpublished while any of
+   them is off, even one whose sync is off), but it still fast-forwards and syncs. `gbrain sources status` and
+   `gbrain sources git-reconcile --dry-run` show which sources are off.
 
    **Say to your agent:** *"Bring my notes source up to date with its remote."*
 
@@ -735,7 +779,12 @@ Any other brain gets names with a suffix: `com.gbrain.autopilot.<suffix>`,
 and a crontab line ending in `# gbrain-autopilot:<suffix>`. The suffix is the
 first 8 hex characters of a random id that `--install` records in
 `<brain>/.gbrain/autopilot-install-id`. Every brain logs to its own
-`<brain>/.gbrain/autopilot.log`.
+`<brain>/.gbrain/autopilot.log`. On macOS, when the brain is on a volume other
+than your home folder (an external `GBRAIN_HOME`), launchd can't start a job
+whose program or log files are on that volume (it exits 78, `EX_CONFIG`). For
+such a brain the job starts the wrapper through `/bin/bash` and logs to
+`~/Library/Logs/gbrain/<label>.log` and `.err`. Re-run `--install` to move
+an existing job onto this layout.
 
 `gbrain autopilot --status [--json]` prints the brain's job name, suffix,
 install-id path, wrapper path and log path (`job` in `--json`). `--status`

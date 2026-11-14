@@ -28,7 +28,9 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { gitBlobOid } from '../src/core/persistence/digest.ts';
 import { SYNC_ORIGIN_DELETED_OP } from '../src/core/persistence/sync-pass-row.ts';
 import { gitHoldItem, readGitHold, writeGitHold, type FileDriftDeletedState, type FileDriftSide } from '../src/core/persistence/sync-holds.ts';
+import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { repairRunner } from '../src/core/repair/registry.ts';
+import { fileDriftConsentText } from '../src/core/repair/file-drift.ts';
 import { resolveRepairScope } from '../src/core/repair/core.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { requirePostgresTestDatabase, testBackends } from './helpers/test-backends.ts';
@@ -97,6 +99,12 @@ for (const backend of testBackends()) describe(`#6712 PR 4b: repair file-drift -
     (await repairRunner(engine, { apply: opts.expect !== undefined, logger })).run('file-drift', await resolveRepairScope(engine, sourceId),
       { explicit: true, sourceFlag: sourceId, held: true, prefer: opts.prefer, ...(opts.side ? { side: opts.side } : {}), ...(opts.state ? { state: opts.state } : {}),
         ...(opts.only ? { only: opts.only } : {}), ...(opts.expect ? { expect: opts.expect } : {}) });
+  const runDatabaseSlug = async (sourceId: string, slug: string, expectHash?: string) =>
+    (await repairRunner(engine, { apply: expectHash !== undefined, logger })).run('file-drift', await resolveRepairScope(engine, sourceId),
+      { explicit: true, sourceFlag: sourceId, slugs: [slug], prefer: 'database', ...(expectHash ? { expect: expectHash } : {}) });
+  const runSlug = async (sourceId: string, slug: string, expectHash?: string) =>
+    (await repairRunner(engine, { apply: expectHash !== undefined, logger })).run('file-drift', await resolveRepairScope(engine, sourceId),
+      { explicit: true, sourceFlag: sourceId, slugs: [slug], prefer: 'file', ...(expectHash ? { expect: expectHash } : {}) });
   const refusal = async (promise: Promise<unknown>) => { try { await promise; } catch (error) { return error as OperationError; } throw new Error('expected a refusal'); };
 
   /** A soft-deleted page whose file then changed: the tombstone_edited Decision. */
@@ -139,6 +147,43 @@ for (const backend of testBackends()) describe(`#6712 PR 4b: repair file-drift -
   const marker = async (f: Fixture, path: string) => (await engine.executeRaw('SELECT 1 FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
     [SYNC_ORIGIN_DELETED_OP, `${f.sourceId}:${f.incarnation}:${path}`])).length > 0;
 
+  // #7950: a held page whose file agrees was listed no_drift by a --slug preview, whose printed apply always refused as
+  // "preview changed": the preview hashed a set the apply could never load. It now enters the approval set as release_hold, and
+  // the apply rechecks the page revision, the file and the observed hold before it schedules the re-screen that releases it.
+  test('#7950: a --slug preview of a held page whose file agrees approves release_hold, and its apply makes the next sync release the hold', () => fixture(async f => {
+    await put(f.ctx, 'notes/agrees', 'Same content on both sides.');
+    commitAll(f.root, 'page');
+    const path = 'notes/agrees.md';
+    const live = (await snapshot(f.sourceId, 'notes/agrees'))!;
+    await hold(f, { path, slug: 'notes/agrees', pageId: Number(live.page.id), side: 'unknown', revision: live.revision });
+    const preview = await runSlug(f.sourceId, 'notes/agrees');
+    expect(preview).toMatchObject({ mode: 'dry_run', affected: 1 });
+    expect(preview.details!.pages).toEqual([expect.objectContaining({ slug: 'notes/agrees', action: 'release_hold', path })]);
+    expect((await runSlug(f.sourceId, 'notes/agrees', preview.preview_hash!)).outcomes).toEqual({ repaired: 1 });
+    await performManagedSync(engine, { sourceId: f.sourceId, noPull: true, noEmbed: true, noExtract: true });
+    expect(await readGitHold(engine, f.sourceId, f.incarnation, path)).toBeNull();
+  }), 240_000);
+
+  test('#7950: a --slug preview with nothing to apply prints an apply command its apply accepts as an empty set', () => fixture(async f => {
+    await put(f.ctx, 'notes/plain', 'No hold, no drift.');
+    commitAll(f.root, 'page');
+    const preview = await runSlug(f.sourceId, 'notes/plain');
+    expect(preview).toMatchObject({ mode: 'dry_run', affected: 0, residuals: { no_drift: 1 } });
+    expect(await runSlug(f.sourceId, 'notes/plain', preview.preview_hash!)).toMatchObject({ mode: 'apply', affected: 0, complete: true });
+  }), 240_000);
+
+  test('#7950: the release_hold apply refuses when the hold it observed was replaced after the preview', () => fixture(async f => {
+    await put(f.ctx, 'notes/again', 'Same content on both sides.');
+    commitAll(f.root, 'page');
+    const path = 'notes/again.md';
+    const live = (await snapshot(f.sourceId, 'notes/again'))!;
+    await hold(f, { path, slug: 'notes/again', pageId: Number(live.page.id), side: 'unknown', revision: live.revision });
+    const preview = await runSlug(f.sourceId, 'notes/again');
+    await Bun.sleep(5);
+    await hold(f, { path, slug: 'notes/again', pageId: Number(live.page.id), side: 'unknown', revision: live.revision });
+    expect((await runSlug(f.sourceId, 'notes/again', preview.preview_hash!)).outcomes).toEqual({ changed_since_preview: 1 });
+  }), 240_000);
+
   test('--side deleted without --state is refused before anything is read, naming each state with its verb', () => fixture(async f => {
     const refused = await refusal(run(f.sourceId, { side: 'deleted', prefer: 'database' }));
     expect(refused.code).toBe('file_drift_state_required');
@@ -174,7 +219,10 @@ for (const backend of testBackends()) describe(`#6712 PR 4b: repair file-drift -
     expect(preview).toMatchObject({ mode: 'dry_run', affected: 1 });
     expect(preview.details!.pages).toEqual([expect.objectContaining({ slug: 'notes/tomb', action: 'remove_file', state: 'tombstone_edited', verb: 'keep the deletion and remove the file' })]);
     expect(preview.listing).toEqual(expect.arrayContaining([expect.objectContaining({ detail: `keep the deletion and remove the file: ${path}` })]));
-    expect(preview.warnings).toEqual([expect.stringContaining("leaves each removed file's deletion uncommitted")]);
+    expect(preview.warnings).toEqual([expect.stringContaining("leaves each removed file's deletion uncommitted"),
+      `The apply removes 1 file(s) that changed after their page was deleted; the deleted page does not hold what they say: ${path}`]);
+    // GST-2579: the consent names each file the apply removes.
+    expect(fileDriftConsentText(preview.preview_hash!, f.sourceId).user_message).toContain(`It also removes 1 file(s) that changed after their page was deleted, and the page does not hold what they say: ${path}.`);
     expect(existsSync(join(f.root, path))).toBe(true);
     const applied = await run(f.sourceId, { side: 'deleted', state: 'tombstone_edited', prefer: 'database', expect: preview.preview_hash! });
     expect(applied.outcomes).toEqual({ repaired: 1 });
@@ -208,6 +256,8 @@ for (const backend of testBackends()) describe(`#6712 PR 4b: repair file-drift -
     writeFileSync(join(f.root, path), page('notes/tomb', 'Edited again after the preview.'));
     const applied = await run(f.sourceId, { side: 'deleted', state: 'tombstone_edited', prefer: 'database', expect: preview.preview_hash! });
     expect(applied.outcomes).toEqual({ changed_since_preview: 1 });
+    // GST-1555: the outcome carries the refusal's own next step.
+    expect((applied.outcome_items![0]!.detail!.fix as { argv: string[] }).argv).toEqual(['gbrain', 'sources', 'status', f.sourceId, '--json']);
     expect(readFileSync(join(f.root, path), 'utf8')).toContain('Edited again after the preview.');
     expect(await readGitHold(engine, f.sourceId, f.incarnation, path)).not.toBeNull();
   }), 240_000);
@@ -240,11 +290,14 @@ for (const backend of testBackends()) describe(`#6712 PR 4b: repair file-drift -
 
   test('file_gone: --prefer database recreates the file, --prefer file soft-deletes the page', () => fixture(async f => {
     const { path } = await fileGone(f, 'notes/gone');
-    const recreate = await run(f.sourceId, { side: 'deleted', state: 'file_gone', prefer: 'database' });
+    // GST-2579: the delete commit is newer than what sync imported, so the held database-wins run keeps it; naming the page recreates.
+    const kept = await run(f.sourceId, { side: 'deleted', state: 'file_gone', prefer: 'database' });
+    expect(kept).toMatchObject({ affected: 0, residuals: { kept_newer_delete: 1 } });
+    const recreate = await runDatabaseSlug(f.sourceId, 'notes/gone');
     expect(recreate.details!.pages).toEqual([expect.objectContaining({ slug: 'notes/gone', action: 'recreate_file', verb: 'recreate the file' })]);
     const soft = await run(f.sourceId, { side: 'deleted', state: 'file_gone', prefer: 'file' });
     expect(soft.details!.pages).toEqual([expect.objectContaining({ slug: 'notes/gone', action: 'soft_delete', verb: 'soft-delete the page' })]);
-    const applied = await run(f.sourceId, { side: 'deleted', state: 'file_gone', prefer: 'database', expect: recreate.preview_hash! });
+    const applied = await runDatabaseSlug(f.sourceId, 'notes/gone', recreate.preview_hash!);
     expect(applied.outcomes).toEqual({ repaired: 1 });
     expect(readFileSync(join(f.root, path), 'utf8')).toContain('The page.');
 

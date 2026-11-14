@@ -11,17 +11,18 @@ import { discoverGitRoot } from '../sync-git.ts';
 import { cliOptsToProgressOptions, getCliOptions } from '../cli-options.ts';
 import type { ProgressOptions } from '../progress.ts';
 import { detectManifestScope, storedManifestScope, worktreeManifest, type StoredWorktreeManifest, type WorktreeManifest } from './worktree-manifest.ts';
-import { localHostId } from './identity.ts';
+import { hostIdFor } from './identity.ts';
 import { repairWedgedReservation, resolveCoordinationLock } from './coordination-lock.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
 import { acquireShared, deferToLease, exclusiveAcquired, foreignWaiterAhead, joinLease, noteWaiting, yieldLease } from './worktree-lease.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { assertPhysicalRoot, claimPhysicalRoot, preparePhysicalRootTransfer, readPhysicalRootReservation, restampPhysicalRoot } from './physical-root.ts';
-import { assertPhysicalRootReservation, readPhysicalRootStamp } from './physical-root-record.ts';
+import { assertPhysicalRootReservation, readPhysicalRootStamp, relocatedRootTransferFix } from './physical-root-record.ts';
 import { nativeFilesystemPath } from './root-registry.ts';
 import { assertWriterAdminState } from './admin-intent.ts';
 import { readGraduationRow } from './graduation-schema.ts';
+import { ownerMarkerMissingError } from './owner-marker.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
 import { inspectPhysicalRootRecovery, repairPhysicalRoot, type PhysicalRootRecovery } from './physical-root-recovery.ts';
 import type { ContentReceiptRebind } from '../shared-skills/receipt-root.ts';
@@ -81,15 +82,15 @@ export const WORKTREE_BINDING_SQL = `SELECT s.source_id,s.source_incarnation,s.w
     JOIN persistence_worktrees w ON w.id=s.worktree_id
     LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid
     WHERE s.source_id=$1`;
-export async function getWorktreeBinding(engine: SqlEngine, sourceId: string, hostId: string | null = localHostId()): Promise<WorktreeBinding | null> {
+export async function getWorktreeBinding(engine: SqlEngine, sourceId: string, hostId: string | null = hostIdFor(engine)): Promise<WorktreeBinding | null> {
   const [row] = await engine.executeRaw<WorktreeBinding>(WORKTREE_BINDING_SQL, [sourceId, hostId]);
   return row ?? null;
 }
 /** `automatic` is only the ordinary first-write claim; the writer admin lock never blocks it. */
-export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = localHostId(), expectedAdminState?: string,
+export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = hostIdFor(engine), expectedAdminState?: string,
   options: { automatic?: boolean } = {}): Promise<WorktreeBinding> {
   if(await managedPersistenceEnabled(engine)) {
-    if(hostId!==localHostId()) throw opError('permission_denied','A source can be claimed only by the local registered host.',
+    if(hostId!==hostIdFor(engine)) throw opError('permission_denied','A source can be claimed only by the local registered host.',
       `Source ${sourceId} can only be claimed from the host that will own its checkout; nothing was claimed. Run the claim in a terminal on that host after reviewing writer status there.`,
       { fix: writerStatusFix(sourceId) });
     const { runManagedSourceLifecycle }=await import('./source-lifecycle.ts');
@@ -225,6 +226,7 @@ async function lockWorktree(binding: WorktreeBinding, waitMs: number, signal: Ab
   try { assertPhysicalRoot(binding.local_path, identity); return lock; }
   catch (error) {
     try {
+      if (error instanceof OperationError && error.code === 'owner_marker_missing') throw ownerMarkerMissingError(binding.source_id, { root: binding.local_path, epoch: String(binding.owner_epoch) });
       if (error instanceof OperationError && error.detail === 'physical_root_directory_changed') {
         // #6501: a directory recreated (or drifted beyond tolerance) at its recorded path; fill the #5914 exit for this source.
         error.suggestion = `The directory at ${binding.local_path} is not the one this owner stamped (inode or birth time changed; owner token, brain, worktree, root and device match). `
@@ -232,10 +234,11 @@ async function lockWorktree(binding: WorktreeBinding, waitMs: number, signal: Ab
           + `then gbrain sources writer transfer prepare ${binding.source_id} --self-transfer --confirm-relocated-root --admin-intent writer_transfer_prepare --expected-state <admin_state>, `
           + `then gbrain sources writer transfer accept ${binding.source_id} --path ${binding.local_path} --expected-epoch ${binding.owner_epoch} --manifest <manifest digest printed by prepare> `
           + `--self-transfer --confirm-relocated-root --admin-intent writer_transfer_accept --expected-state <admin_state from a fresh status>. Retry the original write with the same request_id afterwards; never remove the ownership markers.`;
+        error.fix = relocatedRootTransferFix(binding.source_id, { root: binding.local_path, epoch: String(binding.owner_epoch) });
         throw error;
       }
       if (!(error instanceof OperationError) || error.detail !== 'physical_root_device_changed') throw error;
-      if (engine && await restampPhysicalRoot(engine, binding, localHostId())) { assertPhysicalRoot(binding.local_path, identity); return lock; }
+      if (engine && await restampPhysicalRoot(engine, binding, hostIdFor(engine))) { assertPhysicalRoot(binding.local_path, identity); return lock; }
       const why = !engine ? 'this caller cannot verify database ownership'
         : readPhysicalRootStamp(binding.local_path)?.birth === '0' ? 'this filesystem reports no birth time'
           : 'database ownership of this checkout did not verify';
@@ -256,9 +259,14 @@ async function lockWorktree(binding: WorktreeBinding, waitMs: number, signal: Ab
  */
 export const MANAGED_WRITER_PROBE_WAIT_MS = 1000;
 
-/** Acquire-and-release probe of the worktree lock within MANAGED_WRITER_PROBE_WAIT_MS; false when it stayed busy. */
-export async function probeWorktreeWriter(binding: WorktreeBinding, engine?: BrainEngine): Promise<boolean> {
-  const lock = await acquireWorktree(binding, MANAGED_WRITER_PROBE_WAIT_MS, undefined, engine);
+/**
+ * Acquire-and-release probe of the worktree lock within `waitMs` (MANAGED_WRITER_PROBE_WAIT_MS by default);
+ * false when it stayed busy. #7461: atom maintenance passes its longer publish wait, since the previous
+ * batch's Git effects can hold the lock past the default.
+ */
+export async function probeWorktreeWriter(binding: WorktreeBinding, engine?: BrainEngine,
+  waitMs = MANAGED_WRITER_PROBE_WAIT_MS, signal?: AbortSignal): Promise<boolean> {
+  const lock = await acquireWorktree(binding, waitMs, signal, engine);
   if (!lock) return false;
   await lock.release();
   return true;
@@ -322,7 +330,7 @@ export interface WriterTransferOptions {
   /** #5914: `--confirm-relocated-root`, a self-transfer of a directory recreated at the same path (inode/birth waived; everything else must agree). */
   relocated?: boolean;
 }
-export async function prepareWriterTransfer(engine: BrainEngine, sourceId: string, hostId = localHostId(), expectedAdminState?: string,
+export async function prepareWriterTransfer(engine: BrainEngine, sourceId: string, hostId = hostIdFor(engine), expectedAdminState?: string,
   opts: WriterTransferOptions = {}): Promise<{ worktree_id: string; owner_epoch: string; manifest: StoredWorktreeManifest }> {
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding || binding.owner_host_id !== hostId || !binding.local_path) throw opError('permission_denied', 'Only the current owner can prepare this transfer.',
@@ -374,7 +382,7 @@ export async function prepareWriterTransfer(engine: BrainEngine, sourceId: strin
  * under the native coordination lock and the worktree row's FOR UPDATE. The epoch is kept, so an accept bound to it
  * meets an active worktree and refuses `writer_transfer_conflict`; the owner may prepare again.
  */
-export async function cancelWriterTransfer(engine: BrainEngine, sourceId: string, expectedEpoch: string, hostId = localHostId(), expectedAdminState?: string,
+export async function cancelWriterTransfer(engine: BrainEngine, sourceId: string, expectedEpoch: string, hostId = hostIdFor(engine), expectedAdminState?: string,
   opts: { dryRun?: boolean } = {}): Promise<{ worktree_id: string; owner_epoch: string; state: string; prepared_at: string | null; cancellable: boolean }> {
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   const notOwner = () => opError('permission_denied', 'Only the current owner can cancel this transfer.',
@@ -408,7 +416,7 @@ export async function cancelWriterTransfer(engine: BrainEngine, sourceId: string
     });
   } finally { await lock.release(); }
 }
-export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string, path: string, expectedEpoch: string, expectedManifest: string, hostId = localHostId(), expectedAdminState?: string,
+export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string, path: string, expectedEpoch: string, expectedManifest: string, hostId = hostIdFor(engine), expectedAdminState?: string,
   opts: WriterTransferOptions = {}): Promise<{ content_receipts: ContentReceiptRebind[] }> {
   const root = realpathSync(resolve(path));
   const binding = await getWorktreeBinding(engine, sourceId, hostId);

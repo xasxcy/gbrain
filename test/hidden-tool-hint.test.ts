@@ -14,6 +14,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { operations } from '../src/core/operations.ts';
 import type { AuthInfo } from '../src/core/operations.ts';
+import { fenceTranscriptText } from '../src/core/search/transcript-quote.ts';
 import { allowedOpNames, createStdioSurfaceState, filterOpsForSurface, isReadOnlyOperation, stdioToolListing, type McpSurface } from '../src/mcp/surface.ts';
 import { hiddenToolHint, hiddenToolRoute } from '../src/mcp/hidden-tool-hint.ts';
 import { dispatchRenderContext, dispatchToolCall, toolConnection, type DispatchOpts } from '../src/mcp/dispatch.ts';
@@ -150,7 +151,7 @@ describe('D2 hidden-takes scenario, installed configurations', () => {
     expect(n.fix!.mcp).toEqual({ tool: 'request_tools', arguments: { surface: 'full' } });
     expect(n.fix!.next).toBe('run');
     expect(await assertNextCallable(n, c.dispatchOpts)).toBe('request_tools');
-    expect(await takesVisibleBy(c.dispatchOpts)).toEqual(['Renewal ARR forecast 1.2M']);
+    expect(await takesVisibleBy(c.dispatchOpts)).toEqual([fenceTranscriptText('Renewal ARR forecast 1.2M', SLUG)]); // #8377: a stdio reader gets a claim below the owner's tier quoted
   });
 
   test('callable full, advertised starter: next is the takes_list call itself, stdio lists it (tools/list_changed)', async () => {
@@ -173,7 +174,31 @@ describe('D2 hidden-takes scenario, installed configurations', () => {
     const widen = stdioConnection({ surface: 'starter' });
     const w = hiddenNotice(await dispatchToolCall(engine, 'get_page', { slug: SLUG }, widen.dispatchOpts()))!;
     expect(await assertNextCallable(w, widen.dispatchOpts)).toBe('request_tools');
-    expect(await takesVisibleBy(widen.dispatchOpts)).toEqual(['Renewal ARR forecast 1.2M']);
+    expect(await takesVisibleBy(widen.dispatchOpts)).toEqual([fenceTranscriptText('Renewal ARR forecast 1.2M', SLUG)]); // #8377: a stdio reader gets a claim below the owner's tier quoted
+  });
+
+  test('request_tools {tools} on a widenable starter session never claims a tool outside the surface is listed (#8733)', async () => {
+    const c = stdioConnection({ surface: 'starter' });
+    expect(c.session.allowedOps!.has('takes_list')).toBe(false);
+    const call = async (tools: string[]) => {
+      const r = await dispatchToolCall(engine, 'request_tools', { tools }, c.dispatchOpts());
+      expect(r.isError, r.content[0]?.text).toBeFalsy();
+      return JSON.parse(r.content[0].text) as { tools: Array<{ name: string }>; listed?: boolean; note: string };
+    };
+    const outside = await call(['takes_list']);
+    expect(outside.tools.map(t => t.name)).toEqual(['takes_list']);
+    expect(outside.listed).toBe(false);
+    expect(outside.note).toContain('request_tools {"surface":"full"}');
+    expect(c.reveals).toEqual([]);
+    const listedNames = async () => (await c.listing.listed(c.session.surfacedOps)).map(o => o.name);
+    expect(await listedNames()).not.toContain('takes_list');
+    const mixed = await call(['search', 'takes_list']);
+    expect(mixed.listed).toBe(false);
+    expect(mixed.note).toContain('`search`');
+    expect(mixed.note).toContain('`takes_list`');
+    expect(c.reveals).toEqual([['search']]);
+    const inside = await call(['search']);
+    expect(inside.listed).toBe(true);
   });
 
   test('full (callable and advertised): takes_list is listed, so no notice', async () => {
@@ -208,7 +233,7 @@ describe('D2 hidden-takes scenario, installed configurations', () => {
     expect(n.fix!.argv!.slice(0, 4)).toEqual(['gbrain', 'takes-list', '--page-slug', SLUG]);
     const full = stdioConnection({ surface: 'full', readOnly: true });
     expect(hiddenNotice(await dispatchToolCall(engine, 'get_page', { slug: SLUG }, full.dispatchOpts()))).toBeUndefined();
-    expect(await takesVisibleBy(full.dispatchOpts)).toEqual(['Renewal ARR forecast 1.2M']);
+    expect(await takesVisibleBy(full.dispatchOpts)).toEqual([fenceTranscriptText('Renewal ARR forecast 1.2M', SLUG)]); // #8377: a stdio reader gets a claim below the owner's tier quoted
   });
 
   test('session widening off: the CLI equivalent, never request_tools', async () => {

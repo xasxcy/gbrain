@@ -3,11 +3,14 @@
  *
  * Architecture (codex round 2 #3 + D11 + D2 + D13):
  *
- * - Op-layer, NOT engine-layer. This module is called from the `search` /
- *   `query` / `get_page` op handlers in `operations.ts` AFTER the engine
- *   returns. Internal callers (sync, migrations, helper flows) bypass the
- *   op layer entirely, so this never fires from `import-file.ts`, the
- *   dream cycle, doctor probes, etc. Pure signal: "a user-facing surface
+ * - Op-layer, NOT engine-layer. The writers are the `search`, `query`,
+ *   `get_page` and `fetch` op handlers and `recall`'s `query` arm (the page
+ *   search it runs beside the facts), each AFTER the engine returns; recall's
+ *   facts-only reads write nothing. test/last-retrieved-writers.test.ts pins
+ *   this list, so a new reader that bumps is a deliberate choice. Internal
+ *   callers (sync, migrations, helper flows) bypass the op layer entirely,
+ *   so this never fires from `import-file.ts`, the dream cycle, doctor
+ *   probes, etc. Pure signal: "a user-facing surface
  *   just surfaced this page."
  *
  * - 5-min throttle (D2). The upsert only moves a timestamp older than
@@ -48,8 +51,10 @@
 import type { BrainEngine } from './engine.ts';
 import { isMissingSchemaObject } from './utils.ts';
 import { deferUntilResponse, registerBackgroundWorkDrainer } from './background-work.ts';
+import { engineKey } from './engine-key.ts';
 
-let _trackRetrievalCache: { ts: number; enabled: boolean } | null = null;
+/** Per engine, so each mounted brain honors its own setting. */
+let _trackRetrievalCache = new WeakMap<object, { ts: number; enabled: boolean }>();
 const TRACK_RETRIEVAL_CACHE_TTL_MS = 30_000;
 
 /**
@@ -147,14 +152,16 @@ registerBackgroundWorkDrainer({
 });
 
 /**
- * Resolve `search.track_retrieval` config with a 30s in-process cache so
- * hot-path callers don't pay a SELECT per search. Default-on: missing
+ * Resolve `search.track_retrieval` config with a 30s in-process cache per
+ * engine so hot-path callers don't pay a SELECT per search. Default-on: missing
  * config OR unparseable value → true (D13 default).
  */
 async function isTrackingEnabled(engine: BrainEngine): Promise<boolean> {
   const now = Date.now();
-  if (_trackRetrievalCache && now - _trackRetrievalCache.ts < TRACK_RETRIEVAL_CACHE_TTL_MS) {
-    return _trackRetrievalCache.enabled;
+  const key = engineKey(engine);
+  const cached = _trackRetrievalCache.get(key);
+  if (cached && now - cached.ts < TRACK_RETRIEVAL_CACHE_TTL_MS) {
+    return cached.enabled;
   }
   let enabled = true;
   try {
@@ -165,13 +172,13 @@ async function isTrackingEnabled(engine: BrainEngine): Promise<boolean> {
   } catch {
     // getConfig miss / connection blip → default to enabled (D13 default).
   }
-  _trackRetrievalCache = { ts: now, enabled };
+  _trackRetrievalCache.set(key, { ts: now, enabled });
   return enabled;
 }
 
 /** Test seam — drops the cache so subsequent calls re-read config. */
 export function _resetTrackRetrievalCacheForTests(): void {
-  _trackRetrievalCache = null;
+  _trackRetrievalCache = new WeakMap();
 }
 
 /**
@@ -192,8 +199,8 @@ export const BUMP_LAST_RETRIEVED_SQL = `INSERT INTO page_retrievals (page_id, la
  * MUST NOT await this for the op response. Empty ids list is a no-op.
  *
  * @param engine The BrainEngine handling the op.
- * @param pageIds The page ids surfaced by the op (search hits, query results,
- *   or the single id returned by get_page).
+ * @param pageIds The page ids surfaced by the op (search, query or recall
+ *   query hits, or the single page get_page or fetch returned).
  */
 export function bumpLastRetrievedAt(engine: BrainEngine, pageIds: number[]): void {
   if (pageIds.length === 0) return;

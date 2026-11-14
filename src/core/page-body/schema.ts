@@ -21,7 +21,7 @@
  * body identity is `body_generation`: its body columns are NULL on both sides
  * of a flip, so the generation moves when body_generation does.
  */
-export const PAGE_GENERATION_BUMP_FN_SQL = `CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
+export const PAGE_GENERATION_BUMP_FN_SQL = `CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS $func$
 BEGIN
   IF (TG_OP = 'INSERT') THEN
     NEW.generation := COALESCE((SELECT MAX(generation) FROM pages), 0) + 1;
@@ -71,10 +71,27 @@ export function stagingNeedsTextSql(t: string): string {
       WHERE r.source_id = ${t}.source_id AND r.sha256 = ${t}.sha256 AND ${liveStagingSql('rs')})`;
 }
 
+/**
+ * GST-1209: the tiling of page `p`'s live generation (an alias of pages), as a LATERAL subquery: its manifest rows as every
+ * reader selects them, their count (`n`), the bytes they cover (`covered`) and whether each starts where the previous one
+ * ends, the first at byte 0 (`gapless`). Constant SQL over the alias, no values.
+ */
+export function liveTilingSql(p: string): string {
+  return `SELECT count(*)::bigint AS n, COALESCE(sum(r.byte_len), 0)::bigint AS covered, COALESCE(bool_and(r.byte_start = r.prior), true) AS gapless
+      FROM (SELECT m.byte_start, m.byte_len, COALESCE(sum(m.byte_len) OVER (ORDER BY m.seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS prior
+              FROM page_body_manifest m WHERE m.page_id = ${p}.id AND m.staging_id IS NULL AND m.gen_from <= ${p}.body_generation
+               AND (m.gen_to IS NULL OR m.gen_to > ${p}.body_generation)) r`;
+}
+
+/** Page `p`'s live generation, tiled as `t` (liveTilingSql), does not cover its body_bytes gapless from 0: no reader can read it. */
+export function untiledSql(p: string, t: string): string {
+  return `(NOT ${t}.gapless OR ${t}.covered <> ${p}.body_bytes)`;
+}
+
 /** The staging `s` (an alias of page_body_stagings) is live in stagingNeedsTextSql's sense: a write that may still publish it. */
 export function liveStagingSql(s: string): string {
   return `(${s}.state IN ('open','sealed','prepared')
-          OR EXISTS (SELECT 1 FROM persistence_requests rq WHERE rq.state IN ('queued','running','recovering')
+          OR EXISTS (SELECT 1 FROM persistence_requests rq WHERE rq.state IN ('queued','deferred','running','recovering')
                       AND rq.intent->'body_ref'->>'staging_id' = ${s}.id::text))`;
 }
 
@@ -311,7 +328,7 @@ CREATE TABLE IF NOT EXISTS page_segment_derivation_purge_pages (
   page_id    INTEGER NOT NULL,
   PRIMARY KEY (request_id, page_id)
 );
-CREATE OR REPLACE FUNCTION gbrain_mark_derivation_scope_entry() RETURNS trigger SET search_path = pg_catalog, public AS $func$
+CREATE OR REPLACE FUNCTION gbrain_mark_derivation_scope_entry() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS $func$
 DECLARE
   src TEXT;
   page INTEGER;
@@ -338,7 +355,7 @@ CREATE TRIGGER page_body_manifest_derivation_scope_delete AFTER DELETE ON page_b
 DROP TRIGGER IF EXISTS pages_derivation_scope_delete ON pages;
 CREATE TRIGGER pages_derivation_scope_delete AFTER UPDATE OF deleted_at ON pages
   FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION gbrain_mark_derivation_scope_entry();
-CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public AS $func$
+CREATE OR REPLACE FUNCTION gbrain_refuse_purging_derivation() RETURNS trigger SET search_path = pg_catalog, public, pg_temp AS $func$
 BEGIN
   IF EXISTS (SELECT 1 FROM page_segment_derivation_purges x JOIN pages p ON p.source_id = x.source_id
     WHERE p.id = NEW.page_id AND ${derivationSweepScopeSql('NEW', 'p', 'x.page_ids')}

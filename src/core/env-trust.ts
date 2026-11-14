@@ -173,6 +173,7 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   // --- exec-target: gbrain spawns the named program ------------------------
   'GBRAIN_CLAUDE_CLI_BIN',           // binary run for the claude-cli language model
   'GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG', // becomes that binary's CLAUDE_CONFIG_DIR → its hooks/settings
+  'GBRAIN_CLAUDE_CLI_USER_SETTINGS', // #8342: =1 lets the user's ~/.claude CLAUDE.md and settings.json back into that binary's calls
   'GBRAIN_JOB_CHILD_CLI',            // CLI the job-isolation worker spawns per job
   'GBRAIN_BIN_OVERRIDE',             // gbrain binary used by claw-test
   // --- root / registry redirect ------------------------------------------
@@ -186,6 +187,7 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   'GBRAIN_REMOTE_MCP_URL',           // `init --remote` default: where the thin client sends its MCP traffic and bearer token
   'GBRAIN_REMOTE_ISSUER_URL',        // `init --remote` default: the OAuth issuer the client trusts and hands its credential to
   'GBRAIN_OAUTH_RELAY_URL',          // the OAuth relay that hands back Google tokens (creds/relay-client.ts): a planted relay is token theft
+  'GBRAIN_HOOK_CWD',                 // #8424: the session directory the hook launcher records; a planted value moves the yield checks and the turn-rule project match
   // --- re-run marker ------------------------------------------------------
   'GBRAIN_CWD_ENV_QUARANTINED',      // cli-preflight.ts's sanitized re-run marker; only honoured when the startup cwd IS the .env-free dir it names, so a planted one is inert — listed so it is also dropped and named in the warning
   // --- posture-widening ----------------------------------------------------
@@ -197,6 +199,7 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   'GBRAIN_ALLOW_DEFAULT_WRITE',      // permits writes into the 'default' source
   'GBRAIN_NO_SANITY',                // disables content sanity checks
   'GBRAIN_REMOTE_PRIVATE_PAGES',     // exposes private pages to remote callers
+  'GBRAIN_SURFACE',                  // stdio MCP tool surface: a planted `full` widens the tools an agent sees (a shell export still widens; GBRAIN_MCP_FORCE_SURFACE stays narrow-only)
 ];
 
 /**

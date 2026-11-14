@@ -149,7 +149,7 @@ export function hostOperatorFix(sources: ReadonlyArray<{ source_id: string; rout
       + `to see each one's state and repair the rest now, run ${fences.join(', ')} on the brain host (a read-only preview that prints the apply command).`] : []),
     ...(concurrent.length ? [`Some notes changed in their files while an agent saved a different version to the brain, so both were kept: on the brain host run ${concurrent.map(id => `'gbrain sources status ${id}'`).join(', ')} and reconcile each named note with 'gbrain sources reconcile <source> <slug> --preview'.`] : []),
     ...(stalled.length ? [`Some files are held because the brain's write owner could not finish preparing them (the files themselves are fine): on the brain host run ${stalled.map(id => `'gbrain sources writer status --source ${id} --json'`).join(', ')} to see what the owner was stuck on, fix that or upgrade gbrain, then 'gbrain sources retry-held <source>' and the same sync.`] : []),
-    ...(drift.length ? [`Some notes were edited in the brain after their files were last imported, so sync kept the brain's version instead of overwriting it: on the brain host run ${drift.map(id => `'gbrain sources status ${id}'`).join(', ')} and resolve each named note with 'gbrain repair file-drift --source <source> --slug <slug> --prefer database' (or '--prefer file').`] : []),
+    ...(drift.length ? [`Some notes were edited in the brain after their files were last imported, so sync kept the brain's version instead of overwriting it: on the brain host run ${drift.map(id => `'gbrain sources status ${id}'`).join(', ')} and preview each named note with 'gbrain repair file-drift --source <source> --slug <slug> --prefer database' (or '--prefer file'), which names what it would overwrite; the apply asks for the user's consent.`] : []),
     ...(dirty.length ? [`Some files have uncommitted edits in the brain's checkout that sync would not overwrite: on the brain host commit them, then run ${dirty.map(id => `'gbrain sync unblock --source ${id} --apply'`).join(', ')} (or 'gbrain sources retry-held <source>') and the same sync.`] : []),
   ];
   return { argv: holdRepairSteps(first.source_id, first.route ?? { fences: 0, others: 1 }).argv, consent: [], actor: 'host_admin', requires_exclusive: false, why,
@@ -209,7 +209,7 @@ export async function stampHeldHits(engine: Exec, hits: Array<{ page_id?: number
       SELECT NULL, NULL, (SELECT count(*)::int FROM (SELECT 1 ${HOLD_PAGE_JOIN}
         WHERE h.op=$1 AND s.archived IS NOT TRUE AND s.id=ANY($3::text[])
           AND ((h.completed_keys->0->>'page_id')=ANY($2::text[]) OR p.type=ANY($4::text[])
-            OR lower(concat_ws(' ', h.completed_keys->0->>'path', h.completed_keys->0->>'slug', p.title)) LIKE ANY($5::text[]))
+            OR lower(concat_ws(' ', h.completed_keys->0->>'path', h.completed_keys->0->>'slug', p.title)) ~ ANY($5::text[]))
         LIMIT ${COVERAGE_COUNT_CAP}) x)`,
     [GIT_HOLD_OP, ids, coverage.map(source => source.source_id), relevance.types, relevance.patterns]);
   } catch {

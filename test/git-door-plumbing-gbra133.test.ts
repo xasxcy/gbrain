@@ -154,6 +154,45 @@ describe('G2 plumbing door commit', () => {
     expect(git(root, 'status', '--porcelain')).toBe('');
   });
 
+  for (const how of ['git commit', 'plumbing']) test(`GST-2552: a commit of the same file (${how}) before update-ref refuses git_target_changed; the other commit stays HEAD`, async () => {
+    const root = repo({ 'notes/a.md': 'a\n' });
+    let human = '';
+    doorSeams.beforeUpdateRef = (_root, attempt) => {
+      if (attempt) return;
+      if (how === 'git commit') {
+        put(root, 'notes/a.md', 'a, committed by hand\n');
+        git(root, 'add', '--', 'notes/a.md'); git(root, 'commit', '-qm', 'a commit of the same file');
+      } else {
+        const other = { ...env, GIT_INDEX_FILE: join(root, '.git', 'other-index') };
+        const run = (args: string[], input?: string) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: other, input }).trim();
+        run(['read-tree', 'HEAD']);
+        run(['update-index', '--cacheinfo', `100644,${run(['hash-object', '-w', '--stdin'], 'a, committed by hand\n')},notes/a.md`]);
+        git(root, 'update-ref', 'refs/heads/main', run(['commit-tree', run(['write-tree']), '-p', 'HEAD', '-m', 'a commit of the same file']));
+      }
+      human = git(root, 'rev-parse', 'HEAD');
+    };
+    put(root, 'notes/a.md', 'a, second revision\n');
+    const error = await refusal(door(root, 'notes/a.md'));
+    expect(error).toMatchObject({ code: 'git_target_changed' });
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(human);
+    expect(git(root, 'show', 'HEAD:notes/a.md')).toBe('a, committed by hand');
+  });
+
+  test('GST-2552: a commit that swept in the planned file before update-ref is not a change; the write lands on it', async () => {
+    const root = repo({ 'notes/a.md': 'a\n', 'other/c.md': 'c\n' });
+    let human = '';
+    doorSeams.beforeUpdateRef = (_root, attempt) => {
+      if (attempt) return;
+      put(root, 'other/c.md', 'c, committed by hand\n');
+      git(root, 'add', '-A'); git(root, 'commit', '-qm', 'a commit that took every change');
+      human = git(root, 'rev-parse', 'HEAD');
+    };
+    put(root, 'notes/a.md', 'a, second revision\n');
+    expect(await door(root, 'notes/a.md')).toBe(human);
+    expect(git(root, 'show', 'HEAD:notes/a.md')).toBe('a, second revision');
+    expect(git(root, 'status', '--porcelain')).toBe('');
+  });
+
   test('a branch that moves again refuses; Git and the index keep the other commits', async () => {
     const root = repo({ 'notes/a.md': 'a\n' });
     const seed = git(root, 'rev-parse', 'HEAD:notes/a.md');
@@ -171,8 +210,8 @@ describe('G2 plumbing door commit', () => {
   test('the message and trailers are the porcelain path\'s, alone and in a group', async () => {
     const seed = { 'notes/a.md': 'a\n', 'notes/b.md': 'b\n', 'notes/c.md': 'c\n' };
     const notes: Record<string, GitCommitNote> = {
-      'notes/a.md': { subject: 'gbrain: repair notes/a.md  ', line: 'notes/a.md (invalid_fence)', trailer: 'gbrain-repair: invalid_fence deterministic high' },
-      'notes/b.md': { subject: 'gbrain: repair notes/b.md', line: 'notes/b.md (frontmatter_slug_conflict)', trailer: 'gbrain-repair: frontmatter_slug_conflict deterministic high' },
+      'notes/a.md': { subject: 'gbrain: repair notes/a.md  ', line: 'notes/a.md (invalid_fence)', trailers: ['gbrain-repair: invalid_fence deterministic high'] },
+      'notes/b.md': { subject: 'gbrain: repair notes/b.md', line: 'notes/b.md (frontmatter_slug_conflict)', trailers: ['gbrain-repair: frontmatter_slug_conflict deterministic high'] },
     };
     for (const paths of [['notes/a.md'], ['notes/c.md'], ['notes/a.md', 'notes/b.md', 'notes/c.md']]) {
       const porcelain = repo(seed), plumbing = repo(seed);

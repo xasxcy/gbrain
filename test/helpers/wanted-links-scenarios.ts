@@ -11,6 +11,7 @@ import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts
 import { extractStaleFromDB } from '../../src/commands/extract.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../src/core/link-extraction.ts';
 import { operationsByName } from '../../src/core/operations.ts';
+import { replaceWantedLinks, wantedReadAt } from '../../src/core/wanted-links.ts';
 import { managedBrain } from './managed-brain.ts';
 
 const put = (ctx: OperationContext, slug: string, body: string, type = 'note', frontmatter = '', expectedRevision?: string) =>
@@ -82,6 +83,90 @@ export async function bareNameReferenceSettles(databaseUrl?: string) {
     expect(listed.targets[0]).toMatchObject({ target: 'dave-example', ref_kind: 'name',
       existing_matches: [{ slug: 'people/dave-example', source_id: 'default' }] });
     expect(listed.targets[0].next).toContain('[[people/dave-example]]');
+  }, { databaseUrl });
+}
+
+/**
+ * #9140: a bare-name frontmatter reference resolved under a directory hint stays unresolved even when a
+ * top-level page has the exact slug. It settles after one extraction, and a row an older build stamped
+ * `-infinity` settles on its origin's next extraction.
+ */
+export async function topLevelSlugNameReferenceSettles(databaseUrl?: string) {
+  await managedBrain(async ({ engine, ctx }) => {
+    await put(ctx, 'acme-toolkit', 'Acme toolkit.');
+    await put(ctx, 'people/alice-example', 'Alice.', 'person', 'founded: ["acme-toolkit"]\n');
+    await extractStale(engine);
+    expect(await wantedRows(engine)).toEqual([{ target_ref: 'acme-toolkit', ref_kind: 'name', producer: 'frontmatter' }]);
+    expect(await stale(engine)).toBe(0);
+    await engine.executeRaw("UPDATE wanted_links SET checked_at = '-infinity'::timestamptz WHERE target_ref = 'acme-toolkit'");
+    expect(await stale(engine)).toBe(1);
+    await extractStale(engine);
+    expect(await stale(engine)).toBe(0);
+    const [row] = await engine.executeRaw<{ settled: boolean }>(
+      "SELECT checked_at > '-infinity'::timestamptz AS settled FROM wanted_links WHERE target_ref = 'acme-toolkit'");
+    expect(row?.settled).toBe(true);
+  }, { databaseUrl });
+}
+
+const staleSlugs = async (engine: BrainEngine) =>
+  (await engine.listStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS, batchSize: 100 })).map(page => page.slug).sort();
+
+/** #9140: a later write of a bare name's exact-slug page still wakes its origin, and one extraction settles it again. */
+export async function topLevelSlugNamePageEditWakesOnce(databaseUrl?: string) {
+  await managedBrain(async ({ engine, ctx }) => {
+    const first = await put(ctx, 'acme-toolkit', 'Acme toolkit.');
+    await put(ctx, 'people/alice-example', 'Alice.', 'person', 'founded: ["acme-toolkit"]\n');
+    await extractStale(engine);
+    expect(await stale(engine)).toBe(0);
+    await put(ctx, 'acme-toolkit', 'Acme toolkit, edited.', 'note', '', (first.outcome ?? first).revision);
+    expect(await staleSlugs(engine)).toEqual(['acme-toolkit', 'people/alice-example']);
+    await extractStale(engine);
+    expect(await stale(engine)).toBe(0);
+    expect(await wantedRows(engine)).toEqual([{ target_ref: 'acme-toolkit', ref_kind: 'name', producer: 'frontmatter' }]);
+  }, { databaseUrl });
+}
+
+/** Publish one bare-name body row for an origin as an extraction that read the brain at readAt would. */
+const publishNameRow = async (engine: BrainEngine, originSlug: string, targetRef: string, readAt: string) => {
+  const [origin] = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE slug = $1', [originSlug]);
+  await engine.transaction(tx => replaceWantedLinks(tx, { pageId: Number(origin!.id), sourceId: 'default' }, { producers: ['body'], readAt,
+    rows: [{ producer: 'body', ref_kind: 'name', target_source_id: 'default', target_ref: targetRef, link_type: 'mentions', context: originSlug }] }));
+};
+
+/**
+ * GST-2460: extractions that read the brain before a bare name's exact-slug page was first written, and publish
+ * their wanted row after that write, leave the origin stale however many overlap; the next sweep links it.
+ */
+export async function nameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin(databaseUrl?: string) {
+  await managedBrain(async ({ engine, ctx }) => {
+    await put(ctx, 'notes/call', 'Call about [[Acme Toolkit]].');
+    await extractStale(engine);
+    expect(await wantedRows(engine)).toEqual([{ target_ref: 'acme-toolkit', ref_kind: 'name', producer: 'body' }]);
+    const first = await wantedReadAt(engine);
+    const second = await wantedReadAt(engine);
+    await put(ctx, 'acme-toolkit', 'Acme toolkit.');
+    await publishNameRow(engine, 'notes/call', 'acme-toolkit', second);
+    await publishNameRow(engine, 'notes/call', 'acme-toolkit', first);
+    expect(await staleSlugs(engine)).toContain('notes/call');
+    await extractStale(engine);
+    expect(await backlinks(engine, 'acme-toolkit')).toEqual([{ slug: 'notes/call' }]);
+    expect(await stale(engine)).toBe(0);
+  }, { databaseUrl });
+}
+
+/** GST-2460: the same race for a bare name matched only by a page's basename wakes the origin too. */
+export async function basenameRowPublishedAfterItsTargetWasWrittenWakesItsOrigin(databaseUrl?: string) {
+  await managedBrain(async ({ engine, ctx }) => {
+    await put(ctx, 'notes/call', 'Call with [[Dave Example]].');
+    await extractStale(engine);
+    const readAt = await wantedReadAt(engine);
+    await put(ctx, 'people/dave-example', 'Dave.', 'person');
+    await publishNameRow(engine, 'notes/call', 'dave-example', readAt);
+    expect(await staleSlugs(engine)).toContain('notes/call');
+    await extractStale(engine);
+    expect(await stale(engine)).toBe(0);
+    await extractStale(engine);
+    expect(await stale(engine)).toBe(0);
   }, { databaseUrl });
 }
 

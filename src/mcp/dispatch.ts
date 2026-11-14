@@ -11,13 +11,22 @@ import { affectsRecall } from '../core/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList, opError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
-import type { OperationMeta } from '../core/ops/contract.ts';
+import { asSegmentedWriteRefusal } from '../core/page-body/page-shape.ts';
+import type { Operation, OperationMeta } from '../core/ops/contract.ts';
 import { loadConfig } from '../core/config.ts';
 import { withRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
+import { withCallerAccess } from '../core/search/private-visibility.ts';
+import { appliedAccessSummary, folderAccessFor, identityLookupUnavailable, remoteCallerAccess } from '../core/access/caller.ts';
+import { credentialScopeFor, requesterScopeGate, requesterScopeRefuses, requiresRequesterScope, withServesReread, type RequesterScopeNotice } from '../core/access/requester-scope.ts';
+import { audienceInArguments, audienceInArgumentsError, logAudienceAssertion, parseAudience, type AudienceAuditEvent, type AudienceChannels, type AudiencePrincipal } from '../core/access/audience.ts';
+import { ACTOR_ARGUMENT, actorNotAttested, EXTERNAL_ID_RE, resolveAttestedActor, type ActorChannels } from '../core/access/actor.ts';
+import { attestedReadMode, SCOPE_READ_ACCESS, scopeReadLabelledOnlyRefused, withReadMode, type ReadMode } from '../core/access/scope-read.ts';
+import { attestedReadScope } from '../core/access/member-sources.ts';
+import { QM_PERSONAL_OPS, qmMemoryToolResult, recallArguments, unlinkedRecallResult } from '../core/ops/qm-memory.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
-import { cliRenderContext, orderNotices, redactForTransport, renderNotice, toAgentError, toolErrorResult, toolResultWithNotices, type Notice, type RenderContext } from '../core/agent-output.ts';
+import { cliRenderContext, orderNotices, redactForTransport, renderAction, renderNotice, toAgentError, toolErrorResult, toolResultWithNotices, type Notice, type RenderContext } from '../core/agent-output.ts';
 import { cliOnlyRefusal, isCallable } from '../core/ops/callable.ts';
 import { hostFix, scopeDeniedError } from '../core/ops/op-fix.ts';
 import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger, type NoticeAudience } from '../core/notice-ledger.ts';
@@ -26,7 +35,9 @@ import { searchCountLine } from '../core/search/keyword-paging.ts';
 import { pageCapLine } from '../core/search/remote-page-cap.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
 import { emptyRead, hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
+import { degradedStampFor, degradedStampLine, type DegradedStamp } from '../core/degraded-stamp.ts';
 import { assertUnscopedReadReachesPages } from '../core/sources-not-readable.ts';
+import { accessPolicyNotices } from '../core/access/policy-notice.ts';
 import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, type ToolConnection } from './hidden-tool-hint.ts';
 import { opAllowedForBoundClient } from '../core/ops/context.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
@@ -41,7 +52,7 @@ import {
   findInvalidParam,
   schemaInvalidParams,
   findUnknownParams,
-  buildUnknownParamWarnBlock,
+  narrowingUnknownParams,
   resolveStrictParamsMode,
 } from './validate-params.ts';
 import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
@@ -51,9 +62,10 @@ import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
 import { withSearchConnectionBudget } from '../core/search/connection-budget.ts';
 import { isEngineDegraded } from '../core/degraded-marker.ts';
-import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
+import { admittedPendingReceipt, isWriteReceipt, publicWriteReceipt, type WriteReceipt } from '../core/persistence/types.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withRequestIdentityMemo, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
 import { frameOverCap, resultTooLargeError } from '../core/egress-budget.ts';
+import { isAIInvocationPolicyError } from '../core/ai/invocation-guard.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
@@ -162,11 +174,24 @@ export interface ToolResult {
    * tool call still succeeds.
    */
   _meta?: Record<string, unknown>;
+  /** GST-359 C1: set only on refusals of a call that named an attested actor (`{ error: { code, message, reason, fix } }`). */
+  structuredContent?: Record<string, unknown>;
 }
 
 export interface DispatchOpts {
+  /** Wakeshift: the MCP caller as the transport saw it (OperationContext.mcpCaller); never from tool arguments. */
+  mcpCaller?: OperationContext['mcpCaller'];
+  /** GST-359 C1: the x-qm-actor header the HTTP transport read (a trusted system names the person); stdio never sets it. */
+  actor?: ActorChannels;
+  /**
+   * GBRA-231: the shared-agent audience channels the transport read from the request (the X-Gbrain-On-Behalf-Of
+   * header, request-level `_meta`), set by harness code. Never populated from tool arguments, which are refused.
+   */
+  onBehalfOf?: AudienceChannels;
   /** #6696 (A5): set by the trusted transport for the user's own agent calls; never from wire params. */
   admissionOrigin?: OperationContext['admissionOrigin'];
+  /** The caller's self-declared agent label (X-Gbrain-Agent-Label), parsed by the transport; recorded only, never authority. */
+  agentLabel?: string;
   /** Configuration selected by the resident transport, never populated from wire params. */
   config?: OperationContext['config'];
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
@@ -231,6 +256,13 @@ export interface DispatchOpts {
    */
   sessionId?: string;
   /**
+   * GBRA-156: the request asked for no `_meta.brain_hot_memory` block (MCP request-level
+   * `_meta.hot_memory: "off"`, resolved by the transport). The same value inside the tool
+   * arguments' `_meta` works too. A channel or shared session sets it so a requester's own
+   * facts never ride into a reply other people read.
+   */
+  hotMemoryOff?: boolean;
+  /**
    * v0.31 (eD3): hook called by the dispatcher AFTER op.handler succeeds
    * to compute `_meta.brain_hot_memory` for the response. Wrapped in its
    * own try/catch (eE4) so a DB blip in the helper degrades to no _meta
@@ -280,6 +312,10 @@ export interface DispatchOpts {
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
   /** The stdio session surface (OperationContext.stdioSurface); its allow-set is the one `allowedOps` mirrors. */
   stdioSurface?: OperationContext['stdioSurface'];
+  /** GST-363: OperationContext.stdioMember, from the stdio server's own argv (serve --stdio-member); no other transport sets it. */
+  stdioMember?: string;
+  /** GST-2476 G2: an enforced member CLI read (cli/enforced-member.ts): privacy stays hidden whatever the hatches say, and no owner relaxation. */
+  enforcedMember?: true;
   /** Threaded into OperationContext.revealTools (stdio session tool reveal). */
   revealTools?: (names: string[]) => void;
   /**
@@ -290,6 +326,8 @@ export interface DispatchOpts {
   isListed?: (op: OperationMeta) => Promise<boolean>;
   /** #5232: commit wait for coordinated writes (OperationContext.writeWaitMs); unset = agent default. */
   writeWaitMs?: number;
+  /** PR B: the owner socket answers a write deferred behind a refresh as the write_pending error, so its CLI exits 10 and polls. */
+  pendingAsError?: boolean;
   /** Large pages: the caller sent X-Gbrain-Client (OperationContext.thinClient). Shape only, never authority. */
   thinClient?: boolean;
   /** C1: search/query row shape chosen by the transport (OperationContext.resultRows); unset = lean for remote callers. */
@@ -403,7 +441,7 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
   const r = retrieval as {
     type_filter_notice?: unknown;
     other_names?: Array<{ name: string; alias: string; slug: string }>;
-    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string; linked_from?: string; corrected_by?: number }>;
+    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string; linked_from?: string; corrected_by?: number; quoted?: string }>;
     answer_id?: unknown;
     feedback?: { rateable?: boolean; how_to_rate?: string };
   };
@@ -416,7 +454,7 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
   }
   if (r.saved_facts?.length) {
     const { text, more } = wholeItemsWithin('Saved facts (remember): about the entity this query names (newest first), then facts those point to, then matches for its words; recall returns more:\n',
-      r.saved_facts.map(f => `- ${f.fact} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}${f.linked_from ? `; named in a saved fact about ${f.linked_from}` : ''}${f.corrected_by ? '; corrected by a newer saved fact above' : ''}]`),
+      r.saved_facts.map(f => `- ${f.fact}${f.quoted ? '\n' : ''} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}${f.linked_from ? `; named in a saved fact about ${f.linked_from}` : ''}${f.corrected_by ? '; corrected by a newer saved fact above' : ''}]`),
       '\n', SAVED_FACTS_NOTICE_MAX_CHARS);
     blocks.push(more ? `${text}\n(+${more} more; recall returns them)` : text);
   }
@@ -483,7 +521,7 @@ export function buildEmptyRetrievalBlock(retrieval: unknown): string | null {
     .filter((s): s is string => typeof s === 'string' && s.length > 0);
   parts.push(stages.length > 0
     ? `degraded: ${[...new Set(stages)].join(', ')}.`
-    : 'no retrieval degradation — this is a clean miss.');
+    : 'retrieval healthy (no recall-impairing stage). Try the display name, a synonym or hybrid match (the default) before concluding the brain has nothing.');
   if (typeof r.hint === 'string' && r.hint.length > 0) parts.push(`hint: ${r.hint}`);
   return parts.join(' ');
 }
@@ -519,9 +557,30 @@ export type RequestLogStatus = 'success' | 'success_with_warnings' | 'accepted_p
 
 /** #5249: the receipt of a write the dispatcher returned as accepted but not yet committed. */
 export function acceptedPendingReceipt(result: ToolResult): WriteReceipt | null {
-  if (!result.isError) return null;
-  try { return admittedPendingReceipt(JSON.parse(result.content[0]?.text ?? '{}')); }
-  catch { return null; }
+  const text = result.content[0]?.text ?? '{}';
+  if (!result.isError && !/^\s*\{\s*"status"\s*:\s*"pending"/.test(text.slice(0, 64))) return null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return result.isError ? admittedPendingReceipt(parsed) : deferredPendingReceipt(parsed);
+  } catch { return null; }
+}
+
+/** PR B: the receipt of a successful `status: "pending"` result, a write deferred behind a refresh. */
+function deferredPendingReceipt(parsed: unknown): WriteReceipt | null {
+  const body = parsed as { status?: unknown; receipt?: unknown } | null;
+  return body?.status === 'pending' && isWriteReceipt(body.receipt) ? body.receipt : null;
+}
+
+/**
+ * PR B (docs/designs/REFRESH_WRITE_BARRIER.md): a write deferred behind a worktree refresh was accepted and publishes after
+ * it, so MCP answers it as a pending success instead of an error. Any other `write_pending` stays an error.
+ */
+export function deferredWriteResult(e: unknown, notices: Notice[], opts: DispatchOpts): ToolResult | null {
+  if (opts.pendingAsError || !(e instanceof OperationError) || (e.code !== 'write_pending' && e.writeError !== 'write_pending') || !e.writeRequest?.deferred) return null;
+  const receipt = publicWriteReceipt(e.writeRequest);
+  return toolResultWithNotices({ status: 'pending', request_id: receipt.request_id, receipt, deferred: e.writeRequest.deferred,
+    next: { tool: 'get_write_request', arguments: { request_id: receipt.request_id }, cli: `gbrain write-request ${receipt.request_id}`, retry_after_ms: receipt.retry_after_ms } },
+  admitNotices(notices, opts), dispatchRenderContext(opts));
 }
 
 /**
@@ -547,6 +606,7 @@ export function requestLogStatusForResult(result: ToolResult): RequestLogStatus 
     } catch { /* unparseable error content stays plain 'error' */ }
     return 'error';
   }
+  if (acceptedPendingReceipt(result)) return 'accepted_pending';
   const warnings = result._meta?.warnings;
   return Array.isArray(warnings) && warnings.length > 0 ? 'success_with_warnings' : 'success';
 }
@@ -689,6 +749,17 @@ async function hiddenContentNotices(engine: BrainEngine, name: string, result: u
   }
 }
 
+/**
+ * GST-2353: a refusal safe to retry carries the call to repeat (next: wait) in the id parameter the tool takes: its
+ * request_id with the id it was refused under, or the same arguments when the tool replays by its idempotency_key.
+ */
+function attachRetryCall(op: Pick<Operation, 'mutating' | 'params'>, name: string, params: Record<string, unknown>, e: unknown): void {
+  if (!op.mutating || !(e instanceof OperationError) || e.retryable !== true || !e.fix || e.fix.mcp) return;
+  const retry = op.params.request_id ? (e.requestId ? { ...params, request_id: e.requestId } : null)
+    : op.params.idempotency_key && typeof params.idempotency_key === 'string' ? params : null;
+  if (retry) e.fix = { ...e.fix, mcp: { tool: name, arguments: retry } };
+}
+
 /** A refusal a grant explains: a missing scope or an operation outside the grant's snapshot or fence. */
 function refusedByGrant(e: unknown): boolean {
   return e instanceof OperationError && (e.code === 'insufficient_scope' || e.code === 'permission_denied');
@@ -772,6 +843,29 @@ async function sessionSafetyNotices(engine: BrainEngine, opts: DispatchOpts, con
   return out;
 }
 
+/**
+ * Merges the handler-emitted response meta into a success result, then the GBRA-200 degraded stamp:
+ * `_meta.degraded` and one text block after every other block. The stamp is derived from every notice
+ * the call produced, before dedupe, so it rides every degraded call.
+ */
+function attachResponseMeta(out: ToolResult, responseMeta: Record<string, unknown>, stamp: DegradedStamp | null): void {
+  if (Object.keys(responseMeta).length > 0) out._meta = { ...(out._meta ?? {}), ...responseMeta };
+  if (!stamp) return;
+  out.content.push({ type: 'text', text: degradedStampLine(stamp) });
+  out._meta = { ...(out._meta ?? {}), degraded: stamp };
+}
+
+type ToolTail = Parameters<NonNullable<OperationContext['emitToolTail']>>[0];
+
+/**
+ * Wakeshift's addition: its text (at most 2,000 characters) as the LAST text block, its meta merged into `_meta`
+ * under gbrain's own keys, which it never replaces (a conversation credential: never logged).
+ */
+function appendToolTail(out: ToolResult, tail: ToolTail): void {
+  if (tail.text) out.content.push({ type: 'text', text: tail.text.slice(0, 2000) });
+  if (tail.meta && typeof tail.meta === 'object') out._meta = { ...tail.meta, ...(out._meta ?? {}) };
+}
+
 /** The one error result path: toAgentError → exactly one content block. */
 export function errorResult(e: unknown, opts: DispatchOpts, extra: { op?: string; mutating?: boolean; idempotent?: boolean; notices?: Notice[] } = {}): ToolResult {
   const carried = !!extra.notices?.length && e instanceof OperationError;
@@ -787,6 +881,22 @@ export function errorResult(e: unknown, opts: DispatchOpts, extra: { op?: string
   const { contract_version, ...rest } = envelope;
   const added = extra.notices.map(n => redactForTransport(renderNotice(n, render), render.transport));
   return toolErrorResult({ ...rest, notices: orderNotices([...(envelope.notices ?? []), ...added]), contract_version });
+}
+
+/**
+ * GST-1054: SkillOpt's tool loops hand the model a thrown error's message, so their read handlers throw this: the
+ * error text an MCP caller reads for the same failed read (code, message, suggestion, fix), with `code` kept for
+ * callers that branch on it. It renders for the caller's grant (a read-scope reader when the loop has none) and the
+ * loop's own tools, so a fix names a tool call the model can make. An AI invocation policy stop passes through
+ * unchanged, because the loop rethrows it.
+ */
+export function asAgentToolError(e: unknown, op: string, ctx: Pick<OperationContext, 'sourceId' | 'auth'>, allowedOps: ReadonlySet<string>): unknown {
+  if (isAIInvocationPolicyError(e)) return e;
+  const auth: AuthInfo = ctx.auth ?? { token: '', clientId: '', scopes: ['read'] };
+  const text = errorResult(e, { remote: true, transport: 'http', sourceId: ctx.sourceId, auth, allowedOps }, { op, mutating: false, idempotent: true }).content[0]!.text;
+  const err: Error & { code?: string } = new Error(text);
+  err.code = (JSON.parse(text) as { code?: string }).code;
+  return err;
 }
 
 const stderrLogger: OperationContext['logger'] = {
@@ -806,6 +916,11 @@ const SESSION_ID_MAX_CHARS = 256;
 export function requestMetaSessionId(requestParams: unknown): string | undefined {
   const raw = (requestParams as { _meta?: { session_id?: unknown } } | undefined)?._meta?.session_id;
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
+
+/** GBRA-156: `_meta.hot_memory: "off"` on the request (pass `request.params`) or inside the tool arguments (pass the arguments). */
+export function hotMemoryOffIn(params: unknown): boolean {
+  return (params as { _meta?: { hot_memory?: unknown } } | undefined)?._meta?.hot_memory === 'off';
 }
 
 /**
@@ -854,15 +969,20 @@ export function buildOperationContext(
     ...(opts.explicitReadBinding ? { explicitReadBinding: opts.explicitReadBinding } : {}),
     ...(opts.surfaceCeiling ? { surfaceCeiling: opts.surfaceCeiling } : {}),
     ...(opts.stdioSurface ? { stdioSurface: opts.stdioSurface } : {}),
+    ...(opts.stdioMember !== undefined && opts.transport === 'stdio' && !opts.auth ? { stdioMember: opts.stdioMember } : {}),
     ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
     ...(opts.admissionOrigin ? { admissionOrigin: opts.admissionOrigin } : {}),
+    ...(opts.agentLabel ? { agentLabel: opts.agentLabel } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
     ...(opts.thinClient ? { thinClient: true } : {}),
+    ...(opts.mcpCaller ? { mcpCaller: opts.mcpCaller } : {}),
     isCallable: (opName: string) => (render ??= dispatchRenderContext(opts)).isCallable(opName),
     auth: opts.auth,
   };
 }
+
+const WORLD_ONLY_PACK_OPS = new Set(['context_pack', 'delta']);
 
 /**
  * Resolve operation, validate params, build context, invoke handler, format result.
@@ -879,14 +999,141 @@ export async function dispatchToolCall(
   // #6721: a read op answers every config read from one snapshot of the table
   // (config-snapshot.ts); a write reads config live, so it sees its own writes.
   // GBRA-156: and reads the brain identity and each local writer's credential once for its pre-submission checks.
-  const run = () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, opts));
+  // GBRA-156: a remote read sees private pages only in the sources its grant names under private_pages: granted_sources.
+  // Writes, local callers and every path outside this call keep the empty set, so they hide or see exactly what they did.
+  // context_pack and delta stay world-only for every caller unless a trusted local one passes include_private, so no grant widens them.
+  const op = operations.find(o => o.name === name);
+  const readOnly = op?.mutating === false;
+  const args = op && params ? normalizeOptionalParams(op, params) : params;
+  const privateSources = readOnly && opts.remote !== false && !WORLD_ONLY_PACK_OPS.has(name) ? opts.auth?.privatePages?.sources : undefined;
+  const resolved = opts.metaHook && (opts.hotMemoryOff === true || hotMemoryOffIn(params)) ? { ...opts, metaHook: undefined } : opts;
+  // GBRA-218: a remote call also carries its credential's member identity, which every caller-aware read checks page readers against.
+  // GBRA-231: or the audience a shared agent's harness asserts, resolved (and refused) on every call before any work.
+  const run = async () => {
+    if (opts.remote === false) return qmMemoryToolResult(name, await withCallerAccess({ privateReadableSources: [] }, () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, resolved))));
+    // GST-359 C1: or the person a trusted system attests (x-qm-actor), decided here too, before any work (access/actor.ts).
+    let audience: AudiencePrincipal[] | null = null;
+    let attested: Awaited<ReturnType<typeof resolveAttestedActor>> = null;
+    let access: Awaited<ReturnType<typeof remoteCallerAccess>>;
+    let readMode: ReadMode | null = null;
+    let scoped = resolved;
+    let scopeNotice: RequesterScopeNotice | null = null;
+    const header = opts.actor?.header ?? undefined;
+    const actorNamed = header !== undefined || opts.actor?.audience != null || (!!args && Object.prototype.hasOwnProperty.call(args, ACTOR_ARGUMENT));
+    const assertion = (outcome: AudienceAuditEvent['outcome'], reason?: string) => logAudienceAssertion({ outcome, op: name,
+      audience: [...(attested?.access?.audience ?? audience ?? [])], transport: opts.transport ?? 'unknown',
+      principal: opts.auth?.principal ? `${opts.auth.principal.kind}:${opts.auth.principal.id}` : opts.transport === 'stdio' ? 'local_stdio' : 'unknown',
+      ...(actorNamed ? { actor: { system: 'qm', ...(header && EXTERNAL_ID_RE.test(header) ? { external_id: header } : {}), ...(reason ? { reason } : {}) } } : {}) });
+    try {
+      if (audienceInArguments(args)) throw audienceInArgumentsError();
+      audience = parseAudience(opts.onBehalfOf);
+      attested = await resolveAttestedActor(engine, { channels: opts.actor, params: args, op: name, opShape: op,
+        auth: opts.auth, transport: opts.transport, audienceAsserted: audience !== null });
+      // GST-1158 E1: an attested read that names sources reads as the scope (access/scope-read.ts), or as the person on an attest_read person credential.
+      readMode = attested?.actor ? attestedReadMode(name, attested.params, attested.read) : null;
+      if (readMode === 'scope' && attested?.access?.labelledOnly) throw scopeReadLabelledOnlyRefused(name);
+      access = readMode === 'scope' ? { ...SCOPE_READ_ACCESS, folderCoverage: (await folderAccessFor(engine, [])).folderCoverage } : attested?.access ?? await remoteCallerAccess(engine, opts.auth, privateSources, opts.transport, audience, opts.transport === 'stdio' && !opts.auth ? opts.stdioMember : undefined, readOnly);
+      // GBRA-284: an attested call reads its grant minus other members' personal sources, a scope read minus every personal source (access/member-sources.ts).
+      if (attested?.actor) scoped = await attestedReadScope(engine, resolved, attested.actor.member, readMode === 'scope');
+      if (opts.enforcedMember) access = { ...access, hidePrivate: true, owner: false, privateReadableSources: [] };
+      // GST-363: on a brain that serves several people, a read from a connection bound to nobody is refused (or, in its grace, noticed) before any work.
+      // An op this connection cannot reach (hidden by its surface, localOnly off stdio, or cliOnly over MCP) keeps its own refusal instead.
+      const reachable = !!op && (!opts.allowedOps || opts.allowedOps.has(name)) && (!op.localOnly || opts.transport === 'stdio') && !op.cliOnly;
+      try {
+        if (!attested?.actor && reachable && requiresRequesterScope(op, opts.auth)) {
+          const credential = opts.auth ? await credentialScopeFor(engine, opts.auth) : undefined;
+          access = await withServesReread(engine, access, credential);
+          scopeNotice = requesterScopeGate(op, access, credential, opts.transport);
+        } else if (!attested?.actor && reachable && scoped.metaHook) {
+          // GST-363: the ops the gate lets through (exempt reads, writes) carry no hot memory to a connection whose reads it refuses.
+          const credential = opts.auth ? await credentialScopeFor(engine, opts.auth) : undefined;
+          if (requesterScopeRefuses(await withServesReread(engine, access, credential), credential, opts.transport)) scoped = { ...scoped, metaHook: undefined };
+        }
+      } catch (dbFailure) {
+        // The serves re-read met a database that is unreachable or missing its schema: its own envelope, nothing read.
+        if (dbFailure instanceof OperationError) throw dbFailure;
+        return errorResult(dbFailure, opts, { op: name });
+      }
+    } catch (thrown) {
+      const e = identityLookupUnavailable(thrown) ?? thrown;
+      // GST-359: a call that names a person gets every failure here (a lock timeout reading its link included) in the
+      // envelope QM reads, never a thrown call; a coded refusal (access_identity_unavailable) is an error result, before
+      // anything is admitted; anything else keeps the caller's own error path.
+      if (!(e instanceof OperationError) || !/^(on_behalf_of_|actor_|requester_scope_(required|unknown)$)/.test(String(e.code))) {
+        if (actorNamed) return withStructuredError(errorResult(e, opts, { op: name }));
+        if (e instanceof OperationError) return errorResult(e, opts, { op: name });
+        throw e;
+      }
+      assertion(e.code as AudienceAuditEvent['outcome'], e.reason);
+      if (e.code === 'requester_scope_required' || e.code === 'requester_scope_unknown') return qmMemoryToolResult(name, withStructuredError(errorResult(e, opts, { op: name })));
+      return qmMemoryToolResult(name, actorNamed ? actorRefusal(e, opts, name, header, args) : errorResult(e, opts, { op: name }));
+    }
+    if (audience || attested?.actor) assertion('accepted');
+    const callParams = attested ? attested.params : args;
+    return withCallerAccess(access, async () => {
+      const out = await withRequestIdentityMemo(() => withReadMode(readMode, () => dispatchResolvedCall(engine, name, callParams, scoped)));
+      // _meta.access (MCP_META_CHANNELS.md): the view this call was answered under, for the harness; own producer, isolated.
+      try { out._meta = { ...(out._meta ?? {}), access: await appliedAccessSummary(engine, scoped.auth, [scoped.sourceId, ...(scoped.localFederatedSourceIds ?? [])]) }; } catch { /* the key is absent */ }
+      if (scopeNotice) {
+        const applied = (out._meta?.access ?? {}) as Record<string, unknown>;
+        out._meta = { ...(out._meta ?? {}), access: { ...applied, requester_scope: { ...scopeNotice, fix: renderAction(scopeNotice.fix, dispatchRenderContext(opts)) } } };
+      }
+      const personal = !!attested?.actor;
+      const shaped = qmMemoryToolResult(name, out, personal);
+      // GST-1158 F2: a personal read's structuredContent repeats its JSON, so the final frame is measured again.
+      if (!personal || shaped === out || shaped.isError || !QM_PERSONAL_OPS.has(name) || op?.mutating !== false) return shaped;
+      const over = await frameOverCap(shaped, { remote: true, transport: opts.transport === 'stdio' ? 'stdio' : 'http', engine, config: opts.config ?? loadConfig() });
+      return over ? qmMemoryToolResult(name, errorResult(resultTooLargeError(name, callParams ?? {}, over), opts, { op: name, mutating: false, idempotent: op.idempotent === true }), true) : shaped;
+    });
+  };
   if (name === 'search' || name === 'query') return withSearchConnectionBudget(() => withRequestConfigSnapshot(engine, run));
-  return operations.find(o => o.name === name)?.mutating === false
+  return readOnly
     ? withRequestConfigSnapshot(engine, run)
     : withoutRequestConfigSnapshot(run);
 }
 
+/**
+ * GST-359 C1: the refusal of a call that named an attested actor: gbrain's envelope (top-level `code` in the JSON text
+ * block) plus `structuredContent.error`, both of which QM reads. The single seam where memory_recall answers
+ * actor_unlinked as a success instead (GST-359 D): empty content and structuredContent {facts: [], truncated: false,
+ * code: 'actor_unlinked'}, the code also in `_meta.access`, so a person not yet linked reads nothing and QM's turn goes on.
+ */
+function actorRefusal(e: OperationError, opts: DispatchOpts, op: string, header: string | undefined, params: Record<string, unknown> | undefined): ToolResult {
+  if (op === 'memory_recall' && e.code === 'actor_unlinked') {
+    try { recallArguments(params); } catch (invalid) { if (invalid instanceof OperationError) return actorRefusal(invalid, opts, op, header, params); throw invalid; }
+    return { ...unlinkedRecallResult(), _meta: { access: { code: 'actor_unlinked', member: null, groups: [], audience: null, actor: { system: 'qm', external_id: header } } } };
+  }
+  return withStructuredError(errorResult(e, opts, { op }));
+}
+
+/** An error result with its JSON envelope's code, message, reason, detail and fix also in `structuredContent.error`, which QM reads. */
+function withStructuredError(out: ToolResult): ToolResult {
+  try {
+    const env = JSON.parse(out.content[0]!.text) as Record<string, unknown>;
+    out.structuredContent = { error: { code: env.code, message: env.message, ...(env.reason ? { reason: env.reason } : {}), ...(env.detail ? { detail: env.detail } : {}), ...(env.fix ? { fix: env.fix } : {}) } };
+  } catch { /* the text block still carries the code */ }
+  return out;
+}
+
+/**
+ * GST-359 D: the refusal both HTTP transports give a request carrying x-qm-audience (a channel audience gbrain does
+ * not serve yet), before any work: the tools/call result (with structuredContent.error) and the JSON-RPC error for
+ * every other method that would read (tools/list, resources).
+ */
+export function audienceRefusal(op: string, opts: Pick<DispatchOpts, 'auth' | 'transport'>): { result: ToolResult; rpc: { code: number; message: string; data: Record<string, unknown> } } {
+  const e = actorNotAttested('audience_not_supported', { auth: opts.auth }, { op, transport: opts.transport });
+  return { result: actorRefusal(e, { remote: true, ...opts }, op, undefined, undefined),
+    rpc: { code: -32600, message: `actor_not_attested: ${e.message}`, data: { code: 'actor_not_attested', reason: 'audience_not_supported', message: e.message } } };
+}
+
 /** The response-meta hook's keys, or its failure message; never rejects (a hook failure degrades to no keys). */
+// The hot-memory hook reads ctx.sourceId only, so a call that names its own sources gets no ambient-source payload.
+function namesOwnSources(params: Record<string, unknown>, sourceId: string | undefined): boolean {
+  const ids = params.source_ids;
+  if (Array.isArray(ids) ? ids.length > 0 : typeof ids === 'string' && ids.trim() !== '') return true;
+  return typeof params.source_id === 'string' && params.source_id !== '' && params.source_id !== sourceId;
+}
+
 async function runMetaHook(hook: NonNullable<DispatchOpts['metaHook']>, name: string, ctx: OperationContext): Promise<{ meta?: Record<string, unknown>; failure?: string }> {
   try { return { meta: await hook(name, ctx) }; }
   catch (metaErr) { return { failure: metaErr instanceof Error ? metaErr.message : String(metaErr) }; }
@@ -993,7 +1240,9 @@ async function dispatchResolvedCall(
   const unknownParamWarnings = findUnknownParams(op, safeParams);
   if (unknownParamWarnings.length > 0) {
     const strictMode = op.mutating === true ? 'reject' : await resolveStrictParamsMode(engine, opts.config ?? loadConfig());
-    if (strictMode === 'reject') {
+    // GBRA-431: a misspelled scope or filter on a read would answer unnarrowed, so it rejects in every mode.
+    const narrowing = strictMode === 'reject' ? [] : narrowingUnknownParams(unknownParamWarnings, Object.keys(op.params));
+    if (strictMode === 'reject' || narrowing.length > 0) {
       logVerb(false);
       // Privacy (amendment 11): the raw unknown key rides `suggestion` ONLY.
       // serve-http persists the envelope's `message` into
@@ -1004,9 +1253,9 @@ async function dispatchResolvedCall(
         .map(w => w.suggestion
           ? `Unknown parameter "${w.param}" — did you mean "${w.suggestion}"?`
           : `Unknown parameter "${w.param}".`)
-        .join(' ');
+        .join(' ') + (op.callShape ? ` ${op.callShape}` : '');
       const strict = new OperationError('invalid_params',
-        `${n} unknown parameter${n === 1 ? '' : 's'} not declared in the ${name} tool schema (${op.mutating === true ? 'write operations always reject unknown parameters; nothing was written' : 'mcp.strict_params=reject'}). See suggestion for the submitted name${n === 1 ? '' : 's'}.`,
+        `${n} unknown parameter${n === 1 ? '' : 's'} not declared in the ${name} tool schema (${op.mutating === true ? 'write operations always reject unknown parameters; nothing was written' : narrowing.length > 0 ? 'a read rejects an unknown scope or filter parameter, which would otherwise return unnarrowed results; nothing was read' : 'mcp.strict_params=reject'}). See suggestion for the submitted name${n === 1 ? '' : 's'}.`,
         suggestion);
       if (isVerb) strict.protocolVersion = MEMORY_VERBS_VERSION;
       return errorResult(strict, opts, { op: name });
@@ -1057,6 +1306,7 @@ async function dispatchResolvedCall(
   // failure renders the envelope's `notices` key (one block).
   const notices: Notice[] = [];
   ctx.emitNotice = (n) => { if (n) notices.push(n); };
+  let tail: ToolTail | undefined; ctx.emitToolTail = (t) => { tail = t; }; // Wakeshift's addition, appended last on success
 
   try {
     if (ctx.remote !== false && op.requiredScopes?.length) {
@@ -1078,7 +1328,8 @@ async function dispatchResolvedCall(
     // #5575 CEO-18: a floored connection only reaches read ops that enforce its floor.
     enforceReadTrustFloor(ctx.auth, op);
     // GBRA-156: a read op does not change what the hook reads, so it runs beside the handler (a degraded engine's reconnect stays the handler's).
-    const earlyMeta = opts.metaHook && op.mutating === false && !isEngineDegraded(engine) ? runMetaHook(opts.metaHook, name, ctx) : undefined;
+    const metaHook = namesOwnSources(safeParams, ctx.sourceId) ? undefined : opts.metaHook;
+    const earlyMeta = metaHook && op.mutating === false && !isEngineDegraded(engine) ? runMetaHook(metaHook, name, ctx) : undefined;
     const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
       (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
     let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;
@@ -1123,17 +1374,11 @@ async function dispatchResolvedCall(
     // Cat 40 (#5932) evidence blocks (type-filter notice, other names, saved facts) are retrieval
     // data, not advice: they stay plain extra text blocks right after content[0], as measured.
     const evidenceBlocks = retrievalNoticeBlocks(result, responseMeta.retrieval).slice(emptyBlock ? 1 : 0);
-    // WP3/D8: warn-mode unknown-param notices ride the same channel, so the
-    // grace period actually corrects clients (old thin-clients read content[0]
-    // only — skew-safe). One notice per ignored parameter.
-    for (const w of unknownParamWarnings) {
-      notices.push({ code: 'unknown_param', kind: 'info', why: buildUnknownParamWarnBlock([w]) });
-    }
     // Lane F (F3): degraded recall and a source binding that narrowed an empty read.
     const rerankDegradedCalls = recordRerankDegradation(responseMeta, opts);
     notices.push(...recallInteropNotices(name, result, responseMeta, safeParams,
       { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding, rerankDegradedCalls }));
-    notices.push(...await hiddenContentNotices(engine, name, result, ctx, opts));
+    notices.push(...accessPolicyNotices(name, ctx), ...await hiddenContentNotices(engine, name, result, ctx, opts));
     // Monthly backup-coverage: one AGGREGATE notice per process (counts only —
     // never a local path or source id). The refresher runs on the stdio
     // transport ONLY — the WP1/D7 locality axis localOnly ops use; 'http' or
@@ -1148,12 +1393,13 @@ async function dispatchResolvedCall(
       } catch { /* a pointer, never a failure */ }
     }
     maybeBackupNotice(notices, opts);
-    if (opts.transport === 'stdio' && opts.remote !== false) { const up = takePostUpgradeMcpNotice(); if (up) notices.push(up); } // F7
-    if (opts.transport === 'stdio' && opts.remote !== false) notices.push(...await mcpOnboardingNotices({ engine, op: name, result, meta: responseMeta, config: ctx.config, render: dispatchRenderContext(opts) }));
-    if (opts.transport === 'stdio' && opts.remote !== false) { const drain = takeFactsDrainNotice(); if (drain) notices.push(drain); } // Lane D facts drain
-    notices.push(...await sessionSafetyNotices(engine, opts, ctx.config));
-    notices.push(...await grantBlockedNotices(engine, opts, false));
-    const out: ToolResult = toolResultWithNotices(result, admitNotices(notices, opts), dispatchRenderContext(opts));
+    // GST-1387: a remember batch with a failed item is an MCP error; its body keeps every item's receipt.
+    const batchError = name === 'remember' && typeof result === 'object' && result !== null && (result as { status?: unknown }).status === 'error' && Array.isArray((result as { items?: unknown }).items);
+    if (opts.transport === 'stdio' && opts.remote !== false && !batchError) { const up = takePostUpgradeMcpNotice(); if (up) notices.push(up); } // F7
+    if (opts.transport === 'stdio' && opts.remote !== false && !batchError) notices.push(...await mcpOnboardingNotices({ engine, op: name, result, meta: responseMeta, config: ctx.config, render: dispatchRenderContext(opts) }));
+    if (opts.transport === 'stdio' && opts.remote !== false && !batchError) { const drain = takeFactsDrainNotice(); if (drain) notices.push(drain); } // Lane D facts drain
+    if (!batchError) notices.push(...await sessionSafetyNotices(engine, opts, ctx.config), ...await grantBlockedNotices(engine, opts, false));
+    const out: ToolResult = batchError ? toolErrorResult(result as never) : toolResultWithNotices(result, admitNotices(notices, opts), dispatchRenderContext(opts));
     if (evidenceBlocks.length > 0) out.content.splice(1, 0, ...evidenceBlocks.map(text => ({ type: 'text' as const, text })));
     if (opts.transport === 'stdio') {
       maybeRefreshBackupStatusInProcess(engine);
@@ -1163,15 +1409,13 @@ async function dispatchResolvedCall(
     // BEFORE and independently of the metaHook, so a hot-memory hook
     // failure can never drop the retrieval channel. Per-key merge, never
     // wholesale assignment. See docs/protocol/MCP_META_CHANNELS.md.
-    if (Object.keys(responseMeta).length > 0) {
-      out._meta = { ...(out._meta ?? {}), ...responseMeta };
-    }
+    attachResponseMeta(out, responseMeta, degradedStampFor(name, result, responseMeta, notices)); if (tail) appendToolTail(out, tail);
     // v0.31 (eD3 + eE4): best-effort _meta.brain_hot_memory injection.
     // The hook is wrapped in its own try/catch — any DB blip / cache miss /
     // helper crash degrades to no hook keys rather than flipping the whole
     // tool call to error.
-    if (opts.metaHook) {
-      const { meta, failure } = await (earlyMeta ?? runMetaHook(opts.metaHook, name, ctx));
+    if (metaHook) {
+      const { meta, failure } = await (earlyMeta ?? runMetaHook(metaHook, name, ctx));
       if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
       if (failure !== undefined) ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${failure}; degrading to no hook keys`);
     }
@@ -1179,7 +1423,9 @@ async function dispatchResolvedCall(
     const over = op.mutating ? null : await frameOverCap(out, { remote: ctx.remote, transport: ctx.transport, engine, config: ctx.config });
     if (over) return errorResult(resultTooLargeError(name, safeParams, over), opts, { op: name, mutating: false, idempotent: op.idempotent === true });
     return out;
-  } catch (e: unknown) {
+  } catch (thrown: unknown) {
+    // A transient failure of the member-identity lookup at submission is the retryable access_identity_unavailable.
+    const e = identityLookupUnavailable(thrown) ?? thrown;
     logVerb(false);
     if (op.mutating) invalidateHotMemoryForEngine(engine); // a failed write may have committed part of its work
     // Agent contract v1 (A1): every failure — OperationError, classified DB
@@ -1188,6 +1434,8 @@ async function dispatchResolvedCall(
     // never tells a mutating op with an unknown outcome to retry.
     notices.push(...await sessionSafetyNotices(engine, opts, ctx.config));
     notices.push(...await grantBlockedNotices(engine, opts, refusedByGrant(e)));
-    return errorResult(e, opts, { op: name, mutating: op.mutating === true, idempotent: op.idempotent === true, notices: admitNotices(notices, opts) });
+    attachRetryCall(op, name, safeParams, e);
+    if (op.mutating) asSegmentedWriteRefusal(e);
+    return deferredWriteResult(e, notices, opts) ?? errorResult(e, opts, { op: name, mutating: op.mutating === true, idempotent: op.idempotent === true, notices: admitNotices(notices, opts) });
   }
 }

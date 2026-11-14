@@ -14,6 +14,8 @@
  *   - MANUAL-ONLY. Rows come exclusively from the entity_identity_link op.
  *     No auto-matching, no name-similarity heuristics — a wrong identity
  *     merge silently corrupts retrieval, so v1 keeps a human in the loop.
+ *     Near names are only flagged for review (entities/near-name.ts,
+ *     extraction_pending possible_duplicates); nothing here is written from them.
  *   - A page belongs to at most one identity (UNIQUE (source_id, page_id));
  *     re-linking MOVES it.
  *   - Retrieval union is OFF by default, gated by the
@@ -29,7 +31,7 @@
 import type { BrainEngine } from './engine.ts';
 import type { Link } from './types.ts';
 import { isMissingSchemaObject } from './utils.ts';
-import { privatePagesFilterFragment } from './search/private-visibility.ts';
+import { privatePagesFilterForCaller } from './search/private-visibility.ts';
 
 /** Config key for the flag-gated retrieval union. Default OFF. */
 export const ENTITY_IDENTITY_UNION_CONFIG_KEY = 'entity_identity.union';
@@ -176,7 +178,7 @@ export async function listEntityIdentities(
   const params: unknown[] = [];
   const allowedSources = opts.allowedSources?.length ? opts.allowedSources
     : opts.sourceId ? [opts.sourceId] : undefined;
-  if (opts.excludePrivate) where.push(privatePagesFilterFragment('p'));
+  if (opts.excludePrivate) where.push(privatePagesFilterForCaller('p'));
   if (opts.entityId) {
     params.push(validateEntityId(opts.entityId));
     where.push(`ei.entity_id = $${params.length}`);
@@ -200,7 +202,7 @@ export async function listEntityIdentities(
       });
       seedScope += ` AND ei2.source_id IN (${ph.join(', ')})`;
     }
-    if (opts.excludePrivate) seedScope += ` AND ${privatePagesFilterFragment('p2')}`;
+    if (opts.excludePrivate) seedScope += ` AND ${privatePagesFilterForCaller('p2')}`;
     where.push(`ei.entity_id IN (
       SELECT ei2.entity_id FROM entity_identities ei2
       JOIN pages p2 ON p2.id = ei2.page_id AND p2.source_id = ei2.source_id

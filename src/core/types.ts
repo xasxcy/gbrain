@@ -1089,6 +1089,8 @@ export interface SearchResult {
    * keys off base_score / evidence, not the boosted score).
    */
   title_match_boost?: number;
+  /** Multiplier from the opt-in qualified title boost (`search.title_qualified`); evidence never reads it as an exact title match. */
+  title_mention_boost?: number;
   /**
    * T3 (retrieval-maxpool incident) — set when this result was surfaced or
    * boosted by the free-text alias hop (the query exactly matched a page's
@@ -1098,6 +1100,8 @@ export interface SearchResult {
    * decision keys off (T4).
    */
   alias_hit?: boolean;
+  /** Opt-in qualified alias hop (`search.qualified_aliases`) led this page; autocut and the remote page cap keep it, evidence ignores it. */
+  qualified_alias_hit?: boolean;
   /**
    * #3783 — set when this result was surfaced by a LEXICAL arm (chunk-grain
    * keyword FTS or the page-grain title arm). Stamped pre-fusion by
@@ -1123,10 +1127,10 @@ export interface SearchResult {
    */
   entity_anchored?: 'entity' | 'linked';
   /** Set on a saved-fact row the `search.query_facts_arm` arm added (search/facts-arm.ts); page_id is 0. */
-  fact_row?: { id: number; valid_from: string; valid_until: string | null };
+  fact_row?: { id: number; valid_from: string; valid_until: string | null; source?: string; from_quoted_page?: true };
   /** Fact rows only, and what callers see of them: never a page (no slug or id); follow with `follow_up`, read `page_slug` when the entity page exists. */
   result_type?: 'fact'; fact_id?: string; page_slug?: string; follow_up?: { op: 'recall'; args: Record<string, string> };
-  /** #7600: a conversation page's row, returned fenced as quoted source material with its tool-call blocks summarized (search/transcript-quote.ts). */
+  /** #7600, #8042: a row of third-party text (a chat page or a fact saved from one), returned fenced as quoted source material with its tool-call blocks summarized (search/transcript-quote.ts). */
   quoted?: 'transcript';
   /** A newer active fact covers the same entity and typed claim slot as a fact taken from this page. */
   superseded_claim?: { fact_id: number; valid_from: string };
@@ -1254,7 +1258,7 @@ export interface SearchOpts extends PageReadPolicy {
   /** #5989: bounded CJK keyword arm (deadline + meta sink); set by hybrid only (engine-sql/cjk-search.ts). */
   cjkKeyword?: import('./engine-sql/cjk-search.ts').CjkKeywordRun;
   /** GBRA-156: the Postgres keyword arm ranked a bounded sample of its matches, or its OR retry dropped common terms (search/keyword-chunk-match.ts, search/keyword-or-narrow.ts). */
-  onKeywordIncomplete?: (reason: 'candidate_budget') => void;
+  onKeywordIncomplete?: (reason: 'candidate_budget' | 'timeout' | 'provider_error') => void;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1363,6 +1367,8 @@ export interface SearchOpts extends PageReadPolicy {
   keywordTimeoutCache?: boolean;
   /** Keyword `score` query (websearch syntax) while `query` decides the matches (alias fan-out); ignored on the CJK path. */
   rankQuery?: string;
+  /** #7175: true applies the opt-in keyword phrase factor (`search.keyword_phrase true`); unset or false leaves it off. */
+  keywordPhrase?: boolean;
   /**
    * v0.27.1 / v0.36 (D11): target column for vector search. Two shapes:
    *
@@ -1782,6 +1788,7 @@ export interface ChronicleTimelineRow {
   event_slug: string | null;  // the type:event page, when this is an event projection
   effective_date: string | null; // event page effective_date — drives intra-day order
   kind: string | null;        // event.kind from the event page frontmatter
+  trust_tier: string | null;  // the row's stored tier (GST-687: below the owner's, quoted for an agent reader)
 }
 
 export interface ChronicleTimelineOpts extends PageReadScope {
@@ -1873,6 +1880,8 @@ export type { PageVersion } from './page-state/version-types.ts';
 export interface WriteAttributionView {
   request_id: string | null; operation: string | null; at: string | null;
   principal: { kind: string; id: string; name: string | null } | null;
+  /** The agent label the caller declared on the write request (X-Gbrain-Agent-Label); unverified, absent when none was sent. */
+  agent_label?: string;
   origin: 'request' | 'maintenance' | 'unrecorded';
 }
 /** A `get_versions` row as trusted local and admin callers see it. */
@@ -2095,7 +2104,7 @@ export const DEGRADED_STAGES = [
   'keyword_candidates_incomplete',
   'projection_pending', 'projection_by_design',
   'projection_status_unknown',
-  'keyword_count_unavailable',
+  'keyword_count_unavailable', 'saved_facts_withheld',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -2164,6 +2173,7 @@ export function affectsRecall(d: { stage?: string; reason?: string } | undefined
 export interface HybridSearchMeta {
   /** True iff vector search actually ran. False when OPENAI_API_KEY missing or embed failed. */
   vector_enabled: boolean;
+  /** #7492: an image-reading vector arm ran (cross-modal image or unified multimodal), so pending image pages could change the answer. */ image_arm?: true;
   /** System One: slot diagnostics (only when a slot ran visibly) and the reranker model version that answered. */
   decide?: import('./search/decide-stage.ts').DecideSearchMeta; rerank?: { model_resolved: string };
   /** System One S4 on the query op (diagnostic only): probability the top-k answer the query, threshold and verdict. */

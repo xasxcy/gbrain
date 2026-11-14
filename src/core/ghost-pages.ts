@@ -46,7 +46,7 @@ import type { PageSnapshot } from './page-state/types.ts';
 import { resolveRecordedSourceFilePath, resolveSourceLocalFilePath, sourceGitScope } from './markdown.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from './write-through.ts';
 import { isOpPageSlug } from './ops/context.ts';
-import { existingLocalHostId } from './persistence/identity.ts';
+import { existingHostIdFor } from './persistence/identity.ts';
 import { getWorktreeBinding } from './persistence/ownership.ts';
 import { sourceMirrorReadOnly } from './persistence/mirror-read-only.ts';
 import { publishesDatabaseOnly } from './persistence/page-prepare.ts';
@@ -124,7 +124,7 @@ export type SourceContext = { ok: true; root: string; owner: GhostOwner; mode: A
 const missing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException)?.code ?? '');
 
 export async function sourceContext(engine: BrainEngine, sourceId: string): Promise<SourceContext> {
-  const hostId = existingLocalHostId();
+  const hostId = existingHostIdFor(engine);
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
   if (!binding) return { ok: false, status: 'not_applicable', reason: 'not_applicable' };
   if (!hostId || !binding.local_path || binding.owner_host_id !== hostId || binding.state !== 'active') {
@@ -270,6 +270,12 @@ export async function ghostPageNow(engine: BrainEngine, sourceId: string, slug: 
   if (!context.ok) return { ghost: null, reason: context.reason };
   const result = await confirm(engine, context, sourceId, slug);
   return result.kind === 'ghost' ? { ghost: result.ghost, owner: context.owner } : { ghost: null, reason: result.reason, owner: context.owner };
+}
+
+/** A named page, checked now: the ghost it is, as the scan classifies it (a shared skillpack member is never one, #6910), or null. */
+export async function ghostPageNamed(engine: BrainEngine, sourceId: string, slug: string): Promise<GhostPage | null> {
+  const now = await ghostPageNow(engine, sourceId, slug);
+  return now.ghost && !await sharedPackMemberGhost(engine, now.owner, now.ghost) ? now.ghost : null;
 }
 
 /** Every selected (default: every active) source's ghost count, bounded samples and coverage; the doctor and health reader. */

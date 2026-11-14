@@ -22,12 +22,16 @@ import { hasSourceFilesystemLock, withSourceFilesystemLock, assertSourceFilesyst
  * only does "row exists + repo is a real dir → render + atomic write".
  */
 
-import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync, readFileSync, realpathSync } from 'fs';
-import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from 'path';
-import { atomicWriteFileSync } from './atomic-write.ts';
+// FORK: realpathSync canonicalises /var vs /private/var in recordedPathFromFileUri.
+import { existsSync, statSync, mkdirSync, unlinkSync, readdirSync, readFileSync, renameSync, rmSync, realpathSync } from 'fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { atomicStagingPath, atomicWriteFileSync } from './atomic-write.ts';
+import { flushDirectory } from './fs-durable.ts';
+import { isSegmentedPage } from './page-body/page-shape.ts';
 import type { BrainEngine } from './engine.ts';
+import type { StreamedFileContent } from './persistence/large-file.ts';
 import { isRelativeFileUri, serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
-import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
+import { isForeignAbsolutePath, isHostAbsolutePath, isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import { readSlugRootMode, resolveSlugRootMode, type SlugRootMode } from './sync-anchor.ts';
 import { resolveSlugForPath } from './sync.ts';
 import { PUSH_SCAN_MAX_FILE_BYTES } from './page-size-policy.ts';
@@ -37,7 +41,7 @@ import {
   type PushLogOutcome,
 } from './brain-repo-durability.ts';
 import { bindOrigin } from './persistence/origin-guard.ts';
-import { urlCloneReadOnly } from './url-clone.ts';
+import { readOnlyCheckout } from './persistence/mirror-read-only.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -47,6 +51,8 @@ export interface WriteThroughLogger {
 export interface WriteThroughResult {
   written: boolean;
   path?: string;
+  /** The bytes written to `path` (set with `written: true` for an inline page; a page stored in segments is streamed and never held whole), so a caller can tell its own write from a later edit. */
+  content?: string;
   /**
    * True when the write was also committed to git (#2426). Only attempted on
    * repos hardened via `gbrain sources harden` (durability hook installed).
@@ -97,8 +103,10 @@ export interface WriteThroughResult {
    *     the edit is kept and nothing is written.
    *   - over_push_scan_cap: the rendered file is over the pre-push secret-scan
    *     cap (PUSH_SCAN_MAX_FILE_BYTES), so committing it would block every push.
+   *   - mirror_read_only / url_clone: the source is a read-only mirror (#5409,
+   *     #7098) or a clone gbrain owns and pulls (#6946); its checkout is never written.
    */
-  skipped?: 'disabled_by_config' | 'url_clone' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'file_changed' | 'over_push_scan_cap';
+  skipped?: 'disabled_by_config' | 'mirror_read_only' | 'url_clone' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'file_changed' | 'over_push_scan_cap' | 'segmented_page';
   /** Caller-visible advisory when a permitted DB-only outcome is still risky. */
   warning?: string;
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
@@ -109,6 +117,8 @@ export interface WritePageThroughOpts {
   sourceId?: string;
   /** Merged over the page's own frontmatter at render time (e.g. provenance). */
   frontmatterOverrides?: Record<string, unknown>;
+  /** Skip a page stored in segments (`segmented_page`): the caller compares the written file as a string (derived writes). */
+  inlineOnly?: boolean;
   logger?: WriteThroughLogger;
   /**
    * The file bytes the caller read before writing the database row (null:
@@ -117,9 +127,21 @@ export interface WritePageThroughOpts {
    * (`skipped: 'file_changed'`). Omitted: no preimage check.
    */
   expectedFileBytes?: string | null;
+  /** The caller commits the file itself (#8073: one commit per batch), so the hardened per-file commit is skipped. */
+  deferCommit?: boolean;
+  /** GST-2468: the exact file to write instead of the page rendered from its row (a label-only write keeps the file's own bytes). Inline pages only. */
+  fileText?: string;
 }
 
 export function withNoRepoWriteThroughWarning<T extends { written: boolean; skipped?: string; warning?: string }>(result: T, sourceId: string, operation = 'put_page'): T {
+  if (!result.written && result.skipped === 'relative_root') {
+    return {
+      ...result,
+      warning:
+        `${operation} wrote only to the database for source '${sourceId}': its stored repo path is not an absolute directory on this host, so no durable markdown file was created. ` +
+        `Ask the operator to run gbrain sources set-path ${sourceId} <absolute-directory> before relying on the write.`,
+    } as T;
+  }
   if (result.written || result.skipped !== 'no_repo_configured') return result;
   return {
     ...result,
@@ -301,9 +323,8 @@ export async function otherSourceOwning(engine: BrainEngine, sourceId: string, p
   const target = identity(path);
   return rows.find(row => {
     // #7630: a live source's relative local_path names no known tree, so like any unresolvable spelling it counts as a match.
-    // An absolute path written by another OS (C:\ on POSIX) is not relative, the same reading doctor and --clear use.
-    const native = msysToNativePath(row.local_path);
-    if (!posix.isAbsolute(native) && !win32.isAbsolute(native)) return relativeOwns && !row.archived;
+    // An absolute path written by another OS (C:\ on POSIX) is not relative, the same reading sync, doctor and --clear use.
+    if (!isHostAbsolutePath(row.local_path) && !isForeignAbsolutePath(row.local_path)) return relativeOwns && !row.archived;
     const other = identity(row.local_path);
     if (target === null || other === null) return true;
     const rel = relative(other, target);
@@ -383,7 +404,7 @@ export async function resolvePageWriteTarget(
 
   if (sourceLocalPath) {
     // #7630: a relative local_path (a legacy ".") names whatever directory gbrain runs from, never the source's tree.
-    if (!isAbsolute(sourceLocalPath) || !existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
+    if (!isHostAbsolutePath(sourceLocalPath) || !existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
     filePath = recordedPath
@@ -397,7 +418,7 @@ export async function resolvePageWriteTarget(
     if (!repoPath) {
       return { ok: false, skipped: 'no_repo_configured' };
     }
-    if (!isAbsolute(repoPath) || !existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
+    if (!isHostAbsolutePath(repoPath) || !existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
     const pageRoot = sourceId === 'default' ? repoPath : join(repoPath, '.sources', sourceId);
@@ -432,7 +453,8 @@ export async function resolvePageWriteTarget(
  * `sync.repo_path`. Never throws — failures are reported via the result's
  * `skipped` / `error` fields. put_page calls it before its transaction commits
  * and rejects non-deliberate skips so a file failure rolls back the DB write.
- * A clone gbrain owns on an unmanaged brain is skipped (`url_clone`, #6946).
+ * A read-only mirror source is skipped (`mirror_read_only`, #7098), and so is a
+ * clone gbrain owns on an unmanaged brain (`url_clone`, #6946).
  */
 export async function writePageThrough(
   engine: BrainEngine,
@@ -449,9 +471,8 @@ export async function writePageThrough(
     if (await isWriteThroughDisabled(engine)) {
       return { written: false, skipped: 'disabled_by_config' };
     }
-    if (await urlCloneReadOnly(engine, sourceId)) {
-      return { written: false, skipped: 'url_clone' };
-    }
+    const readOnly = await readOnlyCheckout(engine, sourceId);
+    if (readOnly) return { written: false, skipped: readOnly };
     const target = await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) {
       return { written: false, skipped: target.skipped };
@@ -466,13 +487,21 @@ export async function writePageThrough(
       return { written: false, skipped: 'page_not_found_after_write' };
     }
 
-    const tags = await engine.getTags(slug, { sourceId });
-    const md = serializePageToMarkdown(writtenPage, tags, {
+    const segmented = isSegmentedPage(writtenPage);
+    if (segmented && (opts.inlineOnly || opts.fileText !== undefined)) return { written: false, skipped: 'segmented_page' };
+    if (segmented && opts.frontmatterOverrides) {
+      return { written: false, error: `page ${slug} is stored in segments, and its file is streamed as gbrain export writes it, without frontmatter overrides` };
+    }
+    const md = segmented ? null : opts.fileText ?? serializePageToMarkdown(writtenPage, await engine.getTags(slug, { sourceId }), {
       frontmatterOverrides: opts.frontmatterOverrides,
     });
+    // A segmented body alone over the cap is refused before its segments are streamed to measure the file.
+    const overByBody = segmented && Number((writtenPage as { body_bytes?: number | string | null }).body_bytes ?? 0) > PUSH_SCAN_MAX_FILE_BYTES;
+    const streamed = segmented && !overByBody ? await segmentedPageFile(engine, slug, sourceId) : null;
+    if (segmented && !overByBody && !streamed) return { written: false, skipped: 'page_not_found_after_write' };
     // The pre-push secret scan refuses to push any file it cannot scan, so a
     // file over its cap would block every later push of the brain repo.
-    if (Buffer.byteLength(md, 'utf-8') > PUSH_SCAN_MAX_FILE_BYTES) {
+    if (overByBody || (md !== null ? Buffer.byteLength(md, 'utf-8') : streamed!.bytes) > PUSH_SCAN_MAX_FILE_BYTES) {
       opts.logger?.warn(`[write-through] ${slug}: the rendered file is over the ${PUSH_SCAN_MAX_FILE_BYTES}-byte pre-push secret-scan cap — file not written (DB row is intact)`);
       return { written: false, skipped: 'over_push_scan_cap' };
     }
@@ -515,8 +544,10 @@ export async function writePageThrough(
     assertSourceFilesystemActive();
     if (fileChanged()) return { written: false, skipped: 'file_changed' };
     const changedWhileStaging = new Error('file_changed');
+    const verify = () => { assertSourceFilesystemActive(); if (fileChanged()) throw changedWhileStaging; };
     try {
-      atomicWriteFileSync(filePath, md, { verify: () => { assertSourceFilesystemActive(); if (fileChanged()) throw changedWhileStaging; } });
+      if (md !== null) atomicWriteFileSync(filePath, md, { verify });
+      else await writeStreamedFile(engine, filePath, streamed!, verify);
     } catch (error) {
       if (error === changedWhileStaging) return { written: false, skipped: 'file_changed' };
       throw error;
@@ -533,7 +564,7 @@ export async function writePageThrough(
     let lastPushStatus: PushLogOutcome | undefined;
     try {
       assertSourceFilesystemActive();
-      if (isDurabilityHardened(writeRoot)) {
+      if (!opts.deferCommit && isDurabilityHardened(writeRoot)) {
         committed = commitWriteThroughFile(writeRoot, filePath, slug);
         if (committed) {
           pushed = 'pending';
@@ -545,6 +576,7 @@ export async function writePageThrough(
     return {
       written: true,
       path: filePath,
+      ...(md !== null ? { content: md } : {}),
       ...(committed ? { committed, pushed, lastPushStatus } : {}),
     };
   } catch (e) {
@@ -552,6 +584,40 @@ export async function writePageThrough(
     opts.logger?.warn(`[write-through] failed for ${slug}: ${msg}`);
     return { written: false, error: msg };
   }
+}
+
+/**
+ * The file of a page stored in segments, with the bytes `gbrain export` writes for it: measured from the segments of
+ * the generation its snapshot names (unreadPageFile), as a segmented publication prepares its file, so it is sized
+ * before anything is bound or written. Null when the page is gone. Read on `engine` as given, so a caller inside a
+ * transaction (an owner repair) reads the rows it just wrote.
+ */
+async function segmentedPageFile(engine: BrainEngine, slug: string, sourceId: string): Promise<StreamedFileContent | null> {
+  const { unreadPageFile } = await import('./persistence/page-prepare.ts');
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+  return snapshot ? unreadPageFile(engine, snapshot) : null;
+}
+
+/**
+ * Streams measured file content to `filePath` through the staging writer the withdrawal mirror and restore_page use
+ * (stageStreamedContent: an in-progress name, renamed once whole; bytes that are not the measured ones refuse as
+ * `revision_conflict`), keeping an existing file's mode as atomicWriteFileSync does, then renames it over `filePath`
+ * after `verify`. Never held as one string, whatever its size.
+ */
+async function writeStreamedFile(engine: BrainEngine, filePath: string, content: StreamedFileContent, verify: () => void): Promise<void> {
+  const { stageStreamedContent } = await import('./persistence/large-file.ts');
+  let mode: number | null = null;
+  try { if (existsSync(filePath)) mode = statSync(filePath).mode & 0o7777; } catch { /* stat raced a delete: default mode */ }
+  const stage = { path: atomicStagingPath(filePath), bytes: content.bytes, hash: content.hash };
+  await stageStreamedContent(engine, filePath, content, stage, mode);
+  try {
+    verify();
+    renameSync(stage.path, filePath);
+  } catch (error) {
+    rmSync(stage.path, { force: true });
+    throw error;
+  }
+  flushDirectory(dirname(filePath));
 }
 
 export interface DeleteThroughResult {
@@ -570,13 +636,13 @@ export interface DeleteThroughResult {
    * Non-error reasons nothing was removed. Shares the target-resolution skip
    * vocabulary (kept in lockstep via the Extract), plus:
    *   - disabled_by_config: the operator opted the brain out of the disk sink.
-   *   - url_clone: the source is a clone gbrain owns and pulls (#6946); its checkout is never written.
+   *   - mirror_read_only / url_clone: the source is a read-only mirror (#7098) or a clone gbrain owns and pulls (#6946); its checkout is never written.
    *   - file_not_present: the page had no artifact on disk (DB-only page, or
    *     already removed by hand) — a clean no-op, not a failure.
    *   - file_changed: the caller passed `expectedFileBytes` and the file no
    *     longer holds them (an edit landed after the caller read it) — kept.
    */
-  skipped?: 'disabled_by_config' | 'url_clone' | 'file_not_present' | 'file_changed' | Extract<PageWriteTarget, { ok: false }>['skipped'];
+  skipped?: 'disabled_by_config' | 'mirror_read_only' | 'url_clone' | 'file_not_present' | 'file_changed' | Extract<PageWriteTarget, { ok: false }>['skipped'];
   /** Set when the unlink itself threw (EACCES, EPERM, read-only mount). */
   error?: string;
 }
@@ -612,7 +678,7 @@ export interface DeleteThroughResult {
 export async function deletePageThrough(
   engine: BrainEngine,
   slug: string,
-  opts: { sourceId?: string; logger?: WriteThroughLogger; target?: PageWriteTarget; expectedFileBytes?: string } = {},
+  opts: { sourceId?: string; logger?: WriteThroughLogger; target?: PageWriteTarget; expectedFileBytes?: string; deferCommit?: boolean } = {},
 ): Promise<DeleteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
   try {
@@ -621,9 +687,8 @@ export async function deletePageThrough(
     if (await isWriteThroughDisabled(engine)) {
       return { removed: false, skipped: 'disabled_by_config' };
     }
-    if (await urlCloneReadOnly(engine, sourceId)) {
-      return { removed: false, skipped: 'url_clone' };
-    }
+    const readOnly = await readOnlyCheckout(engine, sourceId);
+    if (readOnly) return { removed: false, skipped: readOnly };
     const target = opts.target ?? await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) return { removed: false, skipped: target.skipped };
     const { filePath, writeRoot } = target;
@@ -649,7 +714,7 @@ export async function deletePageThrough(
     // never fails the delete (the DB row + the unlink are the durable state).
     let committed = false;
     try {
-      if (isDurabilityHardened(writeRoot)) {
+      if (!opts.deferCommit && isDurabilityHardened(writeRoot)) {
         committed = commitWriteThroughFile(writeRoot, filePath, slug, 'delete write-through');
       }
     } catch { /* best-effort */ }

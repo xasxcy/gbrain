@@ -107,14 +107,15 @@ On a managed brain, install this line instead, on the host that owns the
 sources:
 
 ```cron
-*/15 * * * * gbrain-run sources refresh <id> >> /tmp/gbrain-cron.log 2>&1; gbrain-run sync --all --no-pull --hard-deadline 13m >> /tmp/gbrain-cron.log 2>&1
+*/15 * * * * gbrain-run sources git-reconcile >> /tmp/gbrain-cron.log 2>&1; gbrain-run sync --all --no-pull --hard-deadline 13m >> /tmp/gbrain-cron.log 2>&1
 ```
 
-- `gbrain sources refresh <id>` is the only way a managed checkout takes
-  upstream commits (a fetch and `git merge --ff-only`, then a managed sync of
-  the sources on that checkout). Add one refresh per checkout that tracks a
-  remote, with its real source id; drop it for checkouts with no remote. The
-  `;` is deliberate: the sync still runs when a refresh refuses.
+- `gbrain sources git-reconcile` brings every checkout on the host level with
+  its upstream; a managed checkout goes through `gbrain sources refresh` (a
+  fetch and `git merge --ff-only`, then a managed sync of its sources), the
+  only way it takes upstream commits. A level checkout costs one fetch, and
+  autopilot already runs it each tick. The `;` is deliberate: the sync still
+  runs when a reconcile refuses.
 - `refresh_diverged`: the checkout has commits its upstream lacks, so
   something commits outside gbrain (usually a script that writes files and
   runs `git commit` in the checkout). Fix that writer so it commits with
@@ -149,7 +150,7 @@ Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) 
 - `checkpoint_validation_timeout` in a sync log: run the retry command the error prints; do not cancel the request.
 - `writer_coordinator_required` from a scheduled sync: the brain is managed. Replace the line with the [managed brain](#managed-brain) recipe; never retry with `--skip-failed` or without `--no-pull`.
 - `sync_in_progress` from `gbrain sources refresh`: a managed sync cursor is unfinished, and the refresh never waits on it. Run the `gbrain sync --source <id> --no-pull …` command the refusal prints; the next tick's refresh then runs.
-- `worktree_refreshing` from a sync: a refresh is draining or merging that checkout. Leave it; the next tick syncs it.
+- `worktree_refreshing` from a sync: a refresh is draining or merging that checkout. Leave it; the next tick syncs it. A page write answered `pending` (exit 10) during a refresh is waiting behind it: poll its receipt, never resubmit.
 - A job's lookups all come back empty, or its log shows `no_brain` or `GBRAIN_DB_ACCESS no_url`: the job runs without the brain's config. Call gbrain through the wrapper; an empty result from a job whose stderr went to `/dev/null` is not evidence of "no notes".
 - `refresh_not_owner` from cron while the same refresh works by hand: the job resolves another gbrain home, so it is another host. The refusal names the identity file, `HOME` and `GBRAIN_HOME` it read; set the owner's `GBRAIN_HOME` in the wrapper. Never copy or delete a `host.json`.
 - A `--json` caller fails to parse gbrain's output: something the wrapper runs prints to stdout. Send that hook's output to a log file.

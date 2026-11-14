@@ -10,7 +10,7 @@
  *      config.toml, snapshot carries the curated skills + non-root mcp.json +
  *      an EXECUTABLE launcher, dual-marketplace resolution yields exactly one
  *      gbrain plugin, add-twice idempotency, the deterministic tools/list
- *      surface oracle (== the registration surface, via the snapshot launcher),
+ *      surface oracle (== the plugin surface, via the snapshot launcher),
  *      the cold-home fast-fail ("No brain configured. Run: gbrain init"),
  *      the --source-guard write gate (blocked without GBRAIN_SOURCE on a
  *      multi-source brain, allowed with it), the `codex mcp add` coexistence
@@ -30,7 +30,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { REGISTRATION_SURFACE } from '../../src/core/mcp-registration.ts';
+import { PLUGIN_SURFACE } from '../../src/core/mcp-registration.ts';
 
 import {
   resolveCodexBinary,
@@ -44,12 +44,30 @@ import {
 } from '../helpers/agent-harness.ts';
 import { operations } from '../../src/core/operations.ts';
 import { isCallable, publishGatesFromDisabled } from '../../src/core/ops/callable.ts';
+import { disabledOpsForPublishGates } from '../../src/mcp/publish-gates.ts';
+import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { gbrainPath, loadConfig } from '../../src/core/config.ts';
 import { codexPluginProvidesName } from '../../src/core/bootstrap/harness.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const CODEX_BIN = resolveCodexBinary();
 const PLUGIN_CAPABLE = !!CODEX_BIN && codexSupportsPlugins(CODEX_BIN);
+
+/** The ops whose publish gate resolves off on the seeded brain over stdio, read as `gbrain serve` reads them. */
+async function seededGateDisabled(home: string): Promise<ReadonlySet<string>> {
+  const savedHome = process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = home;
+  const engine = new PGLiteEngine();
+  try {
+    await engine.connect({ database_path: gbrainPath('brain.pglite'), engine: 'pglite' });
+    return await disabledOpsForPublishGates(engine, loadConfig(), { transport: 'stdio' });
+  } finally {
+    await engine.disconnect();
+    if (savedHome === undefined) delete process.env.GBRAIN_HOME;
+    else process.env.GBRAIN_HOME = savedHome;
+  }
+}
 
 /** Stage a CLEAN tree (tracked files only, modes preserved) from HEAD. */
 function stageCleanTree(): string {
@@ -188,7 +206,7 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
       expect(statSync(launcher).mode & 0o111, 'launcher lost its exec bit in the snapshot copy').toBeGreaterThan(0);
       const mcpJson = JSON.parse(readFileSync(join(snap!, '.codex-plugin', 'mcp.json'), 'utf8'));
       const serverArgs: string[] = mcpJson.mcpServers.gbrain.args;
-      expect(serverArgs).toEqual(['serve', '--surface', REGISTRATION_SURFACE, '--source-guard']);
+      expect(serverArgs).toEqual(['serve', '--surface', PLUGIN_SURFACE, '--source-guard']);
 
       // (d) idempotency: add twice each — state stays sane (exactly one
       // gbrain@gbrain row; outcome recorded in the evidence, not softened).
@@ -200,7 +218,7 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
       expect(rows.length, `dual-marketplace/idempotency: expected exactly one gbrain@gbrain row:\n${list.stdout}`).toBe(1);
 
       // (e) deterministic surface oracle: tools/list through the SNAPSHOT
-      // launcher == the starter surface (never an LLM-output assertion).
+      // launcher == PLUGIN_SURFACE (never an LLM-output assertion).
       const binDir = mkdtempSync(join(tmpdir(), 'gb-plugin-bin-'));
       const gbrainBin = gbrainBinForTests(binDir);
       const seededHome = mkdtempSync(join(tmpdir(), 'gb-plugin-brain-'));
@@ -218,8 +236,13 @@ describe.skipIf(!PLUGIN_CAPABLE)('codex plugin door — INSTALL (no auth needed)
         env: probeEnv,
         timeoutMs: 120_000,
       });
-      const publishGates = publishGatesFromDisabled(operations, new Set());
-      const expected = operations.filter((o) => isCallable(o, { transport: 'stdio', surface: REGISTRATION_SURFACE, scopes: [], publishGates })).map((o) => o.name).sort();
+      // Publish gates resolve the way serve resolves them for this brain over stdio: a gated op (Wakeshift's watches,
+      // the memory settings) is listed only when its gate is on, and the seeded brain turns on only publish_skills.
+      const gateDisabled = await seededGateDisabled(seededHome);
+      expect(['list_watches', 'set_memory_writeback', 'unwatch', 'watch_job'].filter((name) => !gateDisabled.has(name))).toEqual([]);
+      expect(['get_skill', 'list_skills'].filter((name) => gateDisabled.has(name))).toEqual([]);
+      const publishGates = publishGatesFromDisabled(operations, gateDisabled);
+      const expected = operations.filter((o) => isCallable(o, { transport: 'stdio', surface: PLUGIN_SURFACE, scopes: [], publishGates })).map((o) => o.name).sort();
       expect(tools.sort()).toEqual(expected);
 
       // (f) cold-home fast-fail: fresh empty GBRAIN_HOME → actionable exit,

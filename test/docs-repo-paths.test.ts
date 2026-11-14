@@ -36,6 +36,17 @@ const HISTORICAL = '<!-- repo-paths: historical -->';
 
 /** file -> path -> reason. Paths that live outside this repository. */
 const ALLOWLIST: Record<string, Record<string, string>> = {
+  '.github/workflows/harness-check.yml': {
+    'scripts/gbrain-check.ts': 'a harness-evals script (garrytan/harness-evals), run by the advisory harness-check workflow',
+    'scripts/build-gbrain-image.sh': 'a harness-evals script (garrytan/harness-evals), run by the advisory harness-check workflow',
+  },
+  'docs/architecture/key-files/ci-health-and-test-guards.md': {
+    'scripts/gbrain-check.ts': 'a harness-evals script (garrytan/harness-evals), run by the advisory harness-check workflow',
+  },
+  'docs/ci-event-parity.md': {
+    'scripts/gbrain-check.ts': 'a harness-evals script (garrytan/harness-evals), run by the advisory harness-check workflow',
+    'scripts/build-gbrain-image.sh': 'a harness-evals script (garrytan/harness-evals), run by the advisory harness-check workflow',
+  },
   'docs/guides/minions-shell-jobs.md': {
     'scripts/x-garrytan-daily.mjs': 'example shell job running a script in the operator workspace',
     'scripts/fetch.mjs': 'example shell job running a script in the operator workspace',
@@ -65,6 +76,9 @@ const ALLOWLIST: Record<string, Record<string, string>> = {
     'scripts/brain-commit-push.sh': 'installed into the brain repo by `gbrain sources harden`',
   },
   'docs/architecture/key-files/files-and-sync-1.md': {
+    'scripts/brain-commit-push.sh': 'installed into the brain repo by `gbrain sources harden`',
+  },
+  'docs/architecture/key-files/workspace-push-and-backup.md': {
     'scripts/brain-commit-push.sh': 'installed into the brain repo by `gbrain sources harden`',
   },
   'docs/UPGRADING_DOWNSTREAM_AGENTS.md': {

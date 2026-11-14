@@ -33,6 +33,8 @@
  */
 
 import type { BrainEngine, FactRow, FactKind } from '../core/engine.ts';
+import type { Notice } from '../core/agent-output.ts';
+import type { DegradedStamp } from '../core/degraded-stamp.ts';
 import { clampSearchLimit } from '../core/engine.ts';
 import { effectiveConfidence } from '../core/facts/decay.ts';
 import { resolveEntitySlug } from '../core/entities/resolve.ts';
@@ -442,11 +444,15 @@ export async function recallVerbForCaller(engine: BrainEngine, args: string[], r
 }
 
 export type RecallVerbResult = {
-  facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string; relevance?: number }>;
+  facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string; relevance?: number; rank_score?: number; contested?: { fact_id?: string } }>;
   facts_order?: 'relevance' | 'newest';
+  facts_groups?: Array<{ source_id: string; entity_slug: string | null; fact_ids: string[] }>;
+  entity_unspecified?: { candidates: Array<{ source_id: string; entity_slug: string }>; suggestion: string };
   facts_degraded?: { reason?: string; unembedded?: number };
   results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
   search_degraded?: string;
+  /** GBRA-200: the degraded stamp (CLI only; MCP carries it as `_meta.degraded`). */
+  degraded?: DegradedStamp;
   budget_tokens?: number;
   budget_used?: number;
   dropped_count?: number;
@@ -460,9 +466,15 @@ export type RecallVerbResult = {
  */
 async function recallVerbResult(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<RecallVerbResult> {
   const { operationsByName } = await import('../core/operations.ts');
+  const { degradedStampFor } = await import('../core/degraded-stamp.ts');
   const op = operationsByName['recall'];
+  // GBRA-200: the stamp reads the op's retrieval stages and degraded notices.
+  let retrieval: Record<string, unknown> | null = null;
+  const notices: Notice[] = [];
   const ctx = {
     engine,
+    emitResponseMeta: (key: string, value: unknown) => { if (key === 'retrieval' && value && typeof value === 'object') retrieval = value as Record<string, unknown>; },
+    emitNotice: (notice: Notice | null | undefined) => { if (notice) notices.push(notice); },
     config: loadConfig() || { engine: 'pglite' as const },
     logger: {
       info: (m: string) => process.stderr.write(`[info] ${m}\n`),
@@ -491,9 +503,21 @@ async function recallVerbResult(engine: BrainEngine, flags: ParsedFlags, sourceI
       ...(flags.pending ? { include_pending: true } : {}),
     } : {}),
   };
-  if (!oneShot || !isThinClient(ctx.config)) return await op.handler(ctx, params) as RecallVerbResult;
-  const { callRemoteTool, unpackToolResult } = await import('../core/mcp-client.ts');
-  return unpackToolResult(await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 })) as RecallVerbResult;
+  const stamped = (result: RecallVerbResult, stamp: RecallVerbResult['degraded'] | null): RecallVerbResult => (stamp ? { ...result, degraded: stamp } : result);
+  if (process.env.GBRAIN_ENFORCED_MEMBER !== undefined) { // GST-2476 G2: read as the enforced member's stdio server would answer
+    const { enforcedRead } = await import('../cli/enforced-member.ts');
+    const result = await enforcedRead(engine, 'recall', 'recall', params, { sourceId: ctx.sourceId, config: ctx.config }) as RecallVerbResult;
+    return stamped(result, degradedStampFor('recall', result, null, []));
+  }
+  if (!oneShot || !isThinClient(ctx.config)) {
+    const result = await op.handler(ctx, params) as RecallVerbResult;
+    return stamped(result, degradedStampFor('recall', result, { retrieval }, notices));
+  }
+  const { callRemoteTool, extractResponseMeta, unpackToolResult } = await import('../core/mcp-client.ts');
+  const raw = await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 });
+  const result = unpackToolResult(raw) as RecallVerbResult;
+  const meta = extractResponseMeta(raw);
+  return stamped(result, (meta?.degraded as RecallVerbResult['degraded'] | undefined) ?? degradedStampFor('recall', result, meta, []));
 }
 
 export async function renderRecallVerbResult(flags: ParsedFlags, result: RecallVerbResult): Promise<void> {
@@ -510,9 +534,18 @@ export async function renderRecallVerbResult(flags: ParsedFlags, result: RecallV
   const lines: string[] = [];
   if (result.facts.length) {
     lines.push(result.facts_order === 'relevance' ? 'Facts (ranked by relevance to the question):' : 'Facts:');
-    for (const f of result.facts) {
-      lines.push(`  #${f.fact_id} [${f.kind}]${f.entity_slug ? ` (${f.entity_slug})` : ''} ${f.fact} — ${f.provenance}${typeof f.relevance === 'number' ? ` (relevance ${f.relevance.toFixed(2)})` : ''}`);
+    const factLine = (f: RecallVerbResult['facts'][number], indent: string) =>
+      `${indent}#${f.fact_id} [${f.kind}]${f.entity_slug ? ` (${f.entity_slug})` : ''} ${f.fact} — ${f.provenance}${typeof f.relevance === 'number' ? ` (relevance ${f.relevance.toFixed(2)})` : ''}${f.contested?.fact_id ? ` (contested by #${f.contested.fact_id})` : ''}`;
+    const byId = new Map(result.facts.map(f => [f.fact_id, f]));
+    if (result.facts_groups?.length) {
+      for (const g of result.facts_groups) {
+        lines.push(`  ${g.entity_slug ?? 'No entity'}:`);
+        for (const id of g.fact_ids) { const f = byId.get(id); if (f) lines.push(factLine(f, '    ')); }
+      }
+    } else {
+      for (const f of result.facts) lines.push(factLine(f, '  '));
     }
+    if (result.entity_unspecified) lines.push(`note: ${result.entity_unspecified.candidates.length} entities answer this question; rerun with an entity to read one (${result.entity_unspecified.candidates.map(c => c.entity_slug).join(', ')}).`);
   }
   if (result.results?.length) {
     lines.push('Pages:');
@@ -528,6 +561,7 @@ export async function renderRecallVerbResult(flags: ParsedFlags, result: RecallV
     lines.push(`note: fact ranking degraded (${[d.reason, d.unembedded ? `${d.unembedded} fact(s) without a comparable embedding` : null].filter(Boolean).join('; ')})`);
   }
   if (result.search_degraded) lines.push(`note: search degraded (${result.search_degraded})`);
+  if (result.degraded) process.stderr.write((await import('../core/degraded-stamp.ts')).degradedStampLine(result.degraded) + '\n');
   if (result.budget_tokens !== undefined) {
     lines.push(`budget: ${result.budget_used}/${result.budget_tokens} tokens used, ${result.dropped_count} dropped`);
   }
@@ -679,14 +713,19 @@ async function runRecallOnce(
   const resolvedSince: Date | null = cursor ? cursor.since : flags.since;
   // #6945: only the local cursor read can page (oldest first, by keyset);
   // thin-client and --supersessions keep the newest-N window.
-  const pageable = cursor !== null && !thinClient && !flags.supersessions;
+  const enforced = process.env.GBRAIN_ENFORCED_MEMBER !== undefined; // GST-2476 G2: the remote arm, answered in process as the member
+  const pageable = cursor !== null && !thinClient && !enforced && !flags.supersessions;
 
   let rows: FactRow[];
   let pendingCount: number | undefined;
 
-  if (thinClient) {
+  if (thinClient || enforced) {
     const cfg = loadConfig();
     const { callRemoteTool, unpackToolResult } = await import('../core/mcp-client.ts');
+    const { enforcedRead } = await import('../cli/enforced-member.ts');
+    const fetchRecall = async <T>(p: Record<string, unknown>): Promise<T> => (enforced
+      ? await enforcedRead(engine, 'recall', 'recall', p, { sourceId }) as T
+      : unpackToolResult<T>(await callRemoteTool(cfg!, 'recall', p, { timeoutMs: 30_000 })));
     const params: Record<string, unknown> = {
       limit: flags.limit,
       include_expired: flags.includeExpired,
@@ -703,12 +742,11 @@ async function runRecallOnce(
     // explicit `--source default` silently queried a different source.
     if (sourceId !== 'default' || flags.sourceExplicit) params.source_id = sourceId;
 
-    const raw = await callRemoteTool(cfg!, 'recall', params, { timeoutMs: 30_000 });
-    const unpacked = unpackToolResult<{
+    const unpacked = await fetchRecall<{
       facts: Array<Record<string, unknown>>;
       total: number;
       pending_consolidation_count?: number;
-    }>(raw);
+    }>(params);
     rows = unpacked.facts.map(remoteFactToRow);
     pendingCount = unpacked.pending_consolidation_count;
 
@@ -719,12 +757,11 @@ async function runRecallOnce(
     if (entityTextFallbackApplies(flags, rows.length)) {
       const fbParams: Record<string, unknown> = { ...params, grep: flags.entity!.toLowerCase() };
       delete fbParams.entity;
-      const fbRaw = await callRemoteTool(cfg!, 'recall', fbParams, { timeoutMs: 30_000 });
-      const fb = unpackToolResult<{
+      const fb = await fetchRecall<{
         facts: Array<Record<string, unknown>>;
         total: number;
         pending_consolidation_count?: number;
-      }>(fbRaw);
+      }>(fbParams);
       if (fb.facts.length > 0) {
         noteEntityTextFallback(flags.entity!, fb.facts.length);
         rows = fb.facts.map(remoteFactToRow);
@@ -850,6 +887,7 @@ async function fetchCursorPage(engine: BrainEngine, flags: ParsedFlags, sourceId
     activeOnly: !flags.includeExpired,
     limit: flags.limit,
     excludeAuditRows: true,
+    eligibility: {},
     grep: flags.grep ?? undefined,
     sessionId: flags.sessionId || undefined,
     ...narrow,
@@ -889,6 +927,7 @@ async function fetchRowsLocal(
     return engine.listSupersessions(sourceId, {
       since: resolvedSince ?? undefined,
       limit: flags.limit,
+      eligibility: {},
     });
   }
   // An explicit `--since DURATION` / `--today` cutoff is a "what happened in
@@ -910,6 +949,7 @@ async function fetchRowsLocal(
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
+          eligibility: {},
         })
       : engine.listFactsByEntity(sourceId, entitySlug, {
           sessionId: flags.sessionId || undefined,
@@ -917,6 +957,7 @@ async function fetchRowsLocal(
           limit: flags.limit,
           grep: flags.grep ?? undefined,
           excludeAuditRows: true,
+          eligibility: {},
         })));
     const rows = mergeNewestFirst(lists, flags.limit, resolvedSince && !windowEventTime ? r => r.created_at : r => r.valid_from ?? r.created_at);
     // #4720: the bare positional is entity-first, but keyless/casual usage
@@ -936,6 +977,7 @@ async function fetchRowsLocal(
         limit: flags.limit,
         grep: flags.entity.toLowerCase(),
         excludeAuditRows: true,
+        eligibility: {},
       });
       if (textRows.length > 0) {
         noteEntityTextFallback(flags.entity, textRows.length);
@@ -953,6 +995,7 @@ async function fetchRowsLocal(
         limit: flags.limit,
         grep: flags.grep ?? undefined,
         excludeAuditRows: true,
+        eligibility: {},
       });
     }
     return engine.listFactsBySession(sourceId, flags.sessionId, {
@@ -960,6 +1003,7 @@ async function fetchRowsLocal(
       limit: flags.limit,
       grep: flags.grep ?? undefined,
       excludeAuditRows: true,
+      eligibility: {},
     });
   }
   if (resolvedSince) {
@@ -978,6 +1022,7 @@ async function fetchRowsLocal(
       limit: flags.limit,
       grep: flags.grep ?? undefined,
       excludeAuditRows: true,
+      eligibility: {},
     });
   }
   return engine.listFactsSince(sourceId, new Date(0), {
@@ -986,6 +1031,7 @@ async function fetchRowsLocal(
     limit: flags.limit,
     grep: flags.grep ?? undefined,
     excludeAuditRows: true,
+    eligibility: {},
   });
 }
 

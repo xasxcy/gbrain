@@ -826,6 +826,7 @@ export function pathToSlug(
  * flow through without touching the sync code path.
  */
 export function resolveSlugForPath(filePath: string, repoPrefix?: string): string {
+  if (isImageFilePath(filePath)) return (repoPrefix ? `${repoPrefix}/${filePath}` : filePath).replace(/\\/g, '/').toLowerCase();
   const pageKind = isCodeFilePath(filePath) ? 'code' : 'markdown';
   return pathToSlug(filePath, repoPrefix, { pageKind });
 }
@@ -868,6 +869,8 @@ export {
   renameReconcileErrorMessage,
   parseRenameReconcileFrom,
   DEFAULT_AUTOSKIP_AFTER,
+  STRICT_REQUIRES_MANAGED,
+  strictRequiresManagedAdvice,
 } from './sync-failure-ledger.ts';
 export type {
   SyncFailure,

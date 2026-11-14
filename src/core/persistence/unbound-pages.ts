@@ -11,12 +11,13 @@
  * stamped in the publication transaction), so an ordinary page that merely
  * lacks a recorded origin is never matched to a slug-derived file.
  */
-import { existsSync, readdirSync, type Dirent } from 'node:fs';
+import { readdirSync, type Dirent } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
 import { opError } from '../ops/contract.ts';
 import { scannerSourcePath } from '../write-through.ts';
 import { resolveSlugForPath } from '../sync.ts';
+import { edgeTrimSql } from '../edge-whitespace.ts';
 
 export function isDatabaseOnlyPage(page: { source_path?: string | null; source_uri?: string | null; database_only_reason?: string | null }): boolean {
   return page.database_only_reason === 'unbound_source' && !page.source_path?.trim() && !page.source_uri?.trim();
@@ -24,7 +25,7 @@ export function isDatabaseOnlyPage(page: { source_path?: string | null; source_u
 
 /** `isDatabaseOnlyPage` as a SQL predicate over the `pages` row aliased `alias` (#6536: doctor counts with it). */
 export function databaseOnlyPageSql(alias: string): string {
-  const blank = (column: string) => `COALESCE(btrim(${alias}.${column}, E' \\t\\n\\r\\f\\v'), '')=''`;
+  const blank = (column: string) => `COALESCE(${edgeTrimSql(`${alias}.${column}`)}, '')=''`;
   return `${alias}.database_only_reason IS NOT DISTINCT FROM 'unbound_source' AND ${blank('source_path')} AND ${blank('source_uri')}`;
 }
 
@@ -72,14 +73,12 @@ export function recordsNoFileOrigin(page: { source_path?: string | null; source_
 }
 
 /**
- * GBRA-133: the file at a page's slug path (source-root relative). When `<slug>.md` is absent, the one file whose path
- * imports as the slug in another spelling (`README.md` for slug `readme`) is that file, as discovery names it.
+ * GBRA-133: the file at a page's slug path, in the source's slug-root mode. When no ordinary file is spelled `<slug>.md`,
+ * the one file whose path imports as the slug in another spelling (`README.md` for slug `readme`) is that file, as
+ * discovery names it (#7974: read through `slugDerivedOrigin`, so a symlink or a case-insensitive match never stands in).
  */
-export function slugPathFile(root: string, slug: string): string {
-  const exact = join(root, `${slug}.md`);
-  if (existsSync(exact)) return exact;
-  const derived = slugDerivedOrigin(root, slug, 'source-root');
-  return derived && existsSync(derived.path) ? derived.path : exact;
+export function slugPathFile(root: string, slug: string, mode: 'git-root' | 'source-root'): string {
+  return slugDerivedOrigin(root, slug, mode)?.path ?? join(root, `${slug}.md`);
 }
 
 function entries(dir: string): Dirent[] {

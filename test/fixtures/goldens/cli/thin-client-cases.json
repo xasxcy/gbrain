@@ -57,6 +57,16 @@
       "stdout": []
     },
     {
+      "argv": "access",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain access` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain access",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "export",
       "exitCode": 1,
       "stderr": [
@@ -629,7 +639,9 @@
         "  --model <name>           Override the model: provider:model (preferred) or",
         "                           provider/model or a bare alias. An explicit --model that",
         "                           can't be resolved is a hard error (exit 1) — never a",
-        "                           silent no-LLM degrade.",
+        "                           silent no-LLM degrade. On a thin client the remote",
+        "                           brain answers with its own think model unless its",
+        "                           host allows this one (think.remote_models).",
         "  --source <id>            Scope evidence gathering to this source. An unknown",
         "                           or archived source is a hard error (exit 1).",
         "  --since YYYY-MM-DD       Start of temporal window",
@@ -728,6 +740,16 @@
       "stdout": []
     },
     {
+      "argv": "memory-proposals",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain memory-proposals` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain memory-proposals",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
       "argv": "core",
       "exitCode": 1,
       "stderr": [
@@ -744,6 +766,16 @@
         "Error [requires_local_engine]: `gbrain connectors` is not routable (thin-client of http://127.0.0.1:1/mcp); run it on the brain host.",
         "Fix: gbrain connectors",
         "Why: connectors manage provider session credentials in ~/.gbrain/connectors and sync your chat history on the host. Credentials never cross the wire — run on the host machine.",
+        "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
+      ],
+      "stdout": []
+    },
+    {
+      "argv": "wakeshift",
+      "exitCode": 1,
+      "stderr": [
+        "Error [requires_local_engine]: `gbrain wakeshift` requires a local engine. This install is a thin client of http://127.0.0.1:1/mcp.",
+        "Fix: gbrain wakeshift",
         "Docs: https://github.com/garrytan/gbrain/blob/master/docs/guides/error-codes.md#requires_local_engine"
       ],
       "stdout": []

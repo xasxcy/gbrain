@@ -67,7 +67,7 @@ async function sweepChunk(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: str
   ids: readonly string[] | null = null, exclude: string | null = null): Promise<{ rows: ChunkRow[]; scanned: number; last: string | null }> {
   const rows = await engine.executeRaw<SweepRow>(`WITH chunk AS MATERIALIZED (
       SELECT id,principal_kind,principal_id,sequence,
-        (state IN ('queued','running','recovering') OR recovery IS NOT NULL) AS pending,
+        (state IN ('queued','deferred','running','recovering') OR recovery IS NOT NULL) AS pending,
         lower(COALESCE(intent::text,'')) AS i,lower(COALESCE(outcome::text,'')) AS o,lower(COALESCE(error_detail::text,'')) AS d,lower(COALESCE(error_message,'')) AS m
       FROM persistence_requests WHERE source_id=$1 AND sequence>$2::bigint AND ($3::bigint IS NULL OR sequence<=$3::bigint)
         AND ($6::uuid[] IS NULL OR id=ANY($6::uuid[])) AND ($7::uuid IS NULL OR id<>$7::uuid)
@@ -197,24 +197,26 @@ export async function recheckRequestsCarrying(tx: Pick<BrainEngine, 'executeRaw'
 }
 
 /**
- * Requests in `sourceId` whose stored intent, outcome or error text carries `claim`, bounded, compacted
- * ones included (compaction keeps the outcome). Owner-only; never returns the text.
+ * Requests in `sourceId` whose stored intent, outcome or error text carries `claim`, or `reason` (the claim folded
+ * as a stored change reason is), bounded, compacted ones included (compaction keeps the outcome). Owner-only; never
+ * returns the text.
  */
-export async function findRequestsCarrying(engine: BrainEngine, sourceId: string, claim: string, limit = 10_000): Promise<IntentRedactionTarget[]> {
+export async function findRequestsCarrying(engine: BrainEngine, sourceId: string, claim: string, reason = claim, limit = 10_000): Promise<IntentRedactionTarget[]> {
   const needle = claim.toLowerCase();
   // The claim as it appears inside a JSON string (quotes and backslashes escaped), lowercased.
   const jsonNeedle = JSON.stringify(claim).slice(1, -1).toLowerCase();
-  const carries = (column: string) => `(${column} IS NOT NULL AND (strpos(lower(${column}::text),$2)>0 OR strpos(lower(${column}::text),$3)>0))`;
+  const carries = (column: string) => `(${column} IS NOT NULL AND (strpos(lower(${column}::text),$2)>0 OR strpos(lower(${column}::text),$3)>0 OR strpos(lower(${column}::text),$4)>0))`;
   return engine.executeRaw<IntentRedactionTarget>(`SELECT id::text AS id,principal_kind,principal_id FROM persistence_requests
     WHERE source_id=$1 AND (${carries('intent')} OR ${carries('outcome')} OR ${carries('error_detail')} OR ${carries('error_message')})
-    ORDER BY sequence LIMIT $4`, [sourceId, needle, jsonNeedle, limit]);
+    ORDER BY sequence LIMIT $5`, [sourceId, needle, jsonNeedle, JSON.stringify(reason).slice(1, -1).toLowerCase(), limit]);
 }
 
 /** Replace every JSON string that carries one of `needles` (case-insensitive) with "[purged]"; structure and other values stay. */
-export function redactJson<T>(value: T, needles: readonly string[]): T {
+export function redactJson<T>(value: T, needles: readonly string[], exact?: ReadonlySet<string>): T {
   const lowered = needles.map(n => n.toLowerCase()).filter(Boolean);
-  if (!lowered.length || value === null || value === undefined) return value;
-  const walk = (v: unknown): unknown => typeof v === 'string' ? (lowered.some(n => v.toLowerCase().includes(n)) ? '[purged]' : v)
+  if ((!lowered.length && !exact?.size) || value === null || value === undefined) return value;
+  const hit = (v: string) => { if (exact?.has(v.trim())) return true; const low = v.toLowerCase(); return lowered.some(n => low.includes(n)); };
+  const walk = (v: unknown): unknown => typeof v === 'string' ? (hit(v) ? '[purged]' : v)
     : Array.isArray(v) ? v.map(walk) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)])) : v;
   return walk(value) as T;
 }
@@ -232,19 +234,19 @@ export async function findRequestsForSlugs(engine: BrainEngine, sourceId: string
 export async function findRequestsHoldingStagings(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, stagingIds: readonly string[]): Promise<IntentRedactionTarget[]> {
   if (!stagingIds.length) return [];
   return engine.executeRaw<IntentRedactionTarget>(`SELECT id::text AS id,principal_kind,principal_id FROM persistence_requests
-    WHERE source_id=$1 AND state IN ('queued','running','recovering') AND intent->'body_ref'->>'staging_id'=ANY($2::text[]) ORDER BY sequence`, [sourceId, [...stagingIds]]);
+    WHERE source_id=$1 AND state IN ('queued','deferred','running','recovering') AND intent->'body_ref'->>'staging_id'=ANY($2::text[]) ORDER BY sequence`, [sourceId, [...stagingIds]]);
 }
 
 /**
- * Cancel the queued requests of `targets` with `purged_content` inside the purge's transaction (the caller holds their
- * counter locks): the staged body they would publish is being purged. A request already claimed (running,
- * recovering, or with a recovery record) refuses the purge with retryable `purge_blocked_pending_recovery`.
+ * Cancel the unclaimed (queued, or deferred behind a refresh: GST-1602) requests of `targets` with `purged_content` inside the
+ * purge's transaction (the caller holds their counter locks): the staged body they would publish is being purged. A request
+ * already claimed (running, recovering, or with a recovery record) refuses the purge with retryable `purge_blocked_pending_recovery`.
  */
 export async function cancelRequestsHoldingStagings(tx: BrainEngine, targets: readonly IntentRedactionTarget[], exclude?: string): Promise<number> {
   const ids = targets.map(t => t.id).filter(id => id !== exclude);
   if (!ids.length) return 0;
   const rows = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE', [ids]);
-  const blocked = rows.find(row => (!isTerminal(row) && row.state !== 'queued') || row.recovery);
+  const blocked = rows.find(row => (!isTerminal(row) && row.state !== 'queued' && row.state !== 'deferred') || row.recovery);
   if (blocked) {
     throw opError('purge_blocked_pending_recovery', 'A pending write is publishing a staged body that holds this content, so nothing was purged.',
       `Request ${blocked.request_id} (${blocked.operation} on ${blocked.slug}, state ${blocked.state}) is publishing the staged body. Wait for it to finish, then retry the purge with the same request id.`,
@@ -271,7 +273,7 @@ export function redactionCounterKeys(targets: readonly IntentRedactionTarget[]):
  * `exclude` is the purge's own request id. Returns the number redacted.
  */
 export async function redactRequestIntents(tx: BrainEngine, targets: readonly IntentRedactionTarget[], exclude?: string,
-  opts: { skipPending?: boolean; needles?: readonly string[] } = {}): Promise<number> {
+  opts: { skipPending?: boolean; needles?: readonly string[]; exact?: ReadonlySet<string> } = {}): Promise<number> {
   const ids = targets.map(t => t.id).filter(id => id !== exclude);
   if (!ids.length) return 0;
   await lockCounters(tx, ['brain', ...redactionCounterKeys(targets)]);
@@ -289,8 +291,8 @@ export async function redactRequestIntents(tx: BrainEngine, targets: readonly In
   for (const current of rows) {
     if (!isTerminal(current) || current.recovery) continue;
     // The stored outcome stays the replay answer, with every string carrying the claim replaced by "[purged]".
-    const outcome = redactJson(current.outcome, opts.needles ?? []);
-    const detail = redactJson(current.error_detail, opts.needles ?? []);
+    const outcome = redactJson(current.outcome, opts.needles ?? [], opts.exact);
+    const detail = redactJson(current.error_detail, opts.needles ?? [], opts.exact);
     if (current.compacted && JSON.stringify(outcome) === JSON.stringify(current.outcome) && JSON.stringify(detail) === JSON.stringify(current.error_detail)
       && current.error_message === null) continue;
     const [effects] = await tx.executeRaw<{ bytes: string }>(`SELECT COALESCE(SUM(${EFFECT_BYTES_SQL}),0)::text AS bytes

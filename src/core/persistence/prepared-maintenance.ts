@@ -4,21 +4,24 @@ import { boundedReads } from './bounded-reads.ts';
 import { join } from 'node:path';
 import type { BrainEngine, FactRow } from '../engine.ts';
 import { loadConfig, type GBrainConfig } from '../config.ts';
-import { opError, type OperationContext, type OperationError } from '../ops/contract.ts';
+import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { fenceOperationError, scanCanonicalFences } from '../fence-repair/refusal.ts';
-import { fenceCellReadBackProblem, formatFenceDate, parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, type ParsedFact } from '../facts-fence.ts';
+import { fenceCellReadBackProblem, formatFenceDate, parseFactsFence, parseFactsFenceFor, renderFactsTable, replaceOrInsertFactsFence, isHoldingSlug, UNATTRIBUTED_MEMORY_SLUG, type ParsedFact } from '../facts-fence.ts';
+import { heldRowsInVersions, prepareFenceRowRetirement } from '../facts/fence-fact-append.ts';
+import { noteBelief } from '../belief/ledger.ts';
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
 import { submissionAuthority, authorizeStoredRequest, authorizeWrite } from './authority.ts';
-import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
-import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
+import { currentVerifiedLocalWriter, hostIdFor, registerLocalWriter } from './identity.ts';
+import { acquireWorktree, getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
 import { admitWrite, admitWriteInTransaction, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { assertRefusalBreakerClosed } from './refusal-breaker.ts';
-import { retryWriteAdmission } from './admission-retry.ts';
+import { retryWriteAdmission, waitOutRefreshFence } from './admission-retry.ts';
+import { resolveAdmissionOrigin } from './admission-origin.ts';
 import { declareDurablePersistence } from './protocol.ts';
 import { CANONICAL_FILE_MISSING } from './publication-failure.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
@@ -26,6 +29,7 @@ import { preparePageMutation, prepareFileTarget } from './page-prepare.ts';
 import { prepareTakesMutation } from './takes-prepare.ts';
 import { digest, sha256 } from './digest.ts';
 import type { PreparedMutation } from './coordinator.ts';
+import { withTrustKeep } from './context.ts';
 import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { nativeLockCapability } from './native-lock.ts';
@@ -34,8 +38,9 @@ import { isConnectorSourceKind } from './connector-identity.ts';
 import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import { auditConflictsCommand, FILE_DRIFT_MESSAGE, liveFileDrift } from './drift-conflicts.ts';
 import { lowerToDerivedTier, readDerivationDeclaration, recordTaintEdges, type DerivationDeclaration } from '../trust/taint.ts';
-import { derivationWriteTrust, recordAgentPageLowering, storedPageTier } from '../trust/page-write.ts';
+import { derivationWriteTrust, raisePageLabelGuard, recordAgentPageLowering, storedPageTier } from '../trust/page-write.ts';
 import { sameInstantTies } from '../facts/claim-ties.ts';
+import type { LabelEdit } from './label-edit.ts';
 import { factPreimages, recordConsolidationGeneration } from '../generations/adapters/fact-rows.ts';
 
 export interface MaintenanceAuthority {
@@ -111,7 +116,7 @@ export async function maintenancePreflight(engine: BrainEngine, sourceId: string
   const writeThrough = !/^(false|0|off|no)$/i.test(await engine.getConfig('sync.write_through') ?? 'true');
   const configuredRoot = source.local_path || (sourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
   if (writeThrough && (root || configuredRoot || binding)) {
-    const hostId = localHostId();
+    const hostId = hostIdFor(engine);
     const owner = checkOwner(binding, source.incarnation, hostId);
     if (owner.reason) throw ownerUnavailableError({ sourceId, reason: owner.reason, binding, incarnation: source.incarnation, hostId, remote: false, work: 'maintenance' });
     if (root && realpathSync(root) !== realpathSync(join(owner.binding.local_path, owner.binding.relative_path))) {
@@ -120,7 +125,15 @@ export async function maintenancePreflight(engine: BrainEngine, sourceId: string
         { fix: ownerStatusFix(sourceId) });
     }
     await nativeLockCapability();
-    assertPhysicalRoot(owner.binding.local_path, { worktreeId: owner.binding.worktree_id, coordinationPath: owner.binding.coordination_path });
+    try {
+      assertPhysicalRoot(owner.binding.local_path, { worktreeId: owner.binding.worktree_id, coordinationPath: owner.binding.coordination_path });
+    } catch (error) {
+      // #7760: a device-only change takes the ordinary write's locked, ownership-verified re-stamp (#5604); a busy lock keeps the refusal.
+      if (!(error instanceof OperationError) || error.detail !== 'physical_root_device_changed') throw error;
+      const lock = await acquireWorktree(owner.binding, 0, undefined, engine);
+      if (!lock) throw error;
+      await lock.release();
+    }
   }
   if (!writeThrough) writer.databaseOnlyReason = 'disabled_by_config';
   else if (!binding) writer.databaseOnlyReason = 'no_repo_configured';
@@ -236,17 +249,22 @@ export function maintenanceGhostRefusal(sourceId: string, slug: string): Operati
 /** #5523: a Life Chronicle timeline row projected onto the depth page in the same publication. */
 export interface MaintenanceEventProjection { depth_slug: string; date: string; summary: string; }
 
+/**
+ * `keepTrust`: the edit authors nothing (it only changes privacy labels), so the page keeps its stored trust tier (withTrustKeep).
+ * `labelEdit` (GST-2468): the label keys the write sets or removes; the canonical file keeps its bytes except those lines (page-prepare.ts labelEditFile).
+ */
 type MaintenancePageOptions = { requestId?: string; expectedRevision: string | null; file?: boolean;
-  eventProjection?: MaintenanceEventProjection; derivation?: DerivationDeclaration };
+  eventProjection?: MaintenanceEventProjection; derivation?: DerivationDeclaration; keepTrust?: true; labelEdit?: LabelEdit };
 
 /** A maintenance page publication's intent and request id; `batch` (G6) is the run's batch id, part of both. */
 function maintenancePageRequest(authority: MaintenanceAuthority, slug: string, content: string, options: MaintenancePageOptions, batch?: string) {
   const projection = options.eventProjection ? { event_projection: options.eventProjection } : {};
   const derivation = options.derivation ? { derivation: options.derivation } : {};
   const grouped = batch ? { maintenance_batch: batch } : {};
-  return { intent: { kind: 'managed_maintenance_page', content, expected_revision: options.expectedRevision, ...projection, ...derivation, ...grouped },
+  const keep = { ...(options.keepTrust ? { keep_trust: true } : {}), ...(options.labelEdit ? { label_edit: options.labelEdit } : {}) };
+  return { intent: { kind: 'managed_maintenance_page', content, expected_revision: options.expectedRevision, ...projection, ...derivation, ...grouped, ...keep },
     requestId: options.requestId ?? maintenanceRequestId({ authority: authority.writer, slug, content, revision: options.expectedRevision, file: options.file ?? true,
-      ...projection, ...derivation, ...grouped }) };
+      ...projection, ...derivation, ...grouped, ...keep }) };
 }
 
 /** `derivation` (#5575 I2): the deriver's taint declaration; the page and its edges are stamped from it at publication. */
@@ -261,12 +279,15 @@ export async function publishMaintenancePage(engine: BrainEngine, authority: Mai
  * before any is waited on, each carrying the batch id, so the owner claims them as one contiguous run and publishes them
  * in groups of up to PAGE_BATCH_GROUP_MAX on Postgres (journal.ts publicationGroupKey: an independent group, one page's
  * failure never cancels another). The batch id is derived from its pages, so a rerun over the same pages and revisions
- * replays the same requests. Each page settles on its own: its receipt, or the error publishMaintenancePage would throw.
+ * replays the same requests; a caller that names each page's request id passes a `batch` id that a rerun over a different
+ * split of the same pages repeats (GBRA-443: a repair window resumed mid-window). An interactive admission waits out a
+ * refresh fence like a single write does (admission-retry.ts). Each page settles on its own: its receipt, or the error
+ * publishMaintenancePage would throw.
  */
 export async function publishMaintenancePages(engine: BrainEngine, authority: MaintenanceAuthority,
-  pages: Array<{ slug: string; content: string } & Omit<MaintenancePageOptions, 'requestId'>>): Promise<Array<{ receipt: Record<string, unknown> } | { error: unknown }>> {
+  pages: Array<{ slug: string; content: string } & MaintenancePageOptions>, opts: { batch?: string } = {}): Promise<Array<{ receipt: Record<string, unknown> } | { error: unknown }>> {
   if (new Set(pages.map(page => page.slug)).size !== pages.length) throw new TypeError('A maintenance batch publishes each page once.');
-  const batch = digest(['maintenance-batch-v1', authority.writer.sourceId, pages.map(page => [page.slug, page.expectedRevision, sha256(page.content)])]);
+  const batch = opts.batch ?? digest(['maintenance-batch-v1', authority.writer.sourceId, pages.map(page => [page.slug, page.expectedRevision, sha256(page.content)])]);
   const prepared: Array<{ prior: WriteRequest } | { admission: WriteAdmission } | { error: unknown }> = [];
   for (const page of pages) {
     const { intent, requestId } = maintenancePageRequest(authority, page.slug, page.content, page, batch);
@@ -274,12 +295,13 @@ export async function publishMaintenancePages(engine: BrainEngine, authority: Ma
   }
   const fresh = prepared.flatMap(entry => 'admission' in entry ? [entry.admission] : []);
   // One admission transaction, retried on contention as admitWrite is; when it fails, every page it carried fails with it.
-  const admitted: WriteRequest[] | { error: unknown } = !fresh.length ? [] : await retryWriteAdmission(`maintenance batch ${batch}`, remaining => engine.transaction(async tx => {
-    await declareDurablePersistence(tx, `${Math.min(1000, remaining)}ms`, `${remaining}ms`);
-    const rows: WriteRequest[] = [];
-    for (const admission of fresh) rows.push(await admitWriteInTransaction(tx, admission));
-    return rows;
-  }), 30_000, error => engine.reconnect({ error })).catch(error => ({ error }));
+  const admitted: WriteRequest[] | { error: unknown } = !fresh.length ? [] : await waitOutRefreshFence(resolveAdmissionOrigin() === 'interactive',
+    () => retryWriteAdmission(`maintenance batch ${batch}`, remaining => engine.transaction(async tx => {
+      await declareDurablePersistence(tx, `${Math.min(1000, remaining)}ms`, `${remaining}ms`);
+      const rows: WriteRequest[] = [];
+      for (const admission of fresh) rows.push(await admitWriteInTransaction(tx, admission));
+      return rows;
+    }), 30_000, error => engine.reconnect({ error }))).catch(error => ({ error }));
   const out: Array<{ receipt: Record<string, unknown> } | { error: unknown }> = [];
   let next = 0;
   for (const entry of prepared) {
@@ -405,6 +427,16 @@ export async function submitMaintenanceConsolidation(engine: BrainEngine, author
 export interface FactFenceAssignment { id: number; row_num: number; hash: string }
 
 /**
+ * The row hash an adoption or held-move plan pins. `valid_from` and `valid_until` count to the second, the precision a fence
+ * cell keeps: the facts reconcile rewrites a new row's sub-second time to its cell's, and a request still pending across
+ * that reconcile commits instead of ending revision_conflict beside a second request for the same move (GST-2492).
+ */
+const SUBSECOND = /\.\d+(?=Z$|[+-]\d\d(?::?\d\d)?$)/;
+const toSecond = (time: unknown) => (typeof time === 'string' ? time.replace(SUBSECOND, '') : time);
+const pinnedFactHash = (value: Record<string, unknown> | null | undefined) =>
+  digest(value ? { ...value, valid_from: toSecond(value.valid_from), valid_until: toSecond(value.valid_until) } : null);
+
+/**
  * v0.32.2 on a managed brain: publish the page with its rendered facts fence
  * and adopt the legacy rows in place, so the canonical projection matches
  * them by (source, page, row_num) instead of inserting duplicates.
@@ -416,6 +448,13 @@ const MALFORMED_ADOPTION = 'A fact adoption assigns one fact or fence position t
  * read-back check changes, and every held-back page gets a fresh attempt.
  */
 export const FACT_FENCE_PLANNER = 2;
+/**
+ * GST-2492: the same publication moves facts held on memory/unattributed (a strict source's facts for an entity that had
+ * no page) into their entity page's fence: the rows keep their ids and move in place, and their holding rows are struck.
+ */
+export const HELD_FACT_MOVE = 'managed_maintenance_move_held_fact';
+/** A struck (withdrawn) held row that leaves its holding page with its entity's live rows (GST-2492). */
+export type HeldDrop = { row_num: number; entity: string; claim: string };
 /** How long a refused adoption is held back; the owner that refused it may since have restarted onto code that adopts it. */
 const ADOPTION_REFUSAL_HOLD_MS = 24 * 60 * 60 * 1000;
 
@@ -438,11 +477,13 @@ export type FactFenceAdoptionPlan =
  * every cycle, so the page waits a day or a planner change.
  */
 export async function planFactFenceAdoption(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
-  options: { content: string; expectedRevision: string; assignments: Array<{ id: number; row_num: number }> }): Promise<FactFenceAdoptionPlan> {
+  options: { content: string; expectedRevision: string; assignments: Array<{ id: number; row_num: number }>; move?: { note: string; from_entity?: string; from_slug?: string; drop?: readonly HeldDrop[] } }): Promise<FactFenceAdoptionPlan> {
   const current = await readFacts(engine, authority.writer.sourceId, options.assignments.map(a => a.id));
-  const facts: FactFenceAssignment[] = options.assignments.map(a => ({ ...a, hash: digest(current.find(f => f.id === a.id)?.value ?? null) }));
-  const intent = { kind: 'managed_maintenance_adopt_fact_fence', expected_revision: options.expectedRevision,
-    source_incarnation: authority.writer.sourceIncarnation, content: options.content, facts, planner: FACT_FENCE_PLANNER };
+  const facts: FactFenceAssignment[] = options.assignments.map(a => ({ ...a, hash: pinnedFactHash(current.find(f => f.id === a.id)?.value) }));
+  const intent = { kind: options.move ? HELD_FACT_MOVE : 'managed_maintenance_adopt_fact_fence', expected_revision: options.expectedRevision,
+    source_incarnation: authority.writer.sourceIncarnation, content: options.content, facts, planner: FACT_FENCE_PLANNER,
+    ...(options.move ? { note: options.move.note, ...(options.move.from_entity ? { from_entity: options.move.from_entity } : {}),
+      ...(options.move.from_slug ? { from_slug: options.move.from_slug } : {}), ...(options.move.drop?.length ? { drop: options.move.drop } : {}) } : {}) };
   for (let attempt = 0; ; attempt++) {
     const requestId = maintenanceRequestId({ authority: authority.writer, slug, intent, ...(attempt ? { attempt } : {}) });
     const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
@@ -452,6 +493,16 @@ export async function planFactFenceAdoption(engine: BrainEngine, authority: Main
       return { kind: 'suppressed', prior };
     }
   }
+}
+
+/**
+ * GST-2492: the struck held rows of an entity with no live row left on holding page `from`, removed from it (and its saved
+ * versions) once a rule narrows the entity below that page's readers. The request id is returned before the wait.
+ */
+export function planHeldRowDrop(authority: MaintenanceAuthority, from: string, revision: string, drop: readonly HeldDrop[]) {
+  const intent = { kind: HELD_FACT_MOVE, expected_revision: revision, source_incarnation: authority.writer.sourceIncarnation, facts: [], drop,
+    note: 'moved', planner: FACT_FENCE_PLANNER, ...(from === UNATTRIBUTED_MEMORY_SLUG ? {} : { from_slug: from }) };
+  return { intent, requestId: maintenanceRequestId({ authority: authority.writer, slug: from, intent }) };
 }
 
 export async function submitPlannedFactFenceAdoption(engine: BrainEngine, authority: MaintenanceAuthority, slug: string,
@@ -483,6 +534,7 @@ async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteReques
   const engine = boundedReads(unbounded, clock);
   const p = row.intent!;
   const facts = p.facts as FactFenceAssignment[];
+  const held = p.kind === HELD_FACT_MOVE;
   if (p.source_incarnation !== row.source_incarnation) throw opError('source_changed', 'The fact adoption source changed.',
     `Source ${row.source_id} was replaced after fact-fence adoption request ${row.request_id} for ${row.slug} was accepted, so nothing was published. Read the receipt with gbrain write-request -- ${row.request_id}; the next fact backfill run plans against the current source.`,
     { fix: receiptFix(row) });
@@ -491,16 +543,44 @@ async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteReques
       `Fact-fence adoption request ${row.request_id} for ${row.slug} in ${row.source_id} was refused before publication; nothing changed. The plan itself is malformed, so report the request ID to the user rather than running the same backfill again.`,
       { fix: receiptFix(row) });
   }
+  // The holding page a held row moves off (`from_slug`, memory/unattributed when absent), and the struck rows of the
+  // entity that leave it with the live ones (GST-2492): withdrawn, so they are removed rather than moved.
+  const fromSlug = held && typeof p.from_slug === 'string' && isHoldingSlug(p.from_slug) ? p.from_slug : UNATTRIBUTED_MEMORY_SLUG;
+  const drop = held && Array.isArray(p.drop) ? p.drop as HeldDrop[] : [];
+  const scrubbing = (keys: Array<{ entity: string; claim: string }>, after: PreparedMutation['afterEffects']) => async (tx: BrainEngine, outcome: Record<string, unknown>) => {
+    await after?.(tx, outcome);
+    const edited = await heldRowsInVersions(tx, row.source_id, fromSlug, [...keys, ...drop], true);
+    outcome.held_versions_edited = { slug: fromSlug, moved_to: facts.length ? row.slug : null, fact_ids: facts.map(f => f.id), rows: edited.rows, versions: edited.versions,
+      ...(drop.length ? { struck_rows: drop.length } : {}), ...(edited.segmented ? { segmented_versions_not_edited: edited.segmented } : {}) };
+  };
+  const unhold = (tx: BrainEngine) => tx.executeRaw('UPDATE facts SET row_num=NULL WHERE source_id=$1 AND source_markdown_slug=$2 AND row_num=ANY($3::int[]) AND expired_at IS NOT NULL',
+    [row.source_id, fromSlug, drop.map(d => d.row_num)]);
+  if (held && !facts.length) {
+    const page = await prepareFenceRowRetirement(unbounded, { ...row, intent: { kind: 'managed_maintenance_page' } }, config, fromSlug,
+      { note: 'moved', rowNum: [], validUntil: null, drop: drop.map(d => d.row_num) });
+    if (!page) throw opError('revision_conflict', 'The struck held rows already left their holding page.',
+      `The struck rows of request ${row.request_id} are no longer on ${fromSlug} in ${row.source_id}; nothing was written. The next maintenance run plans from the current page.`, { fix: receiptFix(row) });
+    return { ...page.mutation, afterEffects: scrubbing([], page.mutation.afterEffects), apply: async (tx, preimage) => { await unhold(tx); return page.mutation.apply(tx, preimage); } };
+  }
   enterClaimStep(clock, 'adoption_parse_fence');
-  const fence = new Map(parseFactsFence(p.content as string).facts.map(f => [f.rowNum, f]));
+  const fence = new Map(parseFactsFenceFor(p.content as string, { slug: row.slug }).facts.map(f => [f.rowNum, f]));
+  // GST-2492 PR 2 (gbrain repair facts-home): a database-only fact with no entity, or whose entity has no page, is adopted
+  // onto a holding page; its cell must name the fact's entity (none for a fact with no entity), so the projection keeps it.
+  // A held move onto a holding page (a held row whose entity a folder rule now covers) keeps its entity the same way.
+  const holdingAdoption = isHoldingSlug(row.slug);
+  // A held row keyed by a bare name (`from_entity`) moves to the page that name resolved to, and is re-keyed to it.
+  const fromEntity = held && typeof p.from_entity === 'string' ? p.from_entity : null;
+  const ownsRow = (value: Record<string, unknown>, rowNum: number) => holdingAdoption
+    ? (fence.get(rowNum)?.entity ?? null) === (value.entity_slug === row.slug ? null : value.entity_slug ?? null)
+    : value.entity_slug === (fromEntity ?? row.slug);
   // `lock` is the publication transaction's re-check: the claim's clock stamps only the preparation's reads.
   const check = async (db: BrainEngine, lock: boolean) => {
     if (!lock) enterClaimStep(clock, 'adoption_read_facts', undefined, 'db');
     const current = await readFacts(db, row.source_id, facts.map(f => f.id), lock);
     for (const assignment of facts) {
       const fact = current.find(f => f.id === assignment.id);
-      if (!fact || digest(fact.value) !== assignment.hash || fact.value.entity_slug !== row.slug
-        || fact.value.row_num !== null || fact.value.expired_at !== null) {
+      if (!fact || pinnedFactHash(fact.value) !== assignment.hash || !ownsRow(fact.value, assignment.row_num) || fact.value.expired_at !== null
+        || (held ? fact.value.source_markdown_slug !== fromSlug || fact.value.row_num === null : fact.value.row_num !== null)) {
         throw opError('revision_conflict', 'A legacy fact changed, was already adopted or moved to another owner before adoption.',
           `A legacy fact on ${row.slug} in ${row.source_id} changed before fact-fence adoption request ${row.request_id} published; nothing was written. The next fact backfill run re-reads the facts and plans a fresh request.`,
           { fix: receiptFix(row) });
@@ -523,21 +603,30 @@ async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteReques
       { fix: receiptFix(row) });
   };
   await check(engine, false);
-  const prepared = await preparePageMutation(unbounded, { ...row, intent: { kind: 'managed_maintenance_page', content: p.content,
-    expected_revision: p.expected_revision } }, config, undefined, undefined, { clock });
-  return { ...prepared, validate: async tx => { await prepared.validate?.(tx); await check(tx, true); }, apply: async tx => {
+  const pageRow = { ...row, intent: { kind: 'managed_maintenance_page', content: p.content, expected_revision: p.expected_revision } };
+  const prepared = await preparePageMutation(unbounded, pageRow, config, undefined, undefined, { clock });
+  const holding = held ? await prepareFenceRowRetirement(unbounded, pageRow, config, fromSlug, { note: String(p.note), remove: p.note === 'moved',
+    rowNum: (await readFacts(engine, row.source_id, facts.map(f => f.id))).map(f => Number(f.value.row_num)), validUntil: null, drop: drop.map(d => d.row_num) }) : null;
+  // GST-2492 (A2): a row removed from its holding page (it moved where not every reader of that page can read) leaves the
+  // page's saved versions too, in this transaction; the receipt records which rows, how many versions and where they went.
+  const afterEffects = held && p.note === 'moved'
+    ? scrubbing(facts.map(f => ({ entity: holdingAdoption ? fence.get(f.row_num)!.entity ?? '' : fromEntity ?? row.slug, claim: fence.get(f.row_num)!.claim })), prepared.afterEffects)
+    : prepared.afterEffects;
+  return { ...prepared, ...(afterEffects ? { afterEffects } : {}), ...(holding ? { companions: [holding] } : {}), validate: async tx => { await prepared.validate?.(tx); await check(tx, true); }, apply: async tx => {
     // Runs ahead of the page import and its canonical projection, so the
     // projection's expiry pass and insertFacts see the adopted positions.
     // The fence cell's parsed text is written back with the row number: the
     // projection expires any row whose (row_num, fact, visibility) differs from
     // its fence row and inserts a new one, which would lose the legacy id.
-    const adopted = await tx.executeRaw(`UPDATE facts f SET row_num=a.row_num,source_markdown_slug=$2,fact=a.fact
+    const adopted = await tx.executeRaw(`UPDATE facts f SET row_num=a.row_num,source_markdown_slug=$2,fact=a.fact${held && !holdingAdoption ? ',entity_slug=$2' : ''}
       FROM jsonb_to_recordset($3::text::jsonb) AS a(id integer,row_num integer,fact text)
-      WHERE f.source_id=$1 AND f.id=a.id AND f.row_num IS NULL RETURNING f.id`,
-    [row.source_id, row.slug, JSON.stringify(facts.map(({ id, row_num }) => ({ id, row_num, fact: fence.get(row_num)!.claim })))]);
+      WHERE f.source_id=$1 AND f.id=a.id AND ${held ? 'f.source_markdown_slug=$4' : 'f.row_num IS NULL'} RETURNING f.id`,
+    [row.source_id, row.slug, JSON.stringify(facts.map(({ id, row_num }) => ({ id, row_num, fact: fence.get(row_num)!.claim }))), ...(held ? [fromSlug] : [])]);
     if (adopted.length !== facts.length) throw opError('revision_conflict', 'A legacy fact was adopted by another run.',
       `Another run adopted a legacy fact on ${row.slug} in ${row.source_id} while request ${row.request_id} was publishing, so its transaction rolled back. Read the receipt with gbrain write-request -- ${row.request_id} for the final state before planning any new adoption.`,
       { fix: receiptFix(row) });
+    if (held) noteBelief({ kind: 'transferred', fromSlug, table: 'facts', ids: facts.map(f => f.id) });
+    if (drop.length) await unhold(tx);
     const outcome = await prepared.apply(tx);
     return { ...outcome, facts_adopted: facts.length };
   } };
@@ -569,7 +658,8 @@ export async function prepareMaintenanceMutation(engine: BrainEngine, row: Write
     if (derived) {
       const lowered = await lowerToDerivedTier(tx, derived.table, [derived.id], trust);
       if (declaration) await recordTaintEdges(tx, { ...derived, sourceId: row.source_id }, declaration.inputs);
-      if (lowered.length && prior?.tier) await recordAgentPageLowering(tx, row, { tier: prior.tier, revision: prior.revision });
+      // GST-2518: a publication whose labels were kept already filed its proposal with them; a second record would withdraw them.
+      if (lowered.length && prior?.tier && !outcome.privacy_labels_kept) await recordAgentPageLowering(tx, row, { tier: prior.tier, revision: prior.revision });
     }
     return outcome;
   } };
@@ -580,7 +670,9 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   if (row.authority.remote) throw trustedCliRequired('Remote maintenance publication is not supported.');
   enterClaimStep(clock, 'maintenance_dispatch');
   if (row.intent?.kind === 'managed_maintenance_restore_extractor_facts') return (await import('../repair/extractor-facts.ts')).prepareExtractorFactsRestore(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_restore_unwithdrawn_facts') return (await import('../repair/unwithdrawn-facts.ts')).prepareUnwithdrawnFactsRestore(engine, row);
   if (row.intent?.kind === 'managed_maintenance_expire_captured_facts') return (await import('../repair/captured-facts.ts')).prepareCapturedFactsExpiry(engine, row);
+  if (row.intent?.kind === 'managed_maintenance_agent_session_facts') return (await import('../repair/agent-session-facts.ts')).prepareAgentSessionFactsWrite(engine, row);
   if (row.intent?.kind === 'managed_maintenance_restore_redacted_facts') return (await import('../repair/redacted-facts.ts')).prepareRedactedFactsRestore(engine, row);
   if (row.intent?.kind === 'managed_maintenance_tighten_fact_visibility') return (await import('../repair/visibility.ts')).prepareFactVisibilityTighten(engine, row);
   if (row.intent?.kind === 'managed_maintenance_conversation_label_retire') return (await import('../repair/conversation-labels.ts')).prepareConversationLabelRetirement(engine, row);
@@ -593,8 +685,14 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   if (row.intent?.kind === 'managed_maintenance_timeline_extract') return (await import('../../commands/extract-timeline-db.ts')).prepareTimelineExtract(engine, row);
   if (row.intent?.kind === 'managed_maintenance_meeting_timeline') return (await import('../extract-timeline-from-meetings.ts')).prepareMeetingTimeline(engine, row);
   if (row.intent?.kind === 'managed_maintenance_page') {
-    const prepared = await preparePageMutation(engine, row.intent.expected_revision === null
+    const page = await preparePageMutation(engine, row.intent.expected_revision === null
       ? { ...row, intent: { ...row.intent, expected_revision: undefined } } : row, config, undefined, undefined, { clock });
+    // GST-2521: keep_trust is the owner's label door, which also raises the page's label guard.
+    const prepared: PreparedMutation = row.intent.keep_trust === true ? { ...page, apply: (tx, preimage) => withTrustKeep(tx, ['pages'], async () => {
+      const outcome = await page.apply(tx, preimage);
+      await raisePageLabelGuard(tx, row.source_id, row.slug);
+      return outcome;
+    }) } : page;
     const projection = row.intent.event_projection as MaintenanceEventProjection | undefined;
     if (!projection) return prepared;
     // #5523: the event page and its depth-page timeline row commit together in
@@ -608,7 +706,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
       return { ...outcome, event_projected: projected };
     } };
   }
-  if (row.intent?.kind === 'managed_maintenance_adopt_fact_fence') return prepareFactFenceAdoption(engine, row, config, clock);
+  if (row.intent?.kind === 'managed_maintenance_adopt_fact_fence' || row.intent?.kind === 'managed_maintenance_move_held_fact') return prepareFactFenceAdoption(engine, row, config, clock);
   if (row.intent?.kind === 'managed_maintenance_phantom_merge') return (await import('../cycle/phantom-redirect-managed.ts')).preparePhantomMerge(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_phantom_delete') return (await import('../cycle/phantom-redirect-managed.ts')).preparePhantomDelete(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_chronicle_event' || row.intent?.kind === 'managed_maintenance_chronicle_retire') {
@@ -621,6 +719,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
   if (row.intent?.kind === 'managed_maintenance_file_drift_detach') return (await import('../repair/file-drift.ts')).prepareDriftDetach(engine, row);
   if (row.intent?.kind === 'managed_maintenance_merge_legacy_twin') return (await import('../repair/legacy-twins.ts')).prepareLegacyTwinMerge(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_resolve_origin_twin') return (await import('../repair/origin-twins.ts')).prepareOriginTwinResolve(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_fold_moved_page') return (await import('../repair/moved-pages.ts')).prepareMovedPageFold(engine, row, config);
   if (row.intent?.kind !== 'managed_maintenance_consolidate') throw opError('invalid_params', 'Unsupported maintenance request.',
     `Request ${row.request_id} for ${row.slug} in ${row.source_id} carries a maintenance kind this gbrain version does not publish (likely queued by a newer release); nothing changed. Upgrade gbrain on the brain host, and read the receipt before submitting anything new.`,
     { fix: receiptFix(row) });

@@ -36,10 +36,12 @@ test('the runner compiles its own CLI and avoids GNU-only xargs flags', () => {
 });
 
 describe('ci-local command rendering', () => {
+  // Every tool the runner's prerequisite gate checks; curl backs check:vendor-postgres (#7765).
+  const prerequisites = ['git', 'python3', 'ps', 'psql', 'cc', 'jq', 'curl'];
   const cases = [
     { phaseExit: 0, missingTool: '' },
     { phaseExit: 7, missingTool: '' },
-    ...['git', 'python3', 'ps', 'psql', 'cc', 'jq'].map(missingTool => ({ phaseExit: 0, missingTool })),
+    ...prerequisites.map(missingTool => ({ phaseExit: 0, missingTool })),
   ];
   for (const { phaseExit, missingTool } of cases) {
     test(`preserves stderr and exit ${phaseExit}; missing prerequisite ${missingTool || 'none'}`, () => {
@@ -51,7 +53,7 @@ describe('ci-local command rendering', () => {
         mkdirSync(bin);
         // Execute the actual runner template, with installation/configuration
         // commands stubbed so this regression needs neither Docker nor root.
-        for (const name of ['bun', 'git', 'python3', 'ps', 'psql', 'cc', 'jq']) {
+        for (const name of ['bun', ...prerequisites]) {
           writeFileSync(join(bin, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
         }
         writeFileSync(join(bin, 'apt-get'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INSTALL_LOG"\n', { mode: 0o755 });
@@ -88,7 +90,7 @@ describe('ci-local command rendering', () => {
         expect(result.stdout.includes('phase completed')).toBe(phaseExit === 0);
         expect(existsSync(join(home, '__RUN_PHASES__1'))).toBe(false);
         if (missingTool) {
-          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq build-essential\n');
+          expect(readFileSync(installLog, 'utf8')).toBe('update -qq\ninstall -y -qq git ca-certificates python3 procps postgresql-client jq curl build-essential\n');
         } else {
           expect(existsSync(installLog)).toBe(false);
         }
@@ -136,9 +138,9 @@ for line in {1..35}; do printf 'fixture progress %s\\n' "$line"; done
 `);
     put('scripts/run-e2e.sh', `
 set -eu
-case "$DATABASE_URL" in postgresql://postgres:postgres@postgres-*:5432/gbrain_test) ;; *) exit 42 ;; esac
-[ "$GBRAIN_PGBOUNCER_URL" = postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test ] || exit 43
-[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test ] || exit 44
+case "$DATABASE_URL" in postgresql://postgres:postgres@postgres-*:5432/gbrain_test?sslmode=disable) ;; *) exit 42 ;; esac
+[ "$GBRAIN_PGBOUNCER_URL" = 'postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer_test?sslmode=disable' ] || exit 43
+[ "$GBRAIN_PGBOUNCER_DIRECT_URL" = 'postgresql://postgres:postgres@postgres-1:5432/gbrain_ci_admin_test?sslmode=disable' ] || exit 44
 [ "$GBRAIN_CI_REQUIRE_PGBOUNCER" = 1 ] || exit 45
 [ "$GBRAIN_TEST_DB" = 1 ] || exit 46
 printf 'target:%s\\n' "db=$DATABASE_URL" "pgbouncer=$GBRAIN_PGBOUNCER_URL" "direct=$GBRAIN_PGBOUNCER_DIRECT_URL" >> "$TRACE"
@@ -208,7 +210,7 @@ describe('ci-local execution coverage', () => {
       const admins = new Set(role('direct').map(url => `${url.host}${url.pathname}`));
       expect([...admins]).toEqual(['postgres-1:5432/gbrain_ci_admin_test']);
       for (const shard of shards) expect(shard.pathname).not.toBe('/gbrain_ci_admin_test');
-      const created = result.trace.indexOf('admin_db:postgresql://postgres:postgres@postgres-1:5432/gbrain_test:gbrain_ci_admin_test');
+      const created = result.trace.indexOf('admin_db:postgresql://postgres:postgres@postgres-1:5432/gbrain_test?sslmode=disable:gbrain_ci_admin_test');
       expect(created).toBeGreaterThanOrEqual(0);
       expect(created).toBeLessThan(result.trace.findIndex(line => line.startsWith('e2e:')));
     });

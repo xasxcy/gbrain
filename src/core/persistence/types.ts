@@ -19,8 +19,8 @@ export const WRITE_ERROR_CODES = [
   'invalid_connector_text', 'connector_holds_exhausted', 'connector_fence_below_timeline',
   'core_budget_exceeded', 'core_mark_owner_only', 'core_remote_edit_refused', 'core_delete_owner_only',
   'timeline_rows_would_be_removed', 'purged_content', 'preparation_stalled',
-  'fence_unrenderable', 'page_body_segmented', 'revision_changed', 'tail_changed',
-  'write_outcome_unknown', 'write_interrupted', 'connection_inherited_read_only',
+  'fence_unrenderable', 'page_body_segmented', 'page_body_rows_unreadable', 'revision_changed', 'tail_changed',
+  'write_outcome_unknown', 'write_interrupted', 'connection_inherited_read_only', 'owner_marker_missing',
 ] as const;
 
 export type WriteErrorCode = typeof WRITE_ERROR_CODES[number];
@@ -36,6 +36,8 @@ export interface WriteDiagnostic {
   assessment: typeof WRITE_HEALTH_ASSESSMENTS[number];
   reason: typeof WRITE_HEALTH_REASONS[number];
   next_action: typeof WRITE_HEALTH_ACTIONS[number];
+  /** GBRA-248: present whenever the worktree owner is stale (no live consumer, quiet past the stale window), with its last recorded activity; the reason is owner_unavailable unless recovery outranks it. No host id: receipts reach remote callers. Older readers ignore it. */
+  owner?: { last_active: string | null };
 }
 
 export interface WriteReceipt {
@@ -52,12 +54,16 @@ export interface WriteReceipt {
     mode: 'filesystem' | 'database';
     file_written?: boolean;
     git_state?: string;
-    /** G2: the commit a strict (canonical: git) source's write was committed in before its row. */
+    /** G2: the commit a strict (canonical: git) source's write was committed in before its row; #9227: a classic write's Git effect commit. */
     git_commit?: string;
+    /** #9227: why a classic write's Git effect is superseded, skipped, failed or retrying. */
+    git_reason?: string;
   };
   created_at?: string;
   updated_at?: string;
   diagnostic?: WriteDiagnostic;
+  /** PR B: the write waits behind this worktree refresh and publishes after it (docs/guides/write-refusals.md#deferred-writes). */
+  deferred?: { refresh_id?: string; pending_import?: boolean };
   /** #7248: a remember's target page and the entity slug its fact is keyed under (set on its own replies, never read back from the journal). */
   target?: { slug: string | null; entity_slug: string | null };
 }
@@ -79,7 +85,7 @@ export function isWriteErrorCode(value: unknown): value is WriteErrorCode {
   return typeof value === 'string' && (WRITE_ERROR_CODES as readonly string[]).includes(value);
 }
 
-export function isTerminalWriteState(state: WriteRequestState): boolean {
+export function isTerminalWriteState(state: WriteRequestState | 'deferred'): boolean {
   return state === 'committed' || state === 'conflict' || state === 'failed' || state === 'cancelled';
 }
 
@@ -97,6 +103,10 @@ export function isWriteDiagnostic(value: unknown): value is WriteDiagnostic {
     const utc = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/.exec(value.observed_at);
     if (!utc || !Number.isFinite(Date.parse(value.observed_at))
       || new Date(value.observed_at).toISOString() !== `${utc[1]}.${(utc[2] ?? '').padEnd(3, '0')}Z`) return false;
+  }
+  if (value.owner !== undefined) {
+    const owner = value.owner;
+    if (!isRecord(owner) || (owner.last_active !== null && (typeof owner.last_active !== 'string' || !Number.isFinite(Date.parse(owner.last_active))))) return false;
   }
   return true;
 }
@@ -121,6 +131,7 @@ export function isWriteReceipt(value: unknown): value is WriteReceipt {
     if (value.persistence.file_written !== undefined && typeof value.persistence.file_written !== 'boolean') return false;
     if (value.persistence.git_state !== undefined && typeof value.persistence.git_state !== 'string') return false;
     if (value.persistence.git_commit !== undefined && typeof value.persistence.git_commit !== 'string') return false;
+    if (value.persistence.git_reason !== undefined && typeof value.persistence.git_reason !== 'string') return false;
   }
   return true;
 }
@@ -152,14 +163,19 @@ export function publicWriteReceipt(receipt: WriteReceipt): WriteReceipt {
       ...(receipt.persistence.file_written !== undefined ? { file_written: receipt.persistence.file_written } : {}),
       ...(receipt.persistence.git_state !== undefined ? { git_state: receipt.persistence.git_state } : {}),
       ...(receipt.persistence.git_commit !== undefined ? { git_commit: receipt.persistence.git_commit } : {}),
+      ...(receipt.persistence.git_reason !== undefined ? { git_reason: receipt.persistence.git_reason } : {}),
     } } : {}),
     ...(receipt.created_at !== undefined ? { created_at: receipt.created_at } : {}),
     ...(receipt.updated_at !== undefined ? { updated_at: receipt.updated_at } : {}),
     ...(receipt.target !== undefined ? { target: receipt.target } : {}),
+    ...(receipt.deferred !== undefined && !isTerminalWriteState(receipt.state) ? { deferred: {
+      ...(receipt.deferred.refresh_id !== undefined ? { refresh_id: receipt.deferred.refresh_id } : {}),
+      ...(receipt.deferred.pending_import === true ? { pending_import: true } : {}) } } : {}),
     ...(!isTerminalWriteState(receipt.state) && isWriteDiagnostic(receipt.diagnostic) ? { diagnostic: {
       age_ms: receipt.diagnostic.age_ms, assessment: receipt.diagnostic.assessment,
       reason: receipt.diagnostic.reason, next_action: receipt.diagnostic.next_action,
       ...(receipt.diagnostic.observed_at !== undefined ? { observed_at: receipt.diagnostic.observed_at } : {}),
+      ...(receipt.diagnostic.owner !== undefined ? { owner: { last_active: receipt.diagnostic.owner.last_active } } : {}),
     } } : {}),
   };
 }

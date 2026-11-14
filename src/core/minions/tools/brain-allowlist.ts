@@ -34,6 +34,14 @@ import type { ToolCtx, ToolDef } from '../types.ts';
 import { putPageRejection, rethrowWithCurrentRevision } from './put-page-result.ts';
 import { BRAIN_TOOL_ALLOWLIST } from './brain-tool-allowlist.ts';
 import { stagePutPage } from './staged-put-page.ts';
+import { withCallerAccess } from '../../search/private-visibility.ts';
+import { folderAccessFor, remoteCallerAccess } from '../../access/caller.ts';
+import { credentialScopeFor, requesterScopeGate, requiresRequesterScope, withServesReread } from '../../access/requester-scope.ts';
+import { attestedCallerAccess, attestRightOf, storedActorIdentity } from '../../access/actor.ts';
+import { attestedReadMode, SCOPE_READ_ACCESS, withReadMode } from '../../access/scope-read.ts';
+import { attestedReadScope } from '../../access/member-sources.ts';
+import type { AudiencePrincipal } from '../../access/audience.ts';
+import { currentSubmissionAuthority } from '../submission-authority.ts';
 
 // The allow-list itself lives in a handler-free module so the MCP surface
 // tiers (src/mcp/surface.ts) can read it without this module's operations import.
@@ -304,15 +312,48 @@ function brainTool(op: Operation, opts: BuildBrainToolsOpts): ToolDef {
       const validationError = validateParams(op, params);
       if (validationError) throw new Error(`${toolName}: ${validationError}`);
       const write = op.name === 'put_page' && opts.stageWrites ? stagePutPage : op.handler;
-      const output = op.name === 'put_page'
-        ? await write(opCtx, params).catch(e => rethrowWithCurrentRevision(ctx.engine, opCtx.sourceId ?? 'default', params.slug, e))
-        : await op.handler(opCtx, params);
+      const run = (c: typeof opCtx = opCtx) => op.name === 'put_page'
+        ? write(c, params).catch(e => rethrowWithCurrentRevision(ctx.engine, c.sourceId ?? 'default', params.slug, e))
+        : op.handler(c, params);
+      // GBRA-218: a remote-owned job reads as its client's member, looked up live on every call (a disabled member or
+      // removed binding takes effect at the next tool call); never a GBRA-156 private-pages grant.
+      // GBRA-231: a job a shared agent submitted for an audience reads as that audience, re-checked the same way.
+      const submitted = currentSubmissionAuthority();
+      const actingFor = submitted?.kind === 'remote_agent' ? submitted.grant.actingFor as AudiencePrincipal[] | undefined : undefined;
+      // GST-359 C1: a job submitted for an attested actor reads as that member only while actorCoverage still covers it.
+      const agent = submitted?.kind === 'remote_agent' ? submitted : undefined;
+      const actor = agent?.grant.actor;
+      // GST-1158 E1: and a job tool call that names sources reads them as the scope, exactly as the same call through MCP dispatch.
+      const output = agent && actor
+        ? await (async () => {
+          const identity = await storedActorIdentity(ctx.engine, agent.principal, actor, op.name);
+          const readMode = attestedReadMode(op.name, params, (await attestRightOf(ctx.engine, { principal: agent.principal }))?.read);
+          const access = readMode === 'scope' ? { ...SCOPE_READ_ACCESS, folderCoverage: (await folderAccessFor(ctx.engine, [])).folderCoverage } : await attestedCallerAccess(ctx.engine, actor, identity);
+          return withCallerAccess(access, () => withReadMode(readMode, async () => run(await attestedReadScope(ctx.engine, opCtx, actor.member, readMode === 'scope'))));
+        })()
+        : opCtx.auth
+        ? await withCallerAccess(await scopedJobAccess(ctx.engine, op, opCtx.auth, actingFor), run)
+        : await run();
       const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
       if (rejection) throw new Error(rejection);
       if (op.name === 'get_page' && opts.readBudgetBytes) return budgetedPageRead(ctx.engine, ctx.jobId, opts.readBudgetBytes, params.slug, output);
       return output;
     },
   };
+}
+
+/**
+ * The caller access of a remote-owned job's tool call. GST-363: the same requester-scope gate as dispatch, read live
+ * on every call: on a brain that serves several people, a read by a job whose credential is bound to nobody (and that
+ * names no audience) is refused with requester_scope_required once the grace ends; during it the call runs.
+ */
+async function scopedJobAccess(engine: BrainEngine, op: Operation, auth: NonNullable<OperationContext['auth']>, actingFor: AudiencePrincipal[] | undefined) {
+  const access = await remoteCallerAccess(engine, auth, [], undefined, actingFor, undefined, op.mutating === false);
+  if (!requiresRequesterScope(op, auth)) return access;
+  const credential = await credentialScopeFor(engine, auth);
+  const resolved = await withServesReread(engine, access, credential);
+  requesterScopeGate(op, resolved, credential, 'http');
+  return resolved;
 }
 
 /**

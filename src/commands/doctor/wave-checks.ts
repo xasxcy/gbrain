@@ -80,6 +80,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => { const { derivedVisibilityCheck } = await import('./checks/derived-visibility.ts'); return perSource(scope, id => derivedVisibilityCheck(engine, id)); },
   },
   {
+    id: 'privacy_label_ignored', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.pages ?? 0),
+    impact: 'Some pages carry an access or confidentiality value gbrain does not read as private, so the label does not hide them from remote callers or keep them out of git',
+    instruction: 'List the pages with `gbrain list --where <key>=<value> --json` on the brain host and add `visibility: private` to each page that should stay private; gbrain rewrites no label itself.',
+    run: async (engine, scope) => (await import('./checks/privacy-label-ignored.ts')).privacyLabelIgnoredCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'safe_index_pending', resolution: 'repair', registration: 'wave',
     count: d => Number(d.pages_pending ?? 0),
     impact: 'Some pages are below the safe-chunk index version and are withheld from remote search',
@@ -180,6 +187,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/frontmatter-hook.ts')).frontmatterHookCheck(engine, scope.sourceIds),
   },
   {
+    id: 'url_source_origin', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Which caller added a source is a decision only the brain host operator can record.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some URL source clones have no record of who added them, so their reclones use the clone settings of a local add',
+    instruction: 'Ask the user which of the listed sources a remote caller added; on the brain host, preview `gbrain sources record-origin <id>... --remote` (`--local` for the rest), then rerun it with --apply.',
+    run: async engine => (await import('./checks/url-source-origin.ts')).urlSourceOriginCheck(engine),
+  },
+  {
     id: 'orphan_persistence_bindings', resolution: 'repair', registration: 'wave',
     hostOnly: 'Bindings of removed sources are brain-wide persistence bookkeeping outside any source scope.',
     count: d => Number(d.count ?? 0),
@@ -190,8 +205,8 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     id: 'foreign_ownership_marker', resolution: 'operator', registration: 'wave',
     hostOnly: 'Ownership markers are private files beside the source checkouts on the brain host.',
     count: d => Number(d.count ?? 0),
-    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, so claiming that checkout refuses recovery_required',
-    instruction: 'Confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
+    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, or other users can read it, so claiming or writing that checkout refuses recovery_required',
+    instruction: 'A marker other users can read: run the chmod 600 doctor names on the brain host, never remove it. A marker of another brain: confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
     run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
   },
   {
@@ -245,6 +260,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/dream-breaker.ts')).dreamPaidLoopCheck(engine),
   },
   {
+    id: 'dream_write_deferred', resolution: 'operator', registration: 'wave',
+    count: d => (d.items ?? []).filter((item: { replays: number; bound: number }) => item.replays >= item.bound).length,
+    impact: 'A dream phase write is still pending after its replay bound, so the phase submits nothing more for that source',
+    instruction: 'Read the receipt with the `gbrain write-request` command doctor prints; if the writer is stuck, `gbrain sources writer status --source <id> --json` names why.',
+    run: async (engine, scope) => (await import('./checks/dream-write-deferred.ts')).dreamWriteDeferredCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'embedding_restamp_stalled', resolution: 'operator', registration: 'wave',
+    count: d => (d.last ? 1 : 0),
+    impact: 'The free embedding signature restamp keeps failing, so current vectors still read as another model\'s space',
+    instruction: 'Fix the error doctor prints, then run `gbrain dream --phase embed` once.',
+    run: async engine => (await import('./checks/embedding-restamp.ts')).embeddingRestampStalledCheck(engine),
+  },
+  {
     id: 'writer_version', resolution: 'operator', registration: 'wave',
     impact: 'A writer older than this release admitted or published a recent write',
     instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; an older writer may still delete database-only timeline rows.',
@@ -257,6 +286,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; the hold clears seven days after that writer\'s last request.',
     count: d => (Array.isArray(d.blockers) ? d.blockers.length : 0),
     run: async engine => (await import('./checks/segmented-storage.ts')).segmentedStorageCheck(engine),
+  },
+  {
+    id: 'segmented_tiling', resolution: 'operator', registration: 'doctor.ts',
+    hostOnly: 'It lists page slugs, and the repair it names runs only from the trusted local CLI on the brain host.',
+    impact: 'Some pages stored in segments have segment rows that do not cover their body, so every read of them refuses and sync holds their files',
+    instruction: 'Preview `gbrain repair segmented-tiling --source <id>` (read-only), show the user the listing, and apply it with the printed --expect hash only after they agree; it republishes each page from its file at HEAD and never runs automatically.',
+    count: d => (Array.isArray(d.pages) ? d.pages.length : 0),
+    run: async (engine, scope) => (await import('./checks/segmented-tiling.ts')).segmentedTilingCheck(engine, scope.sourceIds),
   },
   {
     id: 'self_capture', resolution: 'operator', registration: 'wave',
@@ -323,6 +360,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/atom-retirements.ts')).atomRetirementsRestorableCheck(engine, scope.sourceIds),
   },
   {
+    id: 'atom_fence_rows', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Narrowing atoms to private is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some world atoms carry text of a fence row their source page shows only to the owner',
+    run: async (engine, scope) => (await import('./checks/atom-fence-rows.ts')).atomFenceRowsCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'generation_retirements', resolution: 'repair', registration: 'wave',
     hostOnly: 'Restoring a derived generation is a host-side, explicit-only repair.',
     count: d => Number(d.items ?? 0),
@@ -351,6 +395,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/extractor-facts.ts')).extractorFactsCheck(engine, scope.sourceIds),
   },
   {
+    id: 'unwithdrawn_facts', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring facts a facts-fence generation retired without a withdrawal is a host-side, explicit-only repair.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some facts were retired by a facts-fence generation although no fence of their page held them, and recall no longer returns them',
+    run: async (engine, scope) => (await import('./checks/unwithdrawn-facts.ts')).unwithdrawnFactsCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'conversation_label_facts', resolution: 'repair', registration: 'wave',
     hostOnly: 'Retiring label-misattributed conversation facts is a host-side, explicit-only repair.',
     count: d => Number(d.evidenced ?? 0),
@@ -371,6 +422,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
     impact: 'Some active facts were captured from gbrain\'s own model sessions or from pasted text before v0.60.30.0',
     run: async (engine, scope) => (await import('./checks/captured-facts.ts')).capturedFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'agent_session_facts', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Classifying agent-session facts reads the session corpus on the brain host; the repair is explicit-only and needs the user\'s agreement.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some active facts from agent-launched sessions are still attributed to the owner',
+    run: async (engine, scope) => (await import('./checks/agent-session-facts.ts')).agentSessionFactsCheck(engine, scope.sourceIds),
   },
   {
     id: 'facts_redaction_marker', resolution: 'repair', registration: 'wave',

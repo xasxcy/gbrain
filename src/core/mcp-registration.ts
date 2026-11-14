@@ -11,6 +11,7 @@
 
 import { shellQuote } from './shell-quote.ts';
 import type { McpSurface } from '../mcp/surface.ts';
+import { STDIO_MEMBER_FLAG } from './stdio-member-flag.ts';
 
 export { shellQuote };
 
@@ -58,9 +59,10 @@ const SURFACE_ORDER: readonly McpSurface[] = ['verbs', 'starter', 'full'];
  * existing bare registration bare when it replaces it. `--advertise` is
  * written only when it is narrower than the surface.
  */
-export function stdioServeArgv(bin: string, surface: McpSurface | null = REGISTRATION_SURFACE, advertise: McpSurface | null = null): string[] {
-  if (!surface) return [bin, 'serve'];
-  return [bin, 'serve', '--surface', surface, ...(advertise && SURFACE_ORDER.indexOf(advertise) < SURFACE_ORDER.indexOf(surface) ? ['--advertise', advertise] : [])];
+export function stdioServeArgv(bin: string, surface: McpSurface | null = REGISTRATION_SURFACE, advertise: McpSurface | null = null, stdioMember?: string): string[] {
+  const member = stdioMember !== undefined ? [STDIO_MEMBER_FLAG, stdioMember] : [];
+  if (!surface) return [bin, 'serve', ...member];
+  return [bin, 'serve', '--surface', surface, ...(advertise && SURFACE_ORDER.indexOf(advertise) < SURFACE_ORDER.indexOf(surface) ? ['--advertise', advertise] : []), ...member];
 }
 
 /**
@@ -253,10 +255,10 @@ export const OAUTH_SECRET_NOTE =
   'short-lived, scoped access tokens; revoke with `gbrain auth revoke-client`.';
 
 /**
- * Paste-ready OpenClaw wiring block — HONEST v1. OpenClaw has no native
- * remote-MCP client yet, so the scoped path is a thin gbrain install on the
- * OpenClaw machine (`gbrain init` in mcp-only mode), which routes brain access
- * through the OAuth client minted for it. Deliberately NOT an mcpServers/
+ * Paste-ready OpenClaw wiring block — HONEST v1. The scoped path this client
+ * serves is a thin gbrain install on the OpenClaw machine (`gbrain init` in
+ * mcp-only mode), which routes brain access through the OAuth client minted
+ * for it; OpenClaw's own remote MCP client signs in with its own OAuth login. Deliberately NOT an mcpServers/
  * stdio JSON config: the stdio config in docs/mcp/OPENCLAW.md grants FULL
  * local DB access and does not use this client.
  */
@@ -279,7 +281,8 @@ export function openclawThinClientBlock(opts: {
     init,
     '',
     'Your OpenClaw reaches the brain through the scoped gbrain CLI (search/query/recall/put);',
-    "native remote MCP isn't supported yet — the stdio config in docs/mcp/OPENCLAW.md grants",
+    "OpenClaw's native remote MCP client (streamable HTTP + `openclaw mcp login`) is the other scoped",
+    'route, with its own OAuth login (docs/mcp/OPENCLAW.md); the stdio config in docs/mcp/OPENCLAW.md grants',
     'FULL local DB access and does not use this client.',
   ].join('\n');
 }
