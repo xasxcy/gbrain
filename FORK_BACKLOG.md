@@ -451,3 +451,47 @@ removes the symptom, not the cause. doctor's `slug_path_mismatch` (146 pages) is
 
 Next step: find which image import path produces the raw-style slug (sync import vs. asset/projection paths), and
 whether a re-import should reuse the page that already owns the origin path instead of deriving a new slug.
+
+---
+
+## FB-012 · Segmented pages bypassed the stale slices, so a large page re-embedded forever with nothing installed
+
+- **Recorded**: 2026-11-14
+- **Status**: **fixed** on branch `fix/segmented-stale-batch` (stale paths only). The ledger gap below is still open.
+- **Trigger** (for the open part): `Embedded 0 chunks … eligible_now=N` repeats while `embed_failures` stays empty and
+  the stuck page is segmented (`pages.body_storage = 'segmented'`).
+
+### What happened
+
+A 1,069-chunk chat-log page (avg ~2,150 chars/chunk) was imported on 2026-11-11 and stored segmented. From then on
+every 15-minute cron `embed --stale` printed `Embedded 0 chunks … total_null=1069; eligible_now=1069`, stopped on
+`time_budget`, and left `embed_failures` empty. The Windows embedding host ran at ~52% CPU for about 10 of every 15
+minutes for three days, and nothing was installed.
+
+### Root cause
+
+The stale path sent segmented pages to upstream's `embedSegmentedPage` with its default
+`SEGMENTED_EMBED_BATCH_ROWS = 500`. A batch installs only after all its vectors return. `embedBatch` splits 500 rows
+into 100-row provider requests, and at the measured ~8.2 s per real chunk on the CPU ollama host (see FORK_RUNTIME)
+one such request already exceeds `GBRAIN_AI_EMBED_TIMEOUT_MS=180000`, and the whole batch exceeds the 10-minute
+`GBRAIN_EMBED_TIME_BUDGET_MS`. That part is inferred from the code and the timings, not measured per request. The
+budget abort then discarded the batch. The fork's slice checkpointing (`GBRAIN_EMBED_SUBBATCH_SIZE`, ADR-089) and the
+`embed_failures` ledger (FB-002) cover only the inline path, so nothing was kept and nothing backed off.
+
+### Fix
+
+Both stale callers pass `batchRows = resolveEmbedSubBatchSize()` (8 in production, from `.env`; the cron log's
+`[embed-slice] … chunks=8` lines show the cron environment reads it): `runStale`'s `embedOneKey` in
+`src/commands/embed.ts` and `embedStalePages` in `src/core/embed-stale.ts`. Each 8-row batch is one provider request
+and is installed before the next, so a budget stop keeps the finished batches. `embed <slug>` and `embed --all` keep
+the 500 default, so those paths are unchanged. They are the ones that pass an approved cap (`--max-usd`), which
+`embedSegmentedPage` applies on the first batch only, and small batches were not verified against that. Upstream's
+`segmented-embedding.ts` is unchanged.
+Pinned by `test/large-pages/segmented-stale-slices-fork.test.ts`, which fails on the old code (0 rows installed) and
+passes on the fix (8).
+
+### Still open
+
+A segmented batch that fails is recorded only in the run's in-memory result, not in `embed_failures`, so a batch that
+fails every time is retried every run without backoff or quarantine. Wire the segmented path into the ledger if that
+trigger fires.
