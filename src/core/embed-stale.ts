@@ -356,7 +356,8 @@ export async function embedStalePages(
     try {
       const segmented = await readSegmentedEmbedPage(engine, { sourceId, slug });
       if (segmented) {
-        const page = await embedSegmentedPage(engine, segmented, { embedFn, signal: opts.signal, signature: opts.embeddingSignature });
+        // Fork: install per slice so an abort keeps the finished slices (no approved cap on this path).
+        const page = await embedSegmentedPage(engine, segmented, { embedFn, signal: opts.signal, signature: opts.embeddingSignature, batchRows: resolveEmbedSubBatchSize() });
         const stamp = page.complete ? await resolveProvenanceStamp(engine, opts.embeddingSignature) : undefined;
         if (stamp) await stampIfPageProvenanceComplete(engine, slug, sourceId, stamp);
         result.embedded += page.embedded;

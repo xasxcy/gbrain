@@ -1136,10 +1136,10 @@ export async function runEmbed(engine: BrainEngine, args: string[], selectedConf
 /**
  * Wave B: embed a segmented page's vector-less live rows (all of them with `all`)
  * by keyset (`embedSegmentedPage`), never through its body or a whole-page
- * chunk read. A dry run only counts those rows.
+ * chunk read. A dry run only counts those rows. Fork (FB-012): `--stale` passes `batchRows` = slice size.
  */
 async function embedSegmented(engine: BrainEngine, page: SegmentedEmbedPage, result: EmbedResult,
-  opts: { dryRun: boolean; signal?: AbortSignal; signature?: string; approvedCapUsd?: number; all?: boolean }): Promise<void> {
+  opts: { dryRun: boolean; signal?: AbortSignal; signature?: string; approvedCapUsd?: number; all?: boolean; batchRows?: number }): Promise<void> {
   if (opts.dryRun) {
     const counts = await countSegmentedEmbedRows(engine, page.id);
     result.total_chunks += counts.total;
@@ -1149,7 +1149,7 @@ async function embedSegmented(engine: BrainEngine, page: SegmentedEmbedPage, res
   }
   try {
     const done = await embedSegmentedPage(engine, page, { embedFn: (texts, o) => embedBatchWithBackoff(texts, o),
-      signal: opts.signal, signature: opts.signature, approvedCapUsd: opts.approvedCapUsd, all: opts.all });
+      signal: opts.signal, signature: opts.signature, approvedCapUsd: opts.approvedCapUsd, all: opts.all, batchRows: opts.batchRows });
     result.embedded += done.embedded;
     const stamp = done.complete ? await resolveProvenanceStamp(engine, opts.signature) : undefined;
     if (stamp) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, stamp);
@@ -2201,7 +2201,7 @@ async function embedAllStale(
             const segmented = await observed(pacer, () => readSegmentedEmbedPage(engine, { sourceId: keySourceId, slug }));
             if (segmented) {
               const before = result.pages_processed;
-              await embedSegmented(engine, segmented, result, { dryRun: false, signal: effectiveSignal, signature });
+              await embedSegmented(engine, segmented, result, { dryRun: false, signal: effectiveSignal, signature, batchRows: subBatchSize });
               totalProcessedPages += result.pages_processed - before;
               processedPageKeys.add(key);
               return;
