@@ -143,14 +143,14 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
 - **fork 的 `embed_failures` 账本会接管 serve 的延迟 embed 重试。** provider 失败后，该 chunk 进入账本退避（15 分钟起、指数增长）；上游 serve 端的 drain 20 ms 后重试时找不到可做的 chunk，就报 `drained`，页面等退避结束后由下一轮补上。
 - **生产 checkout 里跑 `bun install` 就会迁移生产库。** `postinstall`（`scripts/postinstall.ts`）读 `.env`，会直接跑结构迁移和 fork 迁移，不做确认。v0.60.517.0 落地时就是这样，264→279 加 fork#16 在一次 install 里跑完，用时 38 秒，跳过了迁移前的连接检查。生产上一律用 `bun install --ignore-scripts`，迁移交给下面清单里单独的一步。不要用 `apply-migrations --yes`，它还会扫主机文件、安装 autopilot。
 - **上线清单**（v0.60.331.0 和 v0.60.517.0 两次落地总结出来的；过程记录在 vault 的 `tasks/2026-10-21_gbrain-sync-0.60.331/` 和 `tasks/2026-10-31_gbrain-sync-0.60.517/`）：
-  1. 合并分支先过对抗式评审（自 2026-11-14 起用 Claude 子代理，不再用 Codex），并在当天导出的生产库副本上演练迁移。NAS 每天约 02:00 有夜间备份（`backups/gbrain_qwen2000_nightly_<日期>_*.dump`），可直接当作当天副本。
+  1. 合并分支先过对抗式评审（自 2026-11-14 起用 Claude 子代理，不再用 Codex），并在当天导出的生产库副本上演练迁移。NAS 每天约 02:00 有夜间备份（`backups/gbrain_qwen2000_nightly_<日期>_*.dump`），可直接当作当天副本。做法（v0.60.715.0 用过）：在 NAS 上用生产镜像另起一个容器 `gbrain-pg-rehearsal`，只绑 `127.0.0.1`，把 backups 目录只读挂进去，建 `gbrain` 角色（`BYPASSRLS`）和库后 `pg_restore -j 2`。容器默认 64 MB 的 `/dev/shm` 放不下 HNSW 的并行建索引，pg_restore 会丢掉两个向量索引；当时的做法是恢复后 `SET max_parallel_maintenance_workers = 0` 串行补建（约 10 分钟）。起容器时加 `--shm-size=1g` 应该能避免，未验证。恢复完用 pg_indexes / pg_constraint / pg_trigger / pg_proc / pg_policies 对一遍生产，确认对象一致。Mac 上开 `ssh -L` 隧道，在合并工作树里设 `GBRAIN_HOME=<临时目录>` 与 `GBRAIN_DATABASE_URL=<隧道地址>` 跑 `init --migrate-only`。临时 home 里放一份去掉 `database_url` 的生产 `config.json`：用空 home 时 CLI 搜索冒烟返回 0 条（`keyword_zero`），放了配置就正常，原因没有定位。演练完 `docker rm -f -v` 并删掉密码文件和临时 home。24 个迁移用时 28 秒，但演练容器开了 `fsync=off`、`synchronous_commit=off`、`full_page_writes=off`，生产会更慢。
   2. `touch ~/Library/Logs/gbrain-sync.paused.manual` 暂停 cron，等正在跑的那一轮退出（`pgrep -f gbrain-cron-sync.sh` 查不到为止）。
   3. 备份：在 NAS 上执行 `docker exec gbrain-pg pg_dump -U postgres -Fc gbrain_qwen2000`，写到 `/volume2/docker/gbrain-pg/backups/gbrain_qwen2000_pre-<版本>_<时间>.dump`，然后用 `pg_restore -l` 核对。
   4. 上游提高了 Bun 下限的话，原子替换 `~/.bun/bin/bun`，旧版保留为 `bun-<版本>.bak`。
   5. `git merge --ff-only <合并分支>`，然后 `bun install --ignore-scripts`。
   6. 查 `pg_stat_activity`，确认没有打开的事务，再跑 `set -a; . ./.env; set +a; bun src/cli.ts init --migrate-only`，保留完整输出。
   7. 核对：`config` 里的 `version` 和 `fork_schema_version`、public 表的 RLS 覆盖、新索引的 `indisvalid`。搜索冒烟必须带 `--source lifeos-vault`，不带时只查 default 源，结果为空不代表有问题。
-  8. doctor 用 `--budget-ms 0`：非交互运行的默认总预算是 90 秒，NAS 上会把大部分检查判成“未知”。
+  8. doctor 用 `--budget-ms 0`：非交互运行的默认总预算是 90 秒，NAS 上会把大部分检查判成“未知”。`--budget-ms 0` 只取消总预算，单项仍有 15 秒上限（`doctor.entry_budget_ms`），v0.60.715.0 演练时约 50 项超时成“未知”。与本次迁移相关的检查要用 `gbrain doctor --only <检查名> --budget-ms 110000 --json` 逐个单跑，例如新索引对应的 `persistence_request_indexes`，以及 `vector_plan`、`keyword_plan`。
   9. 先编译到 `bin/gbrain.new`，验证通过后再 `mv` 覆盖，旧版先备份。`rm` 暂停标记恢复 cron，盯完第一轮。
   10. 请用户自己在独立终端执行 `hermes -p default gateway restart`。
 - **Codex 评审要绕开 magpie。** `~/.codex/config.toml` 把默认 OpenAI 地址指向本地的 magpie（`127.0.0.1:3425`），magpie 是可选应用，开机不会自启。headless 评审加 `-c openai_base_url="https://chatgpt.com/backend-api/codex"`。

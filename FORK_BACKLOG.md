@@ -538,3 +538,35 @@ In `src/core/migrate.ts`, when upstream has no pending migration the runner call
 them again, so the effect is a delay, not lost work. Whether that delay can leave a brain in a state doctor misreads is
 not established. Fix direction (unverified): run `harden` and `backfill` in a `finally`, or before the fork pass when
 their order does not matter.
+
+---
+
+## FB-014 · The keyword arm times out on frequent terms in production
+
+- **Recorded**: 2026-11-15 (migration rehearsal of the v0.60.715.0 sync)
+- **Status**: pre-existing, reproduced on production with the production code; the sync does not make it worse.
+- **Trigger**: an MCP or keyword-only caller reports empty or degraded results for a common word, or work on keyword
+  ranking.
+
+`engine.searchKeyword` with PGroonga on: a frequent term such as `Obsidian` hits `statement_timeout` on the
+`excludePrivate` (chunk-driven), source-scoped and plain arms, both on production (pre-merge code) and on the
+rehearsal copy (merged code); the typed arm took 7.4 s on the merge and timed out on production. Rare terms answer
+in 10–200 ms on both. Hybrid CLI search still returns results through the vector arm, so the gap shows mainly for
+remote MCP callers and keyword-only paths. Suspect: the PGroonga match feeds every matching chunk into the ranking
+before the candidate bound applies. Not established.
+
+---
+
+## FB-015 · The job queue holds about 960 waiting jobs that nothing drains
+
+- **Recorded**: 2026-11-15 (doctor on the rehearsal copy of the v0.60.715.0 sync)
+- **Status**: pre-existing state, not a defect of the sync. No worker runs in production: the process table shows
+  only `gbrain serve` processes plus the cron, no serve path imports the minion worker or supervisor, and the newest
+  job update is from the day before the check. So jobs only accumulate: 948 `facts-absorb`, plus a handful of `extract`, `embed-backfill`,
+  `doctor-refresh` and `embed`, all `waiting`.
+- **Trigger**: a worker is ever started in production, or the queue size starts to matter.
+
+Upstream's new doctor check `legacy_job_authority` fails on it after the sync: 262 of them predate submission
+authority and would block any worker. Before starting a worker, decide whether to cancel the backlog or authorize it
+(`gbrain jobs authorize-legacy`, see upstream `docs/guides/repair.md#legacy-job-authority`); 952 queued paid jobs have
+no recorded spend basis.
