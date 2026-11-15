@@ -459,8 +459,8 @@ only those candidates as failures. Needs a mixed-candidate test next to the sing
 ## FB-011 · Image pages carry two slug styles, so a re-import can collide with its own page
 
 - **Recorded**: 2026-11-01 (post-landing doctor of the v0.60.517.0 sync)
-- **Status**: observed in production, root cause NOT established. Predates the sync: the first collision was recorded
-  on 2026-10-30, under v0.60.331.0.
+- **Status**: root cause established 2026-11-15 (see "Cause" below); the residual pages are NOT repaired. Predates
+  the sync: the first collision was recorded on 2026-10-30, under v0.60.331.0.
 - **Trigger**: another `Another live page of source … already records "<path>" as its origin` sync failure, or work on
   `slug_path_mismatch`.
 
@@ -471,8 +471,21 @@ found the origin path already owned by the existing page, and failed three times
 was already imported and embedded, so the ledger entry was stale. It was acknowledged with `sync --skip-failed`, which
 removes the symptom, not the cause. doctor's `slug_path_mismatch` (146 pages) is probably the same split.
 
-Next step: find which image import path produces the raw-style slug (sync import vs. asset/projection paths), and
-whether a re-import should reuse the page that already owns the origin path instead of deriving a new slug.
+**Cause** (2026-11-15, first cron round after landing v0.60.715.0): `importImageFile` has always keyed an image by
+its raw relative path, lowercased (`src/core/import-file.ts`, `imageSlug`). Before upstream #7107 (commit `611c8bff11`,
+in this sync), managed sync derived image slugs with `resolveSlugForPath`, which folded them like Markdown (`【】`, `·`
+dropped, spaces to `-`). Pages first written by that path keep the folded slug. #7107 makes `resolveSlugForPath`
+return the raw-path slug for images, so any later import of such a file derives the raw slug, misses the folded
+page by slug, tries to insert, and the origin guard (`src/core/persistence/origin-guard.ts`) refuses it because the
+folded page already records the file. The first full re-chunk pass after the sync (chunker version gate) hit this
+in `chonghe-writing`.
+
+Residue at landing: 4 live image pages whose slug differs from the lowercased `source_path`, 2 in `chonghe-writing`
+(currently failing every sync, auto-skip after 3) and 2 in `lifeos-vault` (fail the next time their file is
+re-imported). `gbrain repair origin-twins` does not cover it (there is one page, not two) and refuses off the owner
+host; `repair legacy-twins` covers the inverse shape. Options: re-key the 4 pages to the raw-path slug, or have the
+image importer reuse the page that already records the origin before deriving a slug (a fork patch, or an upstream
+report).
 
 ---
 

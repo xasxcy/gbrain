@@ -148,8 +148,8 @@ embedding 模型常驻(2026-10-21 设置并验证):`.124` 上的 `qwen3-embeddin
   3. 备份：在 NAS 上执行 `docker exec gbrain-pg pg_dump -U postgres -Fc gbrain_qwen2000`，写到 `/volume2/docker/gbrain-pg/backups/gbrain_qwen2000_pre-<版本>_<时间>.dump`，然后用 `pg_restore -l` 核对。
   4. 上游提高了 Bun 下限的话，原子替换 `~/.bun/bin/bun`，旧版保留为 `bun-<版本>.bak`。
   5. `git merge --ff-only <合并分支>`，然后 `bun install --ignore-scripts`。
-  6. 查 `pg_stat_activity`，确认没有打开的事务，再跑 `set -a; . ./.env; set +a; bun src/cli.ts init --migrate-only`，保留完整输出。
-  7. 核对：`config` 里的 `version` 和 `fork_schema_version`、public 表的 RLS 覆盖、新索引的 `indisvalid`。搜索冒烟必须带 `--source lifeos-vault`，不带时只查 default 源，结果为空不代表有问题。
+  6. 查 `pg_stat_activity`，确认没有打开的事务，再跑 `set -a; . ./.env; set +a; bun src/cli.ts init --migrate-only`，保留完整输出。迁移前先用 `bun src/cli.ts engine status --probe` 确认新代码连得上库：自 v0.60.715.0 起，非本机主机默认 `sslmode=require`，连不上会报 `postgres_tls_required`。2026-11-15 已在 `gbrain-pg` 开启 TLS：自签证书 `server.crt` / `server.key` 放在数据目录里，执行了 `ALTER SYSTEM SET ssl = on` 加重载，不用重启。pg_hba 全是 `host` 规则，所以明文连接仍然放行。回退是 `ALTER SYSTEM RESET ssl` 再重载。演练走的是 `ssh -L` 隧道，连的是 `127.0.0.1`，属于本机地址，不受这条默认值约束，所以演练暴露不出这个问题。
+  7. 核对：`config` 里的 `version` 和 `fork_schema_version`、public 表的 RLS 覆盖、新索引的 `indisvalid`。搜索冒烟必须带 `--source lifeos-vault`，不带时只查 default 源，结果为空不代表有问题。要选冷门词（例如 `番茄钟`），常见词会撞上 FB-014 超时；即便选冷门词，v0.60.715.0 上线时也要 112 秒，CLI 用 `timeout` 时要给足时间。
   8. doctor 用 `--budget-ms 0`：非交互运行的默认总预算是 90 秒，NAS 上会把大部分检查判成“未知”。`--budget-ms 0` 只取消总预算，单项仍有 15 秒上限（`doctor.entry_budget_ms`），v0.60.715.0 演练时约 50 项超时成“未知”。与本次迁移相关的检查要用 `gbrain doctor --only <检查名> --budget-ms 110000 --json` 逐个单跑，例如新索引对应的 `persistence_request_indexes`，以及 `vector_plan`、`keyword_plan`。
   9. 先编译到 `bin/gbrain.new`，验证通过后再 `mv` 覆盖，旧版先备份。`rm` 暂停标记恢复 cron，盯完第一轮。
   10. 请用户自己在独立终端执行 `hermes -p default gateway restart`。
