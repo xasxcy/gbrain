@@ -591,3 +591,33 @@ Upstream's new doctor check `legacy_job_authority` fails on it after the sync: 2
 authority and would block any worker. Before starting a worker, decide whether to cancel the backlog or authorize it
 (`gbrain jobs authorize-legacy`, see upstream `docs/guides/repair.md#legacy-job-authority`); 952 queued paid jobs have
 no recorded spend basis.
+
+## FB-016 · Seventeen fork tests drifted from the v0.60.715.0 merge (fork CI, not runtime)
+
+- **Recorded**: 2026-11-15 (fork CI `ci/sync-v0.60.715.0-r1`: Test run 43692382610, E2E run 43692385634)
+- **Status**: open, low priority. Production runs the merge normally (sync, image import, serve). Each failure below
+  is new against the v0.60.517.0 sync CI; the 14 shared failures are FB-009 and the fork's CI deltas (runner labels
+  `ubuntu-24.04` vs the Ubicloud labels `test/scripts/ci-runner-routing.test.ts` pins, shard weight maps naming fork
+  test files). Causes come from the CI error text; none was reproduced locally.
+- **Trigger**: cleaning fork CI to a green baseline, or the next upstream sync (refresh these first so real regressions
+  stand out).
+
+- Catalog golden drift, 7 tests (`test/schema-migrations-replay.test.ts` replay from v2/v20/v95,
+  `test/schema-history-upgrade.slow.test.ts` v272–v275): `gbrain_clear_atom_page_state()` body hash differs from the
+  `pglite-engine-init-default` golden (golden `7db0ef05…`, actual `08198894…`). Check whether a fork migration
+  redefines it or the golden predates the merge.
+- `test/fork-repair-masked-119-120.test.ts`: expects the fork counter at `15`; the merge added fork migration 16.
+- `test/scripts/postgres-lane-coverage.test.ts`: `test/large-pages/segmented-stale-slices-fork.test.ts` (FB-012 fix)
+  gates a Postgres arm with no lane; add it to `test/postgres-unit-arms.txt`.
+- `test/engine-surface-coverage.test.ts`: `releaseEmbedFailures` is now referenced by a test; shrink the UNCALLED list.
+- `test/managed-import-statement-budget.test.ts` "within its budget at 1x": 82 statements against a budget of 81.
+  Find the added statement before raising the budget.
+- `test/enforced-member-classes.test.ts`: a CLI-only command has no class, or a class names a missing command.
+- `test/scripts/mine-shard-weights.test.ts` "committed shard weights" and the stalled-checkout workflow scan: fork
+  workflow / weight-map deltas.
+- `a table gbrain did not create in the brain's schema (postgres)`, 3 tests: not investigated.
+- Doctor goldens (`test/doctor-content-golden.test.ts` and the two other doctor golden files; also failing in the
+  v0.60.517.0 sync CI, so not counted in the seventeen): the refresh in
+  `676ed480ba` captured `as_of` with the local `+08` offset; CI runs at `+00`. Regenerate with `TZ=UTC`.
+- E2E: beyond the FB-009 lanes (Tier 1 graduation, Postgres 15), `Selected E2E` shards 2–7, 12 and 14 failed; not
+  investigated.
