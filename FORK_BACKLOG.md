@@ -459,8 +459,8 @@ only those candidates as failures. Needs a mixed-candidate test next to the sing
 ## FB-011 · Image pages carry two slug styles, so a re-import can collide with its own page
 
 - **Recorded**: 2026-11-01 (post-landing doctor of the v0.60.517.0 sync)
-- **Status**: root cause established 2026-11-15 (see "Cause" below); the residual pages are NOT repaired. Predates
-  the sync: the first collision was recorded on 2026-10-30, under v0.60.331.0.
+- **Status**: resolved 2026-11-15. Root cause established (see "Cause" below) and the 4 residual pages re-keyed.
+  Predates the sync: the first collision was recorded on 2026-10-30, under v0.60.331.0.
 - **Trigger**: another `Another live page of source … already records "<path>" as its origin` sync failure, or work on
   `slug_path_mismatch`.
 
@@ -483,9 +483,17 @@ in `chonghe-writing`.
 Residue at landing: 4 live image pages whose slug differs from the lowercased `source_path`, 2 in `chonghe-writing`
 (currently failing every sync, auto-skip after 3) and 2 in `lifeos-vault` (fail the next time their file is
 re-imported). `gbrain repair origin-twins` does not cover it (there is one page, not two) and refuses off the owner
-host; `repair legacy-twins` covers the inverse shape. Options: re-key the 4 pages to the raw-path slug, or have the
-image importer reuse the page that already records the origin before deriving a slug (a fork patch, or an upstream
-report).
+host; `repair legacy-twins` covers the inverse shape.
+
+**Repair applied** (2026-11-15): with cron paused and the 4 identity rows exported to a CSV in the NAS backups
+directory, each page was moved to `lower(source_path)` with `engine.updateSlug` inside
+`maintenanceBeliefTransaction` (`op: 'import_move'`), the same path the importer uses for a moved file: page id,
+chunks, embeddings and links stay, a version snapshot and an old→new slug alias are written. Afterwards no live image
+page has a slug differing from its lowercased `source_path`, the next cron round imported both `chonghe-writing`
+files onto the same page ids with 0 errors, and the sync failure ledger was empty. Not done: an importer that reuses
+the page already recording the origin; since #7107 no new folded image slugs are written, so only a page restored
+from an older backup could reintroduce the shape. To find any, query live `type='image'` pages whose slug differs from
+`lower(replace(source_path, '\', '/'))`.
 
 ---
 
